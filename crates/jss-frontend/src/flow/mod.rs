@@ -648,6 +648,45 @@ export function load<T>(name: string, cb: Callback, opts?: Options = {}): ?Promi
     }
 
     #[test]
+    fn runtime_code_that_looks_like_flow_survives_next_to_flow() {
+        // Every line marked `// RT` is code that runs and has the shape of something a rule
+        // blanks: a curried arrow (`type => type` looks like a bare function type), a conditional
+        // in parentheses (like a cast), a JSX fragment (`<>`), object spread and rest (`...`), an
+        // arrow's own parameters (like an unnamed-parameter list), a default value after an
+        // annotation. Lines marked `// FLOW` have Flow-only syntax. The repair must leave every
+        // RT line byte for byte and change every FLOW line.
+        let src = "\
+// @flow
+const curried = () => type => type; // RT
+const pick = (a ? b : c); // RT
+const merged = {...base, extra: 1, ...more}; // RT
+const [first, ...rest] = list; // RT
+const sum = (a, b) => a + b; // RT
+const view = <><div className=\"x\">{label}</div></>; // RT
+const apply = (fn, ...args) => fn(...args); // RT
+const slice = (n = (a ? 1 : 2)) => n; // RT
+type Props = {a: number, ...Base}; // FLOW
+type Cb = string => void; // FLOW
+export const f = (x: Props = {a: 1}): string => (x.a ? 'y' : 'n'); // RT-AFTER-TYPES
+const c = (list: any); // FLOW
+const label2 = cond ? (a) : b => b; // RT
+";
+        let (text, repair) = run(src, true);
+        assert_eq!(repair.outcome.syntax_errors, 0, "{repair:?}\n{text}");
+        let original: Vec<&str> = src.lines().collect();
+        let repaired: Vec<&str> = text.lines().collect();
+        assert_eq!(original.len(), repaired.len());
+        for (before, after) in original.iter().zip(&repaired) {
+            if before.ends_with("// RT") || before.ends_with("// RT-AFTER-TYPES") {
+                assert_eq!(before, after, "runtime line changed");
+            }
+            if before.ends_with("// FLOW") {
+                assert_ne!(before, after, "Flow-only line left alone: {before}");
+            }
+        }
+    }
+
+    #[test]
     fn only_rules_that_cannot_be_broken_code_run_without_the_pragma() {
         // These shapes could be a broken file rather than Flow: not repaired without `@flow`.
         for src in [

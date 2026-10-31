@@ -10,8 +10,16 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+jss-core.workspace = true
 jss-frontend.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

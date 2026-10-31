@@ -26,6 +26,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # File discovery: .gitignore-aware directory walking (same engine as ripgrep).
 ignore = "0.4.34"
+# Peak RSS for --stats (getrusage through a safe wrapper; unix only).
+nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 # Per-file parallelism on a dedicated pool with large worker stacks.
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.profraw
+
+# Fuzzing artifacts
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
+
+# Corpus harness: git cache and run outputs never live in the repo
+# (default cache is $JSSPECTOR_CORPUS_DIR, outside the project)
+/corpus/.cache/
+/corpus/runs/
+
+# HEAD findings on real apps may be undisclosed vulnerabilities: they belong in the
+# private companion repo, never here (see SECURITY.md)
+/corpus/findings/
+*.findings.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

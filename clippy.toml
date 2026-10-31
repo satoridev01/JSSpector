@@ -1,0 +1,8 @@
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "iteration order is nondeterministic; use indexmap::IndexMap or BTreeMap" },
+  { path = "std::collections::HashSet", reason = "iteration order is nondeterministic; use indexmap::IndexSet or BTreeSet" },
+]
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

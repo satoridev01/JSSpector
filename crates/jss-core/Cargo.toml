@@ -1,0 +1,14 @@
+[package]
+name = "jss-core"
+description = "JSSpector analysis core: IR, linking, value flow, summaries, taint, entry points, reports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

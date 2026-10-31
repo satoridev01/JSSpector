@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97"            # oxc 0.156 MSRV
+license = "Apache-2.0"
+repository = "https://github.com/satoridev01/JSSpector"
+publish = false
+
+[workspace.dependencies]
+# oxc ships breaking releases roughly weekly: pin EXACTLY and upgrade deliberately
+# (golden IR snapshots + corpus diff must pass). Only jss-frontend may depend on oxc_* parser/AST crates.
+oxc_allocator = "=0.156.0"
+oxc_ast = "=0.156.0"
+oxc_parser = "=0.156.0"
+oxc_span = "=0.156.0"
+oxc_resolver = "=11.24.3"
+
+jss-core = { path = "crates/jss-core" }
+jss-frontend = { path = "crates/jss-frontend" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# No panics in analysis code: every failure must become a diagnostic (PySpector lesson).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# Deterministic output: std HashMap/HashSet are banned via clippy.toml.
+disallowed_types = "deny"
+
+[profile.release]
+panic = "unwind"               # per-file catch_unwind isolation relies on unwinding
+debug = "line-tables-only"     # keeps profiles readable (samply)
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2                  # optimize dependencies (oxc) in dev builds so local corpus runs stay fast

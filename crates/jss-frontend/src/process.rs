@@ -8,7 +8,8 @@
 //!   (it cannot be caught; oxc#21953). So the parser always runs on a stack at least
 //!   [`parser_stack_bound`] large for the file: on the worker when that fits, otherwise on a
 //!   thread spawned with that much stack. The bound follows from the file's size alone, so no
-//!   input can overflow it, whatever the nesting prescan concluded.
+//!   input can overflow it, whatever the nesting prescan concluded. Files that need more than a
+//!   worker's stack are parsed one at a time (see [`DEEP_PARSE`]).
 //! - Each worker keeps one oxc [`Allocator`] and resets it between files. After a panic the
 //!   allocator is dropped and the next file gets a fresh one.
 //! - Each file runs inside `catch_unwind`: a panic becomes a `parse/panicked` diagnostic for
@@ -26,7 +27,7 @@ use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Mutex, Once, PoisonError};
 
 use jss_core::content::{self, Skip};
 use jss_core::{
@@ -56,6 +57,12 @@ pub const STACK_PER_BYTE: usize = 768;
 
 /// Stack allowed for everything below and around the parser's recursion.
 pub const STACK_BASE: usize = 4 * 1024 * 1024;
+
+/// Held while a file whose [`parser_stack_bound`] exceeds [`WORKER_STACK_BYTES`] is parsed, so
+/// such files are parsed one at a time. They are rare in real code (one file in about 15,000 on
+/// the day-2 corpus), but pathological input really uses that stack, hundreds of MiB per file:
+/// one per worker at once could multiply the peak memory past the budget.
+static DEEP_PARSE: Mutex<()> = Mutex::new(());
 
 /// An upper bound of the stack the parser can use on `bytes`. Every level of recursion consumes
 /// at least one input byte, so a per-byte cost bounds every construct, nested or chained,
@@ -393,6 +400,9 @@ fn parse_text(
     if needed <= budget {
         return attempt().map_err(ParseFailure::Panicked);
     }
+    // Waits for any other oversized parse to finish; released once this file's thread is joined.
+    let _one_at_a_time = (needed > WORKER_STACK_BYTES)
+        .then(|| DEEP_PARSE.lock().unwrap_or_else(PoisonError::into_inner));
     std::thread::scope(|scope| {
         let handle = std::thread::Builder::new()
             .name("jss-parse-deep".to_owned())
@@ -620,6 +630,7 @@ fn stable_source_path(file: &str) -> String {
 mod tests {
     use super::*;
     use oxc_span::SourceType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn source_file_as(dir: &Path, rel: &str, contents: &[u8], class: FileClass) -> SourceFile {
         let abs_path = dir.join(rel);
@@ -1108,5 +1119,46 @@ mod tests {
         assert!(parser_stack_bound(typical.as_bytes()) <= WORKER_STACK_BYTES);
         let max = vec![b'('; usize::try_from(content::MAX_FILE_BYTES).unwrap()];
         assert!(parser_stack_bound(&max) > WORKER_STACK_BYTES);
+    }
+
+    static ACTIVE_PARSES: AtomicUsize = AtomicUsize::new(0);
+    static MOST_ACTIVE_PARSES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Parses for real, but slowly, and records how many such parses ever overlapped.
+    fn slow_counting_parser(allocator: &Allocator, text: &str, kind: SourceType) -> ParseOutcome {
+        let active = ACTIVE_PARSES.fetch_add(1, Ordering::SeqCst) + 1;
+        MOST_ACTIVE_PARSES.fetch_max(active, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let outcome = parse_with(allocator, text, kind);
+        ACTIVE_PARSES.fetch_sub(1, Ordering::SeqCst);
+        outcome
+    }
+
+    #[test]
+    fn files_that_need_more_than_a_worker_stack_are_parsed_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = "a;\n".repeat(140_000);
+        assert!(parser_stack_bound(src.as_bytes()) > WORKER_STACK_BYTES);
+        let files: Vec<SourceFile> = (0..4)
+            .map(|i| source_file(dir.path(), &format!("big{i}.js"), src.as_bytes()))
+            .collect();
+        let reports: Vec<FileReport> = std::thread::scope(|scope| {
+            let handles: Vec<_> = files
+                .iter()
+                .map(|file| {
+                    scope.spawn(move || {
+                        process_file_with(file, ClassSet::default(), slow_counting_parser)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for report in &reports {
+            assert!(
+                matches!(report.status, FileStatus::Parsed { .. }),
+                "{report:?}"
+            );
+        }
+        assert_eq!(MOST_ACTIVE_PARSES.load(Ordering::SeqCst), 1);
     }
 }

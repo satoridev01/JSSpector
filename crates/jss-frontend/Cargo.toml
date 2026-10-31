@@ -9,10 +9,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+jss-core.workspace = true
 oxc_allocator.workspace = true
 oxc_parser.workspace = true
 oxc_span.workspace = true
+rayon.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

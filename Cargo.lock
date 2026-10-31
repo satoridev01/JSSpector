@@ -415,10 +415,13 @@ dependencies = [
 name = "jss-frontend"
 version = "0.0.1"
 dependencies = [
+ "jss-core",
  "oxc_allocator",
  "oxc_parser",
  "oxc_span",
+ "rayon",
  "serde",
+ "tempfile",
 ]
 
 [[package]]

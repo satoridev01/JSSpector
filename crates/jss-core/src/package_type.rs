@@ -1,14 +1,15 @@
 //! The package.json `"type"` field, which decides whether `.js` and `.ts` files are ES modules.
 //!
 //! Like Node.js, the NEAREST ancestor `package.json` decides, even when it has no `"type"` field
-//! (then the files are CommonJS). The search never leaves the scan root, and results are
+//! (then the files are CommonJS). The search never leaves the search root, and results are
 //! memoized per directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// The `"type"` field of the nearest `package.json`, which decides how `.js` and `.ts` files parse.
@@ -76,6 +77,39 @@ impl PackageTypes {
             self.memo.insert(dir, resolved);
         }
         resolved
+    }
+
+    /// Resolves many directories at once (each relative to the root, like [`Self::for_dir`]):
+    /// every directory on the way up that is not memoized yet is checked for a `package.json`
+    /// in parallel, on the current rayon pool, and then resolved in memory. Later
+    /// [`Self::for_dir`] calls for these directories are lookups.
+    pub fn resolve_all<'a>(&mut self, rel_dirs: impl IntoIterator<Item = &'a Path>) {
+        let mut pending: BTreeSet<&Path> = BTreeSet::new();
+        for dir in rel_dirs {
+            let mut current = Some(dir);
+            while let Some(dir) = current {
+                if self.memo.contains_key(dir) || !pending.insert(dir) {
+                    break;
+                }
+                current = dir.parent();
+            }
+        }
+        let read: Vec<(&Path, Option<PackageType>)> = pending
+            .into_par_iter()
+            .map(|dir| (dir, self.read(dir)))
+            .collect();
+        // Parents before children: a directory without its own package.json inherits from its
+        // parent, which is then either resolved already or memoized.
+        let mut by_depth = read;
+        by_depth.sort_by_key(|(dir, _)| dir.components().count());
+        for (dir, own) in by_depth {
+            let resolved = own.unwrap_or_else(|| {
+                dir.parent()
+                    .and_then(|parent| self.memo.get(parent).copied())
+                    .unwrap_or_default()
+            });
+            self.memo.insert(dir.to_path_buf(), resolved);
+        }
     }
 
     /// Reads `<root>/<rel_dir>/package.json`. `None` when there is no such file (keep looking
@@ -180,6 +214,50 @@ mod tests {
         // ...so later changes on disk are not seen again.
         write(&root, "pkg/a/package.json", r#"{"type": "commonjs"}"#);
         assert_eq!(types.for_dir(Path::new("pkg/a/b")), PackageType::Module);
+    }
+
+    #[test]
+    fn resolving_many_directories_matches_one_at_a_time() {
+        let (_dir, root) = canonical_tempdir();
+        write(&root, "package.json", r#"{"type": "module"}"#);
+        write(&root, "legacy/package.json", r#"{"name": "legacy"}"#);
+        write(&root, "legacy/esm/package.json", r#"{"type": "module"}"#);
+        let dirs = [
+            "",
+            "src/a/b",
+            "src/a",
+            "legacy/lib/x",
+            "legacy/esm/deep/er",
+            "legacy",
+        ];
+        for dir in dirs {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let mut one_by_one = PackageTypes::new(&root);
+        let expected: Vec<PackageType> = dirs
+            .iter()
+            .map(|dir| one_by_one.for_dir(Path::new(dir)))
+            .collect();
+        let mut batch = PackageTypes::new(&root);
+        // A memoized directory stops the upward walk, and is reused.
+        assert_eq!(batch.for_dir(Path::new("legacy")), PackageType::CommonJs);
+        batch.resolve_all(dirs.iter().map(Path::new));
+        let resolved: Vec<PackageType> = dirs
+            .iter()
+            .map(|dir| *batch.memo.get(Path::new(dir)).unwrap())
+            .collect();
+        assert_eq!(resolved, expected);
+        assert_eq!(
+            expected,
+            [
+                PackageType::Module,
+                PackageType::Module,
+                PackageType::Module,
+                PackageType::CommonJs,
+                PackageType::Module,
+                PackageType::CommonJs,
+            ]
+        );
     }
 
     #[test]

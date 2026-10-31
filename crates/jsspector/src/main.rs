@@ -3,14 +3,14 @@
 mod report;
 
 use std::fmt::Display;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
-use jss_core::{ClassSet, DiscoverError, DiscoverOptions, FileClass, PackageType, SourceFile};
+use jss_core::{ClassSet, DiscoverError, DiscoverOptions, FileClass, PackageType};
 use jss_frontend::ParsePool;
 
 /// Exit codes, as defined in `docs/PLAN.md`: 0 = clean, 1 = findings at or above `--fail-on`
@@ -57,7 +57,9 @@ struct ParseArgs {
     /// Add a `stats` object: wall time per phase, threads, peak memory, throughput.
     #[arg(long)]
     stats: bool,
-    /// Parse a single FILE as an ES module, as if its package.json had "type": "module".
+    /// Parse a single FILE as an ES module, as if its package.json had "type": "module". (By
+    /// default a single FILE follows the nearest package.json, searched up to the enclosing git
+    /// work tree.)
     #[arg(long)]
     esm: bool,
 }
@@ -117,12 +119,7 @@ fn parse(args: &ParseArgs) -> ExitCode {
     };
     let discover_time = discover_started.elapsed();
 
-    // A single file is parsed whatever its class: it was asked for explicitly.
-    let include = if discovery.single_file {
-        ClassSet::ALL
-    } else {
-        include_set(&args.include)
-    };
+    let selection = discovery.selection(include_set(&args.include));
     if args.esm {
         if !discovery.single_file {
             return fail(
@@ -135,36 +132,30 @@ fn parse(args: &ParseArgs) -> ExitCode {
             file.package_type = PackageType::Module;
         }
     }
-    let selected: Vec<SourceFile> = discovery
-        .files
-        .iter()
-        .filter(|file| include.contains(file.class))
-        .cloned()
-        .collect();
 
+    // Every file gets a report: selected ones are parsed, the others classified.
     let parse_started = Instant::now();
-    let reports = pool.process(&selected);
+    let reports = pool.process(&discovery.files, selection);
     let parse_time = parse_started.elapsed();
 
     let root = args.path.to_string_lossy().into_owned();
-    let mut report = report::build(root, &discovery, include, &reports, args.list);
+    let mut report = report::build(root, &discovery, selection, &reports, args.list);
     if args.stats {
-        let bytes = selected.iter().map(|file| file.size).sum();
-        report.stats = Some(report::stats(
+        report.stats = Some(report::Stats::new(
             pool.threads(),
+            started,
             discover_time,
             parse_time,
-            started.elapsed(),
-            selected.len(),
-            bytes,
+            &reports,
         ));
     }
-    let json = match serde_json::to_string_pretty(&report) {
-        Ok(json) => json,
-        Err(err) => return fail(EXIT_ENGINE, format!("cannot serialize the report: {err}")),
-    };
-    let mut stdout = io::stdout().lock();
-    if let Err(err) = writeln!(stdout, "{json}").and_then(|()| stdout.flush()) {
+    // Streamed, so the report is never held in memory as text.
+    let mut out = BufWriter::new(io::stdout().lock());
+    let written = serde_json::to_writer_pretty(&mut out, &report)
+        .map_err(io::Error::from)
+        .and_then(|()| writeln!(out))
+        .and_then(|()| out.flush());
+    if let Err(err) = written {
         return fail(EXIT_ENGINE, format!("cannot write the report: {err}"));
     }
     ExitCode::SUCCESS

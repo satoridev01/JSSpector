@@ -2,38 +2,45 @@
 //! [`SCHEMA`]). Only the optional `stats` object varies from run to run.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jss_core::{ClassSet, Diagnostic, Discovery, FileClass, PackageType, SkipReason, diag};
 use jss_frontend::{FileReport, FileStatus};
-use serde::Serialize;
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 
 /// Schema identifier of the parse report. Bump the version on any breaking change.
 pub const SCHEMA: &str = "jsspector.parse-report/1";
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct ParseReport<'a> {
     pub schema: &'static str,
     /// The root exactly as given on the command line.
     pub root: String,
+    /// The classes selected for parsing.
+    pub selection: Vec<FileClass>,
     pub totals: Totals,
     /// Every diagnostic, sorted by path, code, message.
     pub diagnostics: Vec<Diagnostic>,
     /// One record per discovered file (with `--list`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<FileRecord<'a>>>,
-    /// Timing and resource use (with `--stats`): the only non-deterministic part.
+    /// Timing and resource use (with `--stats`): the only non-deterministic part, and always
+    /// the last field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<Stats>,
 }
 
-#[derive(Debug, Default, Serialize)]
+/// Counts over the run. For the selected files,
+/// `selected == parsed_ok + recovered + fatal + panicked + skipped`.
+#[derive(Debug, Default, serde::Serialize)]
 pub struct Totals {
     /// Discovered JS/TS files, whatever their class.
     pub files: usize,
-    /// Discovered files per class (every class is present).
+    /// Discovered files per final class (every class is present). Independent of the selection.
     pub by_class: BTreeMap<&'static str, usize>,
-    /// Files whose class was selected for parsing. The rest were excluded by class.
+    /// TypeScript declaration files seen and not listed (they hold no executable code).
+    pub declaration_files: usize,
+    /// Files whose class is selected. The others were excluded by class.
     pub selected: usize,
     /// Parsed without syntax errors.
     pub parsed_ok: usize,
@@ -43,11 +50,19 @@ pub struct Totals {
     pub fatal: usize,
     /// The parser panicked (contained).
     pub panicked: usize,
-    /// `skip/*` diagnostics per reason (every reason is present), from discovery and parsing.
+    /// Selected files that were not parsed.
+    pub skipped: usize,
+    /// `skipped` per reason (every reason is present).
     pub skipped_by_reason: BTreeMap<&'static str, usize>,
+    /// Selected files that are Flow-typed JavaScript, parsed with TypeScript syntax or fatal.
+    pub flow: usize,
+    /// `skip/*` diagnostics for everything else (every reason is present): entries discovery
+    /// could not list (symlinks leaving the root, unreadable entries) and unselected files
+    /// that could not be read to classify them.
+    pub discovery_skips_by_reason: BTreeMap<&'static str, usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct FileRecord<'a> {
     pub path: &'a str,
     pub class: FileClass,
@@ -61,49 +76,20 @@ pub struct FileRecord<'a> {
     pub statements: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub syntax_errors: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Stats {
-    pub threads: usize,
-    pub wall_ms: WallMs,
-    /// Peak resident set size of the process; `null` where unavailable.
-    pub peak_rss_bytes: Option<u64>,
-    /// Selected files per second of the parse phase.
-    pub files_per_sec: f64,
-    /// Bytes of selected files per second of the parse phase.
-    pub bytes_per_sec: f64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct WallMs {
-    pub discover: f64,
-    pub parse: f64,
-    pub total: f64,
+    /// Flow-typed JavaScript (see `totals.flow`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub flow: bool,
 }
 
 /// Builds the deterministic part of the report. `reports` holds one report per file of
-/// `discovery.files` whose class is in `include`, in order.
+/// `discovery.files`, in order, processed with `selection`.
 pub fn build<'a>(
     root: String,
     discovery: &'a Discovery,
-    include: ClassSet,
+    selection: ClassSet,
     reports: &'a [FileReport],
     list: bool,
 ) -> ParseReport<'a> {
-    let mut remaining = reports.iter();
-    let outcomes: Vec<Option<&FileReport>> = discovery
-        .files
-        .iter()
-        .map(|file| {
-            if include.contains(file.class) {
-                remaining.next()
-            } else {
-                None
-            }
-        })
-        .collect();
-
     let mut diagnostics: Vec<Diagnostic> = discovery
         .diagnostics
         .iter()
@@ -112,28 +98,42 @@ pub fn build<'a>(
         .collect();
     diag::sort(&mut diagnostics);
 
+    let per_reason = || {
+        SkipReason::ALL
+            .iter()
+            .map(|reason| (reason.as_str(), 0))
+            .collect::<BTreeMap<_, _>>()
+    };
     let mut totals = Totals {
         files: discovery.files.len(),
         by_class: FileClass::ALL
             .iter()
             .map(|class| (class.as_str(), 0))
             .collect(),
-        selected: reports.len(),
-        skipped_by_reason: SkipReason::ALL
-            .iter()
-            .map(|reason| (reason.as_str(), 0))
-            .collect(),
+        declaration_files: discovery.declaration_files,
+        skipped_by_reason: per_reason(),
+        discovery_skips_by_reason: per_reason(),
         ..Totals::default()
     };
-    for file in &discovery.files {
-        *totals.by_class.entry(file.class.as_str()).or_insert(0) += 1;
-    }
-    for diagnostic in &diagnostics {
+    let count = |map: &mut BTreeMap<&'static str, usize>, reason: SkipReason| {
+        *map.entry(reason.as_str()).or_insert(0) += 1;
+    };
+    for diagnostic in &discovery.diagnostics {
         if let Some(reason) = diagnostic.code.skip_reason() {
-            *totals.skipped_by_reason.entry(reason.as_str()).or_insert(0) += 1;
+            count(&mut totals.discovery_skips_by_reason, reason);
         }
     }
     for report in reports {
+        *totals.by_class.entry(report.class.as_str()).or_insert(0) += 1;
+        // An exclusion never has a selected class; were it to, it would still not count as one.
+        if !selection.contains(report.class) || report.status == FileStatus::Excluded {
+            if let FileStatus::Skipped(reason) = report.status {
+                count(&mut totals.discovery_skips_by_reason, reason);
+            }
+            continue;
+        }
+        totals.selected += 1;
+        totals.flow += usize::from(report.flow);
         match report.status {
             FileStatus::Parsed {
                 recovered: false, ..
@@ -143,7 +143,11 @@ pub fn build<'a>(
             } => totals.recovered += 1,
             FileStatus::Fatal => totals.fatal += 1,
             FileStatus::Panicked => totals.panicked += 1,
-            FileStatus::Skipped(_) => {}
+            FileStatus::Skipped(reason) => {
+                totals.skipped += 1;
+                count(&mut totals.skipped_by_reason, reason);
+            }
+            FileStatus::Excluded => {}
         }
     }
 
@@ -151,36 +155,36 @@ pub fn build<'a>(
         discovery
             .files
             .iter()
-            .zip(&outcomes)
-            .map(|(file, outcome)| {
+            .zip(reports)
+            .map(|(file, report)| {
                 let mut record = FileRecord {
                     path: &file.rel_path,
-                    class: file.class,
+                    class: report.class,
                     package_type: file.package_type,
                     size: file.size,
                     status: "excluded",
                     reason: None,
                     statements: None,
                     syntax_errors: None,
+                    flow: report.flow,
                 };
-                if let Some(report) = outcome {
-                    match report.status {
-                        FileStatus::Parsed {
-                            statements,
-                            syntax_errors,
-                            recovered,
-                        } => {
-                            record.status = if recovered { "recovered" } else { "parsed" };
-                            record.statements = Some(statements);
-                            record.syntax_errors = Some(syntax_errors);
-                        }
-                        FileStatus::Fatal => record.status = "fatal",
-                        FileStatus::Panicked => record.status = "panicked",
-                        FileStatus::Skipped(reason) => {
-                            record.status = "skipped";
-                            record.reason = Some(reason);
-                        }
+                match report.status {
+                    FileStatus::Parsed {
+                        statements,
+                        syntax_errors,
+                        recovered,
+                    } => {
+                        record.status = if recovered { "recovered" } else { "parsed" };
+                        record.statements = Some(statements);
+                        record.syntax_errors = Some(syntax_errors);
                     }
+                    FileStatus::Fatal => record.status = "fatal",
+                    FileStatus::Panicked => record.status = "panicked",
+                    FileStatus::Skipped(reason) => {
+                        record.status = "skipped";
+                        record.reason = Some(reason);
+                    }
+                    FileStatus::Excluded => {}
                 }
                 record
             })
@@ -190,6 +194,7 @@ pub fn build<'a>(
     ParseReport {
         schema: SCHEMA,
         root,
+        selection: selection.iter().collect(),
         totals,
         diagnostics,
         files,
@@ -197,35 +202,95 @@ pub fn build<'a>(
     }
 }
 
-/// Builds the `stats` object.
-pub fn stats(
-    threads: usize,
-    discover: Duration,
-    parse: Duration,
-    total: Duration,
-    files: usize,
-    bytes: u64,
-) -> Stats {
-    let parse_secs = parse.as_secs_f64();
+/// The `stats` object. Total wall time and peak memory are sampled when it is serialized, which
+/// happens last, so they cover the whole run, writing the report included.
+#[derive(Debug)]
+pub struct Stats {
+    pub threads: usize,
+    pub started: Instant,
+    pub discover: Duration,
+    pub parse: Duration,
+    /// Files that reached the parser.
+    pub parsed_files: usize,
+    /// Bytes handed to the parser.
+    pub parsed_bytes: u64,
+}
+
+impl Stats {
+    /// Builds the stats for a run, counting what reached the parser in `reports`.
+    pub fn new(
+        threads: usize,
+        started: Instant,
+        discover: Duration,
+        parse: Duration,
+        reports: &[FileReport],
+    ) -> Self {
+        let reached_parser = |report: &&FileReport| {
+            matches!(
+                report.status,
+                FileStatus::Parsed { .. }
+                    | FileStatus::Fatal
+                    | FileStatus::Panicked
+                    | FileStatus::Skipped(SkipReason::Template)
+            )
+        };
+        Stats {
+            threads,
+            started,
+            discover,
+            parse,
+            parsed_files: reports.iter().filter(reached_parser).count(),
+            parsed_bytes: reports
+                .iter()
+                .map(|report| report.parsed_bytes)
+                .fold(0, u64::saturating_add),
+        }
+    }
+}
+
+impl Serialize for Stats {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (files_per_sec, bytes_per_sec) =
+            rates(self.parse, self.parsed_files, self.parsed_bytes);
+        let mut stats = serializer.serialize_struct("Stats", 5)?;
+        stats.serialize_field("threads", &self.threads)?;
+        stats.serialize_field(
+            "wall_ms",
+            &WallMs {
+                discover: millis(self.discover),
+                parse: millis(self.parse),
+                total: millis(self.started.elapsed()),
+            },
+        )?;
+        // Peak resident set size of the process; `null` where unavailable.
+        stats.serialize_field("peak_rss_bytes", &peak_rss_bytes())?;
+        // Files and bytes that reached the parser, per second of the parse phase (which also
+        // reads and classifies the files that are not parsed).
+        stats.serialize_field("files_per_sec", &files_per_sec)?;
+        stats.serialize_field("bytes_per_sec", &bytes_per_sec)?;
+        stats.end()
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct WallMs {
+    discover: f64,
+    parse: f64,
+    total: f64,
+}
+
+/// Files and bytes per second of `parse`; 0 for an empty duration.
+fn rates(parse: Duration, files: usize, bytes: u64) -> (f64, f64) {
+    let secs = parse.as_secs_f64();
     let per_sec = |count: f64| {
-        if parse_secs > 0.0 {
-            round3(count / parse_secs)
+        if secs > 0.0 {
+            round3(count / secs)
         } else {
             0.0
         }
     };
-    Stats {
-        threads,
-        wall_ms: WallMs {
-            discover: millis(discover),
-            parse: millis(parse),
-            total: millis(total),
-        },
-        peak_rss_bytes: peak_rss_bytes(),
-        // Counts far beyond 2^53 lose precision, which is fine for a rate.
-        files_per_sec: per_sec(files as f64),
-        bytes_per_sec: per_sec(bytes as f64),
-    }
+    // Counts far beyond 2^53 lose precision, which is fine for a rate.
+    (per_sec(files as f64), per_sec(bytes as f64))
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -258,20 +323,154 @@ fn peak_rss_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jss_core::{DiagCode, SourceFile, SourceKind};
 
     #[test]
     fn rates_handle_a_zero_duration() {
-        let stats = stats(2, Duration::ZERO, Duration::ZERO, Duration::ZERO, 10, 100);
-        assert_eq!(stats.files_per_sec, 0.0);
-        assert_eq!(stats.bytes_per_sec, 0.0);
-        let stats = stats_for(Duration::from_millis(500));
-        assert_eq!(stats.files_per_sec, 20.0);
-        assert_eq!(stats.bytes_per_sec, 200.0);
-        assert_eq!(stats.wall_ms.parse, 500.0);
+        assert_eq!(rates(Duration::ZERO, 10, 100), (0.0, 0.0));
+        assert_eq!(rates(Duration::from_millis(500), 10, 100), (20.0, 200.0));
     }
 
-    fn stats_for(parse: Duration) -> Stats {
-        stats(1, Duration::from_micros(1500), parse, parse, 10, 100)
+    fn file(rel: &str, path_class: FileClass) -> SourceFile {
+        SourceFile {
+            rel_path: rel.to_owned(),
+            rel_path_os: rel.into(),
+            abs_path: format!("/r/{rel}").into(),
+            kind: SourceKind::Js,
+            path_class,
+            package_type: PackageType::CommonJs,
+            size: 10,
+        }
+    }
+
+    fn report(rel: &str, class: FileClass, status: FileStatus, flow: bool) -> FileReport {
+        let diagnostics = match status {
+            FileStatus::Skipped(reason) => vec![Diagnostic::at(reason.code(), rel, "x")],
+            FileStatus::Panicked => vec![Diagnostic::at(DiagCode::ParsePanicked, rel, "boom")],
+            FileStatus::Fatal => vec![Diagnostic::at(DiagCode::ParseFatal, rel, "bad")],
+            _ => Vec::new(),
+        };
+        let parsed_bytes = if matches!(
+            status,
+            FileStatus::Parsed { .. } | FileStatus::Fatal | FileStatus::Panicked
+        ) {
+            10
+        } else {
+            0
+        };
+        FileReport {
+            rel_path: rel.to_owned(),
+            class,
+            status,
+            flow,
+            parsed_bytes,
+            diagnostics,
+        }
+    }
+
+    const OK: FileStatus = FileStatus::Parsed {
+        statements: 1,
+        syntax_errors: 0,
+        recovered: false,
+    };
+
+    #[test]
+    fn totals_add_up_and_split_skips_by_phase() {
+        let files = [
+            file("a.js", FileClass::Source),
+            file("boom.js", FileClass::Source),
+            file("flow.js", FileClass::Source),
+            file("gen.js", FileClass::Source),
+            file("huge.js", FileClass::Source),
+            file("t.test.js", FileClass::Test),
+            file("v.js", FileClass::Vendor),
+        ];
+        let reports = vec![
+            report("a.js", FileClass::Source, OK, false),
+            report("boom.js", FileClass::Source, FileStatus::Panicked, false),
+            report("flow.js", FileClass::Source, FileStatus::Fatal, true),
+            report("gen.js", FileClass::Generated, FileStatus::Excluded, false),
+            report(
+                "huge.js",
+                FileClass::Source,
+                FileStatus::Skipped(SkipReason::TooLarge),
+                false,
+            ),
+            // Unselected and unreadable: a discovery-phase skip, not a skipped selected file.
+            report(
+                "t.test.js",
+                FileClass::Test,
+                FileStatus::Skipped(SkipReason::IoError),
+                false,
+            ),
+            report("v.js", FileClass::Vendor, FileStatus::Excluded, false),
+        ];
+        let discovery = Discovery {
+            root: "/r".into(),
+            single_file: false,
+            files: files.to_vec(),
+            diagnostics: vec![Diagnostic::at(
+                DiagCode::SkipSymlinkOutsideRoot,
+                "escape.js",
+                "out",
+            )],
+            declaration_files: 2,
+        };
+        let parse_report = build(
+            "r".to_owned(),
+            &discovery,
+            ClassSet::default(),
+            &reports,
+            true,
+        );
+        let totals = &parse_report.totals;
+        assert_eq!(totals.files, 7);
+        assert_eq!(totals.declaration_files, 2);
+        assert_eq!(totals.by_class["source"], 4);
+        assert_eq!(totals.by_class["generated"], 1);
+        assert_eq!(totals.selected, 4);
+        assert_eq!(
+            totals.selected,
+            totals.parsed_ok + totals.recovered + totals.fatal + totals.panicked + totals.skipped
+        );
+        assert_eq!(
+            (
+                totals.parsed_ok,
+                totals.fatal,
+                totals.panicked,
+                totals.skipped
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(totals.flow, 1);
+        assert_eq!(totals.skipped_by_reason["too-large"], 1);
+        assert_eq!(totals.skipped_by_reason.values().sum::<usize>(), 1);
+        assert_eq!(totals.discovery_skips_by_reason["io-error"], 1);
+        assert_eq!(totals.discovery_skips_by_reason["symlink-outside-root"], 1);
+        assert_eq!(parse_report.diagnostics.len(), 5);
+
+        let records = parse_report.files.as_ref().unwrap();
+        let status = |path: &str| {
+            let record = records.iter().find(|r| r.path == path).unwrap();
+            (record.status, record.class, record.flow)
+        };
+        assert_eq!(status("boom.js"), ("panicked", FileClass::Source, false));
+        assert_eq!(status("flow.js"), ("fatal", FileClass::Source, true));
+        assert_eq!(status("gen.js"), ("excluded", FileClass::Generated, false));
+        assert_eq!(status("t.test.js"), ("skipped", FileClass::Test, false));
+
+        let stats = Stats::new(
+            1,
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_secs(1),
+            &reports,
+        );
+        // Only the three files that reached the parser count, not the oversized one.
+        assert_eq!((stats.parsed_files, stats.parsed_bytes), (3, 30));
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["files_per_sec"], 3.0);
+        assert_eq!(json["bytes_per_sec"], 30.0);
     }
 
     #[cfg(unix)]

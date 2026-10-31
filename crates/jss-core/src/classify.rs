@@ -2,9 +2,18 @@
 //! example, generated or vendored code. (PySpector duplicated this logic in five places.)
 //!
 //! The rules are a data table ([`RULES`]) matched on the `/`-separated segments of a
-//! root-relative path, case-insensitively. When several rules match, the class with the highest
-//! precedence wins: Vendor > Generated > Test > Example > Docs > Source. Besides the path, a
-//! file is Generated when its first [`GENERATED_SCAN_BYTES`] contain [`GENERATED_MARKER`].
+//! root-relative path. When several rules match, the class with the highest precedence wins:
+//! Vendor > Generated > Test > Example > Docs > Source. Besides the path, a file is Generated
+//! when its first [`GENERATED_SCAN_BYTES`] contain [`GENERATED_MARKER`].
+//!
+//! - Directory names match exactly, case included: the conventional names are lowercase, while
+//!   capitalized segments are usually real code (n8n's `nodes/Google/Docs/`,
+//!   `descriptions/Vendor/`). File name patterns (`.min.js`, `.test.`) ignore case.
+//! - Names that often mean real code inside a source tree ([`Pattern::DirOutsideSrc`]: `build`,
+//!   `spec`, `examples`, `docs`, ...) only apply above the first `src` segment: `build/src/a.js`
+//!   is build output, `src/build/controller.ts` is a feature.
+//! - Hidden paths (any segment starting with `.`, such as `.next/` or `.yarn/`) are never walked
+//!   (see [`crate::discover()`]), so the table has no rules for them.
 
 use std::fmt;
 
@@ -149,17 +158,25 @@ impl FromIterator<FileClass> for ClassSet {
     }
 }
 
-/// What a classification [`Rule`] matches. All names are lowercase ASCII and are compared with
-/// the lowercased path.
+/// What a classification [`Rule`] matches. All names are lowercase ASCII. Directory names are
+/// compared exactly; file name patterns with the lowercased file name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pattern {
     /// A directory segment (any segment but the file name) equal to one of these names.
     Dir(&'static [&'static str]),
+    /// Like [`Pattern::Dir`], but only for segments before the first [`SOURCE_DIR`] segment:
+    /// inside a source tree these names usually name real code.
+    DirOutsideSrc(&'static [&'static str]),
     /// A file name ending with one of these suffixes, e.g. `.min.js`.
     Suffix(&'static [&'static str]),
     /// A file name containing one of these infixes, e.g. `.test.` for `*.test.*`.
     Infix(&'static [&'static str]),
+    /// A file name starting with one of these prefixes, e.g. `jest.config.`.
+    Prefix(&'static [&'static str]),
 }
+
+/// The directory name that starts a source tree (see [`Pattern::DirOutsideSrc`]).
+pub const SOURCE_DIR: &str = "src";
 
 /// One row of the classification table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,30 +189,25 @@ pub struct Rule {
 pub const RULES: &[Rule] = &[
     Rule {
         class: FileClass::Vendor,
+        // Not `vendors`: n8n's `nodes/vendors/` holds its AI vendor integrations (real code).
         pattern: Pattern::Dir(&[
             "node_modules",
             "vendor",
             "bower_components",
             "third_party",
             "third-party",
+            "thirdparty",
+            "3rdparty",
             "jspm_packages",
-            ".yarn",
         ]),
     },
     Rule {
         class: FileClass::Generated,
-        pattern: Pattern::Dir(&[
-            "dist",
-            "build",
-            "out",
-            "coverage",
-            ".next",
-            ".nuxt",
-            ".output",
-            ".svelte-kit",
-            ".turbo",
-            "storybook-static",
-        ]),
+        pattern: Pattern::Dir(&["storybook-static"]),
+    },
+    Rule {
+        class: FileClass::Generated,
+        pattern: Pattern::DirOutsideSrc(&["dist", "build", "out", "coverage"]),
     },
     Rule {
         class: FileClass::Generated,
@@ -206,9 +218,13 @@ pub const RULES: &[Rule] = &[
         pattern: Pattern::Dir(&[
             "test",
             "tests",
+            "__test__",
             "__tests__",
             "__mocks__",
-            "spec",
+            "test-utils",
+            "test_utils",
+            "test-fixtures",
+            "test_fixtures",
             "e2e",
             "cypress",
             "playwright",
@@ -216,24 +232,39 @@ pub const RULES: &[Rule] = &[
     },
     Rule {
         class: FileClass::Test,
+        pattern: Pattern::DirOutsideSrc(&["spec"]),
+    },
+    Rule {
+        class: FileClass::Test,
         pattern: Pattern::Infix(&[".test.", ".spec.", ".e2e.", ".stories."]),
     },
     Rule {
+        // Test-runner configuration: never application code.
+        class: FileClass::Test,
+        pattern: Pattern::Prefix(&[
+            "jest.config.",
+            "jest.setup.",
+            "vitest.config.",
+            "vitest.setup.",
+            "vitest.workspace.",
+            "playwright.config.",
+            "cypress.config.",
+            "karma.conf.",
+        ]),
+    },
+    Rule {
         class: FileClass::Docs,
-        pattern: Pattern::Dir(&["docs", "doc", "documentation", "website"]),
+        pattern: Pattern::DirOutsideSrc(&["docs", "doc", "documentation", "website"]),
     },
     Rule {
         class: FileClass::Example,
-        pattern: Pattern::Dir(&[
-            "examples",
-            "example",
-            "demo",
-            "demos",
-            "samples",
-            "sample",
-            "fixtures",
-            "__fixtures__",
+        pattern: Pattern::DirOutsideSrc(&[
+            "examples", "example", "demo", "demos", "samples", "sample",
         ]),
+    },
+    Rule {
+        class: FileClass::Example,
+        pattern: Pattern::Dir(&["fixtures", "__fixtures__"]),
     },
 ];
 
@@ -246,14 +277,14 @@ pub const GENERATED_SCAN_BYTES: usize = 2048;
 
 /// Classifies a root-relative, `/`-separated path using [`RULES`] alone.
 pub fn classify_path(rel_path: &str) -> FileClass {
-    let lower = rel_path.to_ascii_lowercase();
-    let (dirs, name) = match lower.rsplit_once('/') {
+    let (dirs, name) = match rel_path.rsplit_once('/') {
         Some((dirs, name)) => (dirs, name),
-        None => ("", lower.as_str()),
+        None => ("", rel_path),
     };
+    let name = name.to_ascii_lowercase();
     let mut class = FileClass::Source;
     for rule in RULES {
-        if rule.class > class && rule_matches(rule.pattern, dirs, name) {
+        if rule.class > class && rule_matches(rule.pattern, dirs, &name) {
             class = rule.class;
         }
     }
@@ -261,12 +292,15 @@ pub fn classify_path(rel_path: &str) -> FileClass {
 }
 
 fn rule_matches(pattern: Pattern, dirs: &str, name: &str) -> bool {
+    let mut segments = dirs.split('/').filter(|segment| !segment.is_empty());
     match pattern {
-        Pattern::Dir(names) => dirs
-            .split('/')
-            .any(|segment| !segment.is_empty() && names.contains(&segment)),
+        Pattern::Dir(names) => segments.any(|segment| names.contains(&segment)),
+        Pattern::DirOutsideSrc(names) => segments
+            .take_while(|&segment| segment != SOURCE_DIR)
+            .any(|segment| names.contains(&segment)),
         Pattern::Suffix(suffixes) => suffixes.iter().any(|suffix| name.ends_with(suffix)),
         Pattern::Infix(infixes) => infixes.iter().any(|infix| name.contains(infix)),
+        Pattern::Prefix(prefixes) => prefixes.iter().any(|prefix| name.starts_with(prefix)),
     }
 }
 
@@ -283,14 +317,21 @@ pub fn has_generated_marker(head: &[u8]) -> bool {
         .any(|window| window == GENERATED_MARKER)
 }
 
+/// The final class of a file whose path class is `path_class`, given its leading bytes.
+pub fn with_header(path_class: FileClass, head: &[u8]) -> FileClass {
+    if header_can_change(path_class) && has_generated_marker(head) {
+        FileClass::Generated
+    } else {
+        path_class
+    }
+}
+
 /// Classifies a file from its root-relative path and, when available, its leading bytes.
 pub fn classify(rel_path: &str, head: Option<&[u8]>) -> FileClass {
     let class = classify_path(rel_path);
     match head {
-        Some(head) if header_can_change(class) && has_generated_marker(head) => {
-            FileClass::Generated
-        }
-        _ => class,
+        Some(head) => with_header(class, head),
+        None => class,
     }
 }
 
@@ -325,8 +366,9 @@ mod tests {
             "bower_components",
             "third_party",
             "third-party",
+            "thirdparty",
+            "3rdparty",
             "jspm_packages",
-            ".yarn",
         ] {
             assert_eq!(c(&format!("{dir}/lib/a.js")), FileClass::Vendor, "{dir}");
             assert_eq!(
@@ -334,24 +376,23 @@ mod tests {
                 FileClass::Vendor,
                 "nested {dir}"
             );
+            assert_eq!(
+                c(&format!("src/static/js/{dir}/jquery.ts")),
+                FileClass::Vendor,
+                "inside src: {dir}"
+            );
         }
     }
 
     #[test]
     fn every_generated_rule_is_generated() {
-        for dir in [
-            "dist",
-            "build",
-            "out",
-            "coverage",
-            ".next",
-            ".nuxt",
-            ".output",
-            ".svelte-kit",
-            ".turbo",
-            "storybook-static",
-        ] {
+        for dir in ["dist", "build", "out", "coverage", "storybook-static"] {
             assert_eq!(c(&format!("{dir}/a.js")), FileClass::Generated, "{dir}");
+            assert_eq!(
+                c(&format!("packages/x/{dir}/src/a.js")),
+                FileClass::Generated,
+                "{dir}"
+            );
         }
         for name in ["app.min.js", "app.min.mjs", "app.bundle.js"] {
             assert_eq!(c(&format!("public/{name}")), FileClass::Generated, "{name}");
@@ -364,8 +405,13 @@ mod tests {
         for dir in [
             "test",
             "tests",
+            "__test__",
             "__tests__",
             "__mocks__",
+            "test-utils",
+            "test_utils",
+            "test-fixtures",
+            "test_fixtures",
             "spec",
             "e2e",
             "cypress",
@@ -373,6 +419,27 @@ mod tests {
         ] {
             assert_eq!(c(&format!("{dir}/a.js")), FileClass::Test, "{dir}");
         }
+        for name in [
+            "jest.config.js",
+            "jest.setup.ts",
+            "vitest.config.ts",
+            "vitest.config.mts",
+            "vitest.setup.ts",
+            "vitest.workspace.ts",
+            "playwright.config.ts",
+            "cypress.config.js",
+            "karma.conf.js",
+            "Vitest.Config.TS",
+        ] {
+            assert_eq!(c(&format!("packages/x/{name}")), FileClass::Test, "{name}");
+        }
+        // Build tooling is not test code, and there is no generic `test-*` rule.
+        assert_eq!(c("vite.config.ts"), FileClass::Source);
+        assert_eq!(c("webpack.config.js"), FileClass::Source);
+        assert_eq!(
+            c("packages/cli/src/evaluation.ee/test-runner/runner.ts"),
+            FileClass::Source
+        );
         for name in [
             "a.test.js",
             "a.spec.ts",
@@ -404,14 +471,64 @@ mod tests {
     }
 
     #[test]
-    fn matching_is_case_insensitive() {
-        assert_eq!(c("Node_Modules/x/a.js"), FileClass::Vendor);
-        assert_eq!(c("DIST/a.js"), FileClass::Generated);
+    fn vendors_is_not_a_vendor_directory() {
+        // n8n's AI vendor integration nodes are real code.
+        assert_eq!(
+            c("packages/@n8n/nodes-langchain/nodes/vendors/OpenAi/OpenAi.node.ts"),
+            FileClass::Source
+        );
+    }
+
+    #[test]
+    fn directory_names_match_case_sensitively_and_file_names_do_not() {
+        // Capitalized segments are real code (n8n integration nodes).
+        assert_eq!(
+            c("packages/nodes-base/nodes/Google/Docs/GoogleDocs.node.ts"),
+            FileClass::Source
+        );
+        assert_eq!(
+            c("packages/nodes-base/nodes/QuickBooks/descriptions/Vendor/VendorDescription.ts"),
+            FileClass::Source
+        );
+        assert_eq!(c("Node_Modules/x/a.js"), FileClass::Source);
+        assert_eq!(c("DIST/a.js"), FileClass::Source);
+        assert_eq!(c("Tests/a.js"), FileClass::Source);
+        assert_eq!(c("Examples/a.js"), FileClass::Source);
+        assert_eq!(c("Src/build/a.js"), FileClass::Generated);
+        // File name patterns ignore case.
         assert_eq!(c("src/App.MIN.JS"), FileClass::Generated);
-        assert_eq!(c("Tests/a.js"), FileClass::Test);
         assert_eq!(c("src/a.Test.JS"), FileClass::Test);
-        assert_eq!(c("Docs/a.js"), FileClass::Docs);
-        assert_eq!(c("Examples/a.js"), FileClass::Example);
+        assert_eq!(c("src/Button.Stories.tsx"), FileClass::Test);
+    }
+
+    #[test]
+    fn ambiguous_directory_names_do_not_apply_inside_a_source_tree() {
+        // Real server code in corpus repos (n8n) that these names used to hide.
+        for path in [
+            "packages/modules/apps/backend/src/build/app-build.controller.ts",
+            "packages/cli/src/modules/n8n-packages/spec/requirements.schema.ts",
+            "packages/x/src/prompts/chains/parameter-updater/examples/registry-entry.ts",
+            "src/docs/swagger.ts",
+            "src/out/writer.ts",
+            "src/coverage/report.service.ts",
+            "src/demo/seed.ts",
+        ] {
+            assert_eq!(c(path), FileClass::Source, "{path}");
+        }
+        // Above the first `src`, they still apply.
+        assert_eq!(c("build/src/a.js"), FileClass::Generated);
+        assert_eq!(c("examples/basic/src/index.js"), FileClass::Example);
+        assert_eq!(c("docs/src/components/a.js"), FileClass::Docs);
+        assert_eq!(c("spec/src/a.js"), FileClass::Test);
+        // Unambiguous names apply everywhere.
+        assert_eq!(c("src/__tests__/a.js"), FileClass::Test);
+        assert_eq!(c("src/test/a.js"), FileClass::Test);
+        assert_eq!(c("src/fixtures/a.js"), FileClass::Example);
+        assert_eq!(c("src/node_modules/x/a.js"), FileClass::Vendor);
+        assert_eq!(c("src/storybook-static/a.js"), FileClass::Generated);
+        // File name patterns too.
+        assert_eq!(c("src/spec/a.spec.ts"), FileClass::Test);
+        assert_eq!(c("src/build/app.min.js"), FileClass::Generated);
     }
 
     #[test]
@@ -457,6 +574,9 @@ mod tests {
             classify("src/schema.ts", Some(b"export {}")),
             FileClass::Source
         );
+        assert_eq!(with_header(FileClass::Docs, head), FileClass::Generated);
+        assert_eq!(with_header(FileClass::Vendor, head), FileClass::Vendor);
+        assert_eq!(with_header(FileClass::Source, b"x"), FileClass::Source);
         assert!(header_can_change(FileClass::Test));
         assert!(!header_can_change(FileClass::Generated));
         assert!(!header_can_change(FileClass::Vendor));

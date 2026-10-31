@@ -1,18 +1,18 @@
 //! Parsing one file with oxc and summarizing the result as owned data.
 
-use std::path::Path;
-
 use jss_core::{PackageType, SourceKind};
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
-use serde::Serialize;
 
 /// The oxc [`SourceType`] for a file kind and package type.
 ///
 /// `.js` and `.ts` follow the nearest package.json `"type"`; `.mjs`/`.mts` are always modules and
 /// `.cjs`/`.cts` always CommonJS. JSX is enabled for every JavaScript kind, because React code
 /// commonly puts JSX in `.js` files, but not for `.ts`, where `<T>x` is a type assertion.
+///
+/// `SourceType::from_path` is deliberately not used. It does not enable JSX for `.js`, and it
+/// fails on non-UTF-8 file names.
 pub fn source_type(kind: SourceKind, package_type: PackageType) -> SourceType {
     let (js, ts) = match package_type {
         PackageType::Module => (SourceType::mjs(), SourceType::ts().with_module(true)),
@@ -32,15 +32,22 @@ pub fn source_type(kind: SourceKind, package_type: PackageType) -> SourceType {
     }
 }
 
-/// Picks the oxc [`SourceType`] for a file from its extension.
+/// TypeScript source types to try on a JavaScript file that does not parse as JavaScript, in
+/// order; `None` for TypeScript kinds.
 ///
-/// `SourceType::from_path` is deliberately not used. It does not enable JSX for `.js`, although
-/// React code commonly puts JSX in `.js` files, and it fails on non-UTF-8 file names.
-///
-/// Returns `None` for unsupported files. That includes type declaration files (`.d.ts`, `.d.mts`,
-/// `.d.cts`), which contain no executable code.
-pub fn source_type_for(path: &Path, package_type: PackageType) -> Option<SourceType> {
-    SourceKind::from_path(path).map(|kind| source_type(kind, package_type))
+/// Flow-typed JavaScript (oxc does not parse Flow) is mostly valid TypeScript: annotations,
+/// generics, `import type`, `export type`, interfaces. The module kind stays the same. JSX comes
+/// first (Flow is common in React code), then plain TypeScript, where `<T>(x) => x` is a generic
+/// arrow function rather than a JSX element.
+pub fn typed_fallbacks(kind: SourceKind, package_type: PackageType) -> Option<[SourceType; 2]> {
+    let typed = match kind {
+        SourceKind::Js | SourceKind::Jsx => SourceKind::Ts,
+        SourceKind::Mjs => SourceKind::Mts,
+        SourceKind::Cjs => SourceKind::Cts,
+        SourceKind::Ts | SourceKind::Tsx | SourceKind::Mts | SourceKind::Cts => return None,
+    };
+    let base = source_type(typed, package_type);
+    Some([base.with_jsx(true), base.with_jsx(false)])
 }
 
 /// Parse options shared by every JSSpector parse.
@@ -71,14 +78,18 @@ pub struct ParseOutcome {
     pub syntax_errors: usize,
     /// The parser gave up: the AST is empty and the file cannot be analyzed.
     pub fatal: bool,
-    /// The file uses Flow type annotations.
+    /// oxc found an `@flow` pragma in a file that failed to parse.
     pub flow: bool,
     /// The first error, in oxc's order.
     pub first_error: Option<SyntaxError>,
 }
 
+/// The signature of [`parse_with`], so tests can substitute a parser.
+pub type ParseFn = fn(&Allocator, &str, SourceType) -> ParseOutcome;
+
 /// Parses `source` in `allocator`. Never panics on malformed input by itself (oxc bugs aside,
-/// which callers contain with `catch_unwind`).
+/// which callers contain with `catch_unwind`). It recurses once per nesting level: callers run
+/// it on a stack sized for the input (see `process::parser_stack_bound`).
 pub fn parse_with(allocator: &Allocator, source: &str, source_type: SourceType) -> ParseOutcome {
     let ret = Parser::new(allocator, source, source_type)
         .with_options(parse_options())
@@ -101,66 +112,34 @@ pub fn parse_with(allocator: &Allocator, source: &str, source_type: SourceType) 
     }
 }
 
-/// Parser statistics for one file. This is a development aid until IR lowering lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct ParseStats {
-    /// Top-level statements in the program (0 when parsing failed fatally).
-    pub statements: usize,
-    /// Syntax errors reported by the parser, whether it recovered or not.
-    pub syntax_errors: usize,
-    /// The parser gave up: the AST is empty and the file cannot be analyzed.
-    pub fatal: bool,
-    /// The file uses Flow type annotations.
-    pub flow: bool,
-}
-
-/// Parses `source` with a fresh allocator and reports [`ParseStats`]. Never panics on malformed
-/// input: syntax errors are counted, and a fatal error is reported in [`ParseStats::fatal`].
-pub fn parse_stats(source: &str, source_type: SourceType) -> ParseStats {
-    let allocator = Allocator::default();
-    let outcome = parse_with(&allocator, source, source_type);
-    ParseStats {
-        statements: outcome.statements,
-        syntax_errors: outcome.syntax_errors,
-        fatal: outcome.fatal,
-        flow: outcome.flow,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn st(name: &str) -> Option<SourceType> {
-        source_type_for(Path::new(name), PackageType::CommonJs)
+    fn st(kind: SourceKind) -> SourceType {
+        source_type(kind, PackageType::CommonJs)
+    }
+
+    fn parse(source: &str, source_type: SourceType) -> ParseOutcome {
+        let allocator = Allocator::default();
+        parse_with(&allocator, source, source_type)
     }
 
     #[test]
-    fn source_type_comes_from_the_extension() {
-        assert!(st("app.js").unwrap().is_jsx(), ".js must accept JSX");
-        assert!(st("app.jsx").unwrap().is_jsx());
-        assert!(st("users.ts").unwrap().is_typescript());
+    fn source_type_comes_from_the_kind() {
+        assert!(st(SourceKind::Js).is_jsx(), ".js must accept JSX");
+        assert!(st(SourceKind::Jsx).is_jsx());
+        assert!(st(SourceKind::Ts).is_typescript());
         assert!(
-            !st("users.ts").unwrap().is_jsx(),
+            !st(SourceKind::Ts).is_jsx(),
             ".ts must not enable JSX (`<T>x` casts)"
         );
-        assert!(st("page.tsx").unwrap().is_jsx());
-        assert!(
-            st("APP.JS").is_some(),
-            "extension matching is case-insensitive"
-        );
-        assert!(
-            st("index.d.ts").is_none(),
-            "declaration files have no executable code"
-        );
-        assert!(st("index.d.mts").is_none());
-        assert!(st("style.css").is_none());
-        assert!(st("Makefile").is_none());
+        assert!(st(SourceKind::Tsx).is_jsx());
     }
 
     #[test]
     fn package_type_module_makes_js_an_es_module() {
-        let esm = source_type_for(Path::new("a.js"), PackageType::Module).unwrap();
+        let esm = source_type(SourceKind::Js, PackageType::Module);
         assert!(esm.is_module());
         assert!(esm.is_jsx());
     }
@@ -170,11 +149,11 @@ mod tests {
         for kind in SourceKind::ALL {
             for package_type in [PackageType::CommonJs, PackageType::Module] {
                 let source_type = source_type(kind, package_type);
-                let ts = matches!(
-                    kind,
-                    SourceKind::Ts | SourceKind::Tsx | SourceKind::Mts | SourceKind::Cts
+                assert_eq!(
+                    source_type.is_typescript(),
+                    !kind.is_javascript(),
+                    "{kind:?}"
                 );
-                assert_eq!(source_type.is_typescript(), ts, "{kind:?}");
             }
         }
         assert!(source_type(SourceKind::Mjs, PackageType::CommonJs).is_module());
@@ -184,16 +163,42 @@ mod tests {
     }
 
     #[test]
+    fn typed_fallbacks_keep_the_module_kind_and_try_jsx_first() {
+        for kind in SourceKind::ALL {
+            for package_type in [PackageType::CommonJs, PackageType::Module] {
+                let fallbacks = typed_fallbacks(kind, package_type);
+                assert_eq!(fallbacks.is_some(), kind.is_javascript(), "{kind:?}");
+                let Some([jsx, plain]) = fallbacks else {
+                    continue;
+                };
+                let original = source_type(kind, package_type);
+                for typed in [jsx, plain] {
+                    assert!(typed.is_typescript());
+                    assert_eq!(typed.is_module(), original.is_module(), "{kind:?}");
+                    assert_eq!(
+                        typed.is_unambiguous(),
+                        original.is_unambiguous(),
+                        "{kind:?}"
+                    );
+                }
+                assert!(jsx.is_jsx());
+                assert!(!plain.is_jsx());
+            }
+        }
+    }
+
+    #[test]
     fn jsx_in_a_dot_js_file_parses_cleanly() {
         let src = "const App = () => <div onClick={go}>hi</div>;\nexport default App;\n";
-        let stats = parse_stats(src, st("app.js").unwrap());
+        let outcome = parse(src, st(SourceKind::Js));
         assert_eq!(
-            stats,
-            ParseStats {
+            outcome,
+            ParseOutcome {
                 statements: 2,
                 syntax_errors: 0,
                 fatal: false,
-                flow: false
+                flow: false,
+                first_error: None
             }
         );
     }
@@ -201,28 +206,25 @@ mod tests {
     #[test]
     fn typescript_decorators_parse_cleanly() {
         let src = "@Controller('users')\nexport class UsersController {\n  @Get(':id')\n  find(@Param('id') id: string): string { return id; }\n}\n";
-        let stats = parse_stats(src, st("users.controller.ts").unwrap());
-        assert_eq!(stats.syntax_errors, 0);
-        assert!(!stats.fatal);
+        let outcome = parse(src, st(SourceKind::Ts));
+        assert_eq!(outcome.syntax_errors, 0);
+        assert!(!outcome.fatal);
     }
 
     #[test]
     fn commonjs_top_level_return_is_allowed() {
         let src = "if (!module.parent) return;\nmodule.exports = function routes(app) {};\n";
-        let stats = parse_stats(src, st("routes.cjs").unwrap());
-        assert_eq!(stats.syntax_errors, 0);
+        assert_eq!(parse(src, st(SourceKind::Cjs)).syntax_errors, 0);
     }
 
     #[test]
     fn syntax_errors_are_counted_not_panicked() {
-        let stats = parse_stats("function (", st("broken.js").unwrap());
-        assert!(stats.syntax_errors > 0);
+        assert!(parse("function (", st(SourceKind::Js)).syntax_errors > 0);
     }
 
     #[test]
     fn the_first_error_carries_its_offset() {
-        let allocator = Allocator::default();
-        let outcome = parse_with(&allocator, "let a = 1;\nlet = ;\n", st("a.js").unwrap());
+        let outcome = parse("let a = 1;\nlet = ;\n", st(SourceKind::Js));
         assert!(outcome.syntax_errors > 0);
         let first = outcome.first_error.unwrap();
         assert!(!first.message.is_empty());
@@ -234,9 +236,9 @@ mod tests {
         // Annex B HTML-like comments are legal in scripts but not in modules, and oxc reports
         // them as a recoverable error.
         let src = "<!-- legacy comment\nx();\n";
-        let cjs = parse_stats(src, source_type(SourceKind::Js, PackageType::CommonJs));
+        let cjs = parse(src, source_type(SourceKind::Js, PackageType::CommonJs));
         assert_eq!(cjs.syntax_errors, 0);
-        let esm = parse_stats(src, source_type(SourceKind::Js, PackageType::Module));
+        let esm = parse(src, source_type(SourceKind::Js, PackageType::Module));
         assert_eq!(esm.syntax_errors, 1);
         assert!(!esm.fatal);
         assert_eq!(esm.statements, 1);
@@ -246,7 +248,23 @@ mod tests {
     fn unambiguous_mode_accepts_top_level_await() {
         // Like TypeScript, oxc's unambiguous mode parses top-level `await` as an expression.
         let src = "const data = await load();\n";
-        let cjs = parse_stats(src, source_type(SourceKind::Js, PackageType::CommonJs));
+        let cjs = parse(src, source_type(SourceKind::Js, PackageType::CommonJs));
         assert_eq!(cjs.syntax_errors, 0);
+    }
+
+    #[test]
+    fn flow_files_fail_as_javascript_and_parse_as_typescript() {
+        let src = "// @flow\nimport type { Config } from './Config';\n\
+                   export function load<T>(name: string, config: Config): T {\n  return null;\n}\n";
+        let js = parse(src, st(SourceKind::Js));
+        assert!(js.fatal);
+        assert!(js.flow, "oxc reports the pragma");
+        let [jsx, plain] = typed_fallbacks(SourceKind::Js, PackageType::CommonJs).unwrap();
+        for typed in [jsx, plain] {
+            let outcome = parse(src, typed);
+            assert!(!outcome.fatal, "{outcome:?}");
+            assert_eq!(outcome.syntax_errors, 0, "{outcome:?}");
+            assert_eq!(outcome.statements, 2);
+        }
     }
 }

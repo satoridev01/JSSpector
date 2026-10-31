@@ -32,11 +32,14 @@ pub enum DiagCode {
     ParseRecovered,
     /// `parse/panicked`: the parser panicked; the panic was contained to this file.
     ParsePanicked,
+    /// `skip/template`: the file is a server-side template with a JS extension (EJS-style
+    /// `<%` delimiters), not JavaScript.
+    SkipTemplate,
 }
 
 impl DiagCode {
     /// Every code, in declaration order.
-    pub const ALL: [DiagCode; 9] = [
+    pub const ALL: [DiagCode; 10] = [
         DiagCode::SkipTooLarge,
         DiagCode::SkipMinified,
         DiagCode::SkipNotUtf8,
@@ -46,6 +49,7 @@ impl DiagCode {
         DiagCode::ParseFatal,
         DiagCode::ParseRecovered,
         DiagCode::ParsePanicked,
+        DiagCode::SkipTemplate,
     ];
 
     /// The stable string form, e.g. `skip/too-large`.
@@ -60,6 +64,7 @@ impl DiagCode {
             DiagCode::ParseFatal => "parse/fatal",
             DiagCode::ParseRecovered => "parse/recovered",
             DiagCode::ParsePanicked => "parse/panicked",
+            DiagCode::SkipTemplate => "skip/template",
         }
     }
 
@@ -72,6 +77,7 @@ impl DiagCode {
             DiagCode::SkipTooDeep => Some(SkipReason::TooDeep),
             DiagCode::SkipSymlinkOutsideRoot => Some(SkipReason::SymlinkOutsideRoot),
             DiagCode::SkipIoError => Some(SkipReason::IoError),
+            DiagCode::SkipTemplate => Some(SkipReason::Template),
             DiagCode::ParseFatal | DiagCode::ParseRecovered | DiagCode::ParsePanicked => None,
         }
     }
@@ -135,17 +141,19 @@ pub enum SkipReason {
     TooDeep,
     SymlinkOutsideRoot,
     IoError,
+    Template,
 }
 
 impl SkipReason {
     /// Every reason, in declaration order.
-    pub const ALL: [SkipReason; 6] = [
+    pub const ALL: [SkipReason; 7] = [
         SkipReason::TooLarge,
         SkipReason::Minified,
         SkipReason::NotUtf8,
         SkipReason::TooDeep,
         SkipReason::SymlinkOutsideRoot,
         SkipReason::IoError,
+        SkipReason::Template,
     ];
 
     /// The diagnostic code reported for this reason.
@@ -157,6 +165,7 @@ impl SkipReason {
             SkipReason::TooDeep => DiagCode::SkipTooDeep,
             SkipReason::SymlinkOutsideRoot => DiagCode::SkipSymlinkOutsideRoot,
             SkipReason::IoError => DiagCode::SkipIoError,
+            SkipReason::Template => DiagCode::SkipTemplate,
         }
     }
 
@@ -169,6 +178,7 @@ impl SkipReason {
             SkipReason::TooDeep => "too-deep",
             SkipReason::SymlinkOutsideRoot => "symlink-outside-root",
             SkipReason::IoError => "io-error",
+            SkipReason::Template => "template",
         }
     }
 }
@@ -252,6 +262,7 @@ mod tests {
                 "parse/fatal",
                 "parse/recovered",
                 "parse/panicked",
+                "skip/template",
             ]
         );
         for code in DiagCode::ALL {

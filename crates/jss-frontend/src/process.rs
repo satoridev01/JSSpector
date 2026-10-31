@@ -1,6 +1,14 @@
-//! Parallel per-file processing: read, check and parse every file, each isolated from the others.
+//! Parallel per-file processing: read, classify, check and parse every file, each isolated from
+//! the others.
 //!
 //! - Files run on a dedicated rayon pool whose workers have [`WORKER_STACK_BYTES`] stacks.
+//! - Each file is opened at most once. Its header decides its final class (the `@generated`
+//!   marker; see [`jss_core::Work`]), and only files of a selected class are parsed.
+//! - The parser recurses once per nesting level and a stack overflow aborts the whole process
+//!   (it cannot be caught; oxc#21953). So the parser always runs on a stack at least
+//!   [`parser_stack_bound`] large for the file: on the worker when that fits, otherwise on a
+//!   thread spawned with that much stack. The bound follows from the file's size alone, so no
+//!   input can overflow it, whatever the nesting prescan concluded.
 //! - Each worker keeps one oxc [`Allocator`] and resets it between files. After a panic the
 //!   allocator is dropped and the next file gets a fresh one.
 //! - Each file runs inside `catch_unwind`: a panic becomes a `parse/panicked` diagnostic for
@@ -21,25 +29,46 @@ use std::path::Path;
 use std::sync::Once;
 
 use jss_core::content::{self, Skip};
-use jss_core::{DiagCode, Diagnostic, FileClass, LineIndex, SkipReason, SourceFile};
+use jss_core::{
+    ClassSet, DiagCode, Diagnostic, FileClass, LineIndex, PackageType, SkipReason, SourceFile,
+    SourceKind, Work, classify,
+};
 use oxc_allocator::Allocator;
 use rayon::prelude::*;
 
-use crate::parse::{ParseOutcome, parse_with, source_type};
+use crate::parse::{ParseFn, ParseOutcome, parse_with, source_type, typed_fallbacks};
 
-/// Stack size of each worker thread.
-///
-/// The parser recurses once per nesting level, and a stack overflow aborts the whole process
-/// (it cannot be caught; oxc#21953). Workers therefore get a large stack, and
-/// [`content::MAX_NESTING_DEPTH`] keeps the deepest files away from the parser altogether.
+/// Stack size of each worker thread. Files whose [`parser_stack_bound`] exceeds it are parsed
+/// on a thread of their own with a large enough stack.
 pub const WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
 
-/// Options for [`process_files`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProcessOptions {
-    /// Worker threads. `None` uses rayon's default: `RAYON_NUM_THREADS` when set, otherwise the
-    /// available parallelism.
-    pub threads: Option<NonZeroUsize>,
+/// Parser stack allowed per input byte that can open a nesting level: `(`, `[`, `{` or `<`.
+///
+/// Measured on oxc_parser 0.156 (aarch64, release and test builds), the costliest one-byte
+/// level is `[` in a type (about 1.74 KiB), then `(` (about 1.52 KiB); this leaves room for
+/// other targets and compiler versions.
+pub const STACK_PER_BRACKET_BYTE: usize = 3 * 1024;
+
+/// Parser stack allowed per other input byte. Recursion without brackets costs at most about
+/// 370 bytes per input byte (`a ? a ? ...`; also `a => a => ...`, `a = a = ...`, labels, unary
+/// chains), measured like [`STACK_PER_BRACKET_BYTE`].
+pub const STACK_PER_BYTE: usize = 768;
+
+/// Stack allowed for everything below and around the parser's recursion.
+pub const STACK_BASE: usize = 4 * 1024 * 1024;
+
+/// An upper bound of the stack the parser can use on `bytes`. Every level of recursion consumes
+/// at least one input byte, so a per-byte cost bounds every construct, nested or chained,
+/// without parsing.
+pub fn parser_stack_bound(bytes: &[u8]) -> usize {
+    let brackets = bytes
+        .iter()
+        .filter(|&&byte| matches!(byte, b'(' | b'[' | b'{' | b'<'))
+        .count();
+    let others = bytes.len().saturating_sub(brackets);
+    STACK_BASE
+        .saturating_add(brackets.saturating_mul(STACK_PER_BRACKET_BYTE))
+        .saturating_add(others.saturating_mul(STACK_PER_BYTE))
 }
 
 /// What happened to one file.
@@ -56,17 +85,25 @@ pub enum FileStatus {
     Fatal,
     /// The parser panicked; the panic was contained to this file.
     Panicked,
-    /// The file was not parsed.
+    /// The file was selected but not parsed.
     Skipped(SkipReason),
+    /// The file's class is not selected: it was not parsed.
+    Excluded,
 }
 
 /// The outcome of processing one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileReport {
     pub rel_path: String,
+    /// The final class: the path class, or Generated when the header carries the marker.
     pub class: FileClass,
     pub status: FileStatus,
-    /// This file's diagnostics: one for every status except a clean parse.
+    /// Flow-typed JavaScript: the file has an `@flow` pragma, or it parses only with type
+    /// syntax (read as TypeScript, which covers most Flow annotations).
+    pub flow: bool,
+    /// Bytes handed to the parser: the file's size if it reached the parser, otherwise 0.
+    pub parsed_bytes: u64,
+    /// This file's diagnostics: one for every status except a clean parse and an exclusion.
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -86,20 +123,24 @@ impl std::error::Error for PoolError {
     }
 }
 
-/// A dedicated pool of parser workers. Build it once and reuse it for many batches.
+/// A dedicated pool of parser workers: the frontend's entry point. Build it once and reuse it.
 #[derive(Debug)]
 pub struct ParsePool {
     pool: rayon::ThreadPool,
 }
 
 impl ParsePool {
-    /// Starts `threads` workers (see [`ProcessOptions::threads`] for the default).
+    /// Starts `threads` workers. `None` uses rayon's default: `RAYON_NUM_THREADS` when set,
+    /// otherwise the available parallelism.
     pub fn new(threads: Option<NonZeroUsize>) -> Result<Self, PoolError> {
         install_panic_hook();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads.map_or(0, NonZeroUsize::get))
             .stack_size(WORKER_STACK_BYTES)
             .thread_name(|index| format!("jss-parse-{index}"))
+            .start_handler(|_| {
+                let _ = STACK_BUDGET.try_with(|budget| budget.set(WORKER_STACK_BYTES));
+            })
             .build()
             .map_err(PoolError)?;
         Ok(Self { pool })
@@ -116,60 +157,98 @@ impl ParsePool {
         self.pool.install(work)
     }
 
-    /// Processes `files` in parallel; the reports are in input order.
-    pub fn process(&self, files: &[SourceFile]) -> Vec<FileReport> {
-        self.pool
-            .install(|| files.par_iter().map(process_file).collect())
+    /// Processes every file in parallel: those of a class in `selection` are parsed, the others
+    /// are only classified. Returns one report per file, in input order.
+    pub fn process(&self, files: &[SourceFile], selection: ClassSet) -> Vec<FileReport> {
+        self.pool.install(|| {
+            files
+                .par_iter()
+                .map(|file| process_file(file, selection))
+                .collect()
+        })
     }
 }
 
-/// Processes `files` on a new [`ParsePool`]; the reports are in input order.
-pub fn process_files(
-    files: &[SourceFile],
-    options: &ProcessOptions,
-) -> Result<Vec<FileReport>, PoolError> {
-    Ok(ParsePool::new(options.threads)?.process(files))
+/// Processes one file. Safe on any thread: the parser gets a large enough stack either way.
+fn process_file(file: &SourceFile, selection: ClassSet) -> FileReport {
+    process_file_with(file, selection, parse_with)
 }
 
-/// Processes one file on the current thread: size check, read, content checks, parse. Never
-/// panics: a panic anywhere in the pipeline becomes a `parse/panicked` report.
-///
-/// Prefer [`ParsePool`], whose workers have the large stacks deep files need.
-pub fn process_file(file: &SourceFile) -> FileReport {
-    match isolated(|allocator| analyze(file, allocator)) {
+/// [`process_file`] with the parser as a parameter (a seam for tests). Never panics: a panic
+/// anywhere becomes a `parse/panicked` report.
+fn process_file_with(file: &SourceFile, selection: ClassSet, parse: ParseFn) -> FileReport {
+    match guarded(|| run(file, selection, parse)) {
         Ok(report) => report,
-        Err(panic) => FileReport {
-            rel_path: file.rel_path.clone(),
-            class: file.class,
-            status: FileStatus::Panicked,
-            diagnostics: vec![Diagnostic::at(
-                DiagCode::ParsePanicked,
-                file.rel_path.clone(),
-                format!("parser panicked: {panic}"),
-            )],
-        },
+        Err(panic) => panicked(file, file.path_class, &panic),
     }
 }
 
-fn analyze(file: &SourceFile, allocator: &Allocator) -> FileReport {
+fn run(file: &SourceFile, selection: ClassSet, parse: ParseFn) -> FileReport {
+    match file.work(selection) {
+        Work::Exclude => report(file, file.path_class, FileStatus::Excluded),
+        Work::Classify => match read_head(&file.abs_path) {
+            Ok(head) => report(
+                file,
+                classify::with_header(file.path_class, &head),
+                FileStatus::Excluded,
+            ),
+            Err(err) => unreadable(file, file.path_class, &err),
+        },
+        Work::Parse => parse_candidate(file, selection, parse),
+    }
+}
+
+/// A file that is parsed unless its header makes it a class that is not selected.
+fn parse_candidate(file: &SourceFile, selection: ClassSet, parse: ParseFn) -> FileReport {
     if let Err(skip) = content::check_size(file.size) {
-        return skipped(file, skip);
+        // Too large to parse: read just the header to classify it.
+        return match read_head(&file.abs_path) {
+            Ok(head) => {
+                let class = classify::with_header(file.path_class, &head);
+                if selection.contains(class) {
+                    skipped(file, class, skip)
+                } else {
+                    report(file, class, FileStatus::Excluded)
+                }
+            }
+            Err(err) => unreadable(file, file.path_class, &err),
+        };
     }
     let bytes = match read_capped(&file.abs_path, file.size) {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(err) => return unreadable(file, file.path_class, &err),
+    };
+    let class = classify::with_header(file.path_class, &bytes);
+    if !selection.contains(class) {
+        return report(file, class, FileStatus::Excluded);
+    }
+    let text = match content::check(&bytes) {
+        Ok(text) => text,
+        Err(skip) => return skipped(file, class, skip),
+    };
+    let mut report = match parse_text(text, file.kind, file.package_type, parse) {
+        Ok(Parse::Done { outcome, flow }) => parsed(file, class, text, &outcome, flow),
+        Ok(Parse::Template { message }) => {
+            skipped(file, class, Skip::new(SkipReason::Template, message))
+        }
+        Err(ParseFailure::Panicked(panic)) => panicked(file, class, &panic),
+        Err(ParseFailure::NoStack { bytes, error }) => {
+            // The parser never ran.
             return skipped(
                 file,
-                Skip::new(SkipReason::IoError, format!("cannot read file: {err}")),
+                class,
+                Skip::new(
+                    SkipReason::TooDeep,
+                    format!(
+                        "cannot start a parser thread with the {bytes}-byte stack this file \
+                         may need: {error}"
+                    ),
+                ),
             );
         }
     };
-    let text = match content::check(&bytes) {
-        Ok(text) => text,
-        Err(skip) => return skipped(file, skip),
-    };
-    let outcome = parse_with(allocator, text, source_type(file.kind, file.package_type));
-    parsed(file, text, &outcome)
+    report.parsed_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    report
 }
 
 /// Reads at most one byte more than [`content::MAX_FILE_BYTES`], so a file that grew after
@@ -181,16 +260,60 @@ fn read_capped(path: &Path, size_hint: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn skipped(file: &SourceFile, skip: Skip) -> FileReport {
+/// Reads the first [`classify::GENERATED_SCAN_BYTES`] bytes of a file.
+fn read_head(path: &Path) -> io::Result<Vec<u8>> {
+    let limit = u64::try_from(classify::GENERATED_SCAN_BYTES).unwrap_or(u64::MAX);
+    let mut head = Vec::with_capacity(classify::GENERATED_SCAN_BYTES);
+    File::open(path)?.take(limit).read_to_end(&mut head)?;
+    Ok(head)
+}
+
+fn report(file: &SourceFile, class: FileClass, status: FileStatus) -> FileReport {
     FileReport {
         rel_path: file.rel_path.clone(),
-        class: file.class,
-        status: FileStatus::Skipped(skip.reason),
-        diagnostics: vec![skip.into_diagnostic(file.rel_path.clone())],
+        class,
+        status,
+        flow: false,
+        parsed_bytes: 0,
+        diagnostics: Vec::new(),
     }
 }
 
-fn parsed(file: &SourceFile, text: &str, outcome: &ParseOutcome) -> FileReport {
+fn skipped(file: &SourceFile, class: FileClass, skip: Skip) -> FileReport {
+    FileReport {
+        diagnostics: vec![skip.clone().into_diagnostic(file.rel_path.clone())],
+        ..report(file, class, FileStatus::Skipped(skip.reason))
+    }
+}
+
+/// A file that could not be read. If its class is not known to be selected, it is still
+/// reported (nothing is dropped silently), as a skip.
+fn unreadable(file: &SourceFile, class: FileClass, err: &io::Error) -> FileReport {
+    skipped(
+        file,
+        class,
+        Skip::new(SkipReason::IoError, format!("cannot read file: {err}")),
+    )
+}
+
+fn panicked(file: &SourceFile, class: FileClass, panic: &str) -> FileReport {
+    FileReport {
+        diagnostics: vec![Diagnostic::at(
+            DiagCode::ParsePanicked,
+            file.rel_path.clone(),
+            format!("parser panicked: {panic}"),
+        )],
+        ..report(file, class, FileStatus::Panicked)
+    }
+}
+
+fn parsed(
+    file: &SourceFile,
+    class: FileClass,
+    text: &str,
+    outcome: &ParseOutcome,
+    flow: bool,
+) -> FileReport {
     let (status, code) = if outcome.fatal {
         (FileStatus::Fatal, Some(DiagCode::ParseFatal))
     } else {
@@ -203,14 +326,19 @@ fn parsed(file: &SourceFile, text: &str, outcome: &ParseOutcome) -> FileReport {
         (status, recovered.then_some(DiagCode::ParseRecovered))
     };
     let diagnostics = code
-        .map(|code| Diagnostic::at(code, file.rel_path.clone(), error_message(text, outcome)))
+        .map(|code| {
+            let mut message = error_message(text, outcome);
+            if flow && outcome.fatal {
+                message.insert_str(0, "Flow syntax that TypeScript syntax does not cover: ");
+            }
+            Diagnostic::at(code, file.rel_path.clone(), message)
+        })
         .into_iter()
         .collect();
     FileReport {
-        rel_path: file.rel_path.clone(),
-        class: file.class,
-        status,
+        flow,
         diagnostics,
+        ..report(file, class, status)
     }
 }
 
@@ -233,9 +361,148 @@ fn error_message(text: &str, outcome: &ParseOutcome) -> String {
     message
 }
 
+/// The result of parsing a file's text, all attempts included.
+enum Parse {
+    /// The final outcome; `flow` when the file is Flow-typed (see [`FileReport::flow`]).
+    Done { outcome: ParseOutcome, flow: bool },
+    /// The file is a server-side template, not JavaScript.
+    Template { message: String },
+}
+
+/// Why a file has no [`Parse`].
+enum ParseFailure {
+    Panicked(String),
+    /// A thread with a large enough stack could not be started.
+    NoStack {
+        bytes: usize,
+        error: io::Error,
+    },
+}
+
+/// Parses `text` on a stack of at least [`parser_stack_bound`]: this thread's when it is a pool
+/// worker with room enough, otherwise a thread spawned for this file.
+fn parse_text(
+    text: &str,
+    kind: SourceKind,
+    package_type: PackageType,
+    parse: ParseFn,
+) -> Result<Parse, ParseFailure> {
+    let needed = parser_stack_bound(text.as_bytes());
+    let budget = STACK_BUDGET.try_with(Cell::get).unwrap_or(0);
+    let attempt = || isolated(|allocator| parse_all(allocator, text, kind, package_type, parse));
+    if needed <= budget {
+        return attempt().map_err(ParseFailure::Panicked);
+    }
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("jss-parse-deep".to_owned())
+            .stack_size(needed)
+            .spawn_scoped(scope, attempt)
+            .map_err(|error| ParseFailure::NoStack {
+                bytes: needed,
+                error,
+            })?;
+        match handle.join() {
+            Ok(result) => result.map_err(ParseFailure::Panicked),
+            Err(payload) => Err(ParseFailure::Panicked(describe_panic(payload.as_ref()))),
+        }
+    })
+}
+
+/// Parses `text` as its kind says; a JavaScript file that fails is checked for template tags,
+/// then retried with TypeScript syntax for Flow (see [`typed_fallbacks`]).
+fn parse_all(
+    allocator: &Allocator,
+    text: &str,
+    kind: SourceKind,
+    package_type: PackageType,
+    parse: ParseFn,
+) -> Parse {
+    let primary = parse(allocator, text, source_type(kind, package_type));
+    if primary.fatal
+        && let Some(message) = template_tag(text, &primary)
+    {
+        return Parse::Template { message };
+    }
+    let fallbacks = match typed_fallbacks(kind, package_type) {
+        Some(fallbacks) if primary.fatal || primary.flow => fallbacks,
+        _ => {
+            return Parse::Done {
+                flow: primary.flow,
+                outcome: primary,
+            };
+        }
+    };
+    let mut furthest: Option<ParseOutcome> = None;
+    for typed in fallbacks {
+        let outcome = parse(allocator, text, typed);
+        if !outcome.fatal && (primary.fatal || outcome.syntax_errors == 0) {
+            return Parse::Done {
+                outcome,
+                flow: true,
+            };
+        }
+        if outcome.fatal && error_offset(&outcome) > furthest.as_ref().map_or(0, error_offset) {
+            furthest = Some(outcome);
+        }
+    }
+    // Neither syntax works. For a declared Flow file, the TypeScript attempt that got furthest
+    // shows the first construct only Flow has; for anything else, the JavaScript error stands.
+    match furthest {
+        Some(outcome) if primary.flow => Parse::Done {
+            outcome,
+            flow: true,
+        },
+        _ => Parse::Done {
+            flow: primary.flow,
+            outcome: primary,
+        },
+    }
+}
+
+fn error_offset(outcome: &ParseOutcome) -> u32 {
+    outcome
+        .first_error
+        .as_ref()
+        .and_then(|error| error.offset)
+        .unwrap_or(0)
+}
+
+/// The opening delimiter of server-side templates (EJS, ERB, Underscore/lodash templates).
+const TEMPLATE_TAG: &str = "<%";
+
+/// A skip message when the line of the first syntax error holds a template tag: a template
+/// with a `.js` extension, which no JavaScript parser should accept. Only consulted after a
+/// fatal parse.
+fn template_tag(text: &str, outcome: &ParseOutcome) -> Option<String> {
+    let offset = usize::try_from(outcome.first_error.as_ref()?.offset?).ok()?;
+    let bytes = text.as_bytes();
+    let line_start = bytes
+        .get(..offset.min(bytes.len()))?
+        .iter()
+        .rposition(|&byte| byte == b'\n' || byte == b'\r')
+        .map_or(0, |newline| newline + 1);
+    let line_end = bytes
+        .get(offset.min(bytes.len())..)?
+        .iter()
+        .position(|&byte| byte == b'\n' || byte == b'\r')
+        .map_or(bytes.len(), |newline| offset + newline);
+    let line = text.get(line_start..line_end)?;
+    let tag = line_start + line.find(TEMPLATE_TAG)?;
+    let at = LineIndex::new(text).line_col(u32::try_from(tag).ok()?);
+    Some(format!(
+        "{}:{}: template tag `{TEMPLATE_TAG}` (a server-side template such as EJS, not \
+         JavaScript)",
+        at.line, at.column
+    ))
+}
+
 thread_local! {
     /// This worker's allocator, reused (after `reset`) from one file to the next.
     static ALLOCATOR: Cell<Option<Allocator>> = const { Cell::new(None) };
+    /// Stack this thread can give the parser: [`WORKER_STACK_BYTES`] on pool workers, 0
+    /// elsewhere (the parser then always runs on a thread of its own).
+    static STACK_BUDGET: Cell<usize> = const { Cell::new(0) };
     /// True while this thread processes a file: the panic hook records instead of printing.
     static CAPTURING: Cell<bool> = const { Cell::new(false) };
     /// Location of the last panic recorded on this thread.
@@ -245,44 +512,55 @@ thread_local! {
 /// Runs `work` with this thread's allocator, catching any panic. On a panic the allocator is
 /// dropped (the next call starts with a fresh one) and the panic is described as a string.
 fn isolated<T>(work: impl FnOnce(&Allocator) -> T) -> Result<T, String> {
-    install_panic_hook();
     let mut allocator = ALLOCATOR
         .try_with(Cell::take)
         .ok()
         .flatten()
         .unwrap_or_default();
     allocator.reset();
-    let result = {
-        let _capture = Capture::start();
-        panic::catch_unwind(AssertUnwindSafe(|| work(&allocator)))
-    };
-    match result {
+    match guarded(|| work(&allocator)) {
         Ok(value) => {
             let _ = ALLOCATOR.try_with(|cell| cell.set(Some(allocator)));
             Ok(value)
         }
-        Err(payload) => {
+        Err(panic) => {
             // The arena may be in any state after a panic: never reuse it.
             drop(allocator);
-            Err(describe_panic(payload.as_ref()))
+            Err(panic)
         }
     }
 }
 
-/// Marks this thread as processing a file for as long as it lives.
-struct Capture;
+/// Runs `work`, catching any panic and describing it as a string; the panic hook records the
+/// panic's location instead of printing it.
+fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, String> {
+    install_panic_hook();
+    let result = {
+        let _capture = Capture::start();
+        panic::catch_unwind(AssertUnwindSafe(work))
+    };
+    result.map_err(|payload| describe_panic(payload.as_ref()))
+}
+
+/// Marks this thread as processing a file for as long as it lives (nesting restores the outer
+/// state).
+struct Capture {
+    previous: bool,
+}
 
 impl Capture {
     fn start() -> Self {
-        let _ = CAPTURING.try_with(|capturing| capturing.set(true));
+        let previous = CAPTURING.try_with(|capturing| capturing.replace(true));
         let _ = PANIC_LOCATION.try_with(Cell::take);
-        Capture
+        Capture {
+            previous: previous.unwrap_or(false),
+        }
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        let _ = CAPTURING.try_with(|capturing| capturing.set(false));
+        let _ = CAPTURING.try_with(|capturing| capturing.set(self.previous));
     }
 }
 
@@ -300,7 +578,7 @@ fn describe_panic(payload: &(dyn Any + Send)) -> String {
 
 /// Installs, once per process, a panic hook that records (instead of printing) panics raised
 /// while a thread processes a file, and passes every other panic to the previous hook. Because
-/// it only intercepts panics inside [`isolated`], it never needs to be uninstalled, and
+/// it only intercepts panics inside [`guarded`], it never needs to be uninstalled, and
 /// concurrent pools cannot race to install and restore hooks.
 fn install_panic_hook() {
     static INSTALL: Once = Once::new();
@@ -341,9 +619,9 @@ fn stable_source_path(file: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jss_core::{PackageType, SourceKind};
+    use oxc_span::SourceType;
 
-    fn source_file(dir: &Path, rel: &str, contents: &[u8]) -> SourceFile {
+    fn source_file_as(dir: &Path, rel: &str, contents: &[u8], class: FileClass) -> SourceFile {
         let abs_path = dir.join(rel);
         std::fs::create_dir_all(abs_path.parent().unwrap()).unwrap();
         std::fs::write(&abs_path, contents).unwrap();
@@ -352,10 +630,19 @@ mod tests {
             rel_path_os: rel.into(),
             abs_path,
             kind: SourceKind::from_path(Path::new(rel)).unwrap(),
-            class: FileClass::Source,
+            path_class: class,
             package_type: PackageType::CommonJs,
             size: u64::try_from(contents.len()).unwrap(),
         }
+    }
+
+    fn source_file(dir: &Path, rel: &str, contents: &[u8]) -> SourceFile {
+        source_file_as(dir, rel, contents, FileClass::Source)
+    }
+
+    /// Processes with the default selection (source only).
+    fn process(file: &SourceFile) -> FileReport {
+        process_file(file, ClassSet::default())
     }
 
     fn one_diag(report: &FileReport) -> (&str, &str) {
@@ -365,15 +652,18 @@ mod tests {
         (diag.code.as_str(), diag.message.as_str())
     }
 
+    const CLEAN: FileStatus = FileStatus::Parsed {
+        statements: 1,
+        syntax_errors: 0,
+        recovered: false,
+    };
+
     #[test]
     fn clean_files_parse_without_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
-        let file = source_file(
-            dir.path(),
-            "a.js",
-            b"const a = <b/>;\nmodule.exports = a;\n",
-        );
-        let report = process_file(&file);
+        let src = b"const a = <b/>;\nmodule.exports = a;\n";
+        let file = source_file(dir.path(), "a.js", src);
+        let report = process(&file);
         assert_eq!(
             report.status,
             FileStatus::Parsed {
@@ -383,6 +673,9 @@ mod tests {
             }
         );
         assert!(report.diagnostics.is_empty());
+        assert!(!report.flow);
+        assert_eq!(report.class, FileClass::Source);
+        assert_eq!(report.parsed_bytes, u64::try_from(src.len()).unwrap());
     }
 
     #[test]
@@ -391,7 +684,7 @@ mod tests {
         // Line-leading HTML-like comments are a recoverable error in modules (.mjs).
         let src = "const é = \"😀\";\n<!-- one\n<!-- two\n";
         let file = source_file(dir.path(), "a.mjs", src.as_bytes());
-        let report = process_file(&file);
+        let report = process(&file);
         assert_eq!(
             report.status,
             FileStatus::Parsed {
@@ -412,11 +705,13 @@ mod tests {
     fn fatal_errors_are_reported() {
         let dir = tempfile::tempdir().unwrap();
         let file = source_file(dir.path(), "a.ts", b"class {{{ ]]] <<<");
-        let report = process_file(&file);
+        let report = process(&file);
         assert_eq!(report.status, FileStatus::Fatal, "{report:?}");
         let (code, message) = one_diag(&report);
         assert_eq!(code, "parse/fatal");
         assert!(message.starts_with("1:"), "{message}");
+        assert!(!report.flow);
+        assert_eq!(report.parsed_bytes, 17, "the file reached the parser");
     }
 
     #[test]
@@ -436,21 +731,23 @@ mod tests {
             ),
         ];
         for (rel, contents, expected) in cases {
-            let report = process_file(&source_file(dir.path(), rel, &contents));
+            let report = process(&source_file(dir.path(), rel, &contents));
             assert!(matches!(report.status, FileStatus::Skipped(_)), "{rel}");
             assert_eq!(one_diag(&report).0, expected, "{rel}");
+            assert_eq!(report.parsed_bytes, 0, "{rel} never reached the parser");
         }
     }
 
     #[test]
     fn oversized_and_unreadable_files_are_skipped_without_parsing() {
         let dir = tempfile::tempdir().unwrap();
-        // The size recorded at discovery decides; the file is not even opened.
+        // The size recorded at discovery decides; only the header is read.
         let mut big = source_file(dir.path(), "big.js", b"1;");
         big.size = content::MAX_FILE_BYTES + 1;
-        let report = process_file(&big);
+        let report = process(&big);
         assert_eq!(report.status, FileStatus::Skipped(SkipReason::TooLarge));
         assert_eq!(one_diag(&report).0, "skip/too-large");
+        assert_eq!(report.parsed_bytes, 0);
         // A file that grew past the limit after discovery is caught after reading.
         let grown = source_file(
             dir.path(),
@@ -459,18 +756,187 @@ mod tests {
         );
         let grown = SourceFile { size: 10, ..grown };
         assert_eq!(
-            process_file(&grown).status,
+            process(&grown).status,
             FileStatus::Skipped(SkipReason::TooLarge)
         );
-        let mut gone = source_file(dir.path(), "gone.js", b"1;");
+        let gone = source_file_as(dir.path(), "gone.js", b"1;", FileClass::Test);
         std::fs::remove_file(&gone.abs_path).unwrap();
-        gone.class = FileClass::Test;
-        let report = process_file(&gone);
-        assert_eq!(report.status, FileStatus::Skipped(SkipReason::IoError));
-        assert_eq!(report.class, FileClass::Test);
+        for selection in [ClassSet::ALL, ClassSet::default()] {
+            // Selected (parse) or not (classify only), an unreadable file is reported.
+            let report = process_file(&gone, selection);
+            assert_eq!(report.status, FileStatus::Skipped(SkipReason::IoError));
+            assert_eq!(report.class, FileClass::Test);
+            let (code, message) = one_diag(&report);
+            assert_eq!(code, "skip/io-error");
+            assert!(message.starts_with("cannot read file: "), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_generated_marker_decides_the_final_class_from_the_one_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let marked = b"// @generated by protoc\nexport const a = 1;\n";
+        let schema = source_file(dir.path(), "src/schema.ts", marked);
+        // Source by path, Generated by header: excluded by default...
+        let report = process(&schema);
+        assert_eq!(report.class, FileClass::Generated);
+        assert_eq!(report.status, FileStatus::Excluded);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.parsed_bytes, 0);
+        // ...and parsed when Generated is selected.
+        let generated = ClassSet::default().with(FileClass::Generated);
+        let report = process_file(&schema, generated);
+        assert_eq!((report.class, report.status), (FileClass::Generated, CLEAN));
+        // A test file is only classified: its header is read, but it is not parsed.
+        let test = source_file_as(dir.path(), "test/gen.js", marked, FileClass::Test);
+        let report = process(&test);
+        assert_eq!(
+            (report.class, report.status),
+            (FileClass::Generated, FileStatus::Excluded)
+        );
+        let test = source_file_as(dir.path(), "test/a.js", b"x;\n", FileClass::Test);
+        assert_eq!(process(&test).class, FileClass::Test);
+        // Vendor is final: the file is not even opened.
+        let mut vendor = source_file_as(dir.path(), "vendor/v.js", marked, FileClass::Vendor);
+        std::fs::remove_file(&vendor.abs_path).unwrap();
+        vendor.size = 0;
+        let report = process(&vendor);
+        assert_eq!(
+            (report.class, report.status),
+            (FileClass::Vendor, FileStatus::Excluded)
+        );
+        assert!(report.diagnostics.is_empty());
+        // An oversized file is classified from its header, never read in full.
+        let mut big = source_file(dir.path(), "src/big.ts", marked);
+        big.size = content::MAX_FILE_BYTES + 1;
+        let report = process(&big);
+        assert_eq!(
+            (report.class, report.status),
+            (FileClass::Generated, FileStatus::Excluded)
+        );
+    }
+
+    #[test]
+    fn flow_files_parse_with_typescript_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, &str); 3] = [
+            (
+                "pragma.js",
+                "// @flow\nimport type { Config } from './Config';\n\
+                 export function load<T>(name: string, config: Config): T {\n  return null;\n}\n",
+            ),
+            // No pragma, but type syntax: still Flow (parse-server style).
+            (
+                "types.js",
+                "export type Options = { mount: string };\nclass Id { className: string; }\n",
+            ),
+            // Flow in React code needs JSX too.
+            (
+                "view.jsx",
+                "// @flow\nconst View = (props: Props) => <div>{props.title}</div>;\n",
+            ),
+        ];
+        for (rel, src) in cases {
+            let report = process(&source_file(dir.path(), rel, src.as_bytes()));
+            assert!(
+                matches!(
+                    report.status,
+                    FileStatus::Parsed {
+                        syntax_errors: 0,
+                        ..
+                    }
+                ),
+                "{rel}: {report:?}"
+            );
+            assert!(report.flow, "{rel}");
+            assert!(report.diagnostics.is_empty(), "{rel}");
+        }
+        // Flow-only syntax (a type cast) parses with neither: reported, with where TypeScript
+        // syntax stopped.
+        let cast = "// @flow\nimport type { A } from './a';\nconst sorts = (where.sorts: any);\n";
+        let report = process(&source_file(dir.path(), "cast.js", cast.as_bytes()));
+        assert_eq!(report.status, FileStatus::Fatal);
+        assert!(report.flow);
         let (code, message) = one_diag(&report);
-        assert_eq!(code, "skip/io-error");
-        assert!(message.starts_with("cannot read file: "), "{message}");
+        assert_eq!(code, "parse/fatal");
+        assert!(
+            message.starts_with("Flow syntax that TypeScript syntax does not cover: 3:"),
+            "{message}"
+        );
+        // TypeScript files are never retried, and plain broken JavaScript stays a JS error.
+        let report = process(&source_file(dir.path(), "broken.js", b"const x = ;\n"));
+        assert_eq!(report.status, FileStatus::Fatal);
+        assert!(!report.flow);
+        assert_eq!(one_diag(&report).1, "1:11: Unexpected token");
+    }
+
+    #[test]
+    fn templates_with_a_js_extension_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ejs =
+            "\n(async () => {\n  window.clientVars = { prefix: <%-JSON.stringify(p)%> };\n})()\n";
+        let report = process(&source_file(
+            dir.path(),
+            "indexBootstrap.js",
+            ejs.as_bytes(),
+        ));
+        assert_eq!(report.status, FileStatus::Skipped(SkipReason::Template));
+        let (code, message) = one_diag(&report);
+        assert_eq!(code, "skip/template");
+        assert_eq!(
+            message,
+            "3:33: template tag `<%` (a server-side template such as EJS, not JavaScript)"
+        );
+        // `<%` in a string elsewhere does not make a broken file a template.
+        let broken = "const tag = '<%';\nconst x = ;\n";
+        let report = process(&source_file(dir.path(), "broken.js", broken.as_bytes()));
+        assert_eq!(report.status, FileStatus::Fatal);
+        // Nor in a file that parses.
+        let fine = "const tag = '<% x %>';\n";
+        let report = process(&source_file(dir.path(), "fine.js", fine.as_bytes()));
+        assert_eq!(report.status, CLEAN);
+    }
+
+    fn panicking_parser(_: &Allocator, _: &str, _: SourceType) -> ParseOutcome {
+        panic!("injected parser failure")
+    }
+
+    #[test]
+    fn a_parser_panic_becomes_a_panicked_report_for_that_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = source_file(dir.path(), "boom.js", b"x;\n");
+        let report = process_file_with(&file, ClassSet::default(), panicking_parser);
+        assert_eq!(report.status, FileStatus::Panicked);
+        assert_eq!(report.class, FileClass::Source);
+        assert_eq!(report.parsed_bytes, 3);
+        let (code, message) = one_diag(&report);
+        assert_eq!(code, "parse/panicked");
+        assert!(
+            message.starts_with("parser panicked: injected parser failure (at "),
+            "{message}"
+        );
+        assert!(
+            message.contains("crates/jss-frontend/src/process.rs:"),
+            "{message}"
+        );
+        assert!(!CAPTURING.with(Cell::get), "capture mode is switched off");
+        // The next file on this thread parses normally.
+        let next = source_file(dir.path(), "next.js", b"y;\n");
+        assert_eq!(process(&next).status, CLEAN);
+        // Same on a pool worker, where the parser runs on the worker itself.
+        let pool = ParsePool::new(NonZeroUsize::new(1)).unwrap();
+        let reports = pool.install(|| {
+            [&file, &next].map(|file| {
+                let parse: ParseFn = if file.rel_path == "boom.js" {
+                    panicking_parser
+                } else {
+                    parse_with
+                };
+                process_file_with(file, ClassSet::default(), parse)
+            })
+        });
+        assert_eq!(reports[0].status, FileStatus::Panicked);
+        assert_eq!(reports[1].status, CLEAN);
     }
 
     #[test]
@@ -532,29 +998,29 @@ mod tests {
                     2 => [b"var s = '\xe9", i.to_string().as_bytes(), b"';\n"].concat(),
                     _ => format!("function f{i}() {{ return [{i}]; }}\n").into_bytes(),
                 };
-                source_file(dir.path(), &format!("f{i:02}.js"), &contents)
+                let class = if i % 5 == 0 {
+                    FileClass::Test
+                } else {
+                    FileClass::Source
+                };
+                source_file_as(dir.path(), &format!("f{i:02}.js"), &contents, class)
             })
             .collect();
-        let one = process_files(
-            &files,
-            &ProcessOptions {
-                threads: NonZeroUsize::new(1),
-            },
-        )
-        .unwrap();
+        let one = ParsePool::new(NonZeroUsize::new(1))
+            .unwrap()
+            .process(&files, ClassSet::default());
         let four = ParsePool::new(NonZeroUsize::new(4)).unwrap();
         assert_eq!(four.threads(), 4);
-        let parallel = four.process(&files);
+        let parallel = four.process(&files, ClassSet::default());
         assert_eq!(one, parallel);
         let names: Vec<&str> = parallel.iter().map(|r| r.rel_path.as_str()).collect();
         let expected: Vec<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
         assert_eq!(names, expected);
+        assert_eq!(parallel[0].status, FileStatus::Excluded, "a test file");
     }
 
-    #[test]
-    fn workers_parse_nesting_just_under_the_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let depth = content::MAX_NESTING_DEPTH;
+    /// `[{a:` nesting `depth` levels deep (the prescan counts two levels per line).
+    fn nested_literals(depth: usize) -> String {
         let mut nested = String::from("x =\n");
         for _ in 0..depth / 2 {
             nested.push_str("[{a:\n");
@@ -564,16 +1030,83 @@ mod tests {
             nested.push_str("\n}]");
         }
         nested.push_str(";\n");
-        let file = source_file(dir.path(), "deep.js", nested.as_bytes());
+        nested
+    }
+
+    #[test]
+    fn nesting_at_the_limit_parses_on_workers_and_on_small_stacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = nested_literals(content::MAX_NESTING_DEPTH);
+        let file = source_file(dir.path(), "deep.js", src.as_bytes());
         let pool = ParsePool::new(NonZeroUsize::new(1)).unwrap();
-        let report = pool.process(std::slice::from_ref(&file));
+        let report = pool.process(std::slice::from_ref(&file), ClassSet::default());
+        assert_eq!(report[0].status, CLEAN);
+        // On an ordinary thread with a small stack (D2-PLAN-03), the parser gets a thread of
+        // its own instead of overflowing this one.
+        let report = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || process(&file))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(report.status, CLEAN);
+    }
+
+    #[test]
+    fn deep_recursion_without_brackets_gets_a_large_enough_stack() {
+        // Shapes the bracket prescan cannot see, which overflow any fixed stack once long
+        // enough (D2-PLAN-02). Here they need a few MiB of parser stack, run from a thread
+        // whose own budget is far smaller, so only the stack bound keeps them alive.
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, String); 4] = [
+            ("arrows.js", format!("f =\n{}1;\n", "a =>\n".repeat(20_000))),
+            (
+                "assign.js",
+                format!("var a;\n{}1;\n", "a =\n".repeat(20_000)),
+            ),
+            ("labels.js", format!("{}x;\n", "a:\n".repeat(20_000))),
+            (
+                "generic.ts",
+                format!(
+                    "type T =\n{}B{};\n",
+                    "A<\n".repeat(3_000),
+                    "\n>".repeat(3_000)
+                ),
+            ),
+        ];
+        for (rel, src) in cases {
+            let file = source_file(dir.path(), rel, src.as_bytes());
+            let report = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let _ = STACK_BUDGET.try_with(|budget| budget.set(128 * 1024));
+                    process(&file)
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(
+                matches!(report.status, FileStatus::Parsed { .. }),
+                "{rel}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stack_bound_covers_every_byte() {
+        assert_eq!(parser_stack_bound(b""), STACK_BASE);
         assert_eq!(
-            report[0].status,
-            FileStatus::Parsed {
-                statements: 1,
-                syntax_errors: 0,
-                recovered: false
-            }
+            parser_stack_bound(b"a(b"),
+            STACK_BASE + STACK_PER_BRACKET_BYTE + 2 * STACK_PER_BYTE
         );
+        assert_eq!(
+            parser_stack_bound(b"([{<"),
+            STACK_BASE + 4 * STACK_PER_BRACKET_BYTE
+        );
+        // A typical file stays on the worker; the largest possible one needs its own thread.
+        let typical = "function f(a) { return g(a, [1, 2]); }\n".repeat(2_000);
+        assert!(parser_stack_bound(typical.as_bytes()) <= WORKER_STACK_BYTES);
+        let max = vec![b'('; usize::try_from(content::MAX_FILE_BYTES).unwrap()];
+        assert!(parser_stack_bound(&max) > WORKER_STACK_BYTES);
     }
 }

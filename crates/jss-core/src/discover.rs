@@ -1,30 +1,35 @@
 //! File discovery: lists the JS/TS files under a scan root, contained to the root, deduplicated,
-//! classified and sorted.
+//! classified by path and sorted.
 //!
-//! - The walk uses the `ignore` crate: `.gitignore` files inside the root are honored (whether or
-//!   not the tree is a git checkout), hidden files and directories are skipped, and symlinks are
-//!   never followed by the walker.
+//! - The walk uses the `ignore` crate's parallel walker on as many threads as the current rayon
+//!   pool has (run [`discover`] inside a dedicated pool's `install` to bound them). `.gitignore`
+//!   files inside the root are honored (whether or not the tree is a git checkout), hidden files
+//!   and directories are skipped, and symlinks are never followed by the walker.
 //! - Ignore files outside the root (parent directories, the user's global gitignore,
 //!   `.git/info/exclude`) are deliberately NOT consulted, so the result depends only on the
 //!   tree under the root.
 //! - A symlinked file is accepted only when its canonical target is inside the root; otherwise
-//!   it is reported as `skip/symlink-outside-root`. Files reachable through several paths are
-//!   kept once, under the lexicographically smallest relative path.
-//! - Output is sorted by relative path bytes, so it does not depend on directory order.
-//! - File headers (for the `@generated` check) are read in parallel on the current rayon pool;
-//!   run [`discover`] inside a dedicated pool's `install` to bound its threads.
+//!   it is reported as `skip/symlink-outside-root`. A file reachable through several paths is
+//!   kept once: under its real path when the walk reaches it, otherwise under the smallest
+//!   relative path of the links to it. Either way it is classified by where it really lives,
+//!   so symlinks cannot change what is analyzed.
+//! - Discovery never opens source files: it only reads directory entries, file metadata and
+//!   `package.json` files. The one check that needs a file's content (the `@generated` marker,
+//!   see [`SourceFile::work`]) happens when the frontend reads the file anyway.
+//! - Output is sorted by relative path bytes, so it does not depend on directory order or on the
+//!   number of threads.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
-use ignore::WalkBuilder;
-use rayon::prelude::*;
+use ignore::{ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 
-use crate::classify::{self, FileClass};
+use crate::classify::{self, ClassSet, FileClass};
 use crate::diag::{self, DiagCode, Diagnostic};
 use crate::package_type::{PackageType, PackageTypes};
 
@@ -40,6 +45,9 @@ pub enum SourceKind {
     Mts,
     Cts,
 }
+
+/// Suffixes of TypeScript declaration files, which contain no executable code.
+const DECLARATION_SUFFIXES: [&str; 3] = [".d.ts", ".d.mts", ".d.cts"];
 
 impl SourceKind {
     /// Every kind, in declaration order.
@@ -58,7 +66,7 @@ impl SourceKind {
     /// declaration files (`.d.ts`, `.d.mts`, `.d.cts`), which contain no executable code.
     pub fn from_file_name(name: &OsStr) -> Option<SourceKind> {
         let name = name.to_string_lossy().to_ascii_lowercase();
-        if [".d.ts", ".d.mts", ".d.cts"]
+        if DECLARATION_SUFFIXES
             .iter()
             .any(|suffix| name.ends_with(suffix))
         {
@@ -88,6 +96,22 @@ impl SourceKind {
             SourceKind::Cts => "cts",
         }
     }
+
+    /// Whether this is a JavaScript kind (`.js`, `.jsx`, `.mjs`, `.cjs`).
+    pub const fn is_javascript(self) -> bool {
+        matches!(
+            self,
+            SourceKind::Js | SourceKind::Jsx | SourceKind::Mjs | SourceKind::Cjs
+        )
+    }
+}
+
+/// Whether `name` is a TypeScript declaration file name (`.d.ts`, `.d.mts`, `.d.cts`).
+pub fn is_declaration_file(name: &OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    DECLARATION_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 /// One discovered file.
@@ -101,10 +125,42 @@ pub struct SourceFile {
     /// Canonical absolute path (the target, for a symlink), used for all IO.
     pub abs_path: PathBuf,
     pub kind: SourceKind,
-    pub class: FileClass,
+    /// The class from the file's real location alone ([`classify::classify_path`]). Unless it is
+    /// Generated or Vendor, the file's header may still make it Generated: see
+    /// [`SourceFile::work`].
+    pub path_class: FileClass,
     pub package_type: PackageType,
     /// Size in bytes at discovery time.
     pub size: u64,
+}
+
+/// What processing a discovered file takes, given the classes selected for analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Work {
+    /// Read the file and parse it, unless its header makes it a class that is not selected.
+    Parse,
+    /// Read only the file's header, to classify it ([`classify::classify`]); never parse it.
+    Classify,
+    /// Nothing: the path class is final and not selected.
+    Exclude,
+}
+
+impl SourceFile {
+    /// The work this file needs when `selection` holds the classes to analyze. Every file whose
+    /// header can change its class is read (in full or just the header), so final classes, and
+    /// counts of them, do not depend on the selection.
+    pub fn work(&self, selection: ClassSet) -> Work {
+        let header_matters = classify::header_can_change(self.path_class);
+        if selection.contains(self.path_class)
+            || (header_matters && selection.contains(FileClass::Generated))
+        {
+            Work::Parse
+        } else if header_matters {
+            Work::Classify
+        } else {
+            Work::Exclude
+        }
+    }
 }
 
 /// Discovery options.
@@ -131,8 +187,23 @@ pub struct Discovery {
     pub single_file: bool,
     /// Every candidate file, whatever its class, sorted by `rel_path` bytes.
     pub files: Vec<SourceFile>,
-    /// One diagnostic per file or directory that could not be considered, sorted.
+    /// One diagnostic per entry that could not be considered, sorted: symlinks leaving the
+    /// root, unresolvable links, non-regular files with source names, unreadable directories.
     pub diagnostics: Vec<Diagnostic>,
+    /// TypeScript declaration files seen and not listed (they contain no executable code).
+    pub declaration_files: usize,
+}
+
+impl Discovery {
+    /// The classes to analyze when `include` was requested: a single-file root is analyzed
+    /// whatever its class, since it was named explicitly.
+    pub fn selection(&self, include: ClassSet) -> ClassSet {
+        if self.single_file {
+            ClassSet::ALL
+        } else {
+            include
+        }
+    }
 }
 
 /// A problem with the root itself. Problems below the root are diagnostics instead.
@@ -175,7 +246,9 @@ impl std::error::Error for DiscoverError {
 }
 
 /// Discovers the JS/TS files under `root`, a directory or a single file. For a single file, the
-/// root becomes its parent directory and the result holds that one file.
+/// root becomes its parent directory and the result holds that one file; its package type comes
+/// from the nearest `package.json` up to the enclosing git work tree (see
+/// [`package_type_search_root`]), as a directory scan of that work tree would find it.
 pub fn discover(root: &Path, options: &DiscoverOptions) -> Result<Discovery, DiscoverError> {
     let meta = fs::metadata(root).map_err(io_error(root))?;
     if meta.is_dir() {
@@ -199,7 +272,6 @@ fn discover_dir(root: &Path, options: &DiscoverOptions) -> Result<Discovery, Dis
     // An unreadable root is an error on the root itself, not a diagnostic.
     fs::read_dir(&canonical).map_err(io_error(root))?;
 
-    let mut collector = Collector::new(canonical.clone());
     let mut walker = WalkBuilder::new(&canonical);
     walker
         // Start from no filters, then enable exactly what we want.
@@ -207,20 +279,15 @@ fn discover_dir(root: &Path, options: &DiscoverOptions) -> Result<Discovery, Dis
         .hidden(true)
         .git_ignore(options.respect_gitignore)
         .require_git(false)
-        .follow_links(false);
-    for result in walker.build() {
-        match result {
-            Ok(entry) => collector.visit(&entry),
-            Err(err) => collector.walk_error(&err),
-        }
-    }
-    let (files, diagnostics) = collector.finish();
-    Ok(Discovery {
-        root: canonical,
-        single_file: false,
-        files,
-        diagnostics,
-    })
+        .follow_links(false)
+        .threads(rayon::current_num_threads());
+    let found = Mutex::new(Found::default());
+    walker.build_parallel().visit(&mut VisitorBuilder {
+        root: &canonical,
+        sink: &found,
+    });
+    let found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    Ok(finish(canonical.clone(), &canonical, false, found))
 }
 
 fn discover_file(root: &Path) -> Result<Discovery, DiscoverError> {
@@ -237,50 +304,70 @@ fn discover_file(root: &Path) -> Result<Discovery, DiscoverError> {
         .unwrap_or(Path::new("."));
     let canonical = fs::canonicalize(parent).map_err(io_error(root))?;
 
-    let mut collector = Collector::new(canonical.clone());
     let path = canonical.join(name);
     let rel = PathBuf::from(name);
     let meta = fs::symlink_metadata(&path).map_err(io_error(root))?;
+    let mut found = Found::default();
     if meta.file_type().is_symlink() {
-        collector.visit_symlink(&path, &rel, Some(kind));
+        found.symlink(&canonical, &path, &rel, Some(kind));
     } else {
-        collector.add(path, rel, kind);
+        found.files.push(FoundFile {
+            canonical: path,
+            rel,
+            kind,
+            direct: true,
+            size: meta.len(),
+        });
     }
-    let (files, diagnostics) = collector.finish();
-    Ok(Discovery {
-        root: canonical,
-        single_file: true,
-        files,
-        diagnostics,
-    })
+    let search_root = package_type_search_root(&canonical);
+    Ok(finish(canonical, &search_root, true, found))
 }
 
-/// A file reachable under one canonical path, with the smallest relative path seen so far.
-struct Candidate {
-    rel_path: String,
-    rel_path_os: PathBuf,
-    kind: SourceKind,
+/// Where the `package.json` search of a single-file root may go: the top of the enclosing git
+/// work tree (the nearest ancestor holding `.git`), or the filesystem root outside one.
+pub fn package_type_search_root(dir: &Path) -> PathBuf {
+    dir.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .or_else(|| dir.ancestors().last())
+        .unwrap_or(dir)
+        .to_path_buf()
 }
 
-struct Collector {
-    root: PathBuf,
-    package_types: PackageTypes,
-    /// Keyed by canonical path, which deduplicates files reachable through symlinks.
-    candidates: BTreeMap<PathBuf, Candidate>,
+/// What the walk found, merged from every walker thread.
+#[derive(Debug, Default)]
+struct Found {
+    files: Vec<FoundFile>,
     diagnostics: Vec<Diagnostic>,
+    declaration_files: usize,
 }
 
-impl Collector {
-    fn new(root: PathBuf) -> Self {
-        Self {
-            package_types: PackageTypes::new(root.clone()),
-            root,
-            candidates: BTreeMap::new(),
-            diagnostics: Vec::new(),
-        }
+/// A file reached by the walk, directly or through a symlink.
+#[derive(Debug)]
+struct FoundFile {
+    /// Canonical absolute path: the identity used to deduplicate.
+    canonical: PathBuf,
+    /// Root-relative path it was reached by.
+    rel: PathBuf,
+    kind: SourceKind,
+    /// Reached by its real path rather than through a symlink.
+    direct: bool,
+    size: u64,
+}
+
+impl Found {
+    fn append(&mut self, other: &mut Found) {
+        self.files.append(&mut other.files);
+        self.diagnostics.append(&mut other.diagnostics);
+        self.declaration_files += std::mem::take(&mut other.declaration_files);
     }
 
-    fn visit(&mut self, entry: &ignore::DirEntry) {
+    fn report(&mut self, code: DiagCode, rel: &Path, message: impl Into<String>) {
+        self.diagnostics
+            .push(Diagnostic::at(code, rel_path_string(rel), message));
+    }
+
+    /// One walker entry under `root`.
+    fn entry(&mut self, root: &Path, entry: &ignore::DirEntry) {
         if entry.depth() == 0 {
             return;
         }
@@ -291,15 +378,18 @@ impl Collector {
             return;
         }
         let path = entry.path();
-        let Ok(rel) = path.strip_prefix(&self.root) else {
+        let Ok(rel) = path.strip_prefix(root) else {
             return;
         };
         let kind = SourceKind::from_file_name(entry.file_name());
         if file_type.is_symlink() {
-            self.visit_symlink(path, rel, kind);
+            self.symlink(root, path, rel, kind);
             return;
         }
         let Some(kind) = kind else {
+            if file_type.is_file() && is_declaration_file(entry.file_name()) {
+                self.declaration_files += 1;
+            }
             return;
         };
         if !file_type.is_file() {
@@ -307,12 +397,25 @@ impl Collector {
             self.report(DiagCode::SkipIoError, rel, "not a regular file");
             return;
         }
-        self.add(path.to_path_buf(), rel.to_path_buf(), kind);
+        match entry.metadata() {
+            Ok(meta) => self.files.push(FoundFile {
+                canonical: path.to_path_buf(),
+                rel: rel.to_path_buf(),
+                kind,
+                direct: true,
+                size: meta.len(),
+            }),
+            Err(err) => self.report(
+                DiagCode::SkipIoError,
+                rel,
+                format!("cannot read file metadata: {}", error_message(&err)),
+            ),
+        }
     }
 
-    /// Handles a symlink at `path` (`rel` relative to the root). `kind` is set when the link's
-    /// own name is a JS/TS file name.
-    fn visit_symlink(&mut self, path: &Path, rel: &Path, kind: Option<SourceKind>) {
+    /// Handles a symlink at `path` (`rel` relative to `root`). `kind` is set when the link's own
+    /// name is a JS/TS file name.
+    fn symlink(&mut self, root: &Path, path: &Path, rel: &Path, kind: Option<SourceKind>) {
         let target = match fs::canonicalize(path) {
             Ok(target) => target,
             Err(err) => {
@@ -326,7 +429,7 @@ impl Collector {
                 return;
             }
         };
-        if !target.starts_with(&self.root) {
+        if !target.starts_with(root) {
             // Report links that stand for source files, and directory links whose contents
             // are therefore not scanned. The target is not named: it may be outside anything
             // the report should reveal, and it would make output machine-dependent.
@@ -345,8 +448,20 @@ impl Collector {
             return;
         };
         match fs::metadata(&target) {
-            Ok(meta) if meta.is_file() => self.add(target, rel.to_path_buf(), kind),
-            Ok(_) => {}
+            Ok(meta) if meta.is_file() => self.files.push(FoundFile {
+                canonical: target,
+                rel: rel.to_path_buf(),
+                kind,
+                direct: false,
+                size: meta.len(),
+            }),
+            Ok(meta) if meta.is_dir() => {}
+            // A FIFO, socket or device behind a source-named link: never opened.
+            Ok(_) => self.report(
+                DiagCode::SkipIoError,
+                rel,
+                "symlink target is not a regular file",
+            ),
             Err(err) => self.report(
                 DiagCode::SkipIoError,
                 rel,
@@ -355,30 +470,9 @@ impl Collector {
         }
     }
 
-    /// Records a candidate, keeping the smallest relative path per canonical path.
-    fn add(&mut self, canonical: PathBuf, rel_path_os: PathBuf, kind: SourceKind) {
-        let candidate = Candidate {
-            rel_path: rel_path_string(&rel_path_os),
-            rel_path_os,
-            kind,
-        };
-        match self.candidates.get_mut(&canonical) {
-            Some(existing) => {
-                let smaller = (&candidate.rel_path, &candidate.rel_path_os)
-                    < (&existing.rel_path, &existing.rel_path_os);
-                if smaller {
-                    *existing = candidate;
-                }
-            }
-            None => {
-                self.candidates.insert(canonical, candidate);
-            }
-        }
-    }
-
-    fn walk_error(&mut self, err: &ignore::Error) {
+    fn walk_error(&mut self, root: &Path, err: &ignore::Error) {
         let path = error_path(err)
-            .and_then(|path| path.strip_prefix(&self.root).ok())
+            .and_then(|path| path.strip_prefix(root).ok())
             .map(rel_path_string)
             .filter(|rel| !rel.is_empty());
         self.diagnostics.push(Diagnostic::new(
@@ -387,83 +481,143 @@ impl Collector {
             error_message(err),
         ));
     }
+}
 
-    fn report(&mut self, code: DiagCode, rel: &Path, message: impl Into<String>) {
-        self.diagnostics
-            .push(Diagnostic::at(code, rel_path_string(rel), message));
+/// Creates one [`Visitor`] per walker thread.
+struct VisitorBuilder<'s> {
+    root: &'s Path,
+    sink: &'s Mutex<Found>,
+}
+
+impl<'s> ParallelVisitorBuilder<'s> for VisitorBuilder<'s> {
+    fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
+        Box::new(Visitor {
+            root: self.root,
+            sink: self.sink,
+            found: Found::default(),
+        })
+    }
+}
+
+/// Collects one walker thread's findings, and hands them over when the thread is done.
+struct Visitor<'s> {
+    root: &'s Path,
+    sink: &'s Mutex<Found>,
+    found: Found,
+}
+
+impl ParallelVisitor for Visitor<'_> {
+    fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> WalkState {
+        match entry {
+            Ok(entry) => self.found.entry(self.root, &entry),
+            Err(err) => self.found.walk_error(self.root, &err),
+        }
+        WalkState::Continue
+    }
+}
+
+impl Drop for Visitor<'_> {
+    fn drop(&mut self) {
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append(&mut self.found);
+    }
+}
+
+/// A file reachable under one canonical path, with the path that names it.
+struct Candidate {
+    rel_path: String,
+    rel_path_os: PathBuf,
+    kind: SourceKind,
+    direct: bool,
+    size: u64,
+}
+
+impl Candidate {
+    /// The name a file keeps when it is reached several times: its real path if the walk
+    /// reached it, otherwise the smallest link path. Independent of the order of discovery.
+    fn wins_over(&self, other: &Candidate) -> bool {
+        (!self.direct, &self.rel_path, &self.rel_path_os)
+            < (!other.direct, &other.rel_path, &other.rel_path_os)
+    }
+}
+
+/// Deduplicates, classifies, resolves package types and sorts what the walk found.
+/// `package_root` bounds the `package.json` search.
+fn finish(root: PathBuf, package_root: &Path, single_file: bool, found: Found) -> Discovery {
+    let Found {
+        files: found_files,
+        mut diagnostics,
+        declaration_files,
+    } = found;
+    // Keyed by canonical path, which deduplicates files reachable through symlinks.
+    let mut candidates: BTreeMap<PathBuf, Candidate> = BTreeMap::new();
+    for file in found_files {
+        let candidate = Candidate {
+            rel_path: rel_path_string(&file.rel),
+            rel_path_os: file.rel,
+            kind: file.kind,
+            direct: file.direct,
+            size: file.size,
+        };
+        match candidates.get_mut(&file.canonical) {
+            Some(existing) => {
+                if candidate.wins_over(existing) {
+                    *existing = candidate;
+                }
+            }
+            None => {
+                candidates.insert(file.canonical, candidate);
+            }
+        }
     }
 
-    /// Classifies every candidate, looks up its package type and sorts the output.
-    fn finish(mut self) -> (Vec<SourceFile>, Vec<Diagnostic>) {
-        let candidates: Vec<(PathBuf, Candidate)> =
-            std::mem::take(&mut self.candidates).into_iter().collect();
-        // Opening every file to read its header dominates discovery time, so probe in
-        // parallel (on the caller's rayon pool, if any). The indexed collect keeps the order.
-        let probed: Vec<_> = candidates
-            .into_par_iter()
-            .map(|(canonical, candidate)| {
-                let probed = probe(&canonical, &candidate.rel_path);
-                (canonical, candidate, probed)
-            })
-            .collect();
-        let mut files = Vec::with_capacity(probed.len());
-        for (canonical, candidate, probed) in probed {
-            let (size, class) = match probed {
-                Ok(probed) => probed,
-                Err(err) => {
-                    self.diagnostics.push(Diagnostic::at(
-                        DiagCode::SkipIoError,
-                        candidate.rel_path,
-                        format!("cannot read file: {err}"),
-                    ));
-                    continue;
-                }
-            };
-            let package_type = canonical
-                .parent()
-                .and_then(|dir| dir.strip_prefix(&self.root).ok())
-                .map(|dir| self.package_types.for_dir(dir))
+    let package_dir = |canonical: &Path| {
+        canonical
+            .parent()
+            .and_then(|dir| dir.strip_prefix(package_root).ok())
+            .map(Path::to_path_buf)
+    };
+    let mut package_types = PackageTypes::new(package_root);
+    let dirs: Vec<PathBuf> = candidates.keys().filter_map(|c| package_dir(c)).collect();
+    package_types.resolve_all(dirs.iter().map(PathBuf::as_path));
+
+    let mut files: Vec<SourceFile> = candidates
+        .into_iter()
+        .map(|(canonical, candidate)| {
+            // Classify by where the file really lives, whatever link named it.
+            let real_rel = canonical
+                .strip_prefix(&root)
+                .map(rel_path_string)
+                .unwrap_or_else(|_| candidate.rel_path.clone());
+            let package_type = package_dir(&canonical)
+                .map(|dir| package_types.for_dir(&dir))
                 .unwrap_or_default();
-            files.push(SourceFile {
+            SourceFile {
+                path_class: classify::classify_path(&real_rel),
                 rel_path: candidate.rel_path,
                 rel_path_os: candidate.rel_path_os,
                 abs_path: canonical,
                 kind: candidate.kind,
-                class,
                 package_type,
-                size,
-            });
-        }
-        files.sort_by(|a, b| {
-            a.rel_path
-                .cmp(&b.rel_path)
-                .then_with(|| a.rel_path_os.cmp(&b.rel_path_os))
-        });
-        diag::sort(&mut self.diagnostics);
-        (files, self.diagnostics)
+                size: candidate.size,
+            }
+        })
+        .collect();
+    files.sort_by(|a, b| {
+        a.rel_path
+            .cmp(&b.rel_path)
+            .then_with(|| a.rel_path_os.cmp(&b.rel_path_os))
+    });
+    diag::sort(&mut diagnostics);
+    Discovery {
+        root,
+        single_file,
+        files,
+        diagnostics,
+        declaration_files,
     }
-}
-
-/// Size and final class of a candidate. The file header is read only when it can still change
-/// the class (see [`classify::header_can_change`]).
-fn probe(canonical: &Path, rel_path: &str) -> io::Result<(u64, FileClass)> {
-    let path_class = classify::classify_path(rel_path);
-    if classify::header_can_change(path_class) {
-        let (size, head) = read_head(canonical)?;
-        Ok((size, classify::classify(rel_path, Some(&head))))
-    } else {
-        Ok((fs::metadata(canonical)?.len(), path_class))
-    }
-}
-
-/// Opens a file and returns its size and first [`classify::GENERATED_SCAN_BYTES`] bytes.
-fn read_head(path: &Path) -> io::Result<(u64, Vec<u8>)> {
-    let file = fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    let limit = u64::try_from(classify::GENERATED_SCAN_BYTES).unwrap_or(u64::MAX);
-    let mut head = Vec::with_capacity(classify::GENERATED_SCAN_BYTES);
-    file.take(limit).read_to_end(&mut head)?;
-    Ok((size, head))
 }
 
 /// The path a walker error is about, if any.
@@ -552,6 +706,20 @@ mod tests {
             .unwrap_or_else(|| panic!("{rel} not discovered: {:?}", rel_paths(discovery)))
     }
 
+    fn diags(discovery: &Discovery) -> Vec<(&str, &str, &str)> {
+        discovery
+            .diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    d.path.as_deref().unwrap(),
+                    d.code.as_str(),
+                    d.message.as_str(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn source_kinds_come_from_extensions() {
         let kind = |name: &str| SourceKind::from_file_name(OsStr::new(name));
@@ -569,6 +737,21 @@ mod tests {
         assert_eq!(kind("a.json"), None);
         assert_eq!(kind("Makefile"), None);
         assert_eq!(kind("a.vue"), None);
+        assert!(is_declaration_file(OsStr::new("index.D.ts")));
+        assert!(!is_declaration_file(OsStr::new("index.ts")));
+        let js: Vec<SourceKind> = SourceKind::ALL
+            .into_iter()
+            .filter(|kind| kind.is_javascript())
+            .collect();
+        assert_eq!(
+            js,
+            [
+                SourceKind::Js,
+                SourceKind::Jsx,
+                SourceKind::Mjs,
+                SourceKind::Cjs
+            ]
+        );
     }
 
     #[test]
@@ -586,6 +769,7 @@ mod tests {
             "docs/site.js",
             "examples/e.mjs",
             "src/types.d.ts",
+            "lib/index.d.mts",
             "src/style.css",
             "README.md",
             ".hidden/h.js",
@@ -621,14 +805,16 @@ mod tests {
             "{:?}",
             discovery.diagnostics
         );
-        let class = |rel: &str| file(&discovery, rel).class;
+        assert_eq!(discovery.declaration_files, 2);
+        let class = |rel: &str| file(&discovery, rel).path_class;
         assert_eq!(class("dist/out.js"), FileClass::Generated);
         assert_eq!(class("docs/site.js"), FileClass::Docs);
         assert_eq!(class("examples/e.mjs"), FileClass::Example);
         assert_eq!(class("node_modules/m/index.js"), FileClass::Vendor);
         assert_eq!(class("src/App.jsx"), FileClass::Source);
         assert_eq!(class("src/a.test.js"), FileClass::Test);
-        assert_eq!(class("src/gen.ts"), FileClass::Generated);
+        // Discovery classifies by path only; the marker is checked when the file is read.
+        assert_eq!(class("src/gen.ts"), FileClass::Source);
         assert_eq!(class("test/helper.js"), FileClass::Test);
 
         let app = file(&discovery, "src/App.jsx");
@@ -636,6 +822,54 @@ mod tests {
         assert_eq!(app.size, 11);
         assert_eq!(app.rel_path_os, Path::new("src").join("App.jsx"));
         assert_eq!(app.abs_path, discovery.root.join("src").join("App.jsx"));
+    }
+
+    #[test]
+    fn work_depends_on_the_selection() {
+        let file = |path_class| SourceFile {
+            rel_path: "a.js".to_owned(),
+            rel_path_os: "a.js".into(),
+            abs_path: "/a.js".into(),
+            kind: SourceKind::Js,
+            path_class,
+            package_type: PackageType::CommonJs,
+            size: 1,
+        };
+        let default = ClassSet::default();
+        assert_eq!(file(FileClass::Source).work(default), Work::Parse);
+        // The header can still make a test file Generated: read it, but do not parse it.
+        assert_eq!(file(FileClass::Test).work(default), Work::Classify);
+        // Generated and Vendor are final.
+        assert_eq!(file(FileClass::Vendor).work(default), Work::Exclude);
+        assert_eq!(file(FileClass::Generated).work(default), Work::Exclude);
+        // Selecting Generated means any file that may turn out Generated is a parse candidate.
+        let generated = ClassSet::only(FileClass::Generated);
+        assert_eq!(file(FileClass::Test).work(generated), Work::Parse);
+        assert_eq!(file(FileClass::Generated).work(generated), Work::Parse);
+        assert_eq!(file(FileClass::Vendor).work(generated), Work::Exclude);
+        assert_eq!(file(FileClass::Vendor).work(ClassSet::ALL), Work::Parse);
+    }
+
+    #[test]
+    fn output_is_identical_for_any_thread_count() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..200 {
+            write(
+                dir.path(),
+                &format!("d{}/e{}/f{i}.js", i % 7, i % 3),
+                b"1;\n",
+            );
+        }
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| discover(dir.path(), &DiscoverOptions::default()).unwrap())
+        };
+        let one = run(1);
+        assert_eq!(one.files.len(), 200);
+        assert_eq!(one, run(8));
     }
 
     #[test]
@@ -684,11 +918,33 @@ mod tests {
             fs::canonicalize(dir.path().join("pkg/lib")).unwrap()
         );
         assert_eq!(rel_paths(&discovery), ["a.test.ts"]);
+        assert_eq!(
+            discovery.selection(ClassSet::default()),
+            ClassSet::ALL,
+            "a named file is analyzed whatever its class"
+        );
         let only = file(&discovery, "a.test.ts");
-        assert_eq!(only.class, FileClass::Test);
+        assert_eq!(only.path_class, FileClass::Test);
         assert_eq!(only.kind, SourceKind::Ts);
-        // The package.json lookup stays within the root (the file's directory).
-        assert_eq!(only.package_type, PackageType::CommonJs);
+        // Like a directory scan of the project, the package.json above the file's directory
+        // decides (D2-PLAN-09).
+        assert_eq!(only.package_type, PackageType::Module);
+    }
+
+    #[test]
+    fn a_single_file_package_search_stops_at_the_git_work_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "package.json", br#"{"type": "module"}"#);
+        write(dir.path(), "repo/.git/HEAD", b"ref: refs/heads/main\n");
+        write(dir.path(), "repo/src/a.js", b"1");
+        let discovery = discover(
+            &dir.path().join("repo/src/a.js"),
+            &DiscoverOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(discovery.files[0].package_type, PackageType::CommonJs);
+        let repo = fs::canonicalize(dir.path().join("repo")).unwrap();
+        assert_eq!(package_type_search_root(&repo.join("src")), repo);
     }
 
     #[test]
@@ -728,19 +984,18 @@ mod tests {
         symlink("../src", root.join("src-alias")).unwrap();
 
         let discovery = discover(&root, &DiscoverOptions::default()).unwrap();
-        // src/app.js is reachable as lib-link.js, src/app.js and src/zlink.js: the smallest
-        // relative path wins, and the file is listed once.
-        assert_eq!(rel_paths(&discovery), ["lib-link.js"]);
-        let kept = file(&discovery, "lib-link.js");
+        // src/app.js is reachable as lib-link.js, src/app.js and src/zlink.js: it is listed
+        // once, under its real path, even though a link path sorts first.
+        assert_eq!(rel_paths(&discovery), ["src/app.js"]);
+        let kept = file(&discovery, "src/app.js");
         assert_eq!(kept.abs_path, discovery.root.join("src/app.js"));
         assert_eq!(kept.size, 7);
-        let diags: Vec<(&str, &str)> = discovery
-            .diagnostics
-            .iter()
-            .map(|d| (d.path.as_deref().unwrap(), d.code.as_str()))
+        let codes: Vec<(&str, &str)> = diags(&discovery)
+            .into_iter()
+            .map(|(path, code, _)| (path, code))
             .collect();
         assert_eq!(
-            diags,
+            codes,
             [
                 ("src/dangling.js", "skip/io-error"),
                 ("src/escape.js", "skip/symlink-outside-root"),
@@ -758,7 +1013,82 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unreadable_entries_are_reported_without_absolute_paths() {
+    fn symlink_aliases_cannot_change_a_files_class() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A real source file linked from docs/ (which sorts first): still source (DP-1).
+        write(root, "src/server.js", b"listen();\n");
+        fs::create_dir_all(root.join("docs/snippets")).unwrap();
+        symlink("../../src/server.js", root.join("docs/snippets/server.js")).unwrap();
+        // A vendored file linked into src/: still vendor.
+        write(root, "vendor/jquery.js", b"jq();\n");
+        fs::create_dir_all(root.join("src/lib")).unwrap();
+        symlink("../../vendor/jquery.js", root.join("src/lib/jquery.js")).unwrap();
+        // The real path is ignored, so only the link reaches the file: it keeps the link's
+        // name but the class of its real location.
+        write(root, ".gitignore", b"/third_party/\n");
+        write(root, "third_party/lib.js", b"lib();\n");
+        symlink("../../third_party/lib.js", root.join("src/lib/tp.js")).unwrap();
+
+        let discovery = discover(root, &DiscoverOptions::default()).unwrap();
+        let summary: Vec<(&str, FileClass)> = discovery
+            .files
+            .iter()
+            .map(|file| (file.rel_path.as_str(), file.path_class))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("src/lib/tp.js", FileClass::Vendor),
+                ("src/server.js", FileClass::Source),
+                ("vendor/jquery.js", FileClass::Vendor),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_files_are_reported_never_dropped() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/a.js", b"1");
+        let fifo = |path: &Path| {
+            let status = std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        fifo(&root.join("src/raw-fifo.js"));
+        fifo(&root.join("src/pipe-target"));
+        symlink("pipe-target", root.join("src/fifo-link.js")).unwrap();
+        // A link with a source name to a directory inside the root is not a file: the walker
+        // lists the directory's contents under their own paths.
+        fs::create_dir_all(root.join("src/dir")).unwrap();
+        symlink("dir", root.join("src/dir-link.js")).unwrap();
+
+        let discovery = discover(root, &DiscoverOptions::default()).unwrap();
+        assert_eq!(rel_paths(&discovery), ["src/a.js"]);
+        assert_eq!(
+            diags(&discovery),
+            [
+                (
+                    "src/fifo-link.js",
+                    "skip/io-error",
+                    "symlink target is not a regular file"
+                ),
+                ("src/raw-fifo.js", "skip/io-error", "not a regular file"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directories_are_reported_without_absolute_paths() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -778,32 +1108,19 @@ mod tests {
             return; // running as root: permissions are not enforced
         }
         let discovery = discovery.unwrap();
-        assert_eq!(rel_paths(&discovery), ["ok.js"]);
-        let diags: Vec<(&str, &str, &str)> = discovery
-            .diagnostics
-            .iter()
-            .map(|d| {
-                (
-                    d.path.as_deref().unwrap(),
-                    d.code.as_str(),
-                    d.message.as_str(),
-                )
-            })
-            .collect();
+        // Discovery never opens files: the unreadable file is listed, and reading it fails
+        // later, when the frontend gets to it.
+        assert_eq!(rel_paths(&discovery), ["ok.js", "secret.js"]);
+        let diags = diags(&discovery);
         let denied = io::Error::from(io::ErrorKind::PermissionDenied).kind();
-        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(diags[0].0, "locked");
         assert_eq!(diags[0].1, "skip/io-error");
-        assert_eq!(diags[1].0, "secret.js");
-        assert_eq!(diags[1].1, "skip/io-error");
-        assert!(diags[1].2.starts_with("cannot read file: "), "{diags:?}");
-        for (_, _, message) in diags {
-            assert!(!message.contains('/'), "absolute path leaked: {message}");
-            assert!(
-                message.to_lowercase().contains(&denied.to_string()),
-                "{message}"
-            );
-        }
+        assert!(!diags[0].2.contains('/'), "absolute path leaked: {diags:?}");
+        assert!(
+            diags[0].2.to_lowercase().contains(&denied.to_string()),
+            "{diags:?}"
+        );
     }
 
     #[cfg(unix)]

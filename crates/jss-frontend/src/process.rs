@@ -37,6 +37,7 @@ use jss_core::{
 use oxc_allocator::Allocator;
 use rayon::prelude::*;
 
+use crate::flow;
 use crate::parse::{ParseFn, ParseOutcome, parse_with, source_type, typed_fallbacks};
 
 /// Stack size of each worker thread. Files whose [`parser_stack_bound`] exceeds it are parsed
@@ -108,6 +109,10 @@ pub struct FileReport {
     /// Flow-typed JavaScript: the file has an `@flow` pragma, or it parses only with type
     /// syntax (read as TypeScript, which covers most Flow annotations).
     pub flow: bool,
+    /// Flow-only syntax erased before the file was read as TypeScript: how many ranges were
+    /// blanked (see the `flow` module). 0 for a file that needed none. The blanks keep every
+    /// offset, so locations in this file's results refer to the original text.
+    pub flow_edits: u32,
     /// Bytes handed to the parser: the file's size if it reached the parser, otherwise 0.
     pub parsed_bytes: u64,
     /// This file's diagnostics: one for every status except a clean parse and an exclusion.
@@ -234,7 +239,11 @@ fn parse_candidate(file: &SourceFile, selection: ClassSet, parse: ParseFn) -> Fi
         Err(skip) => return skipped(file, class, skip),
     };
     let mut report = match parse_text(text, file.kind, file.package_type, parse) {
-        Ok(Parse::Done { outcome, flow }) => parsed(file, class, text, &outcome, flow),
+        Ok(Parse::Done {
+            outcome,
+            flow,
+            flow_edits,
+        }) => parsed(file, class, text, &outcome, flow, flow_edits),
         Ok(Parse::Template { message }) => {
             skipped(file, class, Skip::new(SkipReason::Template, message))
         }
@@ -281,6 +290,7 @@ fn report(file: &SourceFile, class: FileClass, status: FileStatus) -> FileReport
         class,
         status,
         flow: false,
+        flow_edits: 0,
         parsed_bytes: 0,
         diagnostics: Vec::new(),
     }
@@ -320,6 +330,7 @@ fn parsed(
     text: &str,
     outcome: &ParseOutcome,
     flow: bool,
+    flow_edits: u32,
 ) -> FileReport {
     let (status, code) = if outcome.fatal {
         (FileStatus::Fatal, Some(DiagCode::ParseFatal))
@@ -344,6 +355,7 @@ fn parsed(
         .collect();
     FileReport {
         flow,
+        flow_edits,
         diagnostics,
         ..report(file, class, status)
     }
@@ -370,8 +382,13 @@ fn error_message(text: &str, outcome: &ParseOutcome) -> String {
 
 /// The result of parsing a file's text, all attempts included.
 enum Parse {
-    /// The final outcome; `flow` when the file is Flow-typed (see [`FileReport::flow`]).
-    Done { outcome: ParseOutcome, flow: bool },
+    /// The final outcome; `flow` when the file is Flow-typed (see [`FileReport::flow`]) and
+    /// `flow_edits` the ranges of Flow-only syntax blanked to get it (see [`FileReport::flow_edits`]).
+    Done {
+        outcome: ParseOutcome,
+        flow: bool,
+        flow_edits: u32,
+    },
     /// The file is a server-side template, not JavaScript.
     Template { message: String },
 }
@@ -420,7 +437,8 @@ fn parse_text(
 }
 
 /// Parses `text` as its kind says; a JavaScript file that fails is checked for template tags,
-/// then retried with TypeScript syntax for Flow (see [`typed_fallbacks`]).
+/// then retried as Flow: read as TypeScript, with the syntax only Flow has erased (see
+/// [`typed_fallbacks`] and the `flow` module).
 fn parse_all(
     allocator: &Allocator,
     text: &str,
@@ -439,32 +457,45 @@ fn parse_all(
         _ => {
             return Parse::Done {
                 flow: primary.flow,
+                flow_edits: 0,
                 outcome: primary,
             };
         }
     };
-    let mut furthest: Option<ParseOutcome> = None;
+    let mut furthest: Option<flow::Repair> = None;
     for typed in fallbacks {
-        let outcome = parse(allocator, text, typed);
+        // Only a file JavaScript could not parse has Flow-only syntax to erase. One that parsed
+        // is never edited: TypeScript's opinion of valid JavaScript is no reason to change it.
+        let repair = if primary.fatal {
+            flow::parse_repaired(allocator, text, typed, parse, primary.flow)
+        } else {
+            flow::Repair::unrepaired(parse(allocator, text, typed))
+        };
+        let outcome = &repair.outcome;
         if !outcome.fatal && (primary.fatal || outcome.syntax_errors == 0) {
             return Parse::Done {
-                outcome,
+                outcome: repair.outcome,
                 flow: true,
+                flow_edits: repair.edits,
             };
         }
-        if outcome.fatal && error_offset(&outcome) > furthest.as_ref().map_or(0, error_offset) {
-            furthest = Some(outcome);
+        if outcome.fatal
+            && error_offset(outcome) > furthest.as_ref().map_or(0, |r| error_offset(&r.outcome))
+        {
+            furthest = Some(repair);
         }
     }
-    // Neither syntax works. For a declared Flow file, the TypeScript attempt that got furthest
-    // shows the first construct only Flow has; for anything else, the JavaScript error stands.
+    // Neither syntax works. For a declared Flow file, the attempt that got furthest shows the
+    // first construct no rule could erase; for anything else, the JavaScript error stands.
     match furthest {
-        Some(outcome) if primary.flow => Parse::Done {
-            outcome,
+        Some(repair) if primary.flow => Parse::Done {
+            outcome: repair.outcome,
             flow: true,
+            flow_edits: repair.edits,
         },
         _ => Parse::Done {
             flow: primary.flow,
+            flow_edits: 0,
             outcome: primary,
         },
     }
@@ -862,12 +893,40 @@ mod tests {
             assert!(report.flow, "{rel}");
             assert!(report.diagnostics.is_empty(), "{rel}");
         }
-        // Flow-only syntax (a type cast) parses with neither: reported, with where TypeScript
-        // syntax stopped.
+        // Flow-only syntax (a type cast) is erased and the file then parses as TypeScript. The
+        // blanks are reported, and keep every offset.
         let cast = "// @flow\nimport type { A } from './a';\nconst sorts = (where.sorts: any);\n";
         let report = process(&source_file(dir.path(), "cast.js", cast.as_bytes()));
+        assert_eq!(
+            report.status,
+            FileStatus::Parsed {
+                statements: 2,
+                syntax_errors: 0,
+                recovered: false
+            }
+        );
+        assert!(report.flow);
+        assert_eq!(report.flow_edits, 1);
+        assert!(report.diagnostics.is_empty());
+        // Files that needed no erasing report none.
+        let plain = process(&source_file(
+            dir.path(),
+            "plain.js",
+            b"// @flow\nconst x: number = 1;\n",
+        ));
+        assert!(plain.flow);
+        assert_eq!(plain.flow_edits, 0);
+        // Syntax no rule erases (component syntax runs, so it cannot be blanked): reported,
+        // with where the parser stopped.
+        let component = "// @flow\nimport type { A } from './a';\ncomponent Foo() {}\n";
+        let report = process(&source_file(
+            dir.path(),
+            "component.js",
+            component.as_bytes(),
+        ));
         assert_eq!(report.status, FileStatus::Fatal);
         assert!(report.flow);
+        assert_eq!(report.flow_edits, 0);
         let (code, message) = one_diag(&report);
         assert_eq!(code, "parse/fatal");
         assert!(
@@ -879,6 +938,47 @@ mod tests {
         assert_eq!(report.status, FileStatus::Fatal);
         assert!(!report.flow);
         assert_eq!(one_diag(&report).1, "1:11: Unexpected token");
+    }
+
+    /// JavaScript parses it; TypeScript syntax rejects it and says so at the start, where the
+    /// repair rules would find a Flow shape if they were looking.
+    fn js_ok_ts_broken(_: &Allocator, text: &str, kind: SourceType) -> ParseOutcome {
+        PARSE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let broken = kind.is_typescript();
+        ParseOutcome {
+            statements: usize::from(!broken && !text.is_empty()),
+            syntax_errors: usize::from(broken),
+            fatal: broken,
+            flow: true,
+            first_error: broken.then(|| crate::parse::SyntaxError {
+                message: "Unexpected token".to_owned(),
+                offset: Some(0),
+            }),
+        }
+    }
+
+    static PARSE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    fn a_file_that_javascript_parses_is_never_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        // `...}` is the inexact-object marker: the repair would blank it if it ran.
+        let src = "// @flow\ntype A = {a: number, ...};\n";
+        let file = source_file(dir.path(), "valid.js", src.as_bytes());
+        let before = PARSE_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let report = process_file_with(&file, ClassSet::ALL, js_ok_ts_broken);
+        let calls = PARSE_CALLS.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert_eq!(
+            report.status,
+            FileStatus::Parsed {
+                statements: 1,
+                syntax_errors: 0,
+                recovered: false
+            }
+        );
+        assert_eq!(report.flow_edits, 0);
+        // One JavaScript parse and one attempt per TypeScript flavor: no repair rounds.
+        assert_eq!(calls, 3);
     }
 
     #[test]

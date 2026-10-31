@@ -56,6 +56,9 @@ pub struct Totals {
     pub skipped_by_reason: BTreeMap<&'static str, usize>,
     /// Selected files that are Flow-typed JavaScript, parsed with TypeScript syntax or fatal.
     pub flow: usize,
+    /// Of those, the files that only parse once their Flow-only syntax is erased (blanked, so
+    /// offsets are unchanged). The ones where some of it could not be erased are `fatal`.
+    pub flow_erased: usize,
     /// `skip/*` diagnostics for everything else (every reason is present): entries discovery
     /// could not list (symlinks leaving the root, unreadable entries) and unselected files
     /// that could not be read to classify them.
@@ -79,6 +82,13 @@ pub struct FileRecord<'a> {
     /// Flow-typed JavaScript (see `totals.flow`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub flow: bool,
+    /// Ranges of Flow-only syntax blanked to parse the file (see `totals.flow_erased`).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub flow_edits: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Builds the deterministic part of the report. `reports` holds one report per file of
@@ -134,6 +144,7 @@ pub fn build<'a>(
         }
         totals.selected += 1;
         totals.flow += usize::from(report.flow);
+        totals.flow_erased += usize::from(report.flow_edits > 0);
         match report.status {
             FileStatus::Parsed {
                 recovered: false, ..
@@ -167,6 +178,7 @@ pub fn build<'a>(
                     statements: None,
                     syntax_errors: None,
                     flow: report.flow,
+                    flow_edits: report.flow_edits,
                 };
                 match report.status {
                     FileStatus::Parsed {
@@ -363,6 +375,7 @@ mod tests {
             class,
             status,
             flow,
+            flow_edits: 0,
             parsed_bytes,
             diagnostics,
         }

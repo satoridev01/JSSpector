@@ -208,6 +208,12 @@ How constructs lower:
   - files over 2 MiB;
   - minified files (a line over 20k characters, or an average line over 300);
   - generated files (`@generated`, `.d.ts`, `dist/`).
+- **Flow-typed JavaScript** (found on 3 of the 100 target repos: metro, Reddit Enhancement Suite, parse-server):
+  - oxc parses TypeScript but not Flow, and the two share most type syntax. A JavaScript file that fails to parse is read as TypeScript, and the Flow-only spellings TypeScript rejects are **blanked** (replaced by spaces, a few by their TypeScript spelling or `any`): `...` in object types, `string => void`, unnamed function parameters, `import typeof`, `declare export`, `opaque type`, `Foo<>`, `(x: T)` casts, `interface { }`, `<T: Bound>` and a few more.
+  - The blanks keep every offset and line break, so findings point at the original text; the repaired text only feeds the parser.
+  - TypeScript is the oracle for what is a type: the loop is parse, take the first syntax error, let the rule that knows the construct blank it, parse again. Nothing here understands JavaScript's grammar.
+  - Safety: only a file JavaScript could not parse is touched. A rule whose shape could come from a merely broken file needs an `@flow` pragma (or earlier proof in the same file). Rules that take a parameter list or a type only fire where the failing item is not a named parameter, so code that runs is never blanked.
+  - Reported, never silent: `flow_edits` per file and `totals.flow_erased`. A construct no rule knows (Flow `component` syntax, for one) leaves the file `parse/fatal`, with the first such construct as the diagnostic.
 - **Paths:**
   - Non-UTF-8 paths are kept as `OsString`.
   - No symlinks are followed out of the root.

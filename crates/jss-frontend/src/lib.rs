@@ -7,7 +7,11 @@
 //! - [`ParsePool`]: the entry point. Parallel, panic-isolated processing of discovered files on
 //!   workers whose parser always has a large enough stack.
 //! - [`source_type`] / [`typed_fallbacks`]: how each kind of file is parsed.
+//!
+//! Flow-typed JavaScript is read as TypeScript after the syntax only Flow has is blanked, which
+//! keeps every offset (see the private `flow` module). `FileReport::flow_edits` says how much.
 
+mod flow;
 mod parse;
 mod process;
 

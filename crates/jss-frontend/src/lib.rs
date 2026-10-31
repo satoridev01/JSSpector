@@ -14,6 +14,8 @@
 mod flow;
 mod parse;
 mod process;
+mod scan;
+pub mod taint;
 
 pub use jss_core::PackageType;
 pub use parse::{source_type, typed_fallbacks};
@@ -21,3 +23,4 @@ pub use process::{
     FileReport, FileStatus, ParsePool, PoolError, STACK_BASE, STACK_PER_BRACKET_BYTE,
     STACK_PER_BYTE, WORKER_STACK_BYTES, parser_stack_bound,
 };
+pub use scan::{ScanReport, ScanStatus, finalize};

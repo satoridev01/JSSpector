@@ -1,0 +1,1496 @@
+//! `scan` v0: a single-file, intra-procedural taint spike over the oxc AST.
+//!
+//! Scope, stated so nobody mistakes it for the plan's M1 engine:
+//! - A hand-rolled walker; symbols are keyed by name per function (shadowing is not modeled).
+//! - Closures see a copy of their parent's tainted names. Calls into user functions are NOT
+//!   followed: an unknown call's result is untainted unless listed in [`models`].
+//! - Sources and sinks are heuristic tables ([`models`]). Regex/allowlist guards are not
+//!   recognized. Every finding is a triage candidate, never a verdict.
+//! - Assignments inside a branch or loop only ever add taint; outside them, an untainted
+//!   assignment clears it.
+//! - Recursion is capped at [`MAX_DEPTH`]; a capped file says so (`truncated`).
+
+pub mod models;
+
+use std::collections::BTreeMap;
+
+use jss_core::{Severity, VulnClass};
+use oxc_ast::ast::{
+    Argument, ArrayExpressionElement, ArrowFunctionBody, AssignmentTarget, BindingPattern,
+    CallExpression, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
+    ForStatementInit, ForStatementLeft, FormalParameters, Function, ModuleDeclaration,
+    ObjectPropertyKind, Program, PropertyKey, Statement, VariableDeclaration,
+};
+use oxc_ast::ast::{BinaryOperator, SimpleAssignmentTarget};
+use oxc_span::{GetSpan, Span};
+
+use models::ArgRule;
+
+/// Deepest AST recursion the walker follows before giving up on a subtree.
+pub const MAX_DEPTH: u32 = 300;
+/// Steps kept per trace.
+const MAX_STEPS: usize = 16;
+
+/// Where a tainted value came from, and how it got here.
+#[derive(Debug, Clone)]
+pub struct Origin {
+    pub kind: &'static str,
+    pub span: Span,
+    /// (offset, note) for each step since the source.
+    pub steps: Vec<(u32, String)>,
+    /// Passed through string concatenation, a template or a formatter.
+    pub built: bool,
+    /// The tainted data is (still) at the start of the string.
+    pub prefix: bool,
+}
+
+impl Origin {
+    fn step(mut self, offset: u32, note: String) -> Self {
+        if self.steps.len() < MAX_STEPS {
+            self.steps.push((offset, note));
+        }
+        self
+    }
+}
+
+/// A sink reached by a tainted value, with byte offsets (the caller makes lines of them).
+#[derive(Debug, Clone)]
+pub struct RawFinding {
+    pub class: VulnClass,
+    pub severity: Severity,
+    pub api: String,
+    pub arg: Span,
+    pub call: Span,
+    pub function: String,
+    pub origin: Origin,
+}
+
+/// Result of scanning one program.
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    pub findings: Vec<RawFinding>,
+    pub truncated: bool,
+}
+
+/// Scans a parsed program.
+pub fn scan_program(program: &Program<'_>, text: &str) -> ScanResult {
+    let _ = text;
+    let mut walker = Walker {
+        modules: BTreeMap::new(),
+        result: ScanResult::default(),
+        depth: 0,
+    };
+    let mut env = Env::new("<module>".to_owned());
+    walker.statements(&program.body, &mut env);
+    walker.result
+}
+
+/// What a local name was bound to by `require` or `import`.
+#[derive(Debug, Clone)]
+struct Imported {
+    family: &'static str,
+    /// The export, or `None` for the module object itself.
+    export: Option<String>,
+}
+
+/// Per-function state.
+#[derive(Debug, Clone)]
+struct Env {
+    vars: BTreeMap<String, Origin>,
+    /// Names bound to request objects, with the source kind they produce.
+    requests: BTreeMap<String, &'static str>,
+    /// Inside a branch or loop: assignments only add taint.
+    branch: u32,
+    function: String,
+}
+
+impl Env {
+    fn new(function: String) -> Self {
+        Self {
+            vars: BTreeMap::new(),
+            requests: BTreeMap::new(),
+            branch: 0,
+            function,
+        }
+    }
+
+    fn closure(&self, function: String) -> Self {
+        Self {
+            vars: self.vars.clone(),
+            requests: self.requests.clone(),
+            branch: 0,
+            function,
+        }
+    }
+
+    fn bind(&mut self, name: &str, taint: Option<Origin>) {
+        match taint {
+            Some(origin) => {
+                self.vars.insert(name.to_owned(), origin);
+            }
+            None if self.branch == 0 => {
+                self.vars.remove(name);
+            }
+            None => {}
+        }
+    }
+}
+
+/// How a function is entered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Plain,
+    /// Registered as a route handler (`app.post(path, fn)`).
+    Route,
+    /// A socket.io event callback: its parameters are client data.
+    Socket,
+}
+
+struct Walker {
+    modules: BTreeMap<String, Imported>,
+    result: ScanResult,
+    depth: u32,
+}
+
+fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Origin {
+            built: a.built || b.built,
+            ..a
+        }),
+        (a, b) => a.or(b),
+    }
+}
+
+fn contains(list: &[&str], name: &str) -> bool {
+    list.contains(&name)
+}
+
+fn prop_name(key: &PropertyKey<'_>) -> Option<String> {
+    key.static_name()
+        .and_then(|name| name.as_str().map(str::to_owned))
+}
+
+/// `require('x')` → `x`.
+fn require_spec(expr: &Expression<'_>) -> Option<String> {
+    let Expression::CallExpression(call) = expr.get_inner_expression() else {
+        return None;
+    };
+    if !call.callee.is_specific_id("require") {
+        return None;
+    }
+    match call.arguments.first()? {
+        Argument::StringLiteral(lit) => lit.value.as_str().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// `{ name: value }` → value, for the first of `names` present.
+fn object_prop<'a, 'e>(expr: &'e Expression<'a>, names: &[&str]) -> Option<&'e Expression<'a>> {
+    let Expression::ObjectExpression(object) = expr.get_inner_expression() else {
+        return None;
+    };
+    object
+        .properties
+        .iter()
+        .find_map(|property| match property {
+            ObjectPropertyKind::ObjectProperty(p)
+                if prop_name(&p.key).is_some_and(|key| contains(names, &key)) =>
+            {
+                Some(&p.value)
+            }
+            _ => None,
+        })
+}
+
+impl Walker {
+    /// Enters one recursion level; false when the cap is reached.
+    fn enter(&mut self) -> bool {
+        if self.depth >= MAX_DEPTH {
+            self.result.truncated = true;
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    // ----- statements -------------------------------------------------------------------
+
+    fn statements(&mut self, statements: &[Statement<'_>], env: &mut Env) {
+        for statement in statements {
+            self.statement(statement, env);
+        }
+    }
+
+    fn branch(&mut self, statement: &Statement<'_>, env: &mut Env) {
+        env.branch += 1;
+        self.statement(statement, env);
+        env.branch -= 1;
+    }
+
+    fn statement(&mut self, statement: &Statement<'_>, env: &mut Env) {
+        if !self.enter() {
+            return;
+        }
+        self.statement_inner(statement, env);
+        self.leave();
+    }
+
+    fn statement_inner(&mut self, statement: &Statement<'_>, env: &mut Env) {
+        match statement {
+            Statement::ExpressionStatement(s) => {
+                self.expr(&s.expression, env);
+            }
+            Statement::VariableDeclaration(d) => self.var_decl(d, env),
+            Statement::FunctionDeclaration(f) => {
+                let name = f.id.as_ref().map(|id| id.name.as_str().to_owned());
+                self.function(f, env, name, Role::Plain);
+            }
+            Statement::ClassDeclaration(c) => self.class(c, env),
+            Statement::BlockStatement(b) => self.statements(&b.body, env),
+            Statement::IfStatement(s) => {
+                self.expr(&s.test, env);
+                self.branch(&s.consequent, env);
+                if let Some(alternate) = &s.alternate {
+                    self.branch(alternate, env);
+                }
+            }
+            Statement::ReturnStatement(s) => {
+                if let Some(argument) = &s.argument {
+                    self.expr(argument, env);
+                }
+            }
+            Statement::ThrowStatement(s) => {
+                self.expr(&s.argument, env);
+            }
+            Statement::TryStatement(s) => {
+                env.branch += 1;
+                self.statements(&s.block.body, env);
+                if let Some(handler) = &s.handler {
+                    self.statements(&handler.body.body, env);
+                }
+                env.branch -= 1;
+                if let Some(finalizer) = &s.finalizer {
+                    self.statements(&finalizer.body, env);
+                }
+            }
+            Statement::ForStatement(s) => {
+                env.branch += 1;
+                match &s.init {
+                    Some(ForStatementInit::VariableDeclaration(d)) => self.var_decl(d, env),
+                    Some(init) => {
+                        if let Some(expr) = init.as_expression() {
+                            self.expr(expr, env);
+                        }
+                    }
+                    None => {}
+                }
+                if let Some(test) = &s.test {
+                    self.expr(test, env);
+                }
+                if let Some(update) = &s.update {
+                    self.expr(update, env);
+                }
+                self.statement(&s.body, env);
+                env.branch -= 1;
+            }
+            Statement::ForOfStatement(s) => {
+                let taint = self.expr(&s.right, env);
+                env.branch += 1;
+                self.for_left(&s.left, taint, env);
+                self.statement(&s.body, env);
+                env.branch -= 1;
+            }
+            Statement::ForInStatement(s) => {
+                // Keys of a tainted object are attacker-chosen too.
+                let taint = self.expr(&s.right, env);
+                env.branch += 1;
+                self.for_left(&s.left, taint, env);
+                self.statement(&s.body, env);
+                env.branch -= 1;
+            }
+            Statement::WhileStatement(s) => {
+                self.expr(&s.test, env);
+                self.branch(&s.body, env);
+            }
+            Statement::DoWhileStatement(s) => {
+                self.branch(&s.body, env);
+                self.expr(&s.test, env);
+            }
+            Statement::SwitchStatement(s) => {
+                self.expr(&s.discriminant, env);
+                env.branch += 1;
+                for case in &s.cases {
+                    if let Some(test) = &case.test {
+                        self.expr(test, env);
+                    }
+                    self.statements(&case.consequent, env);
+                }
+                env.branch -= 1;
+            }
+            Statement::LabeledStatement(s) => self.statement(&s.body, env),
+            Statement::WithStatement(s) => {
+                self.expr(&s.object, env);
+                self.branch(&s.body, env);
+            }
+            _ => {
+                if let Some(module) = statement.as_module_declaration() {
+                    self.module_decl(module, env);
+                }
+            }
+        }
+    }
+
+    fn module_decl(&mut self, module: &ModuleDeclaration<'_>, env: &mut Env) {
+        match module {
+            ModuleDeclaration::ImportDeclaration(import) => {
+                let Some(family) = import.source.value.as_str().and_then(models::module_family)
+                else {
+                    return;
+                };
+                for specifier in import.specifiers.iter().flatten() {
+                    use oxc_ast::ast::ImportDeclarationSpecifier as S;
+                    let (local, export) = match specifier {
+                        S::ImportSpecifier(s) => {
+                            (s.local.name.as_str(), s.imported.name().as_str().to_owned())
+                        }
+                        S::ImportDefaultSpecifier(s) => (s.local.name.as_str(), String::new()),
+                        S::ImportNamespaceSpecifier(s) => (s.local.name.as_str(), String::new()),
+                    };
+                    self.modules.insert(
+                        local.to_owned(),
+                        Imported {
+                            family,
+                            export: (!export.is_empty()).then_some(export),
+                        },
+                    );
+                }
+            }
+            ModuleDeclaration::ExportDeclaration(export) => match &export.declaration {
+                Declaration::FunctionDeclaration(f) => {
+                    let name = f.id.as_ref().map(|id| id.name.as_str().to_owned());
+                    let role = if name
+                        .as_deref()
+                        .is_some_and(|n| contains(models::ROUTE_EXPORTS, n))
+                    {
+                        Role::Route
+                    } else {
+                        Role::Plain
+                    };
+                    self.function(f, env, name, role);
+                }
+                Declaration::VariableDeclaration(d) => self.var_decl(d, env),
+                Declaration::ClassDeclaration(c) => self.class(c, env),
+                _ => {}
+            },
+            ModuleDeclaration::ExportDefaultDeclaration(export) => match &export.declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                    let name = f.id.as_ref().map(|id| id.name.as_str().to_owned());
+                    self.function(f, env, name, Role::Plain);
+                }
+                ExportDefaultDeclarationKind::ClassDeclaration(c) => self.class(c, env),
+                other => {
+                    if let Some(expr) = other.as_expression() {
+                        self.expr(expr, env);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn for_left(&mut self, left: &ForStatementLeft<'_>, taint: Option<Origin>, env: &mut Env) {
+        match left {
+            ForStatementLeft::VariableDeclaration(d) => {
+                for declarator in &d.declarations {
+                    self.bind_pattern(&declarator.id, taint.clone(), None, env);
+                }
+            }
+            other => {
+                if let Some(target) = other.as_assignment_target() {
+                    self.assign_target(target, taint, env);
+                }
+            }
+        }
+    }
+
+    fn var_decl(&mut self, declaration: &VariableDeclaration<'_>, env: &mut Env) {
+        for declarator in &declaration.declarations {
+            let Some(init) = &declarator.init else {
+                continue;
+            };
+            if let Some(spec) = require_spec(init) {
+                self.bind_require(&declarator.id, &spec, None);
+                continue;
+            }
+            // `const { exec } = require('child_process').promises` and `require('fs').promises`
+            if let Some(member) = init.get_inner_expression().as_member_expression()
+                && let Some(spec) = require_spec(member.object())
+            {
+                let export = member
+                    .static_property_name()
+                    .and_then(|name| name.as_str().map(str::to_owned));
+                self.bind_require(&declarator.id, &spec, export);
+                continue;
+            }
+            let name_hint = match &declarator.id {
+                BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
+                _ => None,
+            };
+            let taint = self.expr_named(init, env, name_hint);
+            // `const { body, query } = req`
+            let request = match init.get_inner_expression() {
+                Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
+                _ => None,
+            };
+            self.bind_pattern(
+                &declarator.id,
+                taint,
+                request.map(|kind| (kind, init.span())),
+                env,
+            );
+        }
+    }
+
+    /// Binds `const x = require(spec)` and `const { a, b: c } = require(spec)`.
+    fn bind_require(&mut self, pattern: &BindingPattern<'_>, spec: &str, export: Option<String>) {
+        let Some(family) = models::module_family(spec) else {
+            return;
+        };
+        // `require('fs').promises` is still fs.
+        let export = export.filter(|e| e != "promises");
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                self.modules
+                    .insert(id.name.as_str().to_owned(), Imported { family, export });
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    let Some(key) = prop_name(&property.key) else {
+                        continue;
+                    };
+                    if let BindingPattern::BindingIdentifier(local) = &property.value {
+                        let export = if key == "promises" { None } else { Some(key) };
+                        self.modules
+                            .insert(local.name.as_str().to_owned(), Imported { family, export });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Binds every name in `pattern` to `taint`. With `request`, the value is a request object:
+    /// destructured properties named like request data become sources.
+    fn bind_pattern(
+        &mut self,
+        pattern: &BindingPattern<'_>,
+        taint: Option<Origin>,
+        request: Option<(&'static str, Span)>,
+        env: &mut Env,
+    ) {
+        if !self.enter() {
+            return;
+        }
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                let taint =
+                    taint.map(|o| o.step(id.span.start, format!("assigned to `{}`", id.name)));
+                env.bind(id.name.as_str(), taint);
+            }
+            BindingPattern::ObjectPattern(object) => {
+                for property in &object.properties {
+                    let key = prop_name(&property.key);
+                    let field = match (request, key.as_deref()) {
+                        (Some((kind, _)), Some(key)) if contains(models::REQUEST_PROPS, key) => {
+                            Some(Origin {
+                                kind,
+                                span: property.span,
+                                steps: Vec::new(),
+                                built: false,
+                                prefix: true,
+                            })
+                        }
+                        (Some(_), _) => None,
+                        (None, _) => taint.clone(),
+                    };
+                    self.bind_pattern(&property.value, field, None, env);
+                }
+                if let Some(rest) = &object.rest {
+                    self.bind_pattern(&rest.argument, taint.clone(), None, env);
+                }
+            }
+            BindingPattern::ArrayPattern(array) => {
+                for element in array.elements.iter().flatten() {
+                    self.bind_pattern(element, taint.clone(), None, env);
+                }
+                if let Some(rest) = &array.rest {
+                    self.bind_pattern(&rest.argument, taint.clone(), None, env);
+                }
+            }
+            BindingPattern::AssignmentPattern(assign) => {
+                let default = self.expr(&assign.right, env);
+                self.bind_pattern(&assign.left, union(taint, default), request, env);
+            }
+        }
+        self.leave();
+    }
+
+    fn class(&mut self, class: &Class<'_>, env: &mut Env) {
+        let class_name = class.id.as_ref().map(|id| id.name.as_str().to_owned());
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(method) => {
+                    let name = prop_name(&method.key).map(|key| match &class_name {
+                        Some(class) => format!("{class}.{key}"),
+                        None => key,
+                    });
+                    self.function(&method.value, env, name, Role::Plain);
+                }
+                ClassElement::PropertyDefinition(property) => {
+                    if let Some(value) = &property.value {
+                        let name = prop_name(&property.key);
+                        self.expr_named(value, env, name);
+                    }
+                }
+                ClassElement::StaticBlock(block) => {
+                    let mut inner = env.closure(env.function.clone());
+                    self.statements(&block.body, &mut inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ----- functions --------------------------------------------------------------------
+
+    fn function(&mut self, f: &Function<'_>, parent: &Env, name: Option<String>, role: Role) {
+        let Some(body) = &f.body else {
+            return;
+        };
+        let mut env = self.enter_function(&f.params, parent, name, role);
+        if self.enter() {
+            self.statements(&body.statements, &mut env);
+            self.leave();
+        }
+    }
+
+    fn enter_function(
+        &mut self,
+        params: &FormalParameters<'_>,
+        parent: &Env,
+        name: Option<String>,
+        role: Role,
+    ) -> Env {
+        let name = name.unwrap_or_else(|| "<anonymous>".to_owned());
+        let mut env = parent.closure(name);
+        let names: Vec<Option<&str>> = params
+            .items
+            .iter()
+            .map(|p| match &p.pattern {
+                BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Parameters shadow outer taint of the same name.
+        for name in names.iter().flatten() {
+            env.vars.remove(*name);
+            env.requests.remove(*name);
+        }
+        let first = names.first().copied().flatten();
+        match role {
+            Role::Socket => {
+                for (param, name) in params.items.iter().zip(&names) {
+                    if name.is_some_and(|n| contains(models::SOCKET_ACK_NAMES, n)) {
+                        continue;
+                    }
+                    let origin = Origin {
+                        kind: "socket",
+                        span: param.span,
+                        steps: Vec::new(),
+                        built: false,
+                        prefix: true,
+                    };
+                    self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
+                }
+            }
+            Role::Route | Role::Plain => {
+                let conventional = first.is_some_and(|n| contains(models::REQUEST_NAMES, n))
+                    && (names.len() >= 2 || role == Role::Route);
+                if let Some(first) = first {
+                    if first == "ctx" && (role == Role::Route || names.len() <= 2) {
+                        env.requests.insert("ctx".to_owned(), "koa");
+                    } else if conventional || (role == Role::Route && names.len() >= 2) {
+                        env.requests.insert(first.to_owned(), "http");
+                    }
+                } else if role == Role::Route
+                    && let Some(param) = params.items.first()
+                {
+                    // `({ body, query }, res) => ...`
+                    self.bind_pattern(&param.pattern, None, Some(("http", param.span)), &mut env);
+                }
+            }
+        }
+        env
+    }
+
+    fn arrow(
+        &mut self,
+        params: &FormalParameters<'_>,
+        body: &ArrowFunctionBody<'_>,
+        parent: &Env,
+        name: Option<String>,
+        role: Role,
+    ) {
+        let mut env = self.enter_function(params, parent, name, role);
+        if !self.enter() {
+            return;
+        }
+        match body {
+            ArrowFunctionBody::FunctionBody(body) => self.statements(&body.statements, &mut env),
+            other => {
+                if let Some(expr) = other.as_expression() {
+                    self.expr(expr, &mut env);
+                }
+            }
+        }
+        self.leave();
+    }
+
+    /// Walks a function-valued expression, if it is one. Returns whether it was.
+    fn maybe_function(
+        &mut self,
+        expr: &Expression<'_>,
+        env: &Env,
+        name: Option<String>,
+        role: Role,
+    ) -> bool {
+        match expr.get_inner_expression() {
+            Expression::ArrowFunctionExpression(arrow) => {
+                self.arrow(&arrow.params, &arrow.body, env, name, role);
+                true
+            }
+            Expression::FunctionExpression(f) => {
+                let name = name.or_else(|| f.id.as_ref().map(|id| id.name.as_str().to_owned()));
+                self.function(f, env, name, role);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // ----- expressions ------------------------------------------------------------------
+
+    fn expr_named(
+        &mut self,
+        expr: &Expression<'_>,
+        env: &mut Env,
+        name: Option<String>,
+    ) -> Option<Origin> {
+        if self.maybe_function(expr, env, name, Role::Plain) {
+            return None;
+        }
+        self.expr(expr, env)
+    }
+
+    fn expr(&mut self, expr: &Expression<'_>, env: &mut Env) -> Option<Origin> {
+        if !self.enter() {
+            return None;
+        }
+        let taint = self.expr_inner(expr, env);
+        self.leave();
+        taint
+    }
+
+    fn expr_inner(&mut self, expr: &Expression<'_>, env: &mut Env) -> Option<Origin> {
+        match expr {
+            Expression::Identifier(id) => env.vars.get(id.name.as_str()).cloned(),
+            Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+            | Expression::PrivateFieldExpression(_) => self.member(expr, env),
+            Expression::TemplateLiteral(template) => {
+                let mut taint = None;
+                for (index, expression) in template.expressions.iter().enumerate() {
+                    if let Some(mut origin) = self.expr(expression, env) {
+                        origin.built = true;
+                        let leading = index == 0
+                            && template.quasis.first().is_some_and(|q| {
+                                q.value
+                                    .cooked
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("x")
+                                    .trim()
+                                    .is_empty()
+                            });
+                        origin.prefix = origin.prefix && leading;
+                        let origin = origin.step(
+                            expression.span().start,
+                            "interpolated into a template".to_owned(),
+                        );
+                        taint = union(taint, Some(origin));
+                    }
+                }
+                taint
+            }
+            Expression::TaggedTemplateExpression(tagged) => {
+                self.expr(&tagged.tag, env);
+                for expression in &tagged.quasi.expressions {
+                    self.expr(expression, env);
+                }
+                None
+            }
+            Expression::BinaryExpression(binary) => {
+                let left = self.expr(&binary.left, env);
+                let right = self.expr(&binary.right, env);
+                if binary.operator == BinaryOperator::Addition {
+                    let left = left.map(|mut o| {
+                        o.built = true;
+                        o
+                    });
+                    let right = right.map(|mut o| {
+                        o.built = true;
+                        o.prefix = false;
+                        o.step(binary.span.start, "concatenated".to_owned())
+                    });
+                    union(left, right)
+                } else {
+                    None
+                }
+            }
+            Expression::LogicalExpression(logical) => {
+                let left = self.expr(&logical.left, env);
+                let right = self.expr(&logical.right, env);
+                union(left, right)
+            }
+            Expression::ConditionalExpression(c) => {
+                self.expr(&c.test, env);
+                let a = self.expr(&c.consequent, env);
+                let b = self.expr(&c.alternate, env);
+                union(a, b)
+            }
+            Expression::AwaitExpression(a) => self.expr(&a.argument, env),
+            Expression::ParenthesizedExpression(p) => self.expr(&p.expression, env),
+            Expression::TSAsExpression(e) => self.expr(&e.expression, env),
+            Expression::TSSatisfiesExpression(e) => self.expr(&e.expression, env),
+            Expression::TSNonNullExpression(e) => self.expr(&e.expression, env),
+            Expression::TSTypeAssertion(e) => self.expr(&e.expression, env),
+            Expression::TSInstantiationExpression(e) => self.expr(&e.expression, env),
+            Expression::SequenceExpression(s) => {
+                let mut last = None;
+                for expression in &s.expressions {
+                    last = self.expr(expression, env);
+                }
+                last
+            }
+            Expression::UnaryExpression(u) => {
+                self.expr(&u.argument, env);
+                // `+x`, `-x`, `!x`, `typeof x`, `void x`, `~x`: none carries the string.
+                None
+            }
+            Expression::UpdateExpression(_) => None,
+            Expression::AssignmentExpression(assign) => {
+                let name = match &assign.left {
+                    AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                        Some(id.name.as_str().to_owned())
+                    }
+                    target => target
+                        .as_simple_assignment_target()
+                        .and_then(|t| t.as_member_expression())
+                        .and_then(|m| m.static_property_name())
+                        .and_then(|n| n.as_str().map(str::to_owned)),
+                };
+                let taint = self.expr_named(&assign.right, env, name);
+                // `x += tainted` keeps x's own taint too.
+                let taint = if assign.operator.is_assign() {
+                    taint
+                } else {
+                    let own = match &assign.left {
+                        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                            env.vars.get(id.name.as_str()).cloned()
+                        }
+                        _ => None,
+                    };
+                    union(own, taint).map(|mut o| {
+                        o.built = true;
+                        o
+                    })
+                };
+                self.assign_target(&assign.left, taint.clone(), env);
+                taint
+            }
+            Expression::ArrayExpression(array) => {
+                let mut taint = None;
+                for element in &array.elements {
+                    let t = match element {
+                        ArrayExpressionElement::SpreadElement(s) => self.expr(&s.argument, env),
+                        ArrayExpressionElement::Elision(_) => None,
+                        other => other.as_expression().and_then(|e| self.expr(e, env)),
+                    };
+                    taint = union(taint, t);
+                }
+                taint
+            }
+            Expression::ObjectExpression(object) => {
+                let mut taint = None;
+                for property in &object.properties {
+                    let t = match property {
+                        ObjectPropertyKind::ObjectProperty(p) => {
+                            if let Some(key) = p.key.as_expression()
+                                && p.computed
+                            {
+                                self.expr(key, env);
+                            }
+                            let name = prop_name(&p.key);
+                            self.expr_named(&p.value, env, name)
+                        }
+                        ObjectPropertyKind::SpreadProperty(s) => self.expr(&s.argument, env),
+                    };
+                    taint = union(taint, t);
+                }
+                taint
+            }
+            Expression::CallExpression(call) => self.call(call, env),
+            Expression::NewExpression(new) => {
+                let callee = self.callee(&new.callee);
+                let mut taints = Vec::new();
+                for argument in &new.arguments {
+                    taints.push(self.argument(argument, env, Role::Plain));
+                }
+                let sink = match &callee {
+                    Callee::Module { family, export } => {
+                        models::module_sink(family, export.as_deref().unwrap_or(""))
+                    }
+                    Callee::Global(name) => models::global_sink(name),
+                    Callee::Method { .. } => None,
+                };
+                if let Some(sink) = sink {
+                    self.check_sink(sink, &callee, &new.arguments, &taints, new.span, env);
+                }
+                None
+            }
+            Expression::ChainExpression(chain) => {
+                use oxc_ast::ast::ChainElement;
+                match &chain.expression {
+                    ChainElement::CallExpression(call) => self.call(call, env),
+                    ChainElement::TSNonNullExpression(e) => self.expr(&e.expression, env),
+                    other => other
+                        .as_member_expression()
+                        .and_then(|m| self.member_of(m, env)),
+                }
+            }
+            Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {
+                self.maybe_function(expr, env, None, Role::Plain);
+                None
+            }
+            Expression::ClassExpression(class) => {
+                self.class(class, env);
+                None
+            }
+            Expression::YieldExpression(y) => {
+                if let Some(argument) = &y.argument {
+                    self.expr(argument, env);
+                }
+                None
+            }
+            Expression::ImportExpression(import) => {
+                self.expr(&import.source, env);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn assign_target(
+        &mut self,
+        target: &AssignmentTarget<'_>,
+        taint: Option<Origin>,
+        env: &mut Env,
+    ) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                let taint =
+                    taint.map(|o| o.step(id.span.start, format!("assigned to `{}`", id.name)));
+                env.bind(id.name.as_str(), taint);
+            }
+            other => {
+                if let Some(member) = other
+                    .as_simple_assignment_target()
+                    .and_then(SimpleAssignmentTarget::as_member_expression)
+                {
+                    // `obj.x = tainted` taints `obj` (coarse: fields are not tracked).
+                    if let (Some(origin), Expression::Identifier(root)) =
+                        (taint, member.object().get_inner_expression())
+                    {
+                        let origin = origin.step(
+                            member.span().start,
+                            format!("stored in a field of `{}`", root.name),
+                        );
+                        env.vars.insert(root.name.as_str().to_owned(), origin);
+                    }
+                }
+            }
+        }
+    }
+
+    fn member(&mut self, expr: &Expression<'_>, env: &mut Env) -> Option<Origin> {
+        let member = expr.as_member_expression()?;
+        self.member_of(member, env)
+    }
+
+    fn member_of(
+        &mut self,
+        member: &oxc_ast::ast::MemberExpression<'_>,
+        env: &mut Env,
+    ) -> Option<Origin> {
+        use oxc_ast::ast::MemberExpression as M;
+        if let M::ComputedMemberExpression(computed) = member {
+            self.expr(&computed.expression, env);
+        }
+        let property = member
+            .static_property_name()
+            .and_then(|name| name.as_str().map(str::to_owned));
+        let object = member.object().get_inner_expression();
+        if let Some(kind) = self.request_kind(object, env)
+            && property
+                .as_deref()
+                .is_some_and(|p| contains(models::REQUEST_PROPS, p))
+        {
+            return Some(Origin {
+                kind,
+                span: member.span(),
+                steps: Vec::new(),
+                built: false,
+                prefix: true,
+            });
+        }
+        if object.is_specific_id("process") && property.as_deref() == Some("argv") {
+            return Some(Origin {
+                kind: "cli",
+                span: member.span(),
+                steps: Vec::new(),
+                built: false,
+                prefix: true,
+            });
+        }
+        // Any property of a tainted object is tainted.
+        self.expr(member.object(), env)
+    }
+
+    /// The source kind when `expr` is a request object: a request parameter, or `ctx.request`.
+    fn request_kind(&self, expr: &Expression<'_>, env: &Env) -> Option<&'static str> {
+        match expr {
+            Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
+            Expression::StaticMemberExpression(m) if m.property.name == "request" => {
+                match m.object.get_inner_expression() {
+                    Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn argument(&mut self, argument: &Argument<'_>, env: &mut Env, role: Role) -> Option<Origin> {
+        match argument {
+            Argument::SpreadElement(spread) => self.expr(&spread.argument, env),
+            other => {
+                let expr = other.as_expression()?;
+                if self.maybe_function(expr, env, None, role) {
+                    None
+                } else {
+                    self.expr(expr, env)
+                }
+            }
+        }
+    }
+
+    fn callee(&self, callee: &Expression<'_>) -> Callee {
+        let callee = callee.get_inner_expression();
+        match callee {
+            Expression::Identifier(id) => match self.modules.get(id.name.as_str()) {
+                Some(imported) => Callee::Module {
+                    family: imported.family,
+                    export: imported.export.clone(),
+                },
+                None => Callee::Global(id.name.as_str().to_owned()),
+            },
+            _ => {
+                let Some(member) = callee.as_member_expression() else {
+                    return Callee::Method {
+                        object: None,
+                        method: String::new(),
+                    };
+                };
+                let method = member
+                    .static_property_name()
+                    .and_then(|name| name.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let object = member.object().get_inner_expression();
+                let family = match object {
+                    Expression::Identifier(id) => self
+                        .modules
+                        .get(id.name.as_str())
+                        .filter(|imported| {
+                            imported.export.is_none()
+                                || imported.export.as_deref() == Some("default")
+                        })
+                        .map(|imported| imported.family)
+                        .or_else(|| {
+                            // Unimported but conventional: `child_process.exec`, `fs.readFile`.
+                            models::module_family(id.name.as_str())
+                                .filter(|f| matches!(*f, "child_process" | "fs" | "vm" | "path"))
+                        }),
+                    // `fs.promises.readFile`
+                    Expression::StaticMemberExpression(inner)
+                        if inner.property.name == "promises" =>
+                    {
+                        match inner.object.get_inner_expression() {
+                            Expression::Identifier(id) => {
+                                self.modules.get(id.name.as_str()).map(|i| i.family)
+                            }
+                            _ => None,
+                        }
+                    }
+                    other => require_spec(other).and_then(|spec| models::module_family(&spec)),
+                };
+                match family {
+                    Some(family) => Callee::Module {
+                        family,
+                        export: Some(method),
+                    },
+                    None => {
+                        let object_name = match object {
+                            Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                            _ => None,
+                        };
+                        // `Buffer.from`, `JSON.parse`, `util.format` as globals.
+                        if let Some(object) = &object_name
+                            && contains(models::PASS_GLOBALS, &format!("{object}.{method}"))
+                        {
+                            return Callee::Global(format!("{object}.{method}"));
+                        }
+                        Callee::Method {
+                            object: object_name,
+                            method,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn call(&mut self, call: &CallExpression<'_>, env: &mut Env) -> Option<Origin> {
+        let callee = self.callee(&call.callee);
+        // Receiver taint (for pass-through methods), walking the callee once.
+        let receiver = match call.callee.get_inner_expression().as_member_expression() {
+            Some(member) => self.expr(member.object(), env),
+            None => {
+                self.expr(&call.callee, env);
+                None
+            }
+        };
+
+        // How function arguments are entered.
+        let role = match &callee {
+            Callee::Method { method, object } if method == "on" || method == "once" => {
+                let socketish = object.as_deref().is_some_and(|o| {
+                    let o = o.to_ascii_lowercase();
+                    o.contains("socket") || o == "client" || o == "ws"
+                });
+                let event = match call.arguments.first() {
+                    Some(Argument::StringLiteral(lit)) => lit.value.as_str(),
+                    _ => None,
+                };
+                if socketish && event.is_some_and(|e| !contains(models::SOCKET_BUILTIN_EVENTS, e)) {
+                    Role::Socket
+                } else {
+                    Role::Plain
+                }
+            }
+            Callee::Method { method, .. }
+            | Callee::Module {
+                export: Some(method),
+                ..
+            } if contains(models::ROUTE_METHODS, method) && call.arguments.len() >= 2 => {
+                Role::Route
+            }
+            _ => Role::Plain,
+        };
+        let route_name = match (&callee, call.arguments.first()) {
+            (Callee::Method { method, .. }, Some(Argument::StringLiteral(path)))
+                if role == Role::Route =>
+            {
+                Some(format!(
+                    "{} {}",
+                    method.to_ascii_uppercase(),
+                    path.value.as_str().unwrap_or("?")
+                ))
+            }
+            _ => None,
+        };
+        let mut taints = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            let taint = match (argument.as_expression(), &route_name) {
+                (Some(expr), Some(name)) if role == Role::Route => {
+                    if self.maybe_function(expr, env, Some(name.clone()), role) {
+                        None
+                    } else {
+                        self.expr(expr, env)
+                    }
+                }
+                _ => self.argument(argument, env, role),
+            };
+            taints.push(taint);
+        }
+
+        // Sinks.
+        let sink = match &callee {
+            Callee::Module { family, export } => {
+                models::module_sink(family, export.as_deref().unwrap_or(""))
+            }
+            Callee::Global(name) => models::global_sink(name),
+            Callee::Method { method, .. } => models::method_sink(method),
+        };
+        if let Some(sink) = sink {
+            self.check_sink(sink, &callee, &call.arguments, &taints, call.span, env);
+        }
+
+        // Result taint.
+        let any_arg = || taints.iter().flatten().next().cloned();
+        match &callee {
+            Callee::Method { object, method } => {
+                // `req.get('x')`, `await request.json()`
+                if let Some(member) = call.callee.get_inner_expression().as_member_expression()
+                    && let Some(kind) =
+                        self.request_kind(member.object().get_inner_expression(), env)
+                    && contains(models::REQUEST_METHODS, method)
+                {
+                    return Some(Origin {
+                        kind,
+                        span: call.span,
+                        steps: Vec::new(),
+                        built: false,
+                        prefix: true,
+                    });
+                }
+                let _ = object;
+                if contains(models::PASS_METHODS, method) {
+                    let built = contains(models::BUILD_METHODS, method);
+                    let taint = union(receiver, any_arg());
+                    return taint.map(|mut o| {
+                        o.built |= built;
+                        o.step(call.span.start, format!("through .{method}()"))
+                    });
+                }
+                None
+            }
+            Callee::Module { family, export } => {
+                let export = export.as_deref().unwrap_or("");
+                if *family == "path" && contains(models::PATH_PASS, export) {
+                    return any_arg()
+                        .map(|o| o.step(call.span.start, format!("through path.{export}()")));
+                }
+                if *family == "util" && export == "format" {
+                    return any_arg().map(|mut o| {
+                        o.built = true;
+                        o.step(call.span.start, "through util.format()".to_owned())
+                    });
+                }
+                None
+            }
+            Callee::Global(name) => {
+                if contains(models::CLEARING, name) {
+                    return None;
+                }
+                if contains(models::PASS_GLOBALS, name) {
+                    let built = name == "util.format";
+                    return any_arg().map(|mut o| {
+                        o.built |= built;
+                        o.step(call.span.start, format!("through {name}()"))
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    fn check_sink(
+        &mut self,
+        sink: models::Sink,
+        callee: &Callee,
+        arguments: &[Argument<'_>],
+        taints: &[Option<Origin>],
+        span: Span,
+        env: &Env,
+    ) {
+        let api = match callee {
+            Callee::Module { family, export } => match export.as_deref() {
+                Some(export) if !export.is_empty() => format!("{family}.{export}"),
+                _ => (*family).to_owned(),
+            },
+            Callee::Global(name) => name.clone(),
+            Callee::Method { object, method } => match object {
+                Some(object) => format!("{object}.{method}"),
+                None => format!(".{method}"),
+            },
+        };
+        // `res.sendFile(p, { root })` confines the path.
+        if matches!(callee, Callee::Method { method, .. } if method == "sendFile" || method == "download")
+            && arguments
+                .iter()
+                .skip(1)
+                .filter_map(Argument::as_expression)
+                .any(|e| object_prop(e, &["root"]).is_some())
+        {
+            return;
+        }
+        let mut severity = sink.severity;
+        let mut rules: Vec<ArgRule> = sink.args.to_vec();
+        // spawn/execFile with `shell: true`: every argument is shell text.
+        if let Callee::Module {
+            family: "child_process",
+            export: Some(export),
+        } = callee
+            && matches!(
+                export.as_str(),
+                "spawn" | "spawnSync" | "execFile" | "execFileSync"
+            )
+            && arguments
+                .iter()
+                .filter_map(Argument::as_expression)
+                .any(|e| {
+                    object_prop(e, &["shell"]).is_some_and(|v| {
+                    !matches!(v.get_inner_expression(), Expression::BooleanLiteral(b) if !b.value)
+                })
+                })
+        {
+            severity = Severity::Critical;
+            rules = vec![ArgRule::Any(0), ArgRule::Any(1)];
+        }
+        for rule in rules {
+            let (index, origin) = match rule {
+                ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
+                ArgRule::Built(index) => (
+                    index,
+                    taints.get(index).cloned().flatten().filter(|o| o.built),
+                ),
+                ArgRule::UrlPrefix(index) => {
+                    let direct = taints.get(index).cloned().flatten().filter(|o| o.prefix);
+                    let from_options = arguments
+                        .get(index)
+                        .and_then(Argument::as_expression)
+                        .and_then(|e| {
+                            object_prop(e, &["url", "uri", "host", "hostname", "baseURL"])
+                        })
+                        .and_then(|value| {
+                            let mut probe = env.clone();
+                            self.expr(value, &mut probe)
+                        })
+                        .filter(|o| o.prefix);
+                    (index, direct.or(from_options))
+                }
+            };
+            let Some(origin) = origin else { continue };
+            // The CLI is the user's own machine: never above low.
+            let severity = if origin.kind == "cli" {
+                Severity::Low
+            } else {
+                severity
+            };
+            let Some(arg) = arguments.get(index) else {
+                continue;
+            };
+            self.result.findings.push(RawFinding {
+                class: sink.class,
+                severity,
+                api: api.clone(),
+                arg: arg.span(),
+                call: span,
+                function: env.function.clone(),
+                origin,
+            });
+            break;
+        }
+    }
+}
+
+/// A callee, resolved as far as the file allows.
+#[derive(Debug, Clone)]
+enum Callee {
+    /// A function of a known module family (`export` `None`/empty: the module itself).
+    Module {
+        family: &'static str,
+        export: Option<String>,
+    },
+    /// A free identifier (or a known `Object.method` global).
+    Global(String),
+    /// A method on something else.
+    Method {
+        object: Option<String>,
+        method: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::{parse_options, source_type};
+    use jss_core::{PackageType, SourceKind};
+    use oxc_allocator::Allocator;
+    use oxc_parser::Parser;
+
+    /// (class, sink api, source kind) for every finding in `src`.
+    fn scan(src: &str) -> Vec<(VulnClass, Severity, String, &'static str)> {
+        let allocator = Allocator::default();
+        let ret = Parser::new(
+            &allocator,
+            src,
+            source_type(SourceKind::Js, PackageType::CommonJs),
+        )
+        .with_options(parse_options())
+        .parse();
+        assert!(!ret.fatal_error, "{:?}", ret.diagnostics);
+        scan_program(&ret.program, src)
+            .findings
+            .into_iter()
+            .map(|f| (f.class, f.severity, f.api, f.origin.kind))
+            .collect()
+    }
+
+    const HEAD: &str = "const { exec, spawn } = require('child_process');\n\
+        const fs = require('fs');\nconst path = require('path');\n\
+        const axios = require('axios');\n";
+
+    fn one(body: &str) -> Vec<(VulnClass, Severity, String, &'static str)> {
+        scan(&format!("{HEAD}{body}"))
+    }
+
+    #[test]
+    fn command_injection_through_concatenation() {
+        let found =
+            one("app.get('/p', (req, res) => { const h = req.query.host; exec('ping ' + h); });");
+        assert_eq!(
+            found,
+            vec![(
+                VulnClass::CommandInjection,
+                Severity::Critical,
+                "child_process.exec".to_owned(),
+                "http"
+            )]
+        );
+    }
+
+    #[test]
+    fn literal_commands_and_numeric_conversions_are_not_findings() {
+        assert!(one("app.get('/p', (req, res) => { exec('uptime'); const n = parseInt(req.query.n, 10); exec(`echo ${n}`); });").is_empty());
+    }
+
+    #[test]
+    fn regex_exec_is_not_child_process_exec() {
+        assert!(scan("app.get('/p', (req, res) => { /x/.exec(req.query.a); });").is_empty());
+    }
+
+    #[test]
+    fn spawn_with_shell_true_is_critical() {
+        let found = one(
+            "app.post('/r', (req, res) => { spawn('sh', ['-c', req.body.c], { shell: true }); });",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, Severity::Critical);
+    }
+
+    #[test]
+    fn path_traversal_and_basename() {
+        let tp = one(
+            "router.post('/f', function (r, s) { const { name } = r.body; fs.readFile(path.join(__dirname, name), cb); });",
+        );
+        assert_eq!(tp.len(), 1);
+        assert_eq!(tp[0].0, VulnClass::PathTraversal);
+        let fp = one(
+            "router.post('/f', function (r, s) { const { name } = r.body; fs.readFile(path.join(__dirname, path.basename(name)), cb); s.sendFile(name, { root: __dirname }); });",
+        );
+        assert!(fp.is_empty(), "{fp:?}");
+    }
+
+    #[test]
+    fn sql_built_by_template_but_not_parameterized() {
+        let tp = one(
+            "app.get('/u', async (req, res) => { const id = req.params.id; await db.query(`SELECT * FROM t WHERE id = ${id}`); });",
+        );
+        assert_eq!(tp.len(), 1);
+        assert_eq!(tp[0].0, VulnClass::SqlInjection);
+        assert!(one("app.get('/u', async (req, res) => { await db.query('SELECT * FROM t WHERE id = ?', [req.params.id]); });").is_empty());
+    }
+
+    #[test]
+    fn ssrf_needs_control_of_the_url_start() {
+        let tp = one(
+            "app.post('/x', async (req, res) => { const u = req.body.url; await axios.get(u); await fetch(`${u}/x`); });",
+        );
+        assert_eq!(tp.len(), 2, "{tp:?}");
+        assert!(one("app.post('/x', async (req, res) => { await axios.get('https://api.example.com/' + req.body.id); });").is_empty());
+    }
+
+    #[test]
+    fn eval_socket_and_web_request_sources() {
+        assert_eq!(
+            one("app.post('/e', (req, res) => { eval(req.body.code); });")[0].0,
+            VulnClass::CodeInjection
+        );
+        assert_eq!(one("io.on('connection', (socket) => { socket.on('run', (data, cb) => exec(data.cmd)); });")[0].3, "socket");
+        let next = scan(
+            "import { exec } from 'node:child_process';\nexport async function POST(request) { const b = await request.json(); exec(b.cmd); }",
+        );
+        assert_eq!(next.len(), 1, "{next:?}");
+    }
+
+    #[test]
+    fn untainted_reassignment_clears_but_branches_only_add() {
+        assert!(
+            one("app.get('/p', (req, res) => { let h = req.query.h; h = 'x'; exec(h); });")
+                .is_empty()
+        );
+        assert_eq!(one("app.get('/p', (req, res) => { let h = 'x'; if (a) { h = req.query.h; } exec(h); });").len(), 1);
+    }
+
+    #[test]
+    fn runtime_code_shaped_like_handlers_without_requests_is_quiet() {
+        // `(a, b)` callbacks that are not route registrations carry no request.
+        assert!(one("list.forEach((item, i) => exec(item.cmd));").is_empty());
+        assert!(one("function helper(cmd) { exec(cmd); }").is_empty());
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_not_overflowed() {
+        let deep = format!("x = {}1{};", "f(".repeat(2000), ")".repeat(2000));
+        let deep_arr = format!("x = {}1{};", "[".repeat(2000), "]".repeat(2000));
+        for src in [deep, deep_arr] {
+            // The parser needs its bounded stack (never a default thread); the walker's own
+            // recursion is capped.
+            let stack = crate::process::parser_stack_bound(src.as_bytes());
+            let truncated = std::thread::Builder::new()
+                .stack_size(stack)
+                .spawn(move || {
+                    let allocator = Allocator::default();
+                    let ret = Parser::new(
+                        &allocator,
+                        &src,
+                        source_type(SourceKind::Js, PackageType::CommonJs),
+                    )
+                    .with_options(parse_options())
+                    .parse();
+                    let result = scan_program(&ret.program, &src);
+                    assert!(result.findings.is_empty());
+                    result.truncated
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(truncated);
+        }
+    }
+}

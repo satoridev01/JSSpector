@@ -423,6 +423,7 @@ version = "0.0.1"
 dependencies = [
  "jss-core",
  "oxc_allocator",
+ "oxc_ast",
  "oxc_parser",
  "oxc_span",
  "rayon",

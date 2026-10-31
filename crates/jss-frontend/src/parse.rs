@@ -51,7 +51,7 @@ pub fn typed_fallbacks(kind: SourceKind, package_type: PackageType) -> Option<[S
 }
 
 /// Parse options shared by every JSSpector parse.
-fn parse_options() -> ParseOptions {
+pub(crate) fn parse_options() -> ParseOptions {
     ParseOptions {
         // CommonJS modules and scripts may `return` at the top level.
         allow_return_outside_function: true,

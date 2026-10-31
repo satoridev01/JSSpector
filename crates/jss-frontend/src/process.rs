@@ -269,7 +269,7 @@ fn parse_candidate(file: &SourceFile, selection: ClassSet, parse: ParseFn) -> Fi
 
 /// Reads at most one byte more than [`content::MAX_FILE_BYTES`], so a file that grew after
 /// discovery is still caught by the size check without reading all of it.
-fn read_capped(path: &Path, size_hint: u64) -> io::Result<Vec<u8>> {
+pub(crate) fn read_capped(path: &Path, size_hint: u64) -> io::Result<Vec<u8>> {
     let limit = content::MAX_FILE_BYTES.saturating_add(1);
     let mut bytes = Vec::with_capacity(usize::try_from(size_hint.min(limit)).unwrap_or(0));
     File::open(path)?.take(limit).read_to_end(&mut bytes)?;
@@ -277,7 +277,7 @@ fn read_capped(path: &Path, size_hint: u64) -> io::Result<Vec<u8>> {
 }
 
 /// Reads the first [`classify::GENERATED_SCAN_BYTES`] bytes of a file.
-fn read_head(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_head(path: &Path) -> io::Result<Vec<u8>> {
     let limit = u64::try_from(classify::GENERATED_SCAN_BYTES).unwrap_or(u64::MAX);
     let mut head = Vec::with_capacity(classify::GENERATED_SCAN_BYTES);
     File::open(path)?.take(limit).read_to_end(&mut head)?;
@@ -394,7 +394,7 @@ enum Parse {
 }
 
 /// Why a file has no [`Parse`].
-enum ParseFailure {
+pub(crate) enum ParseFailure {
     Panicked(String),
     /// A thread with a large enough stack could not be started.
     NoStack {
@@ -411,9 +411,21 @@ fn parse_text(
     package_type: PackageType,
     parse: ParseFn,
 ) -> Result<Parse, ParseFailure> {
+    on_parser_stack(text, |allocator| {
+        parse_all(allocator, text, kind, package_type, parse)
+    })
+}
+
+/// Runs `work` (which parses `text`, and may walk the result) with this thread's allocator on a
+/// stack of at least [`parser_stack_bound`] for `text`, catching any panic. Anything that parses
+/// must go through here: a stack overflow cannot be caught.
+pub(crate) fn on_parser_stack<T: Send>(
+    text: &str,
+    work: impl Fn(&Allocator) -> T + Sync,
+) -> Result<T, ParseFailure> {
     let needed = parser_stack_bound(text.as_bytes());
     let budget = STACK_BUDGET.try_with(Cell::get).unwrap_or(0);
-    let attempt = || isolated(|allocator| parse_all(allocator, text, kind, package_type, parse));
+    let attempt = || isolated(&work);
     if needed <= budget {
         return attempt().map_err(ParseFailure::Panicked);
     }
@@ -515,7 +527,7 @@ const TEMPLATE_TAG: &str = "<%";
 /// A skip message when the line of the first syntax error holds a template tag: a template
 /// with a `.js` extension, which no JavaScript parser should accept. Only consulted after a
 /// fatal parse.
-fn template_tag(text: &str, outcome: &ParseOutcome) -> Option<String> {
+pub(crate) fn template_tag(text: &str, outcome: &ParseOutcome) -> Option<String> {
     let offset = usize::try_from(outcome.first_error.as_ref()?.offset?).ok()?;
     let bytes = text.as_bytes();
     let line_start = bytes
@@ -574,7 +586,7 @@ fn isolated<T>(work: impl FnOnce(&Allocator) -> T) -> Result<T, String> {
 
 /// Runs `work`, catching any panic and describing it as a string; the panic hook records the
 /// panic's location instead of printing it.
-fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, String> {
+pub(crate) fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, String> {
     install_panic_hook();
     let result = {
         let _capture = Capture::start();

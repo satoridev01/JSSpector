@@ -10,8 +10,11 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
-use jss_core::{ClassSet, DiscoverError, DiscoverOptions, FileClass, PackageType};
-use jss_frontend::ParsePool;
+use jss_core::{
+    ClassSet, DiscoverError, DiscoverOptions, FileClass, Finding, PackageType, Severity,
+};
+use jss_frontend::{ParsePool, ScanStatus};
+use serde::Serialize;
 
 /// Exit codes, as defined in `docs/PLAN.md`: 0 = clean, 1 = findings at or above `--fail-on`
 /// (once scanning exists), 2 = usage error, 3 = engine error (including IO errors on the root).
@@ -38,6 +41,54 @@ enum Command {
     /// diagnostics, not errors: the exit code is 0 unless the root itself is unusable.
     #[command(hide = true)]
     Parse(ParseArgs),
+    /// Scan a file or directory for tainted data reaching dangerous sinks (v0 spike).
+    ///
+    /// Single-file, intra-procedural, heuristic: every finding is a candidate for hand triage.
+    /// Prints deterministic JSON (byte-identical for any number of threads).
+    Scan(ScanArgs),
+}
+
+#[derive(Args)]
+struct ScanArgs {
+    /// File or directory to scan.
+    path: PathBuf,
+    /// Number of threads [default: all available cores, or RAYON_NUM_THREADS].
+    #[arg(long, value_name = "N")]
+    threads: Option<NonZeroUsize>,
+    /// Also scan these file classes (source files always are). Comma-separated.
+    #[arg(long, value_name = "CLASSES", value_delimiter = ',', value_parser = parse_include)]
+    include: Vec<Include>,
+    /// Report only findings at or above this severity: critical, high, medium or low.
+    #[arg(long, value_name = "SEVERITY", default_value = "low", value_parser = parse_severity)]
+    min_severity: Severity,
+}
+
+fn parse_severity(value: &str) -> Result<Severity, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "critical" => Ok(Severity::Critical),
+        "high" => Ok(Severity::High),
+        "medium" => Ok(Severity::Medium),
+        "low" => Ok(Severity::Low),
+        _ => Err(format!("unknown severity `{value}`")),
+    }
+}
+
+/// The `scan` report.
+#[derive(Serialize)]
+struct ScanOutput {
+    root: String,
+    files_scanned: usize,
+    findings: Vec<Finding>,
+    /// Files not analyzed, with the reason; sorted by path.
+    skipped: Vec<FileNote>,
+    /// Files where the walker hit its depth cap.
+    truncated: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FileNote {
+    file: String,
+    reason: String,
 }
 
 #[derive(Args)]
@@ -100,7 +151,62 @@ fn include_set(includes: &[Include]) -> ClassSet {
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Parse(args) => parse(&args),
+        Command::Scan(args) => scan(&args),
     }
+}
+
+fn scan(args: &ScanArgs) -> ExitCode {
+    let pool = match ParsePool::new(args.threads) {
+        Ok(pool) => pool,
+        Err(err) => return fail(EXIT_ENGINE, err),
+    };
+    let discovered = pool.install(|| jss_core::discover(&args.path, &DiscoverOptions::default()));
+    let discovery = match discovered {
+        Ok(discovery) => discovery,
+        Err(err @ DiscoverError::Io { .. }) => return fail(EXIT_ENGINE, err),
+        Err(err) => return fail(EXIT_USAGE, err),
+    };
+    let selection = discovery.selection(include_set(&args.include));
+    let reports = pool.scan(&discovery.files, selection);
+    let mut output = ScanOutput {
+        root: args.path.to_string_lossy().into_owned(),
+        files_scanned: 0,
+        findings: Vec::new(),
+        skipped: Vec::new(),
+        truncated: Vec::new(),
+    };
+    for report in reports {
+        match report.status {
+            ScanStatus::Scanned => output.files_scanned += 1,
+            ScanStatus::Skipped(reason) => output.skipped.push(FileNote {
+                file: report.rel_path.clone(),
+                reason,
+            }),
+            ScanStatus::Panicked(panic) => output.skipped.push(FileNote {
+                file: report.rel_path.clone(),
+                reason: format!("panicked: {panic}"),
+            }),
+        }
+        if report.truncated {
+            output.truncated.push(report.rel_path.clone());
+        }
+        output.findings.extend(
+            report
+                .findings
+                .into_iter()
+                .filter(|f| f.severity <= args.min_severity),
+        );
+    }
+    jss_frontend::finalize(&mut output.findings);
+    let mut out = BufWriter::new(io::stdout().lock());
+    let written = serde_json::to_writer_pretty(&mut out, &output)
+        .map_err(io::Error::from)
+        .and_then(|()| writeln!(out))
+        .and_then(|()| out.flush());
+    if let Err(err) = written {
+        return fail(EXIT_ENGINE, format!("cannot write the report: {err}"));
+    }
+    ExitCode::SUCCESS
 }
 
 fn parse(args: &ParseArgs) -> ExitCode {

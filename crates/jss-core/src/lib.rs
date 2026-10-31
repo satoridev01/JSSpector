@@ -17,6 +17,7 @@ pub mod classify;
 pub mod content;
 pub mod diag;
 pub mod discover;
+pub mod finding;
 pub mod line_index;
 pub mod package_type;
 
@@ -26,5 +27,6 @@ pub use discover::{
     DiscoverError, DiscoverOptions, Discovery, SourceFile, SourceKind, Work, discover,
     rel_path_string,
 };
+pub use finding::{Finding, Severity, SinkLoc, SourceLoc, TraceStep, VulnClass};
 pub use line_index::{LineCol, LineIndex};
 pub use package_type::PackageType;

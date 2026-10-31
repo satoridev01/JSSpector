@@ -571,11 +571,13 @@ export function load<T>(name: string, cb: Callback, opts?: Options = {}): ?Promi
     #[test]
     fn type_parameter_bounds_and_variance_go() {
         let src = "function f<T: Object, U: {a: number} = V>(x: T) {}\nclass A { m<T: {[key: string]: any}>(a: T, b: T) {} }\n";
+        // A sole parameter keeps a comma where its bound was: `<T,>`.
         assert_repairs(
             src,
-            &blanked(
-                src,
-                &[": Object", ": {a: number}", ": {[key: string]: any}"],
+            &swapped(
+                &blanked(src, &[": Object", ": {a: number}"]),
+                ": {[key: string]: any}",
+                ",",
             ),
         );
         let src =
@@ -684,6 +686,66 @@ const label2 = cond ? (a) : b => b; // RT
                 assert_ne!(before, after, "Flow-only line left alone: {before}");
             }
         }
+    }
+
+    #[test]
+    fn what_independent_flow_samples_needed() {
+        // The existential type as a function type's return, and in a tuple.
+        let src = "type Fn = (x: *) => *;\nconst a: [*, string] = b;\n";
+        assert_repairs(
+            src,
+            &swapped(&swapped(&swapped(src, "*", "_"), "*", "_"), "*", "_"),
+        );
+        // Optional indexed access.
+        let src = "type Opt = Obj?.['a']?.['b'];\ntype Deep = Foo<T>?.[K];\n";
+        assert_repairs(src, &blanked(src, &["?.", "?.", "?."]));
+        // An inline interface that extends.
+        let src = "type U = interface extends Base, Other<T> { c: boolean };\n";
+        assert_repairs(src, &blanked(src, &["interface extends Base, Other<T>"]));
+        // Casts in nested conditionals: oxc fails far after the first one.
+        let src = "const f = y > 0 ? (x: any) : y < 0 ? (z: number) : 0;\nconst g = a ? (b: T) : c ? (d: U) : e ? (f: V) : g;\n";
+        assert_repairs(
+            src,
+            &blanked(src, &[": any", ": number", ": T", ": U", ": V"]),
+        );
+    }
+
+    #[test]
+    fn a_sole_bounded_type_parameter_keeps_a_comma_so_a_generic_arrow_is_not_jsx() {
+        // `<T: { +id: string }>(p) => ...` in a file with JSX: without the comma the JSX flavor
+        // reads `<T      >` as an element. With it, `<T,>` is a generic arrow function.
+        let src = "const Row = <T: { +id: string }>(p: {| item: T |}): Node => (\n  <li key={p.item.id}>{p.item.id}</li>\n);\nconst el = <Row item={x} />;\n";
+        let (text, repair) = run(src, true);
+        assert_eq!(repair.outcome.syntax_errors, 0, "{repair:?}\n{text}");
+        // `<T`, then the comma where the bound was, then blanks up to the `>`.
+        assert!(text.starts_with("const Row = <T,  "), "{text}");
+        assert!(text.contains(">(p: {  item: T  }): Node => ("), "{text}");
+        for kept in [
+            "<li key={p.item.id}>{p.item.id}</li>",
+            "const el = <Row item={x} />;",
+        ] {
+            assert!(text.contains(kept), "{kept:?} missing from\n{text}");
+        }
+        // With a default after the bound the colon is plainly blanked: `<T, = D>` would not parse.
+        let src = "function f<T: Object = {}>(x: T) {}\n";
+        assert_repairs(src, &blanked(src, &[": Object"]));
+    }
+
+    #[test]
+    fn a_failure_at_the_first_annotation_can_be_about_a_later_parameter() {
+        // oxc gives up on `<T>(xs: ..., f: T => T)` as a generic arrow at the first colon; the
+        // construct TypeScript cannot read is the bare function type two parameters on.
+        let src = "const map = <T>(xs: Array<T>, f: T => T): Array<T> => xs.map(f);\n";
+        let (text, repair) = run(src, false);
+        assert_eq!(repair.outcome.syntax_errors, 0, "{repair:?}\n{text}");
+        // Whichever way the type is taken out, the parameters and the body are untouched.
+        for kept in [
+            "const map = <T>(xs: Array<T>, f",
+            "): Array<T> => xs.map(f);",
+        ] {
+            assert!(text.contains(kept), "{kept:?} missing from\n{text}");
+        }
+        assert!(!text.contains("T => T"), "{text}");
     }
 
     #[test]
@@ -919,10 +981,20 @@ const label2 = cond ? (a) : b => b; // RT
                 .collect::<String>()
                 .contains("@flow");
             let mut result = None;
+            let mut per_flavor = Vec::new();
             for flavor in flavors {
                 let first = parse_with(&Allocator::default(), &text, flavor);
                 let done = repair_rounds(&text, flavor, parse_with, first, pragma);
                 let clean = done.1.outcome.syntax_errors == 0;
+                per_flavor.push(format!(
+                    "{}: {:?}",
+                    if flavor.is_jsx() { "jsx" } else { "plain" },
+                    done.1
+                        .outcome
+                        .first_error
+                        .as_ref()
+                        .map(|e| (e.message.as_str(), e.offset))
+                ));
                 result = Some(done);
                 if clean {
                     break;
@@ -934,9 +1006,9 @@ const label2 = cond ? (a) : b => b; // RT
             if repair.outcome.syntax_errors > 0 {
                 still_failing += 1;
                 println!(
-                    "STILL FAILING {}: {:?}",
+                    "STILL FAILING {}: {}",
                     path.display(),
-                    repair.outcome.first_error
+                    per_flavor.join(" | ")
                 );
                 continue;
             }

@@ -52,6 +52,16 @@ const RULES: &[(&str, Rule, Evidence)] = &[
     ("exact_object", exact_object, Evidence::Anywhere),
     ("inline_interface", inline_interface, Evidence::Anywhere),
     ("type_spread", type_spread, Evidence::Flow),
+    (
+        "optional_indexed_access",
+        optional_indexed_access,
+        Evidence::Flow,
+    ),
+    (
+        "inline_interface_extends",
+        inline_interface_extends,
+        Evidence::Flow,
+    ),
     ("variance", variance, Evidence::Flow),
     ("checks", checks, Evidence::Flow),
     ("implies_guard", implies_guard, Evidence::Flow),
@@ -120,16 +130,16 @@ pub(crate) fn step(src: &str, offset: usize, message: &str, flow: bool) -> Optio
     if let Some(fix) = attempt(anchor, message) {
         return Some(fix);
     }
-    // oxc fails at the `:` of a parameter's annotation when something later in the annotation is
-    // Flow's (`({ a }: { a: T, ... }) => ...`): it gives up on the parentheses as arrow
-    // parameters before it reaches the construct. The construct is inside the annotation, so look
-    // there. The message belongs to the colon, not to these tokens.
+    // oxc fails at the `:` of a parameter's annotation when something later in the parameters is
+    // Flow's (`({ a }: { a: T, ... }) => ...`, `<T>(a: A, f: T => T) => ...`): it gives up on the
+    // parentheses as arrow parameters before it reaches the construct. The construct is further
+    // inside the parentheses, so look there. The message belongs to the colon, not to these
+    // tokens.
     if toks.is(anchor, ":")
         && let Some(open) = enclosing_open(&toks, anchor).filter(|&open| toks.is(open, "("))
         && let Some(close) = toks.close_of(open)
-        && let Some(end) = toks.type_end(anchor + 1)
     {
-        for inner in anchor + 1..end.min(close) {
+        for inner in anchor + 1..close {
             if let Some(fix) = attempt(inner, "") {
                 return Some(fix);
             }
@@ -606,17 +616,18 @@ fn bare_arrow(toks: &Toks<'_>, arrow: usize) -> Option<Vec<Edit>> {
 }
 
 /// `(expr: Type)` cast that oxc read as the parameters of an arrow function: it reports the
-/// missing `=>` at the token after the parenthesis (or, for `((a: A): B)`, at the closing one,
-/// and for `c ? (a: A) : b`, after the `b` it took for a return type). The annotation goes;
-/// what is left is the parenthesized expression.
+/// missing `=>` at the token after the parenthesis (or, for `((a: A): B)`, at the closing one).
+/// For `c ? (a: A) : b` it takes `b` for a return type and fails somewhere after it, in whatever
+/// way `b` fails as a type (`c ? (a: A) : d < 0 ? (e: E) : f` fails at the second `?`). The
+/// annotation goes; what is left is the parenthesized expression.
 fn cast_read_as_arrow(toks: &Toks<'_>, anchor: usize, message: &str) -> Option<Vec<Edit>> {
-    if !message.contains("`=>`") {
-        return None;
-    }
+    let missing_arrow = message.contains("`=>`");
     let close = match toks.back(anchor, 1) {
-        Some(prev) if toks.is(prev, ")") => prev,
-        _ if toks.is(anchor, ")") => anchor,
-        _ => return_colon_paren(toks, anchor)?,
+        Some(prev) if missing_arrow && toks.is(prev, ")") => prev,
+        _ if missing_arrow && toks.is(anchor, ")") => anchor,
+        // Any other failure after a `) :`, except at an arrow, which is some other rule's.
+        _ if !toks.is(anchor, "=>") => return_colon_paren(toks, anchor)?,
+        _ => return None,
     };
     let open = toks.open_of(close)?;
     let colon = annotation_colon(toks, open, close)?;
@@ -828,11 +839,17 @@ fn function_type_member(toks: &Toks<'_>, anchor: usize, _message: &str) -> Optio
 }
 
 /// `<T: Bound>`: Flow's type parameter bound, which TypeScript spells `extends`. The bound goes
-/// (the default after it, `= D`, stays).
+/// (the default after it, `= D`, stays). When `T` is the only parameter the bound becomes a
+/// comma, `<T,>`: for a generic arrow function in a file with JSX, `<T>(x) => x` reads as an
+/// element, and the comma is what says it is not.
 fn type_param_bound(toks: &Toks<'_>, anchor: usize, _message: &str) -> Option<Vec<Edit>> {
-    if !toks.is(anchor, ":") {
-        return None;
-    }
+    // The error is at the colon, or (in the JSX flavor, which reads `<T: B>` as an element with a
+    // namespaced name) at the token after it.
+    let anchor = if toks.is(anchor, ":") {
+        anchor
+    } else {
+        toks.back(anchor, 1).filter(|&colon| toks.is(colon, ":"))?
+    };
     let name = toks.back(anchor, 1).filter(|&name| toks.is_ident(name))?;
     let before = toks.back(name, 1)?;
     // After `<`, `,`, or a variance sign.
@@ -843,7 +860,11 @@ fn type_param_bound(toks: &Toks<'_>, anchor: usize, _message: &str) -> Option<Ve
         return None;
     }
     let end = toks.type_end(anchor + 1)?;
-    Some(vec![blank(toks, anchor, end)?])
+    let mut edit = blank(toks, anchor, end)?;
+    if toks.is(before, "<") && toks.is(end, ">") {
+        edit.fill = ",";
+    }
+    Some(vec![edit])
 }
 
 /// Token `i` sits directly inside the `<...>` of a type parameter list.
@@ -919,7 +940,7 @@ fn existential(toks: &Toks<'_>, anchor: usize, _message: &str) -> Option<Vec<Edi
     let in_type_position = toks.kind(prev) == Some(Kind::Punct)
         && matches!(
             toks.text(prev),
-            "<" | "," | ":" | "=" | "|" | "&" | "(" | "?"
+            "<" | "," | ":" | "=" | "|" | "&" | "(" | "?" | "=>" | "["
         );
     in_type_position.then(|| replace(toks, anchor, anchor + 1, "_"))?
 }
@@ -1053,3 +1074,65 @@ fn constructor_return_type(toks: &Toks<'_>, anchor: usize, message: &str) -> Opt
     let end = toks.type_end(anchor)?;
     Some(vec![blank(toks, colon, end)?])
 }
+
+/// `Obj?.['a']` in a type: Flow's optional indexed access, which TypeScript syntax does not
+/// have. The `?.` goes, leaving the plain indexed access. (In an expression, `a?.[0]` parses and
+/// never gets here.)
+fn optional_indexed_access(toks: &Toks<'_>, anchor: usize, _message: &str) -> Option<Vec<Edit>> {
+    let dot = anchor + 1;
+    let bracket = anchor + 2;
+    let after_a_type = toks
+        .back(anchor, 1)
+        .is_some_and(|prev| toks.is_ident(prev) || toks.is(prev, ">") || toks.is(prev, "]"));
+    (toks.is(anchor, "?")
+        && toks.is(dot, ".")
+        && toks.is(bracket, "[")
+        && toks.adjacent(anchor, dot)
+        && toks.adjacent(dot, bracket)
+        && after_a_type)
+        .then(|| blank(toks, anchor, dot + 1))?
+        .map(|edit| vec![edit])
+}
+
+/// `interface extends A, B { ... }` as a type: the object type is what matters, so the
+/// `interface extends A, B` goes. (oxc reads `interface extends A` as a conditional type: it
+/// fails at the brace after one name, or at the comma after the first of several.)
+fn inline_interface_extends(toks: &Toks<'_>, anchor: usize, _message: &str) -> Option<Vec<Edit>> {
+    if !(toks.is(anchor, "{") || toks.is(anchor, ",")) {
+        return None;
+    }
+    // Back over `A, B<T>, c.D` to the `extends` and the `interface` before it.
+    let mut k = anchor;
+    let keyword = loop {
+        k = k.checked_sub(1)?;
+        if toks.is(k, ">") {
+            k = toks.angle_open(k)?;
+        } else if toks.is(k, "extends") {
+            break toks
+                .back(k, 1)
+                .filter(|&keyword| toks.is(keyword, "interface"))?;
+        } else if !(toks.is_ident(k) || toks.is(k, ",") || toks.is(k, ".")) {
+            return None;
+        }
+        if anchor - k > MAX_EXTENDS_LOOKBACK {
+            return None;
+        }
+    };
+    // Forward over the rest of the list to the brace that opens the object type.
+    let mut j = keyword + 2;
+    while j < toks.len() && !toks.is(j, "{") {
+        if toks.is(j, "<") {
+            j = toks.angle_close(j)? + 1;
+        } else if toks.is_ident(j) || toks.is(j, ",") || toks.is(j, ".") {
+            j += 1;
+        } else {
+            return None;
+        }
+    }
+    toks.is(j, "{")
+        .then(|| blank(toks, keyword, j))?
+        .map(|edit| vec![edit])
+}
+
+/// How far back from the `{` of an inline interface its `extends` list can reach.
+const MAX_EXTENDS_LOOKBACK: usize = 64;

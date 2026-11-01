@@ -91,6 +91,8 @@ const ENGINE_LABELS: &[&str] = &[
     "socket",
     "param",
     "context",
+    // JavaScript itself (CommonJS).
+    "exports",
     // Pack schema vocabulary.
     "all",
     "first",

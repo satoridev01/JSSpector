@@ -31,18 +31,37 @@ pub fn resolve(from: &str, spec: &str, files: &BTreeSet<String>) -> Option<Strin
 #[derive(Debug, Clone, Default)]
 pub struct Workspace {
     packages: BTreeMap<String, (String, Vec<String>)>,
+    /// TypeScript configs: directory -> (base directory, `paths` patterns -> targets).
+    tsconfigs: BTreeMap<String, TsConfig>,
+}
+
+/// The module-resolution part of a `tsconfig.json` / `jsconfig.json`.
+#[derive(Debug, Clone, Default)]
+struct TsConfig {
+    /// `baseUrl`, root-relative (`None`: not set).
+    base: Option<String>,
+    /// `paths`, with targets root-relative.
+    paths: Vec<(String, Vec<String>)>,
 }
 
 impl Workspace {
     /// Reads every `package.json` under `root`.
     pub fn load(root: &Path) -> Self {
         let mut packages = BTreeMap::new();
+        let mut tsconfigs = BTreeMap::new();
         let walker = ignore::WalkBuilder::new(root)
             .standard_filters(false)
             .hidden(true)
             .filter_entry(|e| e.file_name() != "node_modules" && e.file_name() != ".git")
             .build();
         for entry in walker.flatten() {
+            let name = entry.file_name().to_string_lossy();
+            if name == "tsconfig.json" || name == "jsconfig.json" {
+                if let Some((dir, config)) = read_tsconfig(root, entry.path()) {
+                    tsconfigs.entry(dir).or_insert(config);
+                }
+                continue;
+            }
             if entry.file_name() != "package.json" {
                 continue;
             }
@@ -71,7 +90,57 @@ impl Workspace {
             }
             packages.insert(name.to_owned(), (dir, entries));
         }
-        Self { packages }
+        Self {
+            packages,
+            tsconfigs,
+        }
+    }
+
+    /// The file a bare specifier names through the nearest tsconfig's `paths` or `baseUrl`.
+    pub fn resolve_typescript(
+        &self,
+        from: &str,
+        spec: &str,
+        files: &BTreeSet<String>,
+    ) -> Option<String> {
+        // The nearest config whose directory contains `from`.
+        let mut dir = from.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
+        let config = loop {
+            if let Some(config) = self.tsconfigs.get(&dir) {
+                break config;
+            }
+            if dir.is_empty() {
+                return None;
+            }
+            dir = dir
+                .rsplit_once('/')
+                .map_or(String::new(), |(d, _)| d.to_owned());
+        };
+        let join = |base: &str, rest: &str| {
+            if base.is_empty() {
+                rest.to_owned()
+            } else {
+                format!("{base}/{rest}")
+            }
+        };
+        for (pattern, targets) in &config.paths {
+            let wildcard = match pattern.split_once('*') {
+                Some((prefix, suffix)) => spec
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.strip_suffix(suffix)),
+                None => (spec == pattern).then_some(""),
+            };
+            let Some(wildcard) = wildcard else { continue };
+            for target in targets {
+                let path = normalize(&target.replace('*', wildcard))?;
+                if let Some(found) = candidates(&path).into_iter().find(|c| files.contains(c)) {
+                    return Some(found);
+                }
+            }
+        }
+        let base = config.base.as_deref()?;
+        let path = normalize(&join(base, spec))?;
+        candidates(&path).into_iter().find(|c| files.contains(c))
     }
 
     /// The file a bare specifier names when it is a package of this workspace.
@@ -121,8 +190,140 @@ impl Workspace {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.packages.is_empty()
+        self.packages.is_empty() && self.tsconfigs.is_empty()
     }
+}
+
+/// Reads a tsconfig (JSON with comments and trailing commas): its directory and settings, both
+/// root-relative.
+fn read_tsconfig(root: &Path, path: &Path) -> Option<(String, TsConfig)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&strip_jsonc(&text)).ok()?;
+    let dir = path
+        .parent()?
+        .strip_prefix(root)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let options = json.get("compilerOptions")?;
+    let in_dir = |relative: &str| {
+        let joined = if dir.is_empty() {
+            relative.to_owned()
+        } else {
+            format!("{dir}/{relative}")
+        };
+        normalize(&joined)
+    };
+    let base = options
+        .get("baseUrl")
+        .and_then(|b| b.as_str())
+        .and_then(in_dir);
+    let paths_base = base.clone().or_else(|| Some(dir.clone()))?;
+    let paths = options
+        .get("paths")
+        .and_then(|p| p.as_object())
+        .map(|object| {
+            object
+                .iter()
+                .map(|(pattern, targets)| {
+                    let targets = targets
+                        .as_array()
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|t| t.as_str())
+                                .filter_map(|t| {
+                                    let joined = if paths_base.is_empty() {
+                                        t.to_owned()
+                                    } else {
+                                        format!("{paths_base}/{t}")
+                                    };
+                                    normalize(&joined)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (pattern.clone(), targets)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((dir, TsConfig { base, paths }))
+}
+
+/// JSON with comments (`//`, `/* */`) and trailing commas, made plain JSON.
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut previous = ' ';
+                for next in chars.by_ref() {
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // Trailing commas: `,` followed (after whitespace) by `}` or `]`.
+    let mut cleaned = String::with_capacity(out.len());
+    let bytes: Vec<char> = out.chars().collect();
+    let mut in_string = false;
+    let mut index = 0;
+    while let Some(&c) = bytes.get(index) {
+        if in_string {
+            cleaned.push(c);
+            if c == '\\' {
+                if let Some(&next) = bytes.get(index + 1) {
+                    cleaned.push(next);
+                    index += 1;
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            cleaned.push(c);
+        } else if c == ',' {
+            let rest = bytes.get(index + 1..).unwrap_or(&[]);
+            let next = rest.iter().find(|ch| !ch.is_whitespace());
+            if !matches!(next, Some('}' | ']')) {
+                cleaned.push(c);
+            }
+        } else {
+            cleaned.push(c);
+        }
+        index += 1;
+    }
+    cleaned
 }
 
 /// Every path `base` may name, in resolution order.
@@ -203,5 +404,36 @@ mod tests {
         assert_eq!(resolve("app.js", "./missing", &set), None);
         assert_eq!(resolve("src/app.js", "express", &set), None);
         assert_eq!(resolve("a.js", "../../outside", &set), None);
+    }
+
+    #[test]
+    fn tsconfig_paths_and_base_url_resolve_bare_specifiers() {
+        let dir = std::env::temp_dir().join(format!("jss-tsconfig-{}", std::process::id()));
+        let server = dir.join("server");
+        std::fs::create_dir_all(server.join("src")).unwrap();
+        std::fs::write(
+            server.join("tsconfig.json"),
+            "{\n  // comment\n  \"compilerOptions\": { \"baseUrl\": \"./\", \"paths\": { \"@app/*\": [\"./src/*\"], }, },\n}\n",
+        )
+        .unwrap();
+        let workspace = Workspace::load(&dir);
+        let set = files(&["server/src/enum.ts", "server/src/controllers/a.ts"]);
+        assert_eq!(
+            workspace
+                .resolve_typescript("server/src/controllers/a.ts", "src/enum", &set)
+                .as_deref(),
+            Some("server/src/enum.ts")
+        );
+        assert_eq!(
+            workspace
+                .resolve_typescript("server/src/controllers/a.ts", "@app/enum", &set)
+                .as_deref(),
+            Some("server/src/enum.ts")
+        );
+        assert_eq!(
+            workspace.resolve_typescript("server/src/controllers/a.ts", "lodash", &set),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

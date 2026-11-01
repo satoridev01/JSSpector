@@ -36,6 +36,8 @@ const SPARSE: &[&str] = &[
     "*.mts",
     "*.cts",
     "package.json",
+    "tsconfig*.json",
+    "jsconfig*.json",
     "!node_modules/",
 ];
 

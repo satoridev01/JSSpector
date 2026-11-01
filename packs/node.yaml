@@ -54,6 +54,7 @@ propagation:
   pass_methods: [trim, trimStart, trimEnd, toLowerCase, toUpperCase, toLocaleLowerCase, toLocaleUpperCase, replace,
     replaceAll, slice, substring, substr, split, join, concat, toString, padStart, padEnd, normalize, at, valueOf, repeat]
   build_methods: [concat, join, format]
+  strip_methods: [replace, replaceAll]
   pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, util.format, URL, encodeURI,
     encodeURL, normalizeUrl, url.parse, url.resolve, querystring.parse]
 sanitizers:

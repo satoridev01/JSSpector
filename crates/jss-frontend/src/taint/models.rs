@@ -27,6 +27,10 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ("socketio", include_str!("../../../../packs/socketio.yaml")),
     ("nextjs", include_str!("../../../../packs/nextjs.yaml")),
     ("nestjs", include_str!("../../../../packs/nestjs.yaml")),
+    (
+        "decorator-controllers",
+        include_str!("../../../../packs/decorator-controllers.yaml"),
+    ),
     ("graphql", include_str!("../../../../packs/graphql.yaml")),
     ("trpc", include_str!("../../../../packs/trpc.yaml")),
     ("queues", include_str!("../../../../packs/queues.yaml")),
@@ -121,6 +125,14 @@ pub struct AuthSpec {
     pub request_fields: Vec<String>,
     #[serde(default)]
     pub decorators: Vec<String>,
+}
+
+/// An authentication level in a pack.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeverityAuth {
+    User,
+    Admin,
 }
 
 /// A member read whose value is client data.
@@ -243,6 +255,12 @@ pub struct RouteSpec {
     /// Method decorators that register a route: `@Get(':id')`.
     #[serde(default)]
     pub route_decorators: Vec<String>,
+    /// Authentication a controller decorator implies for its routes: `RestController: user`.
+    #[serde(default)]
+    pub controller_auth: BTreeMap<String, SeverityAuth>,
+    /// Route options that make a route public: `@Post('/login', { skipAuth: true })`.
+    #[serde(default)]
+    pub public_options: Vec<String>,
     #[serde(default)]
     pub path_keys: Vec<String>,
 }
@@ -313,6 +331,10 @@ pub struct Propagation {
     pub iteration_methods: Vec<String>,
     #[serde(default)]
     pub pass_globals: Vec<String>,
+    /// Methods that, with a global negated class and an empty replacement, strip everything
+    /// but an allowlist: `s.replace(/[^a-z0-9]/g, '')`.
+    #[serde(default)]
+    pub strip_methods: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -474,6 +496,7 @@ pub struct Model {
     pub pass_methods: Vec<String>,
     pub build_methods: Vec<String>,
     pub iteration_methods: Vec<String>,
+    pub strip_methods: Vec<String>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -510,6 +533,8 @@ pub struct Model {
     pub router_names: Vec<String>,
     pub controller_decorators: Vec<String>,
     pub route_decorators: Vec<String>,
+    pub controller_auth: BTreeMap<String, jss_core::Auth>,
+    pub public_options: Vec<String>,
     pub route_path_keys: Vec<String>,
     /// Packs that failed to load, with the reason.
     pub errors: Vec<String>,
@@ -606,6 +631,7 @@ impl Model {
         self.build_methods.extend(pack.propagation.build_methods);
         self.iteration_methods
             .extend(pack.propagation.iteration_methods);
+        self.strip_methods.extend(pack.propagation.strip_methods);
         self.jsx_html_props.extend(pack.jsx.html_props);
         self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
         if pack.jsx.props_kind.is_some() {
@@ -653,6 +679,14 @@ impl Model {
         self.controller_decorators
             .extend(pack.routes.controller_decorators);
         self.route_decorators.extend(pack.routes.route_decorators);
+        for (decorator, auth) in pack.routes.controller_auth {
+            let auth = match auth {
+                SeverityAuth::User => jss_core::Auth::User,
+                SeverityAuth::Admin => jss_core::Auth::Admin,
+            };
+            self.controller_auth.insert(decorator, auth);
+        }
+        self.public_options.extend(pack.routes.public_options);
         self.route_path_keys.extend(pack.routes.path_keys);
     }
 

@@ -118,15 +118,28 @@ fn resolve_local(
             let target = by_file.get(target_file.as_str())?;
             let name = import.export.as_deref().unwrap_or("default");
             let exported = target.module.exports.get(name)?;
-            Some((target_file.clone(), exported.clone()))
+            Some((target_file.clone(), product(target, exported)))
         }
         None => Some((file.to_owned(), local.to_owned())),
     }
 }
 
 fn default_export(by_file: &BTreeMap<&str, &ScanReport>, file: &str) -> Option<RouterId> {
-    let exported = by_file.get(file)?.module.exports.get("default")?;
-    Some((file.to_owned(), exported.clone()))
+    let report = by_file.get(file)?;
+    let exported = report.module.exports.get("default")?;
+    Some((file.to_owned(), product(report, exported)))
+}
+
+/// The router an export stands for: itself, or what it returns when it is a factory
+/// (`module.exports = function () { ...; return router; }`).
+fn product(report: &ScanReport, exported: &str) -> String {
+    report
+        .module
+        .functions
+        .iter()
+        .find(|f| f.name == exported)
+        .and_then(|f| f.returns_local.clone())
+        .unwrap_or_else(|| exported.to_owned())
 }
 
 /// Every prefix a router is reachable under (`""` for a root).

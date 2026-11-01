@@ -15,6 +15,20 @@ use crate::process::{
     ParseFailure, ParsePool, guarded, on_parser_stack, read_capped, template_tag,
 };
 use crate::taint::{self, ExtSink, Linking, RawFinding, Summaries};
+
+/// One file's route templates: function -> templates.
+type Templates = BTreeMap<String, Vec<taint::RouteTemplate>>;
+
+/// What analyzing one file yields: findings, whether the walk was capped, summaries, the lowered
+/// module, route templates and constants.
+type Analysis = (
+    Vec<Finding>,
+    bool,
+    Summaries,
+    ir::Module,
+    Templates,
+    BTreeMap<String, String>,
+);
 use jss_core::ir;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,6 +55,10 @@ pub struct ScanReport {
     /// The file lowered to the owned IR: imports, exports, functions (calls and flows), entry
     /// points and mounts.
     pub module: ir::Module,
+    /// Functions of this file that register routes from their parameters.
+    templates: BTreeMap<String, Vec<taint::RouteTemplate>>,
+    /// Constants of this file (enum members, `const` strings).
+    constants: BTreeMap<String, String>,
 }
 
 /// What every file's scan needs to know about the scan root.
@@ -48,6 +66,8 @@ struct Context<'a> {
     all: &'a BTreeSet<String>,
     workspace: &'a jss_core::resolve::Workspace,
     reexports: BTreeMap<String, BTreeSet<String>>,
+    templates: taint::Templates,
+    constants: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ParsePool {
@@ -68,12 +88,16 @@ impl ParsePool {
             .map(|r| jss_core::resolve::Workspace::load(&r))
             .unwrap_or_default();
         let run = |external: &Summaries,
-                   reexports: BTreeMap<String, BTreeSet<String>>|
+                   reexports: BTreeMap<String, BTreeSet<String>>,
+                   templates: taint::Templates,
+                   constants: BTreeMap<String, BTreeMap<String, String>>|
          -> Vec<ScanReport> {
             let context = Context {
                 all: &all,
                 workspace: &workspace,
                 reexports,
+                templates,
+                constants,
             };
             self.install(|| {
                 files
@@ -90,13 +114,40 @@ impl ParsePool {
         // Each round lets a summary cross one more file: a route, its controller, a service,
         // a helper. Stop when nothing new is learned (at most `CROSS_FILE_HOPS` rounds).
         let mut external = Summaries::new();
-        let mut reports = run(&external, BTreeMap::new());
+        let mut known_templates = 0;
+        let mut known_constants = 0;
+        let mut reports = run(
+            &external,
+            BTreeMap::new(),
+            taint::Templates::new(),
+            BTreeMap::new(),
+        );
         for _ in 1..CROSS_FILE_HOPS {
             let reexports = reexport_closure(&reports);
+            let templates: taint::Templates = reports
+                .iter()
+                .filter(|r| !r.templates.is_empty())
+                .map(|r| (r.rel_path.clone(), r.templates.clone()))
+                .collect();
+            let template_count: usize = templates
+                .values()
+                .flat_map(BTreeMap::values)
+                .map(Vec::len)
+                .sum();
+            let constants: BTreeMap<String, BTreeMap<String, String>> = reports
+                .iter()
+                .filter(|r| !r.constants.is_empty())
+                .map(|r| (r.rel_path.clone(), r.constants.clone()))
+                .collect();
+            let constant_count: usize = constants.values().map(BTreeMap::len).sum();
             let merged = merge(reports);
-            let grew = count(&merged) > count(&external);
+            let grew = count(&merged) > count(&external)
+                || template_count > known_templates
+                || constant_count > known_constants;
+            known_templates = template_count;
+            known_constants = constant_count;
             external = merged;
-            reports = run(&external, reexports);
+            reports = run(&external, reexports, templates, constants);
             if !grew {
                 break;
             }
@@ -158,6 +209,8 @@ fn report(file: &SourceFile, status: ScanStatus) -> ScanReport {
         findings: Vec::new(),
         summaries: Summaries::new(),
         module: ir::Module::default(),
+        templates: BTreeMap::new(),
+        constants: BTreeMap::new(),
     }
 }
 
@@ -193,13 +246,15 @@ fn scan_file(
         scan_text(allocator, file, text, external, context)
     });
     Some(match outcome {
-        Ok(Ok((findings, truncated, summaries, module))) => ScanReport {
+        Ok(Ok((findings, truncated, summaries, module, templates, constants))) => ScanReport {
             rel_path: file.rel_path.clone(),
             status: ScanStatus::Scanned,
             truncated,
             findings,
             summaries,
             module,
+            templates,
+            constants,
         },
         Ok(Err(reason)) => report(file, ScanStatus::Skipped(reason)),
         Err(ParseFailure::Panicked(panic)) => report(file, ScanStatus::Panicked(panic)),
@@ -218,7 +273,7 @@ fn scan_text(
     text: &str,
     external: &Summaries,
     context: &Context<'_>,
-) -> Result<(Vec<Finding>, bool, Summaries, ir::Module), String> {
+) -> Result<Analysis, String> {
     let primary = source_type(file.kind, file.package_type);
     let mut candidates = vec![primary];
     if let Some(fallbacks) = typed_fallbacks(file.kind, file.package_type) {
@@ -283,12 +338,14 @@ fn analyze(
     text: &str,
     external: &Summaries,
     context: &Context<'_>,
-) -> (Vec<Finding>, bool, Summaries, ir::Module) {
+) -> Analysis {
     let linking = Linking {
         file: &file.rel_path,
         files: context.all,
         workspace: context.workspace,
         reexports: &context.reexports,
+        templates: &context.templates,
+        constants: &context.constants,
     };
     let result = taint::scan_file_program(program, &linking, external);
     let index = LineIndex::new(text);
@@ -331,6 +388,7 @@ fn analyze(
                     params: params.clone(),
                     calls: Vec::new(),
                     flows: Vec::new(),
+                    returns_local: facts.returned_locals.get(name).cloned(),
                 },
             )
         })
@@ -416,7 +474,14 @@ fn analyze(
             })
             .collect(),
     };
-    (findings, result.truncated, summaries, module)
+    (
+        findings,
+        result.truncated,
+        summaries,
+        module,
+        result.templates,
+        result.constants,
+    )
 }
 
 fn snippet(text: &str, span: Span) -> String {

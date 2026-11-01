@@ -21,6 +21,7 @@ use oxc_ast::ast::{
     CallExpression, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
     ForStatementInit, ForStatementLeft, FormalParameters, Function, ModuleDeclaration,
     ObjectPropertyKind, Program, PropertyKey, Statement, UnaryOperator, VariableDeclaration,
+    VariableDeclarationKind,
 };
 use oxc_ast::ast::{BinaryOperator, SimpleAssignmentTarget};
 use oxc_span::{GetSpan, Span};
@@ -126,6 +127,10 @@ pub struct ScanResult {
     pub summaries: Summaries,
     /// Entry points, mounts, exports and imports, for the inventory.
     pub facts: FileFacts,
+    /// This file's route templates (functions that register routes from their parameters).
+    pub templates: BTreeMap<String, Vec<RouteTemplate>>,
+    /// This file's constants: `Enum.Member`, `NAME`, `OBJ.key` -> text.
+    pub constants: BTreeMap<String, String>,
 }
 
 /// Scans a parsed program on its own.
@@ -139,11 +144,15 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
     let files = BTreeSet::new();
     let workspace = jss_core::resolve::Workspace::default();
     let reexports = BTreeMap::new();
+    let templates = Templates::new();
+    let constants = BTreeMap::new();
     let linking = Linking {
         file: "",
         files: &files,
         workspace: &workspace,
         reexports: &reexports,
+        templates: &templates,
+        constants: &constants,
     };
     scan_file_program(program, &linking, external)
 }
@@ -158,6 +167,10 @@ pub struct Linking<'a> {
     pub workspace: &'a jss_core::resolve::Workspace,
     /// File -> every file it re-exports (transitively): barrels (`export * from './x'`).
     pub reexports: &'a BTreeMap<String, BTreeSet<String>>,
+    /// Route templates found in every file (from the previous round).
+    pub templates: &'a Templates,
+    /// Constants of every file (enum members, `const` strings): file -> name -> value.
+    pub constants: &'a BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Linking<'_> {
@@ -166,7 +179,10 @@ impl Linking<'_> {
         if spec.starts_with('.') {
             jss_core::resolve::resolve(self.file, spec, self.files)
         } else {
-            self.workspace.resolve(spec, self.files)
+            self.workspace.resolve(spec, self.files).or_else(|| {
+                self.workspace
+                    .resolve_typescript(self.file, spec, self.files)
+            })
         }
     }
 
@@ -191,6 +207,9 @@ pub fn scan_file_program(
         router_auth: BTreeMap::new(),
         routers: BTreeSet::new(),
         injected: BTreeMap::new(),
+        export_aliases: BTreeSet::new(),
+        constants: BTreeMap::new(),
+        last_returned_fields: None,
         route_templates: BTreeMap::new(),
         record_only: false,
         current_class: None,
@@ -216,6 +235,8 @@ pub fn scan_file_program(
         truncated: walker.result.truncated,
         summaries: Summaries::new(),
         facts: FileFacts::default(),
+        templates: BTreeMap::new(),
+        constants: BTreeMap::new(),
     };
     walker.facts = FileFacts::default();
     let mut env = Env::new("<module>".to_owned());
@@ -232,6 +253,8 @@ pub fn scan_file_program(
         });
     }
     result.facts = facts;
+    result.templates = walker.route_templates;
+    result.constants = walker.constants;
     result
 }
 
@@ -246,6 +269,8 @@ pub struct FileFacts {
     pub imports: Vec<jss_core::ir::Import>,
     /// Files this one re-exports from (`export * from`, `export { x } from`).
     pub reexports: Vec<String>,
+    /// The local variable each function returns (`return router`).
+    pub returned_locals: BTreeMap<String, String>,
     /// Request inputs each function reads: function -> (location, name).
     pub inputs: BTreeMap<String, BTreeSet<(String, String)>>,
     /// Named functions: name -> (start offset, parameter names).
@@ -269,15 +294,27 @@ pub struct RouteFact {
     pub kind: &'static str,
 }
 
-/// A route registered from a function's parameters, instantiated at each call.
-#[derive(Debug, Clone)]
-struct RouteTemplate {
-    receiver: Option<String>,
+/// A route registered from a function's parameters, instantiated at each call (in this file or,
+/// through imports, in others).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTemplate {
+    /// The router: a variable of the defining file, or the index of the parameter holding it.
+    pub receiver: Result<Option<String>, usize>,
     /// The method, or the index of the parameter holding it.
-    method: Result<String, usize>,
-    path_param: usize,
-    auth: Auth,
+    pub method: Result<String, usize>,
+    pub path: Vec<PathPart>,
+    pub auth: Auth,
 }
+
+/// A piece of a route path a helper builds: literal text, or one of its parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathPart {
+    Lit(String),
+    Param(usize),
+}
+
+/// Route templates of every file: file -> function -> templates.
+pub type Templates = BTreeMap<String, BTreeMap<String, Vec<RouteTemplate>>>;
 
 /// `router.use('/prefix', child)`: `child` is mounted under `prefix`.
 #[derive(Debug, Clone)]
@@ -307,6 +344,9 @@ pub struct Summary {
     /// The field of the parameter that reaches the sink, when the helper destructures it:
     /// `function f({ table, ids })` reaches a sink with `ids` only.
     pub field: Option<String>,
+    /// Return summaries only: the field of the returned object literal that carries the
+    /// parameter (`return { command: bin, args }`).
+    pub out_field: Option<String>,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -484,6 +524,12 @@ struct Walker<'e> {
     routers: BTreeSet<String>,
     /// Constructor-injected fields of the class being walked: `this.users` -> `UsersService`.
     injected: BTreeMap<String, String>,
+    /// Names bound to `module.exports` (`const helpers = module.exports`).
+    export_aliases: BTreeSet<String>,
+    /// Constants of this file: `Enum.Member`, `NAME`, `OBJ.key` -> text.
+    constants: BTreeMap<String, String>,
+    /// The per-field taint of the object the last helper call returned (for `const x = f()`).
+    last_returned_fields: Option<BTreeMap<String, Origin>>,
     /// Functions that register a route from their parameters: `add(path, handler)`.
     route_templates: BTreeMap<String, Vec<RouteTemplate>>,
     /// Re-walking a route-table loop for one row: record routes, emit no findings.
@@ -574,6 +620,25 @@ fn sink_for_api(api: &str) -> Option<&'static models::Sink> {
         .or_else(|| model.module_sink(api, ""))
         .or_else(|| model.method_sink(api))
         .or_else(|| model.method_sink(last))
+}
+
+/// `(/[^a-z0-9]/g, '')`: a global negated character class replaced by nothing.
+fn allowlist_strip(arguments: &[Argument<'_>]) -> bool {
+    let (Some(Argument::RegExpLiteral(regex)), Some(Argument::StringLiteral(replacement))) =
+        (arguments.first(), arguments.get(1))
+    else {
+        return false;
+    };
+    let pattern = regex.regex.pattern.text.as_str();
+    let class = pattern
+        .strip_suffix('+')
+        .or_else(|| pattern.strip_suffix('*'))
+        .unwrap_or(pattern);
+    replacement.value.as_str() == Some("")
+        && regex.regex.flags.contains(oxc_ast::ast::RegExpFlags::G)
+        && class.starts_with("[^")
+        && class.ends_with(']')
+        && !class.get(2..class.len() - 1).unwrap_or("").contains(']')
 }
 
 /// A route path written as a literal, or built from literals: `urljoin(base, 'api/x')`,
@@ -762,7 +827,14 @@ impl Walker<'_> {
             Statement::ReturnStatement(s) => {
                 if let Some(argument) = &s.argument {
                     let taint = self.expr(argument, env);
-                    self.record_return(taint, argument.span(), env);
+                    self.record_returned(argument, taint, env);
+                    // `return router`: a factory's product (for mounts of `require('./x')()`).
+                    if let Expression::Identifier(id) = argument.get_inner_expression() {
+                        self.facts
+                            .returned_locals
+                            .entry(env.function.clone())
+                            .or_insert_with(|| id.name.as_str().to_owned());
+                    }
                 }
             }
             Statement::ThrowStatement(s) => {
@@ -851,6 +923,7 @@ impl Walker<'_> {
                 env.branch -= 1;
             }
             Statement::LabeledStatement(s) => self.statement(&s.body, env),
+            Statement::TSEnumDeclaration(e) => self.record_enum(e),
             Statement::WithStatement(s) => {
                 self.expr(&s.object, env);
                 self.branch(&s.body, env);
@@ -979,6 +1052,7 @@ impl Walker<'_> {
                     self.var_decl(d, env);
                 }
                 Declaration::ClassDeclaration(c) => self.class(c, env),
+                Declaration::TSEnumDeclaration(e) => self.record_enum(e),
                 _ => {}
             },
             ModuleDeclaration::ExportDefaultDeclaration(export) => match &export.declaration {
@@ -1056,6 +1130,48 @@ impl Walker<'_> {
                 BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
                 _ => None,
             };
+            // `const PREFIX = '/api'`, `const ROUTES = { users: '/users' }`: constants.
+            if let (Some(name), VariableDeclarationKind::Const) = (&name_hint, declaration.kind) {
+                if let Some(text) = literal_path(init).filter(|_| {
+                    matches!(
+                        init.get_inner_expression(),
+                        Expression::StringLiteral(_) | Expression::TemplateLiteral(_)
+                    )
+                }) {
+                    self.constants.insert(name.clone(), text);
+                } else if let Expression::ObjectExpression(object) = init.get_inner_expression() {
+                    for property in &object.properties {
+                        if let ObjectPropertyKind::ObjectProperty(p) = property
+                            && let Some(key) = prop_name(&p.key)
+                            && let Expression::StringLiteral(value) = p.value.get_inner_expression()
+                            && let Some(text) = value.value.as_str()
+                        {
+                            self.constants
+                                .insert(format!("{name}.{key}"), text.to_owned());
+                        }
+                    }
+                }
+            }
+            // `const helpers = module.exports`
+            if let Some(name) = &name_hint
+                && guards::path_key(init).is_some_and(|k| k == "module.exports" || k == "exports")
+            {
+                self.export_aliases.insert(name.clone());
+            }
+            // `const { setupApiRoute } = routeHelpers`, where `routeHelpers` is one of our modules.
+            if let (BindingPattern::ObjectPattern(object), Expression::Identifier(module)) =
+                (&declarator.id, init.get_inner_expression())
+                && let Some((spec, None)) = self.relative.get(module.name.as_str()).cloned()
+            {
+                for property in &object.properties {
+                    if let (Some(key), BindingPattern::BindingIdentifier(local)) =
+                        (prop_name(&property.key), &property.value)
+                    {
+                        self.relative
+                            .insert(local.name.as_str().to_owned(), (spec.clone(), Some(key)));
+                    }
+                }
+            }
             // `const routes = [{ method: 'get', path: '/x', handler: list }]`
             if let (Some(name), Expression::ArrayExpression(array)) =
                 (&name_hint, init.get_inner_expression())
@@ -1079,7 +1195,37 @@ impl Walker<'_> {
                     self.routers.insert(name.clone());
                 }
             }
+            self.last_returned_fields = None;
             let taint = self.expr_named(init, env, name_hint.clone());
+            // `const launch = prepare(bin, args)`, returning `{ command, args }`: field by field.
+            let is_call = match init.get_inner_expression() {
+                Expression::CallExpression(_) => true,
+                Expression::AwaitExpression(a) => {
+                    matches!(
+                        a.argument.get_inner_expression(),
+                        Expression::CallExpression(_)
+                    )
+                }
+                _ => false,
+            };
+            if let (true, Some(fields)) = (is_call, self.last_returned_fields.take()) {
+                match &declarator.id {
+                    BindingPattern::BindingIdentifier(id) => {
+                        env.fields.insert(id.name.as_str().to_owned(), fields);
+                        env.bind(id.name.as_str(), taint);
+                        continue;
+                    }
+                    BindingPattern::ObjectPattern(object) if object.rest.is_none() => {
+                        for property in &object.properties {
+                            let field =
+                                prop_name(&property.key).and_then(|k| fields.get(&k).cloned());
+                            self.bind_pattern(&property.value, field, None, env);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             // `const opts = { table: 'x', ids: req.body.ids }`: remember each field's taint.
             if let (Some(name), Expression::ObjectExpression(object)) =
                 (&name_hint, init.get_inner_expression())
@@ -1250,6 +1396,17 @@ impl Walker<'_> {
         };
         let class_auth = guarded(&class.decorators).unwrap_or_default();
         // NestJS-style controller prefix: `@Controller('users')`.
+        // The controller decorator's own authentication default (`RestController: user`).
+        let controller_default_auth = class
+            .decorators
+            .iter()
+            .filter_map(|d| match &d.expression {
+                Expression::CallExpression(call) => callee_name(&call.callee),
+                _ => None,
+            })
+            .filter_map(|name| m().controller_auth.get(&name).copied())
+            .max()
+            .unwrap_or_default();
         let controller_prefix = class.decorators.iter().find_map(|d| {
             let Expression::CallExpression(call) = &d.expression else {
                 return None;
@@ -1259,7 +1416,14 @@ impl Walker<'_> {
                 call.arguments
                     .first()
                     .and_then(Argument::as_expression)
-                    .and_then(literal_path)
+                    .and_then(|e| {
+                        // `@Controller('users')`, `@Controller(RouteKey.User)` or
+                        // `@Controller({ path: 'users' })`.
+                        let keys: Vec<&str> =
+                            m().route_path_keys.iter().map(String::as_str).collect();
+                        let path = object_prop(e, &keys).unwrap_or(e);
+                        self.resolve_text(path, env)
+                    })
                     .unwrap_or_default()
             })
         });
@@ -1308,16 +1472,38 @@ impl Walker<'_> {
                         .arguments
                         .first()
                         .and_then(Argument::as_expression)
-                        .and_then(literal_path)
+                        .and_then(|e| self.resolve_text(e, env))
                         .unwrap_or_default();
                     let key = prop_name(&method.key).unwrap_or_default();
                     self.facts.routes.push(RouteFact {
                         receiver: None,
                         method: verb.to_ascii_uppercase(),
-                        path: format!("/{}/{}", prefix.trim_matches('/'), sub.trim_matches('/')),
+                        path: {
+                            let parts: Vec<&str> =
+                                [prefix.trim_matches('/'), sub.trim_matches('/')]
+                                    .into_iter()
+                                    .filter(|p| !p.is_empty())
+                                    .collect();
+                            format!("/{}", parts.join("/"))
+                        },
                         handler: format!("{}.{key}", class_name.as_deref().unwrap_or("<class>")),
                         span: method.span,
-                        auth: class_auth.max(guarded(&method.decorators).unwrap_or_default()),
+                        auth: {
+                            // `@Post('/login', { skipAuth: true })` opts out of the default.
+                            let public = call.arguments.iter().skip(1).any(|a| {
+                                a.as_expression().is_some_and(|e| {
+                                    m().public_options.iter().any(|key| {
+                                        object_prop(e, &[key.as_str()]).is_some_and(|v| {
+                                            matches!(v.get_inner_expression(), Expression::BooleanLiteral(b) if b.value)
+                                        })
+                                    })
+                                })
+                            });
+                            let default = if public { Auth::NoneDetected } else { controller_default_auth };
+                            class_auth
+                                .max(default)
+                                .max(guarded(&method.decorators).unwrap_or_default())
+                        },
                         kind: "http",
                     });
                 }
@@ -1579,7 +1765,7 @@ impl Walker<'_> {
             other => {
                 if let Some(expr) = other.as_expression() {
                     let taint = self.expr(expr, &mut env);
-                    self.record_return(taint, expr.span(), &env);
+                    self.record_returned(expr, taint, &env);
                 }
             }
         }
@@ -1587,7 +1773,13 @@ impl Walker<'_> {
     }
 
     /// Summary pass: a function that returns (a value derived from) its parameter.
-    fn record_return(&mut self, taint: Option<Origin>, span: Span, env: &Env) {
+    fn record_return(
+        &mut self,
+        taint: Option<Origin>,
+        span: Span,
+        env: &Env,
+        out_field: Option<String>,
+    ) {
         let Some(origin) = taint else { return };
         if !self.summarize || env.function == "<anonymous>" || env.function == "<module>" {
             return;
@@ -1596,10 +1788,9 @@ impl Walker<'_> {
         let param = origin.param.unwrap_or(RETURNS_SOURCE);
         let field = self.field_of.get(&origin.span.start).cloned();
         let list = self.summaries.entry(env.function.clone()).or_default();
-        if list
-            .iter()
-            .any(|s| s.api == RETURNS && s.param == param && s.field == field)
-        {
+        if list.iter().any(|s| {
+            s.api == RETURNS && s.param == param && s.field == field && s.out_field == out_field
+        }) {
             return;
         }
         list.push(Summary {
@@ -1613,7 +1804,34 @@ impl Walker<'_> {
             at_sink: origin,
             ext: None,
             field,
+            out_field,
         });
+    }
+
+    /// Records what a returned value carries: per field for an object literal
+    /// (`return { command, args }`), as a whole otherwise.
+    fn record_returned(&mut self, argument: &Expression<'_>, whole: Option<Origin>, env: &Env) {
+        if !self.summarize {
+            return;
+        }
+        if let Expression::ObjectExpression(object) = argument.get_inner_expression()
+            && object
+                .properties
+                .iter()
+                .all(|p| matches!(p, ObjectPropertyKind::ObjectProperty(_)))
+        {
+            for property in &object.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = property
+                    && let Some(key) = prop_name(&p.key)
+                {
+                    let mut probe = env.clone();
+                    let taint = self.expr(&p.value, &mut probe);
+                    self.record_return(taint, p.span, env, Some(key));
+                }
+            }
+            return;
+        }
+        self.record_return(whole, argument.span(), env, None);
     }
 
     /// Walks a function-valued expression, if it is one. Returns whether it was.
@@ -1786,15 +2004,28 @@ impl Walker<'_> {
                     .and_then(SimpleAssignmentTarget::as_member_expression)
                     && let Some(key) = guards::member_key(target)
                 {
+                    // A function is exported under the name the walker gives it: its own, or the
+                    // property it is assigned to (`module.exports = function () {}` is `exports`).
+                    let property = target
+                        .static_property_name()
+                        .and_then(|n| n.as_str().map(str::to_owned));
                     let local = match assign.right.get_inner_expression() {
                         Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
                         Expression::FunctionExpression(f) => {
-                            f.id.as_ref().map(|id| id.name.as_str().to_owned())
+                            f.id.as_ref()
+                                .map(|id| id.name.as_str().to_owned())
+                                .or_else(|| property.clone())
                         }
+                        Expression::ArrowFunctionExpression(_) => property.clone(),
                         _ => None,
                     };
+                    let (head, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
                     let export = match key.as_str() {
                         "module.exports" => Some("default".to_owned()),
+                        // `const helpers = module.exports; helpers.setup = ...`
+                        _ if self.export_aliases.contains(head) && !rest.contains('.') => {
+                            Some(rest.to_owned())
+                        }
                         k => k
                             .strip_prefix("module.exports.")
                             .or_else(|| k.strip_prefix("exports."))
@@ -2919,28 +3150,42 @@ impl Walker<'_> {
                 _ => None,
             }
         });
-        // What the helper returns: the taint of the arguments its return summaries name.
+        // What the helper returns: the taint of the arguments its return summaries name, field
+        // by field when it returns an object literal.
+        let mut returned_fields: BTreeMap<String, Origin> = BTreeMap::new();
         let returned = helper.as_ref().and_then(|(name, summaries)| {
-            summaries
-                .iter()
-                .filter(|s| s.api == RETURNS)
-                .filter_map(|s| {
-                    if s.param == RETURNS_SOURCE {
-                        let mut origin = Origin::source(s.at_sink.kind, call.span);
-                        origin.object = s.at_sink.object;
-                        return Some(origin);
-                    }
-                    let whole = taints.get(s.param).cloned().flatten();
+            let mut whole = None;
+            for s in summaries.iter().filter(|s| s.api == RETURNS) {
+                let origin = if s.param == RETURNS_SOURCE {
+                    let mut origin = Origin::source(s.at_sink.kind, call.span);
+                    origin.object = s.at_sink.object;
+                    Some(origin)
+                } else {
+                    let arg = taints.get(s.param).cloned().flatten();
                     match &s.field {
                         Some(field) => {
-                            self.field_taint(call.arguments.get(s.param), field, env, whole)
+                            self.field_taint(call.arguments.get(s.param), field, env, arg)
                         }
-                        None => whole,
+                        None => arg,
                     }
-                })
-                .fold(None, |acc, o| union(acc, Some(o)))
-                .map(|o| o.step(call.span.start, format!("returned by `{name}()`")))
+                };
+                let Some(origin) =
+                    origin.map(|o| o.step(call.span.start, format!("returned by `{name}()`")))
+                else {
+                    continue;
+                };
+                if let Some(field) = &s.out_field {
+                    let entry = returned_fields.remove(field);
+                    returned_fields.insert(
+                        field.clone(),
+                        union(entry, Some(origin.clone())).unwrap_or(origin.clone()),
+                    );
+                }
+                whole = union(whole, Some(origin));
+            }
+            whole
         });
+        self.last_returned_fields = (!returned_fields.is_empty()).then_some(returned_fields);
         if let Some((name, summaries)) = helper {
             self.apply_summaries(
                 &name,
@@ -3036,6 +3281,10 @@ impl Walker<'_> {
                 // Pack result sources: `zip.getEntries()`.
                 if let Some(source) = m().result_sources.iter().find(|s| has(&s.methods, method)) {
                     return Some(Origin::source(source.kind.as_str(), call.span));
+                }
+                // `s.replace(/[^a-z0-9_-]/gi, '')`: an allowlist strip leaves only safe characters.
+                if has(&m().strip_methods, method) && allowlist_strip(&call.arguments) {
+                    return None;
                 }
                 if has(&m().pass_methods, method) {
                     let built = has(&m().build_methods, method);
@@ -3230,35 +3479,12 @@ impl Walker<'_> {
         auth: Auth,
         env: &Env,
     ) {
-        // A helper registered earlier: `add('/x', handler)` instantiates its route.
-        if let Callee::Global(name) = callee
-            && let Some(templates) = self.route_templates.get(name).cloned()
-        {
+        // A helper that registers routes from its parameters: `add('/x', handler)` here or in
+        // another file instantiates its routes (or, called with this function's own parameters,
+        // makes this function a template too).
+        if let Some((name, templates)) = self.templates_for(callee) {
             for template in templates {
-                let text = |index: usize| {
-                    call.arguments
-                        .get(index)
-                        .and_then(Argument::as_expression)
-                        .and_then(|e| self.resolve_text(e, env))
-                };
-                let (Some(path), Some(method)) = (
-                    text(template.path_param),
-                    match &template.method {
-                        Ok(method) => Some(method.clone()),
-                        Err(index) => text(*index),
-                    },
-                ) else {
-                    continue;
-                };
-                self.facts.routes.push(RouteFact {
-                    receiver: template.receiver.clone(),
-                    method: method.to_ascii_uppercase(),
-                    path,
-                    handler: format!("{name}()"),
-                    span: call.span,
-                    auth: template.auth.max(auth),
-                    kind: "http",
-                });
+                self.instantiate(&name, &template, call, auth, env);
             }
             return;
         }
@@ -3303,27 +3529,39 @@ impl Walker<'_> {
         };
         let first = call.arguments.first().and_then(Argument::as_expression);
         // `function add(path, h) { router.get(path, h) }`: a template, not a route.
-        let path_param = first.and_then(|e| match e.get_inner_expression() {
-            Expression::Identifier(id) => env.params.iter().position(|p| p == id.name.as_str()),
-            _ => None,
-        });
+        let parts = first.and_then(|e| self.path_parts(e, env));
+        let receiver_param = object
+            .as_deref()
+            .and_then(|o| env.params.iter().position(|p| p == o));
+        let depends_on_params = parts
+            .as_ref()
+            .is_some_and(|p| p.iter().any(|part| matches!(part, PathPart::Param(_))))
+            || method_param.is_some();
         if role == Role::Route
+            && depends_on_params
             && env.function != "<anonymous>"
             && env.function != "<module>"
-            && let Some(path_param) = path_param
+            && let Some(parts) = parts
         {
-            self.route_templates
+            let template = RouteTemplate {
+                receiver: match receiver_param {
+                    Some(index) => Err(index),
+                    None => Ok(object.clone()),
+                },
+                method: match method_param {
+                    Some(index) => Err(index),
+                    None => Ok(method.clone()),
+                },
+                path: parts,
+                auth,
+            };
+            let list = self
+                .route_templates
                 .entry(env.function.clone())
-                .or_default()
-                .push(RouteTemplate {
-                    receiver: object.clone(),
-                    method: match method_param {
-                        Some(index) => Err(index),
-                        None => Ok(method.clone()),
-                    },
-                    path_param,
-                    auth,
-                });
+                .or_default();
+            if !list.contains(&template) {
+                list.push(template);
+            }
             return;
         }
         if method_param.is_some() {
@@ -3381,10 +3619,16 @@ impl Walker<'_> {
                         Some(Expression::Identifier(id)) => {
                             (Some(id.name.as_str().to_owned()), None)
                         }
-                        Some(e) => (
-                            None,
-                            require_spec(e).and_then(|spec| self.linking.resolve(&spec)),
-                        ),
+                        Some(e) => {
+                            // `require('./users')` or a factory `require('./users')()`.
+                            let required = match e {
+                                Expression::CallExpression(c) if require_spec(e).is_none() => {
+                                    require_spec(&c.callee)
+                                }
+                                _ => require_spec(e),
+                            };
+                            (None, required.and_then(|spec| self.linking.resolve(&spec)))
+                        }
                         None => (None, None),
                     };
                     self.facts.mounts.push(MountFact {
@@ -3461,13 +3705,247 @@ impl Walker<'_> {
         })
     }
 
-    /// Text an expression stands for: a literal path, or a field of the current table row.
+    /// The route templates a callee has: this file's, or (through an import) another file's.
+    fn templates_for(&self, callee: &Callee) -> Option<(String, Vec<RouteTemplate>)> {
+        let (local, linked) = match callee {
+            Callee::Global(name) => (
+                Some(name.clone()),
+                self.relative.get(name).map(|(spec, export)| {
+                    let key = export
+                        .clone()
+                        .filter(|e| e != "default")
+                        .unwrap_or_else(|| name.clone());
+                    (spec.clone(), key)
+                }),
+            ),
+            Callee::Method {
+                object: Some(object),
+                method,
+            } => (
+                // `helpers.setupPageRoute(...)` inside the file that defines it.
+                (!self.relative.contains_key(object)).then(|| method.clone()),
+                self.relative
+                    .get(object)
+                    .map(|(spec, _)| (spec.clone(), method.clone())),
+            ),
+            _ => (None, None),
+        };
+        if let Some(name) = local
+            && let Some(list) = self.route_templates.get(&name)
+        {
+            return Some((name, list.clone()));
+        }
+        let (spec, key) = linked?;
+        let file = self.linking.resolve(&spec)?;
+        let mut files = vec![file.clone()];
+        if let Some(more) = self.linking.reexports.get(&file) {
+            files.extend(more.iter().cloned());
+        }
+        files.iter().find_map(|f| {
+            self.linking
+                .templates
+                .get(f)
+                .and_then(|by_name| by_name.get(&key))
+                .map(|list| (key.clone(), list.clone()))
+        })
+    }
+
+    /// Instantiates a route template at a call: a route when every part is known, otherwise a
+    /// template of the calling function (when it passes its own parameters along).
+    fn instantiate(
+        &mut self,
+        name: &str,
+        template: &RouteTemplate,
+        call: &CallExpression<'_>,
+        auth: Auth,
+        env: &Env,
+    ) {
+        let arg = |index: usize| call.arguments.get(index).and_then(Argument::as_expression);
+        let mut path = Vec::new();
+        for part in &template.path {
+            match part {
+                PathPart::Lit(text) => path.push(PathPart::Lit(text.clone())),
+                PathPart::Param(index) => {
+                    let Some(parts) = arg(*index).and_then(|e| self.path_parts(e, env)) else {
+                        return;
+                    };
+                    path.extend(parts);
+                }
+            }
+        }
+        let param_of =
+            |expr: Option<&Expression<'_>>| match expr.map(Expression::get_inner_expression) {
+                Some(Expression::Identifier(id)) => {
+                    env.params.iter().position(|p| p == id.name.as_str())
+                }
+                _ => None,
+            };
+        let method = match &template.method {
+            Ok(method) => Ok(method.clone()),
+            Err(index) => match arg(*index).and_then(|e| self.resolve_text(e, env)) {
+                Some(method) => Ok(method),
+                None => match param_of(arg(*index)) {
+                    Some(own) => Err(own),
+                    None => return,
+                },
+            },
+        };
+        let receiver = match &template.receiver {
+            Ok(receiver) => Ok(receiver.clone()),
+            Err(index) => match param_of(arg(*index)) {
+                Some(own) => Err(own),
+                None => Ok(match arg(*index).map(Expression::get_inner_expression) {
+                    Some(Expression::Identifier(id)) => Some(id.name.as_str().to_owned()),
+                    _ => None,
+                }),
+            },
+        };
+        let open = path.iter().any(|p| matches!(p, PathPart::Param(_))) || method.is_err();
+        if open {
+            if env.function != "<anonymous>" && env.function != "<module>" {
+                let derived = RouteTemplate {
+                    receiver,
+                    method,
+                    path,
+                    auth: template.auth.max(auth),
+                };
+                let list = self
+                    .route_templates
+                    .entry(env.function.clone())
+                    .or_default();
+                if !list.contains(&derived) {
+                    list.push(derived);
+                }
+            }
+            return;
+        }
+        let text: String = path
+            .iter()
+            .map(|p| match p {
+                PathPart::Lit(text) => text.as_str(),
+                PathPart::Param(_) => "",
+            })
+            .collect();
+        let Ok(method) = method else { return };
+        self.facts.routes.push(RouteFact {
+            receiver: receiver.ok().flatten(),
+            method: method.to_ascii_uppercase(),
+            path: text,
+            handler: call
+                .arguments
+                .last()
+                .and_then(Argument::as_expression)
+                .and_then(callee_name)
+                .unwrap_or_else(|| format!("{name}()")),
+            span: call.span,
+            auth: template.auth.max(auth),
+            kind: "http",
+        });
+    }
+
+    /// A path expression in terms of this function's parameters: `` `/api${name}` `` is
+    /// `["/api", Param(name)]`. Unknown pieces fall back to the literal text around them.
+    fn path_parts(&self, expr: &Expression<'_>, env: &Env) -> Option<Vec<PathPart>> {
+        let param = |name: &str| env.params.iter().position(|p| p == name);
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) if param(id.name.as_str()).is_some() => {
+                param(id.name.as_str()).map(|i| vec![PathPart::Param(i)])
+            }
+            Expression::TemplateLiteral(template) => {
+                let mut parts = Vec::new();
+                for (index, quasi) in template.quasis.iter().enumerate() {
+                    if let Some(text) = quasi.value.cooked.and_then(|c| c.as_str())
+                        && !text.is_empty()
+                    {
+                        parts.push(PathPart::Lit(text.to_owned()));
+                    }
+                    if let Some(expression) = template.expressions.get(index) {
+                        // An unknown piece (`${relativePath}`) is dropped, as for literal paths.
+                        parts.extend(self.path_parts(expression, env).unwrap_or_default());
+                    }
+                }
+                Some(parts)
+            }
+            Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
+                let mut parts = self.path_parts(&b.left, env).unwrap_or_default();
+                parts.extend(self.path_parts(&b.right, env).unwrap_or_default());
+                (!parts.is_empty()).then_some(parts)
+            }
+            _ => self
+                .resolve_text(expr, env)
+                .map(|text| vec![PathPart::Lit(text)]),
+        }
+    }
+
+    /// Text an expression stands for: a literal path, a field of the current table row, or a
+    /// constant (an enum member or `const` string, here or in an imported module).
     fn resolve_text(&self, expr: &Expression<'_>, env: &Env) -> Option<String> {
         literal_path(expr).or_else(|| {
             let key = guards::path_key(expr)?;
-            let (var, field) = key.split_once('.')?;
-            env.rows.get(var)?.get(field).cloned()
+            if let Some((var, field)) = key.split_once('.')
+                && let Some(value) = env.rows.get(var).and_then(|row| row.get(field))
+            {
+                return Some(value.clone());
+            }
+            self.constant(&key)
         })
+    }
+
+    /// A constant by access path: this file's, or an imported module's (`RouteKey.Asset`).
+    fn constant(&self, key: &str) -> Option<String> {
+        if let Some(value) = self.constants.get(key) {
+            return Some(value.clone());
+        }
+        let (head, rest) = match key.split_once('.') {
+            Some((head, rest)) => (head, Some(rest)),
+            None => (key, None),
+        };
+        let (spec, export) = self.relative.get(head)?;
+        let file = self.linking.resolve(spec)?;
+        let name = match (export.as_deref(), rest) {
+            (Some(e), Some(rest)) if e != "default" => format!("{e}.{rest}"),
+            (Some(e), None) if e != "default" => e.to_owned(),
+            (_, Some(rest)) => rest.to_owned(),
+            (_, None) => return None,
+        };
+        let mut files = vec![file.clone()];
+        if let Some(more) = self.linking.reexports.get(&file) {
+            files.extend(more.iter().cloned());
+        }
+        files.iter().find_map(|f| {
+            self.linking
+                .constants
+                .get(f)
+                .and_then(|c| c.get(&name))
+                .cloned()
+        })
+    }
+
+    /// Records a TypeScript enum's members with literal values.
+    fn record_enum(&mut self, declaration: &oxc_ast::ast::TSEnumDeclaration<'_>) {
+        use oxc_ast::ast::TSEnumMemberName;
+        let enum_name = declaration.id.name.as_str();
+        for member in &declaration.body.members {
+            let key = match &member.id {
+                TSEnumMemberName::Identifier(id) => id.name.as_str().to_owned(),
+                TSEnumMemberName::String(lit) | TSEnumMemberName::ComputedString(lit) => {
+                    lit.value.as_str().unwrap_or("").to_owned()
+                }
+                TSEnumMemberName::ComputedTemplateString(_) => continue,
+            };
+            let value = match member
+                .initializer
+                .as_ref()
+                .map(Expression::get_inner_expression)
+            {
+                Some(Expression::StringLiteral(lit)) => lit.value.as_str().map(str::to_owned),
+                Some(Expression::NumericLiteral(n)) => Some(n.value.to_string()),
+                _ => None,
+            };
+            if let Some(value) = value {
+                self.constants.insert(format!("{enum_name}.{key}"), value);
+            }
+        }
     }
 
     /// Whether the relative import `spec` names `file`: resolved exactly when the scan root's
@@ -3607,6 +4085,7 @@ impl Walker<'_> {
                         field: self.field_of.get(&finding.origin.span.start).cloned(),
                         at_sink: finding.origin,
                         ext: finding.ext,
+                        out_field: None,
                     });
                 }
             }
@@ -4355,6 +4834,46 @@ mod tests {
         assert!(one("app.get('/f', (req, res) => { const u = req.query.u; if (!isValidUUID(u)) return; exec('x ' + u); });").is_empty());
         // `isInvalid` is a rejecter, not a validator
         assert_eq!(one("app.get('/f', (req, res) => { const u = req.query.u; if (!isInvalidName(u)) return; exec('x ' + u); });").len(), 1);
+    }
+
+    #[test]
+    fn returned_objects_keep_their_fields_apart() {
+        let helper = "function prepare(bin, args) { return { command: bin, args: args }; }\n";
+        // The message goes into the argument list, not the program: argument injection at most.
+        let found = one(&format!(
+            "{helper}app.post('/a', (req, res) => {{ const launch = prepare('codex', ['exec', req.body.message]); spawn(launch.command, launch.args); }});"
+        ));
+        assert_eq!(
+            found,
+            vec![(
+                VulnClass::CommandInjection,
+                Severity::Medium,
+                "child_process.spawn".to_owned(),
+                "http"
+            )]
+        );
+        // The program itself from the request is the real thing.
+        let found = one(&format!(
+            "{helper}app.post('/a', (req, res) => {{ const {{ command, args }} = prepare(req.body.bin, []); spawn(command, args); }});"
+        ));
+        assert_eq!(
+            found,
+            vec![(
+                VulnClass::CommandInjection,
+                Severity::High,
+                "child_process.spawn".to_owned(),
+                "http"
+            )]
+        );
+    }
+
+    #[test]
+    fn allowlist_strips_clean_but_partial_replacements_do_not() {
+        assert!(one("app.post('/s', (req, res) => { const id = String(req.body.id).replace(/[^a-z0-9_-]/gi, ''); fs.writeFileSync(path.join(dir, id + '.md'), x); });").is_empty());
+        // removing `../` once is bypassable (`....//`): still a finding
+        assert_eq!(one("app.post('/s', (req, res) => { const id = req.body.id.replace(/\\.\\.\\//g, ''); fs.writeFileSync(path.join(dir, id), x); });").len(), 1);
+        // not global: only the first bad character goes
+        assert_eq!(one("app.post('/s', (req, res) => { const id = req.body.id.replace(/[^a-z]/, ''); fs.writeFileSync(path.join(dir, id), x); });").len(), 1);
     }
 
     #[test]

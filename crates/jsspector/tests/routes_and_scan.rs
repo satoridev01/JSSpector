@@ -303,3 +303,113 @@ fn workspace_packages_and_barrels_are_followed() {
         "packages/components/src/storage.ts"
     );
 }
+
+#[test]
+fn route_helpers_across_files_build_paths_and_factories_mount_their_router() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // NodeBB-style helpers: the path is built from a parameter, the method can be one too.
+    write(
+        root,
+        "src/routes/helpers.js",
+        "const helpers = module.exports;\n\
+         helpers.setupPageRoute = function (router, name, controller) {\n  router.get(name, controller);\n  router.get(`/api${name}`, controller);\n};\n\
+         helpers.setupApiRoute = function (router, verb, name, controller) {\n  router[verb](name, controller);\n};\n",
+    );
+    write(
+        root,
+        "src/routes/write/users.js",
+        "const router = require('express').Router();\nconst routeHelpers = require('../helpers');\nconst { setupApiRoute } = routeHelpers;\n\
+         module.exports = function () {\n  setupApiRoute(router, 'get', '/:uid', controllers.get);\n  setupApiRoute(router, 'delete', '/:uid', controllers.del);\n  return router;\n};\n",
+    );
+    write(
+        root,
+        "src/routes/write/index.js",
+        "const express = require('express');\nconst router = express.Router();\nrouter.use('/api/v3/users', require('./users')());\nmodule.exports = router;\n",
+    );
+    write(
+        root,
+        "src/routes/index.js",
+        "const helpers = require('./helpers');\nconst { setupPageRoute } = helpers;\n\
+         function mainRoutes(app) {\n  setupPageRoute(app, '/login', controllers.login);\n  setupPageRoute(app, '/search', controllers.search);\n}\n\
+         module.exports = mainRoutes;\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for expected in [
+        "GET /api/v3/users/{uid}",
+        "DELETE /api/v3/users/{uid}",
+        "GET /login",
+        "GET /api/login",
+        "GET /api/search",
+    ] {
+        assert!(
+            list.iter().any(|r| r == expected),
+            "{expected} missing from {list:?}"
+        );
+    }
+}
+
+#[test]
+fn nest_prefixes_from_imported_enums_through_tsconfig_paths_and_controller_auth_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "server/tsconfig.json",
+        "{\n  \"compilerOptions\": { \"baseUrl\": \"./\", \"paths\": { \"src/*\": [\"./src/*\"], }, },\n}\n",
+    );
+    write(
+        root,
+        "server/src/enum.ts",
+        "export enum RouteKey {\n  Asset = 'assets',\n  User = 'users',\n}\n",
+    );
+    write(
+        root,
+        "server/src/controllers/asset.controller.ts",
+        "import { Controller, Get } from '@nestjs/common';\nimport { RouteKey } from 'src/enum';\n\
+         @Controller(RouteKey.Asset)\nexport class AssetController {\n  @Get(':id')\n  get() {}\n}\n",
+    );
+    write(
+        root,
+        "server/src/controllers/auth.controller.ts",
+        "import { RestController, Get, Post } from '@n8n/decorators';\n\
+         @RestController()\nexport class AuthController {\n  @Post('/login', { skipAuth: true })\n  login() {}\n  @Get('/login')\n  current() {}\n}\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<(String, String, String)> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["method"].as_str().unwrap().to_owned(),
+                r["path"].as_str().unwrap().to_owned(),
+                r["auth"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        list.contains(&("GET".into(), "/assets/{id}".into(), "none-detected".into())),
+        "{list:?}"
+    );
+    assert!(
+        list.contains(&("POST".into(), "/login".into(), "none-detected".into())),
+        "{list:?}"
+    );
+    assert!(
+        list.contains(&("GET".into(), "/login".into(), "user".into())),
+        "{list:?}"
+    );
+}

@@ -49,6 +49,8 @@ pub struct Function {
     pub params: Vec<String>,
     pub calls: Vec<Call>,
     pub flows: Vec<Flow>,
+    /// The local variable the function returns, when it returns one (`return router`).
+    pub returns_local: Option<String>,
 }
 
 /// A call made by a function.

@@ -60,11 +60,7 @@ impl ParsePool {
             })
         };
         let first = run(&Summaries::new());
-        let external = merge(first);
-        if external.is_empty() {
-            return run(&external);
-        }
-        run(&external)
+        run(&merge(first))
     }
 }
 
@@ -185,7 +181,7 @@ fn scan_text(
             }
             continue;
         }
-        let result = taint::scan_program_with(&ret.program, text, external);
+        let result = taint::scan_program_with(&ret.program, external);
         let index = LineIndex::new(text);
         let findings = result
             .findings

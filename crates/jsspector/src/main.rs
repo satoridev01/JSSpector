@@ -283,7 +283,7 @@ fn describe(class: jss_core::VulnClass) -> &'static str {
     }
 }
 
-/// Semgrep-style output: findings grouped by the file of their sink, with the code lines.
+/// Readable output: findings grouped by the file of their sink, with the code lines.
 fn write_text(
     out: &mut impl Write,
     output: &ScanOutput,

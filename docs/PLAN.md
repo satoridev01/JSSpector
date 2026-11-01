@@ -63,7 +63,7 @@
 | ❌ CFG ignores try/catch/finally; branch sanitizers ignored; no destructuring; `await` not unwrapped | Use oxc's CFG (or our own over our IR) with exceptions, short-circuit evaluation and destructuring lowering. `await`/promises are first-class. |
 | ❌ Silent drops, silent caps, `unwrap` panics, non-UTF-8 path panic | Per-file isolation; every drop or cap becomes a **diagnostic** in the output; no panics in release builds. |
 | ❌ Fingerprint = sha1(rule\|abs path\|line\|code); no exit code; HashMap output order; no column or trace | Line-independent fingerprints; deterministic sorted output; exit codes; every finding carries a full **witness path** (SARIF `codeFlows`). |
-| ❌ 142 noisy rules deleted in one PR; regex secret scanners | Ship only HIGH/CRITICAL taint sink classes, each with fixture plus corpus evidence. Leave secrets and linting to existing tools (Satori already has trufflehog/semgrep playbooks). |
+| ❌ 142 noisy rules deleted in one PR; regex secret scanners | Ship only HIGH/CRITICAL taint sink classes, each with fixture plus corpus evidence. Leave secrets and linting to existing tools (Satori already has secret-scanning and linting playbooks). |
 | ❌ No endpoint inventory output at all | The entry-point inventory is **deliverable #1**. |
 
 ## Architecture

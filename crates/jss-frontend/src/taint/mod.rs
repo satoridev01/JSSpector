@@ -94,14 +94,14 @@ pub struct ScanResult {
     pub summaries: Summaries,
 }
 
-/// Scans a parsed program.
-pub fn scan_program(program: &Program<'_>, text: &str) -> ScanResult {
-    scan_program_with(program, text, &Summaries::new())
+/// Scans a parsed program on its own.
+#[cfg(test)]
+fn scan_program(program: &Program<'_>, _text: &str) -> ScanResult {
+    scan_program_with(program, &Summaries::new())
 }
 
 /// Scans a parsed program, with summaries of the repository's other files.
-pub fn scan_program_with(program: &Program<'_>, text: &str, external: &Summaries) -> ScanResult {
-    let _ = text;
+pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanResult {
     let mut walker = Walker {
         external,
         modules: BTreeMap::new(),
@@ -1158,7 +1158,6 @@ impl Walker<'_> {
                         && member
                             .static_property_name()
                             .is_some_and(|p| contains(models::HTML_PROPS, p.as_str().unwrap_or("")))
-                        && (origin.built || origin.kind != "param")
                     {
                         let property = member
                             .static_property_name()
@@ -1628,7 +1627,7 @@ impl Walker<'_> {
         // Result taint.
         let any_arg = || taints.iter().flatten().next().cloned();
         match &callee {
-            Callee::Method { object, method } => {
+            Callee::Method { method, .. } => {
                 // `req.get('x')`, `await request.json()`
                 if let Some(member) = call.callee.get_inner_expression().as_member_expression()
                     && let Some(kind) =
@@ -1645,7 +1644,6 @@ impl Walker<'_> {
                         param: None,
                     });
                 }
-                let _ = object;
                 // adm-zip: `zip.getEntries()` lists entries named by the archive's author.
                 if method == "getEntries" {
                     return Some(Origin {

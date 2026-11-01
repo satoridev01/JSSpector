@@ -90,6 +90,10 @@ pub struct Pack {
     pub sanitizers: Sanitizers,
     #[serde(default)]
     pub html_props: Vec<String>,
+    /// Source kinds of a page in the browser (`location.hash`, messages): a finding they
+    /// reach is labeled with its page when no route reaches it.
+    #[serde(default)]
+    pub page_kinds: Vec<String>,
     /// Classes whose objects hold no HTML and are no DOM node: method sinks (`append`, `html`)
     /// do not apply to `new C()` of them.
     #[serde(default)]
@@ -561,6 +565,9 @@ pub struct ToolObjectSpec {
     /// default.
     #[serde(default)]
     pub params: Option<String>,
+    /// Keys whose literal value names the tool (`name: 'run-sql'`): the entry point's name.
+    #[serde(default)]
+    pub name_keys: Vec<String>,
     pub kind: String,
 }
 
@@ -906,6 +913,7 @@ pub struct Model {
     pub jsx_html_value_keys: Vec<String>,
     pub component_wrappers: Vec<String>,
     pub props_kind: Option<String>,
+    pub page_kinds: Vec<String>,
     pub pass_globals: Vec<String>,
     pub object_globals: Vec<String>,
     pub clearing: Vec<String>,
@@ -1167,6 +1175,7 @@ impl Model {
             self.escapers.entry(class).or_default().extend(calls);
         }
         self.html_props.extend(pack.html_props);
+        self.page_kinds.extend(pack.page_kinds);
         self.plain_constructors.extend(pack.plain_constructors);
         self.node_factories.extend(pack.node_factories);
         self.sql_keywords.extend(pack.sql_keywords);

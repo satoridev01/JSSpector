@@ -69,10 +69,18 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
         .map(|(auth, label, _)| (label, auth))
         .collect();
     let reached = jss_core::ir::reachable(&graph, &roots);
+    let model = crate::taint::models::model();
     for report in reports.iter_mut() {
         for finding in &mut report.findings {
             let id = (finding.file.clone(), finding.function.clone());
             let Some((label, auth)) = reached.get(&id).and_then(|index| labels.get(*index)) else {
+                // Browser-side data no route reaches: the page or the component it enters.
+                let kind: &str = finding.source.kind;
+                if model.page_kinds.iter().any(|k| k == kind) {
+                    finding.entry = Some(format!("PAGE {}", finding.file));
+                } else if model.props_kind.as_deref() == Some(kind) {
+                    finding.entry = Some(format!("COMPONENT {}", finding.function));
+                }
                 continue;
             };
             finding.entry = Some(label.clone());

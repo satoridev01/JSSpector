@@ -15,4 +15,5 @@ tool_objects:
   - schema_keys: [inputFields]
     handler_keys: [mutateAndGetPayload]
     params: first
+    name_keys: [name]
     kind: graphql

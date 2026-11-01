@@ -1748,3 +1748,75 @@ fn routers_in_fields_and_included_classes_are_inventoried() {
     let routes = listed(&["routes", "--json", root.to_str().unwrap()]);
     assert!(routes.iter().any(|r| r == "GET /from-test"), "{routes:?}");
 }
+
+/// Entry points beyond routes and events: an LLM tool (named by its `name`), a dev server's
+/// middleware, and, for browser-side data no route reaches, the page or the component.
+#[test]
+fn tools_dev_servers_pages_and_components_are_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/tools.js",
+        "const { exec } = require('child_process');\n\
+         aibitat.function({ name: 'run-report', parameters: { type: 'object' }, handler: async ({ dir }) => { exec('ls ' + dir); } });\n",
+    );
+    write(
+        root,
+        "vite.config.js",
+        "import fs from 'fs';\nexport default { plugins: [{ configureServer(server) { server.middlewares.use((req, res, next) => { res.end(fs.readFileSync('.' + req.url)); }); } }] };\n",
+    );
+    write(
+        root,
+        "web/page.js",
+        "document.getElementById('out').innerHTML = '<b>' + decodeURIComponent(location.hash.slice(1)) + '</b>';\n",
+    );
+    write(
+        root,
+        "web/Card.jsx",
+        "export function Card({ html }) { return <div dangerouslySetInnerHTML={{ __html: html }} />; }\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let entries: Vec<String> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["entry"].as_str().unwrap_or("").to_owned())
+        .collect();
+    for entry in [
+        "LLM-TOOL run-report",
+        "ANY *",
+        "PAGE web/page.js",
+        "COMPONENT Card",
+    ] {
+        assert!(
+            entries.iter().any(|e| e == entry),
+            "{entry} missing from {entries:?}"
+        );
+    }
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let kinds: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["kind"].as_str().unwrap(),
+                r["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for route in ["llm-tool run-report", "dev-server *"] {
+        assert!(
+            kinds.iter().any(|k| k == route),
+            "{route} missing from {kinds:?}"
+        );
+    }
+}

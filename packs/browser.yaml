@@ -4,6 +4,8 @@ client_sources:
   - {methods: [addEventListener], event: message, params: first, kind: postmessage}
   - {methods: [addListener], via: [onMessage, onMessageExternal, onConnectExternal], params: first, kind: ext-message}
 html_props: [innerHTML, outerHTML]
+# A page's own data (its URL, messages to it): findings no route reaches are the page's.
+page_kinds: [dom, postmessage, ext-message]
 # Objects of these classes are never DOM nodes or jQuery sets: `params.append(k, v)` is no sink.
 plain_constructors: [URLSearchParams, FormData, Headers, URL, Map, Set, WeakMap, Array, Blob, File]
 # A service worker: its `request`s are the page's own (browser-side data).

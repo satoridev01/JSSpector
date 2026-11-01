@@ -9,6 +9,8 @@ tool_objects:
   - schema_keys: [parameters, inputSchema, input_schema, schema, argsSchema]
     handler_keys: [handler, execute, func, run, invoke, call]
     not_keys: [url, path, method, route, routes]
+    # `name: 'sql-get-table-schema'`: the entry point is the tool.
+    name_keys: [name]
     kind: llm-tool
 # Reached only through what the model read (indirect, like component props): medium at most.
 severity_caps:

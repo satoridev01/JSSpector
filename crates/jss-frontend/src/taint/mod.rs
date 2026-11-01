@@ -4820,6 +4820,36 @@ impl Walker<'_> {
                 let mut taint = None;
                 // `{ parameters, handler: async (args) => ... }`: an LLM tool.
                 let tool = tool_object(object);
+                // `{ name: 'run-sql', parameters, handler }`: an entry named by the tool, and its
+                // handler by the entry.
+                let tool_entry = tool.and_then(|(_, spec)| {
+                    let tool_name = object.properties.iter().find_map(|property| {
+                        let ObjectPropertyKind::ObjectProperty(p) = property else {
+                            return None;
+                        };
+                        prop_name(&p.key)
+                            .is_some_and(|k| has(&spec.name_keys, &k))
+                            .then(|| match p.value.get_inner_expression() {
+                                Expression::StringLiteral(l) => l.value.as_str().map(str::to_owned),
+                                _ => None,
+                            })
+                            .flatten()
+                    })?;
+                    let entry = format!("{} {tool_name}", spec.kind.to_ascii_uppercase());
+                    if !self.summarize && !self.record_only {
+                        self.facts.routes.push(RouteFact {
+                            receiver: None,
+                            receiver_file: None,
+                            method: spec.kind.to_ascii_uppercase(),
+                            path: tool_name,
+                            handler: entry.clone(),
+                            span: object.span,
+                            auth: Auth::NoneDetected,
+                            kind: spec.kind.as_str(),
+                        });
+                    }
+                    Some(entry)
+                });
                 for property in &object.properties {
                     let t = match property {
                         ObjectPropertyKind::ObjectProperty(p) => {
@@ -4834,7 +4864,7 @@ impl Walker<'_> {
                                 && self.maybe_function(
                                     &p.value,
                                     env,
-                                    name.clone(),
+                                    tool_entry.clone().or_else(|| name.clone()),
                                     Role::Client(
                                         spec.kind.as_str(),
                                         spec.params.as_deref().map_or(Params::First, Params::parse),
@@ -6198,22 +6228,48 @@ impl Walker<'_> {
                         Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
                     )
                 });
-            (role == Role::Route && factory && handler.is_some()).then(|| {
-                let name = self.inline_route_name("ANY", "*", None, call.span.start);
-                if !self.summarize && !self.record_only {
-                    self.facts.routes.push(RouteFact {
-                        receiver: None,
-                        receiver_file: None,
-                        method: "ANY".to_owned(),
-                        path: "*".to_owned(),
-                        handler: name.clone(),
-                        span: call.span,
-                        auth: Auth::NoneDetected,
-                        kind: "http",
-                    });
-                }
-                name
-            })
+            // `server.middlewares.use((req, res, next) => ...)`: a dev server's every request.
+            let middleware = match &callee {
+                Callee::Method { method, .. } => call
+                    .callee
+                    .get_inner_expression()
+                    .as_member_expression()
+                    .and_then(|m| match m.object().get_inner_expression() {
+                        Expression::StaticMemberExpression(via) => Some(via.property.name.as_str()),
+                        _ => None,
+                    })
+                    .and_then(|via| {
+                        m().middleware_registrations
+                            .iter()
+                            .find(|r| has(&r.methods, method) && has(&r.via, via))
+                    })
+                    .map(|r| r.kind.as_str()),
+                _ => None,
+            };
+            let kind = match (factory, middleware) {
+                (true, _) => Some("http"),
+                (false, Some(kind)) => Some(kind),
+                (false, None) => None,
+            };
+            (role == Role::Route && handler.is_some())
+                .then_some(kind)
+                .flatten()
+                .map(|kind| {
+                    let name = self.inline_route_name("ANY", "*", None, call.span.start);
+                    if !self.summarize && !self.record_only {
+                        self.facts.routes.push(RouteFact {
+                            receiver: None,
+                            receiver_file: None,
+                            method: "ANY".to_owned(),
+                            path: "*".to_owned(),
+                            handler: name.clone(),
+                            span: call.span,
+                            auth: Auth::NoneDetected,
+                            kind,
+                        });
+                    }
+                    name
+                })
         });
         // `socket.on('join', (data) => ...)`: the callback goes by its entry's name, so the
         // findings in it are linked to that entry.

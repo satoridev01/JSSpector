@@ -24,6 +24,8 @@ jss-frontend = { path = "crates/jss-frontend" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Exclude patterns in .jsspector.yml and --exclude (the matcher behind `ignore`).
+globset = "0.4.21"
 # File discovery: .gitignore-aware directory walking (same engine as ripgrep).
 ignore = "0.4.34"
 # Peak RSS for --stats (getrusage through a safe wrapper; unix only).
@@ -32,6 +34,8 @@ nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 rayon = "1.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# YAML: packs and .jsspector.yml.
+serde_norway = "0.9.42"
 # Tests only: temporary directory trees.
 tempfile = "3.27.0"
 

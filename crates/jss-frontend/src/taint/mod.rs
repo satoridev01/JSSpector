@@ -111,8 +111,8 @@ pub struct ExtSink {
     pub line: u32,
     pub col: u32,
     pub arg: String,
-    /// The helper's own steps, as text.
-    pub steps: Vec<String>,
+    /// The helper's own steps, located in its file.
+    pub steps: Vec<jss_core::TraceStep>,
 }
 
 /// Repo-wide summaries: function name -> parameters that reach a sink.

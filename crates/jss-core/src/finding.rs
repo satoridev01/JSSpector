@@ -94,6 +94,10 @@ pub struct SinkLoc {
 /// One step of the value's path from source to sink.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct TraceStep {
+    /// Set when the step is in another file than the finding's source (inside a helper reached
+    /// through a repo-wide summary).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     pub line: u32,
     pub col: u32,
     pub note: String,

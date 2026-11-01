@@ -16,7 +16,7 @@ oxc_parser.workspace = true
 oxc_span.workspace = true
 rayon.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_norway = "0.9.42"
+serde_norway.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

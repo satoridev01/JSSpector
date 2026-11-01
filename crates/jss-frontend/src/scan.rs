@@ -368,7 +368,12 @@ fn analyze(
                     .iter()
                     .map(|(offset, note)| {
                         let step = index.line_col(*offset);
-                        format!("{}:{}: {note}", file.rel_path, step.line)
+                        TraceStep {
+                            file: Some(file.rel_path.clone()),
+                            line: step.line,
+                            col: step.column,
+                            note: note.clone(),
+                        }
                     })
                     .collect(),
             });
@@ -527,6 +532,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
         .map(|(offset, note)| {
             let step = at(*offset);
             TraceStep {
+                file: None,
                 line: step.line,
                 col: step.column,
                 note: note.clone(),
@@ -534,11 +540,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
         })
         .collect();
     if let Some(ext) = &raw.ext {
-        trace.extend(ext.steps.iter().map(|note| TraceStep {
-            line: 0,
-            col: 0,
-            note: note.clone(),
-        }));
+        trace.extend(ext.steps.iter().cloned());
     }
     Finding {
         file: file.to_owned(),
@@ -561,8 +563,52 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
     }
 }
 
-/// Sorts findings deterministically and fills in each line-independent key.
+/// Fills in each finding's line-independent key and fingerprint, then sorts the findings for
+/// output (severity first).
+///
+/// The key is `class|file|function|sink api|source expr|ordinal`; the ordinal tells apart
+/// findings that share the rest, counted in source order (sink position, then source position).
+/// Severity plays no part, so call this on every finding before filtering by severity: a key
+/// then never depends on the filters or on how a finding was rated.
 pub fn finalize(findings: &mut [Finding]) {
+    fn identity(f: &Finding) -> (jss_core::VulnClass, &str, &str, &str, &str) {
+        (f.class, &f.file, &f.function, &f.sink.api, &f.source.expr)
+    }
+    fn position(f: &Finding) -> (Option<&str>, u32, u32, u32, u32) {
+        (
+            f.sink.file.as_deref(),
+            f.sink.line,
+            f.sink.col,
+            f.source.line,
+            f.source.col,
+        )
+    }
+    findings.sort_by(|a, b| {
+        identity(a)
+            .cmp(&identity(b))
+            .then_with(|| position(a).cmp(&position(b)))
+            .then_with(|| a.cmp(b))
+    });
+    let mut previous: Option<String> = None;
+    let mut ordinal = 0u32;
+    for finding in findings.iter_mut() {
+        let base = format!(
+            "{}|{}|{}|{}|{}",
+            finding.class.name(),
+            finding.file,
+            finding.function,
+            finding.sink.api,
+            finding.source.expr
+        );
+        ordinal = if previous.as_deref() == Some(base.as_str()) {
+            ordinal + 1
+        } else {
+            0
+        };
+        finding.key = format!("{base}|{ordinal}");
+        finding.fingerprint = jss_core::finding::fingerprint(&finding.key);
+        previous = Some(base);
+    }
     findings.sort_by(|a, b| {
         (
             a.severity,
@@ -580,20 +626,6 @@ pub fn finalize(findings: &mut [Finding]) {
                 b.sink.col,
                 &b.source.expr,
             ))
+            .then_with(|| a.key.cmp(&b.key))
     });
-    let mut seen: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-    for finding in findings.iter_mut() {
-        let base = format!(
-            "{}|{}|{}|{}|{}",
-            finding.class.name(),
-            finding.file,
-            finding.function,
-            finding.sink.api,
-            finding.source.expr
-        );
-        let ordinal = seen.entry(base.clone()).or_insert(0);
-        finding.key = format!("{base}|{ordinal}");
-        finding.fingerprint = jss_core::finding::fingerprint(&finding.key);
-        *ordinal += 1;
-    }
 }

@@ -6,7 +6,7 @@
 //! [`Model::errors`], never silently dropped.
 
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use jss_core::{Severity, VulnClass};
 use serde::Deserialize;
@@ -766,6 +766,50 @@ impl Model {
         }
     }
 
+    /// Every sink API of `class`, as written in the packs: `child_process.exec`, `eval`,
+    /// `.query` (a method on any receiver), `innerHTML =` (an assignment). Sorted, deduplicated.
+    pub fn sink_names(&self, class: VulnClass) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .module_sinks
+            .iter()
+            .filter(|(_, sink)| sink.class == class)
+            .map(|((module, export), _)| {
+                if export.is_empty() {
+                    format!("{module}()")
+                } else {
+                    format!("{module}.{export}")
+                }
+            })
+            .chain(
+                self.global_sinks
+                    .iter()
+                    .filter(|(_, sink)| sink.class == class)
+                    .map(|(name, _)| name.clone()),
+            )
+            .chain(
+                self.method_sinks
+                    .iter()
+                    .filter(|(_, sink)| sink.class == class)
+                    .map(|(name, _)| {
+                        if name.contains('.') {
+                            name.clone()
+                        } else {
+                            format!(".{name}")
+                        }
+                    }),
+            )
+            .chain(
+                self.assign_sinks
+                    .iter()
+                    .filter(|(_, sink)| sink.class == class)
+                    .map(|(target, _)| format!("{target} =")),
+            )
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Caps `severity` by the source kind's cap (a lower severity sorts later).
     pub fn cap(&self, kind: &str, severity: Severity) -> Severity {
         match self.severity_caps.get(kind) {
@@ -782,12 +826,31 @@ impl Model {
     }
 }
 
-/// The built-in model.
-static MODEL: LazyLock<Model> = LazyLock::new(|| Model::from_packs(BUILTIN_PACKS.iter().copied()));
+/// The model in use: the built-in packs, plus the extra ones given to [`install`].
+static MODEL: OnceLock<Model> = OnceLock::new();
 
-/// The built-in model.
+/// Installs the model: the built-in packs followed by `extra` (name, YAML text), merged the same
+/// way. Call it once, before the first [`model`] call (that is, before scanning); afterwards the
+/// model is fixed and this fails. A pack that fails to load fails the install, with every error.
+pub fn install(extra: &[(String, String)]) -> Result<(), Vec<String>> {
+    let model = Model::from_packs(
+        BUILTIN_PACKS.iter().copied().chain(
+            extra
+                .iter()
+                .map(|(name, text)| (name.as_str(), text.as_str())),
+        ),
+    );
+    if !model.errors.is_empty() {
+        return Err(model.errors);
+    }
+    MODEL
+        .set(model)
+        .map_err(|_| vec!["the taint model is already in use".to_owned()])
+}
+
+/// The model: the one [`install`]ed, or else the built-in packs alone.
 pub fn model() -> &'static Model {
-    &MODEL
+    MODEL.get_or_init(|| Model::from_packs(BUILTIN_PACKS.iter().copied()))
 }
 
 /// `list` contains `name`.
@@ -807,6 +870,19 @@ mod tests {
         assert!(model.global_sink("eval").is_some());
         assert!(model.method_sink("query").is_some());
         assert_eq!(model.module_family("node:fs"), Some("fs"));
+    }
+
+    #[test]
+    fn sinks_are_listed_by_class() {
+        let model = Model::from_packs(BUILTIN_PACKS.iter().copied());
+        let commands = model.sink_names(VulnClass::CommandInjection);
+        assert!(
+            commands.iter().any(|n| n == "child_process.exec"),
+            "{commands:?}"
+        );
+        assert!(!commands.iter().any(|n| n == "eval"));
+        let code = model.sink_names(VulnClass::CodeInjection);
+        assert!(code.iter().any(|n| n == "eval"), "{code:?}");
     }
 
     #[test]

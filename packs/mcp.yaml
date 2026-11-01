@@ -1,6 +1,12 @@
 # Model Context Protocol servers: tool, prompt and resource arguments come from the client (and,
-# through it, from whatever text the model read).
+# through it, from whatever text the model read). MCP clients: a stdio transport runs a program.
 name: mcp
+modules:
+  '@modelcontextprotocol/sdk/client/stdio.js': mcp-stdio
+  '@modelcontextprotocol/sdk/client/stdio': mcp-stdio
+sinks:
+  # new StdioClientTransport({ command, args, env }) spawns `command` with `args`.
+  - {module: mcp-stdio, exports: [StdioClientTransport], class: command-injection, severity: critical, args: ["any:0"]}
 client_sources:
   # @modelcontextprotocol/sdk McpServer: server.tool(name, [description], [schema], handler)
   - {methods: [tool, registerTool, prompt, registerPrompt, resource, registerResource], shape: last-callback, params: first, kind: mcp}

@@ -50,6 +50,10 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
         include_str!("../../../../packs/dev-servers.yaml"),
     ),
     ("mcp", include_str!("../../../../packs/mcp.yaml")),
+    (
+        "multipart",
+        include_str!("../../../../packs/multipart.yaml"),
+    ),
 ];
 
 /// One pack file, as written.
@@ -331,6 +335,10 @@ pub struct ClientSource {
     /// `all`, `first`, `second`, `after-first` or `input` (the `input` field of the first param).
     pub params: String,
     pub kind: String,
+    /// Fields of the callback's object parameters that the server chose, not the client: an
+    /// upload's temporary `path`.
+    #[serde(default)]
+    pub server_fields: Vec<String>,
 }
 
 /// A call whose result is client data.
@@ -352,6 +360,10 @@ pub struct Propagation {
     pub iteration_methods: Vec<String>,
     #[serde(default)]
     pub pass_globals: Vec<String>,
+    /// The `pass_globals` whose result can be an object built from the text (`JSON.parse`):
+    /// a NoSQL operator object. The others give strings.
+    #[serde(default)]
+    pub object_globals: Vec<String>,
     /// Methods that, with a global negated class and an empty replacement, strip everything
     /// but an allowlist: `s.replace(/[^a-z0-9]/g, '')`.
     #[serde(default)]
@@ -522,6 +534,7 @@ pub struct Model {
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
     pub pass_globals: Vec<String>,
+    pub object_globals: Vec<String>,
     pub clearing: Vec<String>,
     pub validators: Vec<String>,
     pub receiver_validators: Vec<String>,
@@ -661,6 +674,7 @@ impl Model {
             self.props_kind = pack.jsx.props_kind;
         }
         self.pass_globals.extend(pack.propagation.pass_globals);
+        self.object_globals.extend(pack.propagation.object_globals);
         self.clearing.extend(pack.sanitizers.calls);
         self.validators.extend(pack.sanitizers.validators);
         self.receiver_validators

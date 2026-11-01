@@ -55,8 +55,10 @@ propagation:
     replaceAll, slice, substring, substr, split, join, concat, toString, padStart, padEnd, normalize, at, valueOf, repeat]
   build_methods: [concat, join, format]
   strip_methods: [replace, replaceAll]
-  pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, util.format, URL, encodeURI,
-    encodeURL, normalizeUrl, url.parse, url.resolve, querystring.parse]
+  pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, JSON.stringify, util.format,
+    URL, encodeURI, encodeURL, normalizeUrl, url.parse, url.resolve, querystring.parse]
+  # Of those, the ones whose result can be an object (a NoSQL operator object); the others give strings.
+  object_globals: [JSON.parse, querystring.parse, url.parse]
 sanitizers:
   calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN]
   # Used as a guard (`if (!isValid(x)) return;`), these clear their argument on the passing path.

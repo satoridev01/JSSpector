@@ -214,6 +214,7 @@ pub fn scan_file_program(
         field_of: BTreeMap::new(),
         pending_auth: Auth::NoneDetected,
         pending_request_kind: std::cell::Cell::new(None),
+        pending_server_fields: std::cell::Cell::new(None),
         router_auth: BTreeMap::new(),
         routers: BTreeSet::new(),
         injected: BTreeMap::new(),
@@ -396,6 +397,8 @@ struct Env {
     /// Names bound to `new C()` of a class whose objects hold no HTML (`URLSearchParams`):
     /// method sinks such as `.append()` do not apply to them.
     plain: BTreeSet<String>,
+    /// Client-source parameters whose listed fields the server chose (`file.path` of an upload).
+    server_fields: BTreeMap<String, &'static [String]>,
     /// Inside a branch or loop: assignments only add taint.
     branch: u32,
     function: String,
@@ -434,6 +437,7 @@ impl Env {
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
             plain: BTreeSet::new(),
+            server_fields: BTreeMap::new(),
             branch: 0,
             function,
         }
@@ -453,6 +457,7 @@ impl Env {
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
             plain: self.plain.clone(),
+            server_fields: self.server_fields.clone(),
             branch: 0,
             function,
         }
@@ -537,6 +542,8 @@ struct Walker<'e> {
     pending_auth: Auth,
     /// The request kind for the next route handler entered (`dev-server`), when not plain `http`.
     pending_request_kind: std::cell::Cell<Option<&'static str>>,
+    /// The `server_fields` of the client source the next callback is registered for.
+    pending_server_fields: std::cell::Cell<Option<&'static [String]>>,
     /// Routers with authentication middleware applied to every later route: `router.use(auth)`.
     router_auth: BTreeMap<String, Auth>,
     /// Variables bound to a router or app from a factory: `const router = express.Router()`.
@@ -1741,9 +1748,13 @@ impl Walker<'_> {
         }
         match role {
             Role::Client(kind, selected) => {
+                let server_fields = self.pending_server_fields.take();
                 for (index, (param, name)) in params.items.iter().zip(&names).enumerate() {
                     if !selected.wants(index) {
                         continue;
+                    }
+                    if let (Some(fields), Some(name)) = (server_fields, name) {
+                        env.server_fields.insert((*name).to_owned(), fields);
                     }
                     if selected == Params::Input {
                         // tRPC: `({ input, ctx }) => ...` or `(opts) => opts.input`
@@ -2716,6 +2727,15 @@ impl Walker<'_> {
         {
             return fields.get(property).cloned();
         }
+        // `file.path` of an upload event: chosen by the server.
+        if let (Expression::Identifier(id), Some(property)) = (object, property.as_deref())
+            && env
+                .server_fields
+                .get(id.name.as_str())
+                .is_some_and(|fields| has(fields, property))
+        {
+            return None;
+        }
         // Any property of a tainted object is tainted.
         self.expr(member.object(), env)
     }
@@ -3410,6 +3430,8 @@ impl Walker<'_> {
                     let built = has(&m().build_methods, export);
                     return any_arg().map(|mut o| {
                         o.built |= built;
+                        // `path.join(...)`, `util.format(...)`: a string.
+                        o.object = false;
                         o.step(call.span.start, format!("through {qualified}()"))
                     });
                 }
@@ -3426,6 +3448,8 @@ impl Walker<'_> {
                         .is_some_and(|last| last != name && has(&m().build_methods, last));
                     return any_arg().map(|mut o| {
                         o.built |= built;
+                        // `String(x)` is a string; `JSON.parse(x)` can be an operator object.
+                        o.object = has(&m().object_globals, name);
                         o.step(call.span.start, format!("through {name}()"))
                     });
                 }
@@ -3445,6 +3469,7 @@ impl Walker<'_> {
     ) -> (Role, Shape) {
         let model = m();
         self.pending_request_kind.set(None);
+        self.pending_server_fields.set(None);
         let event = match arguments.first() {
             Some(Argument::StringLiteral(lit)) => lit.value.as_str(),
             _ => None,
@@ -3484,6 +3509,10 @@ impl Walker<'_> {
                 continue;
             }
             let params = Params::parse(&source.params);
+            if !source.server_fields.is_empty() {
+                self.pending_server_fields
+                    .set(Some(source.server_fields.as_slice()));
+            }
             let shape = match source.shape.as_deref() {
                 Some("last-callback") => Shape::LastCallback,
                 Some("object-of-functions") => Shape::ObjectOfFunctions,
@@ -5103,6 +5132,77 @@ mod tests {
                  app.get('/p', (req, res) => { document.body.innerHTML = bold(req.query.n); });"
             ),
             vec![VulnClass::Xss]
+        );
+    }
+
+    #[test]
+    fn mcp_stdio_transports_run_programs() {
+        let found = scan(
+            "import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';\n\
+             app.post('/servers', (req, res) => {\n\
+               const { command, args } = req.body;\n\
+               const transport = new StdioClientTransport({ command, args });\n\
+             });",
+        );
+        assert_eq!(
+            found.iter().map(|f| (f.0, f.1)).collect::<Vec<_>>(),
+            vec![(VulnClass::CommandInjection, Severity::Critical)],
+            "{found:?}"
+        );
+        assert!(
+            scan(
+                "import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';\n\
+                 const transport = new StdioClientTransport({ command: 'node', args: ['server.js'] });"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn json_stringify_passes_strings_on_and_strings_are_no_operator_objects() {
+        assert_eq!(
+            one(
+                "app.get('/p', (req, res) => { exec('notify ' + JSON.stringify(req.query.msg)); });"
+            )
+            .len(),
+            1
+        );
+        // A string cannot carry `{ \"$ne\": null }`.
+        assert!(
+            one("app.post('/l', async (req, res) => { await User.findOne({ email: String(req.body.email) }); });")
+                .is_empty()
+        );
+        // JSON.parse can.
+        assert_eq!(
+            one("app.post('/l', async (req, res) => { await User.findOne({ email: JSON.parse(req.body.q) }); });")
+                .iter()
+                .map(|f| f.0)
+                .collect::<Vec<_>>(),
+            vec![VulnClass::NosqlInjection]
+        );
+    }
+
+    #[test]
+    fn multipart_parser_events_carry_request_data() {
+        let found = one("app.post('/up', (req, res) => {\n\
+               const bb = busboy({ headers: req.headers });\n\
+               bb.on('file', (name, stream, info) => {\n\
+                 stream.pipe(fs.createWriteStream(path.join(dir, info.filename)));\n\
+               });\n\
+               req.pipe(bb);\n\
+             });");
+        assert_eq!(
+            found.iter().map(|f| f.0).collect::<Vec<_>>(),
+            vec![VulnClass::PathTraversal],
+            "{found:?}"
+        );
+        // The temporary path is the parser's.
+        assert!(
+            one("app.post('/up', (req, res) => {\n\
+                   const form = new multiparty.Form();\n\
+                   form.on('file', (name, file) => { fs.remove(file.path); });\n\
+                 });")
+            .is_empty()
         );
     }
 

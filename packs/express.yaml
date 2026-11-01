@@ -21,6 +21,11 @@ routes:
   verbs: [get, post, put, patch, delete, del, head, options, all]
   factories: [express, Router, express.Router, createServer, polka, connect]
   names: [app, router, server, api, routes, route, apirouter, application, express]
+  # `api.get('/users', params).then(...)`, `await api.put(url, data)`: a client's request (a
+  # registration returns its router, not a promise).
+  promise_methods: [then, catch, finally]
+  # `api.get(url, params, (err, result) => ...)`: an error-first callback answers a request sent.
+  callback_error_params: [err, error]
 sinks:
   # A `root` option confines these (engine rule).
   # Never a browser's `chrome.downloads.download()`: browser-side sources do not reach Express.

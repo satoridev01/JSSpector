@@ -378,6 +378,15 @@ pub struct RouteSpec {
     /// Handler registrations on a property of a server: `server.middlewares.use(handler)`.
     #[serde(default)]
     pub middleware_registrations: Vec<MiddlewareRegistration>,
+    /// Methods of a promise: `api.get(url).then(...)` (or `await api.get(url)`) sends a request;
+    /// a registration returns its router, never a promise.
+    #[serde(default)]
+    pub promise_methods: Vec<String>,
+    /// First parameters of an error-first callback (`api.get(url, (err, data) => ...)`), which
+    /// answers a request sent: a route's handler takes the request first (an error handler,
+    /// four parameters).
+    #[serde(default)]
+    pub callback_error_params: Vec<String>,
 }
 
 /// `X.<via>.<method>(handler)` registers `(req, res)` handlers whose requests are `kind`.
@@ -423,6 +432,15 @@ pub struct ClientSource {
     /// The receiver must be `X.<via>` for one of these.
     #[serde(default)]
     pub via: Vec<String>,
+    /// The receiver's name or class must contain one of these (lower case):
+    /// `emailQueue.process(..)`, `q.process(..)` on a `new Queue()`, `this.mcpServer.tool(..)`;
+    /// never `posthtml().process(..)` or `bootbox.prompt(..)`.
+    #[serde(default)]
+    pub object_contains: Vec<String>,
+    /// The callee must be an export of a module of this family: BullMQ's `new Worker(..)`,
+    /// never the browser's.
+    #[serde(default)]
+    pub family: Option<String>,
     /// `callback` (default: any function argument), `last-callback`, `object-of-functions`
     /// (each function-valued property of an object argument) or `resolver-map` (an object
     /// property named like a method whose value is an object of resolver functions).
@@ -966,6 +984,8 @@ pub struct Model {
     pub mount_methods: Vec<String>,
     pub route_chain_methods: Vec<String>,
     pub route_verb_first_methods: Vec<String>,
+    pub promise_methods: Vec<String>,
+    pub callback_error_params: Vec<String>,
     pub route_prefix_keys: Vec<String>,
     pub route_prefix_methods: Vec<String>,
     pub router_factories: Vec<String>,
@@ -1215,6 +1235,9 @@ impl Model {
         self.route_chain_methods.extend(pack.routes.chain_methods);
         self.route_verb_first_methods
             .extend(pack.routes.verb_first_methods);
+        self.promise_methods.extend(pack.routes.promise_methods);
+        self.callback_error_params
+            .extend(pack.routes.callback_error_params);
         self.route_prefix_keys.extend(pack.routes.prefix_keys);
         self.route_prefix_methods.extend(pack.routes.prefix_methods);
         self.router_factories.extend(pack.routes.factories);

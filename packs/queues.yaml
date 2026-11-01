@@ -1,5 +1,10 @@
 # Job queues: job payloads are written by whoever can enqueue.
 name: queues
+modules:
+  bullmq: bullmq
 client_sources:
-  - {methods: [process], shape: last-callback, params: first, kind: queue}
-  - {methods: [Worker], shape: last-callback, params: first, kind: queue}
+  # Bull, Bee-Queue, Kue: `emailQueue.process(name?, concurrency?, async (job) => ...)`, on a
+  # receiver named or typed like a queue (`q = new Queue('emails')`, `new Bull('x')`).
+  - {methods: [process], object_contains: [queue, bull], shape: last-callback, params: first, kind: queue}
+  # BullMQ: `new Worker(name, async (job) => ...)` (not the browser's Web Worker).
+  - {methods: [Worker], family: bullmq, shape: last-callback, params: first, kind: queue}

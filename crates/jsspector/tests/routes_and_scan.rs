@@ -1820,3 +1820,135 @@ fn tools_dev_servers_pages_and_components_are_entries() {
         );
     }
 }
+
+/// A table of route modules called by a computed key from a callback (NodeBB's
+/// `_mounts[original](router, mount, ...)` over `Object.keys(mounts)`): every module's routes
+/// are registered with the run-time mount as a path parameter, a module that registers more
+/// than a few dozen routes through helpers keeps them all, and each route names its handler.
+#[test]
+fn route_tables_called_by_computed_key_are_instantiated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/routes/helpers.js",
+        "const helpers = module.exports;\n\
+         helpers.setupPageRoute = function (router, name, middlewares, controller) {\n  \
+         router.get(name, middlewares, controller);\n  \
+         router.get(`/api${name}`, middlewares, controller);\n};\n",
+    );
+    let pages: String = (0..70)
+        .map(|i| {
+            format!(
+                "  helpers.setupPageRoute(app, `/${{name}}/page{i}`, [], controllers.page{i});\n"
+            )
+        })
+        .collect();
+    write(
+        root,
+        "src/routes/admin.js",
+        &format!(
+            "const helpers = require('./helpers');\n\
+             module.exports = function (app, name, middleware, controllers) {{\n{pages}  \
+             apiRoutes(app, name, middleware, controllers);\n}};\n\
+             function apiRoutes(router, name, middleware, controllers) {{\n  \
+             router.post(`/api/${{name}}/uploadlogo`, [middleware.validateFiles], controllers.uploadLogo);\n}}\n"
+        ),
+    );
+    write(
+        root,
+        "src/routes/index.js",
+        "const express = require('express');\n\
+         const _mounts = { admin: require('./admin') };\n\
+         _mounts.topic = (app, name, middleware, controllers) => {\n  \
+         app.get(`/${name}/:tid`, controllers.topics.get);\n};\n\
+         function addRemountableRoutes(router, middleware, controllers, mounts) {\n  \
+         Object.keys(mounts).map((mount) => {\n    \
+         _mounts[mount](router, mounts[mount], middleware, controllers);\n  });\n}\n\
+         exports.reloadRoutes = function (params) {\n  \
+         const router = express.Router();\n  \
+         addRemountableRoutes(router, params.middleware, params.controllers, { admin: 'admin', topic: 'topic' });\n  \
+         params.app.use('/', router);\n};\n",
+    );
+    let routes: Vec<String> = run(&["routes", "--json", root.to_str().unwrap()])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap(),
+                r["handler"].as_str().unwrap()
+            )
+        })
+        .collect();
+    // Each route names the handler its module passed, not the table call's last argument.
+    for route in [
+        "GET /{mount}/page0 controllers.page0",
+        "GET /api/{mount}/page69 controllers.page69",
+        "POST /api/{mount}/uploadlogo controllers.uploadLogo",
+        "GET /{mount}/{tid} controllers.topics.get",
+    ] {
+        assert!(
+            routes.iter().any(|r| r == route),
+            "{route} missing from {routes:?}"
+        );
+    }
+    let pages = routes.iter().filter(|r| r.contains("}/page")).count();
+    assert_eq!(pages, 140, "{routes:?}");
+}
+
+/// Queue and MCP registrations go by their receiver: a queue's `process`, BullMQ's `Worker`, a
+/// server's `tool`. A Web Worker, `posthtml().process(..)`, `bootbox.prompt(..)` and Fluent's
+/// `bundle.addResource(..)` are no entries.
+#[test]
+fn queue_and_mcp_registrations_need_their_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/jobs.js",
+        "import { Worker } from 'bullmq';\nimport { exec } from 'child_process';\n\
+         const Queue = require('bull');\nconst emailQueue = new Queue('email');\n\
+         new Worker('reports', async (job) => { exec('make-report ' + job.data.name); });\n\
+         emailQueue.process(async (job) => { exec('mail ' + job.data.to); });\n",
+    );
+    write(
+        root,
+        "src/mcp.js",
+        "import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';\n\
+         import { exec } from 'child_process';\n\
+         const server = new McpServer({ name: 'x', version: '1' });\n\
+         server.tool('run', { cmd: {} }, async ({ cmd }) => { exec(cmd); return { content: [] }; });\n",
+    );
+    write(
+        root,
+        "public/viewer.js",
+        "const worker = new Worker(workerSrc, { type: 'module' });\n\
+         posthtml(plugins).process(content, posthtmlProcessOptions);\n\
+         bootbox.prompt('[[name]]', (name) => { document.body.innerHTML = name; });\n\
+         bundle.addResource(resource);\n",
+    );
+    let routes: Vec<String> = run(&["routes", "--json", root.to_str().unwrap()])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap(),
+                r["file"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            "MCP run src/mcp.js",
+            "QUEUE reports src/jobs.js",
+            "QUEUE {emailQueue} src/jobs.js"
+        ]
+    );
+}

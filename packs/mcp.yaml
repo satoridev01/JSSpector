@@ -7,13 +7,18 @@ modules:
 sinks:
   # new StdioClientTransport({ command, args, env }) spawns `command` with `args`.
   - {module: mcp-stdio, exports: [StdioClientTransport], class: command-injection, severity: critical, args: ["any:0"]}
+# Registrations are on a server (`server`, `mcpServer`, `this.mcp`) or a page's WebMCP context
+# (`navigator.modelContext.registerTool(tool)`): never `bootbox.prompt(..)`, `inquirer.prompt(..)`
+# or Fluent's `bundle.addResource(..)`.
 client_sources:
   # @modelcontextprotocol/sdk McpServer: server.tool(name, [description], [schema], handler)
-  - {methods: [tool, registerTool, prompt, registerPrompt, resource, registerResource], shape: last-callback, params: first, kind: mcp}
+  - {methods: [tool, registerTool, prompt, registerPrompt, resource, registerResource],
+     object_contains: [server, mcp, modelcontext], shape: last-callback, params: first, kind: mcp}
   # Low-level Server: server.setRequestHandler(CallToolRequestSchema, async (request) => ...)
-  - {methods: [setRequestHandler], shape: last-callback, params: first, kind: mcp}
+  - {methods: [setRequestHandler], object_contains: [server, mcp], shape: last-callback, params: first, kind: mcp}
   # FastMCP: server.addTool({ name, parameters, execute: async (args) => ... })
-  - {methods: [addTool, addPrompt, addResource, addResourceTemplate], shape: object-of-functions, params: first, kind: mcp}
+  - {methods: [addTool, addPrompt, addResource, addResourceTemplate], object_contains: [server, mcp],
+     shape: object-of-functions, params: first, kind: mcp}
 # Over stdio a server answers the client that launched it: its arguments are what the model chose,
 # reached only through text the model read (as with llm-tool). Served over HTTP, any client can
 # call it.

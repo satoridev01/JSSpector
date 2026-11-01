@@ -424,7 +424,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jss-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ignore",
  "rayon",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "jss-frontend"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "jss-core",
  "oxc_allocator",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "jsspector"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "globset",
@@ -1162,7 +1162,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",

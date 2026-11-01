@@ -254,6 +254,10 @@ pub struct SinkSpec {
     /// (`.find()` is a MongoDB query only where a MongoDB driver is a dependency).
     #[serde(default)]
     pub requires: Vec<String>,
+    /// `url`: the call returns the response of the URL its `url:N` rule checks, which is the
+    /// attacker's when they chose that URL's start (`await fetch(url)`).
+    #[serde(default)]
+    pub result: Option<String>,
 }
 
 /// A secondary argument rule with its own severity.
@@ -771,6 +775,12 @@ pub enum ArgRule {
     Html(usize),
     /// A tainted value that can be an object: a NoSQL query where `{ "$ne": null }` changes it.
     Object(usize),
+    /// [`Self::Object`], when the argument before it names a collection or class with a
+    /// literal or a constant: `database.find('_User', { token })`.
+    ObjectAfterName(usize),
+    /// SQL by contract (`orderByRaw`, `whereRaw`, a column type): any tainted text, built
+    /// or not, SQL-looking or not.
+    Fragment(usize),
     /// A value (or an element of an argument list) whose start the attacker chooses: an
     /// argument that can begin with `-` (argument injection).
     Start(usize),
@@ -787,6 +797,8 @@ impl ArgRule {
             "start" => Self::Start(index),
             "html" => Self::Html(index),
             "object" => Self::Object(index),
+            "object-after-name" => Self::ObjectAfterName(index),
+            "fragment" => Self::Fragment(index),
             _ => return None,
         })
     }
@@ -808,6 +820,8 @@ pub struct Sink {
     pub cleared_by: Vec<VulnClass>,
     /// See [`SinkSpec::requires`].
     pub requires: Vec<String>,
+    /// See [`SinkSpec::result`]: the call returns the response of its URL.
+    pub response: bool,
 }
 
 /// Every pack merged.
@@ -982,6 +996,7 @@ impl Model {
                 ignore_kinds: spec.ignore_kinds.clone(),
                 cleared_by: spec.cleared_by.iter().map(|c| c.class()).collect(),
                 requires: spec.requires.clone(),
+                response: spec.result.as_deref() == Some("url"),
             };
             self.sink_packages.extend(spec.requires.iter().cloned());
             if let Some(module) = &spec.module {
@@ -1092,6 +1107,7 @@ impl Model {
                     ignore_kinds: Vec::new(),
                     cleared_by: Vec::new(),
                     requires: Vec::new(),
+                    response: false,
                 },
                 tags: spec.tags,
                 setters: spec.setters,

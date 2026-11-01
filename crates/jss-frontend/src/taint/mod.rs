@@ -66,6 +66,9 @@ pub struct Origin {
     pub upload: bool,
     /// Checked not to start with `-` (`if (p.startsWith('-')) throw`): no argument injection.
     pub dash_free: bool,
+    /// The response of a request to this value's URL (`await fetch(url)`): the attacker's only
+    /// where they chose the URL's start.
+    pub response: bool,
 }
 
 /// The key under which a tracked object keeps what its fields of unknown name may hold
@@ -206,6 +209,7 @@ impl Origin {
             also: Vec::new(),
             upload: false,
             dash_free: false,
+            response: false,
         }
     }
 
@@ -1071,6 +1075,7 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
                 escaped: a.escaped & b.escaped,
                 upload: a.upload && b.upload,
                 dash_free: a.dash_free && b.dash_free,
+                response: a.response || b.response,
                 ..a
             })
         }
@@ -1316,6 +1321,35 @@ fn prototype_owner(
     Some((class.to_owned(), method))
 }
 
+/// What a helper that returns a response gives for the caller's URL `o`: the body, all of it
+/// the attacker's (and an object, for JSON). Other return summaries leave `o` as it is.
+fn response_of_value(mut o: Origin, s: &Summary) -> Origin {
+    if s.start {
+        o.object = true;
+        o.built = false;
+        o.sqlish = false;
+        o.prefix = true;
+        o.escaped = 0;
+        o.response = true;
+    }
+    o
+}
+
+/// A callee as a trace names it: `fetch`, `http-client.get`, `client.send`.
+fn callee_label(callee: &Callee) -> String {
+    match callee {
+        Callee::Global(name) => name.clone(),
+        Callee::Module { family, export } => match export.as_deref() {
+            Some(export) if !export.is_empty() => format!("{family}.{export}"),
+            _ => (*family).to_owned(),
+        },
+        Callee::Method { object, method } => match object {
+            Some(object) => format!("{object}.{method}"),
+            None => method.clone(),
+        },
+    }
+}
+
 /// `"--"`: the end of a command's options; what follows is positional.
 fn ends_options(expr: Option<&Expression<'_>>) -> bool {
     matches!(
@@ -1476,6 +1510,10 @@ fn summary_returns(
         } else {
             argument_taint(arguments, s.param, s.rest)
         };
+        // A response: only of a URL whose start the caller let the attacker choose.
+        let origin = origin
+            .filter(|o| !s.start || o.prefix)
+            .map(|o| response_of_value(o, s));
         let at = &s.at_sink;
         returned = union(
             returned,
@@ -2800,6 +2838,7 @@ impl Walker<'_> {
                                 also: Vec::new(),
                                 upload: false,
                                 dash_free: false,
+                                response: false,
                             })
                         }
                         (Some(_), _) => None,
@@ -3244,6 +3283,7 @@ impl Walker<'_> {
                     also: Vec::new(),
                     upload: false,
                     dash_free: false,
+                    response: false,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -3287,6 +3327,7 @@ impl Walker<'_> {
                     also: Vec::new(),
                     upload: false,
                     dash_free: false,
+                    response: false,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -3386,6 +3427,7 @@ impl Walker<'_> {
                         also: Vec::new(),
                         upload: false,
                         dash_free: false,
+                        response: false,
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -3600,7 +3642,9 @@ impl Walker<'_> {
                 field,
                 out_field: out_field.clone(),
                 defined_in: None,
-                start: false,
+                // The response of a request to the parameter's URL: the attacker's only where
+                // the caller let them choose that URL's start.
+                start: origin.response,
                 rest: false,
                 instance_of: None,
             });
@@ -4699,6 +4743,73 @@ impl Walker<'_> {
         self.leave();
     }
 
+    /// What a request to an attacker-chosen URL returns (`fetch(url)`, `axios.get(url)`): the
+    /// attacker's server answers, so its body is attacker data (an object, for JSON). Nothing for
+    /// a URL whose start the code fixed.
+    fn response_of(
+        &self,
+        callee: &Callee,
+        taints: &[Option<Origin>],
+        span: Span,
+    ) -> Option<Origin> {
+        let sink = match callee {
+            Callee::Module { family, export } => {
+                m().module_sink(family, export.as_deref().unwrap_or(""))
+            }
+            Callee::Global(name) => m().global_sink(name),
+            Callee::Method { .. } => None,
+        }?;
+        if !sink.response {
+            return None;
+        }
+        let index = sink.args.iter().find_map(|rule| match rule {
+            ArgRule::UrlPrefix(index) => Some(*index),
+            _ => None,
+        })?;
+        let origin = taints.get(index)?.clone()?;
+        if !origin.prefix {
+            return None;
+        }
+        let api = callee_label(callee);
+        Some(
+            Origin {
+                object: true,
+                built: false,
+                sqlish: false,
+                escaped: 0,
+                response: true,
+                ..origin
+            }
+            .step(span.start, format!("response of `{api}()`")),
+        )
+    }
+
+    /// A NoSQL query argument that JSON or qs can turn into `{ "$ne": null }`: the value itself
+    /// (`find(req.body.filter)`), or a value written in a literal query
+    /// (`find({ email: req.body.email })`).
+    fn object_query(
+        &mut self,
+        index: usize,
+        arguments: &[Argument<'_>],
+        taints: &[Option<Origin>],
+        env: &Env,
+    ) -> Option<Origin> {
+        let arg = arguments.get(index).and_then(Argument::as_expression);
+        let literal = matches!(
+            arg.map(Expression::get_inner_expression),
+            Some(Expression::ObjectExpression(_) | Expression::ArrayExpression(_))
+        );
+        let from_fields = arg
+            .filter(|_| literal)
+            .and_then(|arg| self.query_values(arg, env, 0));
+        let direct = taints
+            .get(index)
+            .cloned()
+            .flatten()
+            .filter(|o| !o.built && o.object && !literal);
+        from_fields.or(direct)
+    }
+
     /// The first value of a query written as a literal (`{ email: x }`, an aggregation
     /// pipeline `[{ $match: { type: t } }]`) that JSON or qs could turn into an operator
     /// object. Not an ORM's options (`{ where: { email } }`: its operators cannot come from
@@ -5260,6 +5371,7 @@ impl Walker<'_> {
                     .as_deref()
                     .is_some_and(|p| has(&m().upload_objects, p)),
                 dash_free: false,
+                response: false,
             });
         }
         // `this.url` in a class method: what another method stored there.
@@ -6508,6 +6620,10 @@ impl Walker<'_> {
                 };
                 // What the helper did to the value on its way out: built into a string,
                 // put after a prefix, converted to a string, escaped.
+                // A response: only of a URL whose start the caller let the attacker choose.
+                let origin = origin
+                    .filter(|o| !s.start || o.prefix)
+                    .map(|o| response_of_value(o, s));
                 let at = &s.at_sink;
                 let Some(origin) = origin.map(|mut o| {
                     o.built |= at.built;
@@ -6612,6 +6728,7 @@ impl Walker<'_> {
                             also: Vec::new(),
                             upload: false,
                             dash_free: false,
+                            response: false,
                         })
                     })
                     .collect();
@@ -6666,6 +6783,10 @@ impl Walker<'_> {
         if returned.is_some() {
             return returned;
         }
+        // `await fetch(url)` where the attacker chose the URL's start: the response is theirs.
+        if let Some(response) = self.response_of(&callee, &taints, call.span) {
+            return Some(response);
+        }
         let any_arg = || taints.iter().flatten().next().cloned();
         match &callee {
             Callee::Method { method, .. }
@@ -6707,6 +6828,7 @@ impl Walker<'_> {
                         also: Vec::new(),
                         upload: false,
                         dash_free: false,
+                        response: false,
                     });
                 }
                 // Pack result sources: `zip.getEntries()`.
@@ -8920,7 +9042,10 @@ impl Walker<'_> {
             }
             let built = at_sink.built || origin.built;
             let sqlish = at_sink.sqlish || origin.sqlish;
-            if summary.class == VulnClass::SqlInjection && !(built && sqlish) {
+            // A raw SQL fragment (`orderByRaw`) is SQL whatever the text looks like.
+            let fragment = sink_for_api(&summary.api)
+                .is_some_and(|s| s.args.iter().any(|r| matches!(r, ArgRule::Fragment(_))));
+            if summary.class == VulnClass::SqlInjection && !fragment && !(built && sqlish) {
                 continue;
             }
             if summary.class == VulnClass::Xss && !built {
@@ -9167,23 +9292,26 @@ impl Walker<'_> {
                         .flatten()
                         .filter(|o| o.built || (self.summarize && o.param.is_some())),
                 ),
-                ArgRule::Object(index) => {
-                    // `find(req.body.filter)` or `find({ email: req.body.email })`: a value that
-                    // JSON or qs can turn into `{ "$ne": null }`.
-                    let arg = arguments.get(index).and_then(Argument::as_expression);
-                    let literal = matches!(
-                        arg.map(Expression::get_inner_expression),
-                        Some(Expression::ObjectExpression(_) | Expression::ArrayExpression(_))
-                    );
-                    let from_fields = arg
-                        .filter(|_| literal)
-                        .and_then(|arg| self.query_values(arg, env, 0));
-                    let direct = taints
-                        .get(index)
-                        .cloned()
-                        .flatten()
-                        .filter(|o| !o.built && o.object && !literal);
-                    (index, from_fields.or(direct))
+                ArgRule::Object(index) => (index, self.object_query(index, arguments, taints, env)),
+                // `knex('t').orderByRaw('"t"."' + field + '"')`: text that is SQL by contract.
+                ArgRule::Fragment(index) => (index, taints.get(index).cloned().flatten()),
+                // `database.find('_User', { token })`: a data-access wrapper that takes the
+                // collection's name first.
+                ArgRule::ObjectAfterName(index) => {
+                    let named = index
+                        .checked_sub(1)
+                        .and_then(|i| arguments.get(i))
+                        .and_then(Argument::as_expression)
+                        .is_some_and(|name| {
+                            matches!(name.get_inner_expression(), Expression::StringLiteral(_))
+                                || self.resolve_text(name, env).is_some()
+                        });
+                    let origin = if named {
+                        self.object_query(index, arguments, taints, env)
+                    } else {
+                        None
+                    };
+                    (index, origin)
                 }
                 ArgRule::Built(index) => (
                     index,
@@ -10375,6 +10503,28 @@ mod tests {
         assert!(
             one("app.get('/u', (req, res) => { cache.get('user:' + req.query.id); });").is_empty()
         );
+        // Query-builder fragments are SQL by contract, keyword or not, directly or through a
+        // helper; their bindings are not.
+        for found in [
+            "app.get('/u', (req, res) => { knex('t').orderByRaw('\"t\".\"' + req.query.f + '\"'); });",
+            "app.get('/u', (req, res) => { knex('t').orderByRaw(req.query.sort); });",
+            "app.post('/u', (req, res) => { knex.schema.table('t', (table) => { table.specificType('c', `geometry(${req.body.t}, 4326)`); }); });",
+            "function order(q, f) { q.orderByRaw(f); }\napp.get('/u', (req, res) => { order(qb, req.query.f); });",
+        ] {
+            let tp = one(found);
+            assert_eq!(
+                tp.iter().map(|f| f.0).collect::<Vec<_>>(),
+                vec![VulnClass::SqlInjection],
+                "{found}"
+            );
+        }
+        for quiet in [
+            "app.get('/u', (req, res) => { knex('t').whereRaw('id = ?', [req.query.id]); });",
+            "app.get('/u', (req, res) => { _.orderBy(list, req.query.f); });",
+            "function order(q, f) { q.orderByRaw(f); }\napp.get('/u', (req, res) => { order(qb, 'created_at desc'); });",
+        ] {
+            assert!(one(quiet).is_empty(), "{quiet}: {:?}", one(quiet));
+        }
     }
 
     #[test]
@@ -10506,6 +10656,27 @@ mod tests {
             one("app.get('/u/:id', async (req, res) => { await User.findById(req.params.id); });")
                 .is_empty()
         );
+        // Wrappers that take the collection's name first; aggregation pipelines.
+        for found in [
+            "app.get('/t', async (req, res) => { await db.find('_User', { token: req.query.t }); });",
+            "app.post('/q', async (req, res) => { await database.find('_User', { $or: req.body.q }, { limit: 2 }); });",
+            "app.post('/a', async (req, res) => { await posts.aggregate([{ $match: { type: req.body.type } }]); });",
+        ] {
+            let tp = one(found);
+            assert_eq!(
+                tp.iter().map(|f| f.0).collect::<Vec<_>>(),
+                vec![VulnClass::NosqlInjection],
+                "{found}"
+            );
+        }
+        for quiet in [
+            "app.get('/t', async (req, res) => { await db.find('_User', { token: String(req.query.t) }); });",
+            "app.get('/t', async (req, res) => { await cache.find('k', { limit: 10 }); });",
+            "app.get('/t', async (req, res) => { await db.find(name, { token: req.query.t }); });",
+            "app.post('/a', async (req, res) => { await posts.aggregate([{ $match: { url: { $ne: req.body.url } } }]); });",
+        ] {
+            assert!(one(quiet).is_empty(), "{quiet}: {:?}", one(quiet));
+        }
     }
 
     #[test]
@@ -10641,6 +10812,32 @@ mod tests {
             .into_iter()
             .map(|f| (f.class, f.severity, f.api, f.origin.kind))
             .collect()
+    }
+
+    #[test]
+    fn responses_of_attacker_chosen_urls_are_attacker_data() {
+        use VulnClass::*;
+        let helper =
+            "async function doFetch(url) { const r = await fetch(url); return r.json(); }\n";
+        for found in [
+            "app.get('/a', async (req, res) => { const r = await fetch(req.query.url); const d = await r.json(); fs.writeFileSync('/x/' + d.name, ''); });",
+            "app.get('/b', async (req, res) => { const d = await doFetch(req.query.url); fs.writeFileSync('/x/' + d.name, ''); });",
+            "app.get('/c', async (req, res) => { const { data } = await axios.get(req.query.url); fs.writeFileSync('/x/' + data.name, ''); });",
+        ] {
+            let got = one(&format!("{helper}{found}"));
+            assert!(got.iter().any(|f| f.0 == PathTraversal), "{found}: {got:?}");
+        }
+        // A response from a URL whose start the code fixed is the API's, not the attacker's.
+        for quiet in [
+            "app.get('/d', async (req, res) => { const r = await fetch('https://api.github.com/x?q=' + req.query.q); exec((await r.json()).cmd); });",
+            "app.get('/e', async (req, res) => { const d = await doFetch('https://api.example.com/x?q=' + req.query.q); exec(d.cmd); });",
+        ] {
+            let got = one(&format!("{helper}{quiet}"));
+            assert!(
+                !got.iter().any(|f| f.0 == CommandInjection),
+                "{quiet}: {got:?}"
+            );
+        }
     }
 
     #[test]

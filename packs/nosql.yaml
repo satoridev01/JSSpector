@@ -5,7 +5,7 @@ sinks:
       deleteOne, deleteMany, countDocuments, findById, exists, aggregate, distinct, replaceOne]
     class: nosql-injection
     severity: high
-    args: ["object:0"]
+    args: ["object:0", "object-after-name:1"]
     # Only where a MongoDB driver (or a Meteor app's collections) is in the project: elsewhere
     # `.find()` is an ORM's or the app's own method.
     requires: [mongoose, mongodb, monk, mongojs, mongoist, "@nestjs/mongoose", "@typegoose/typegoose",

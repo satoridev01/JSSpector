@@ -1,4 +1,7 @@
 # NestJS parameter decorators that inject request data.
 name: nestjs
 request:
-  decorators: [Body, Query, Param, Headers]
+  decorators: [Body, Query, Param, Headers, Args, Req, UploadedFile, MessageBody]
+routes:
+  controller_decorators: [Controller]
+  route_decorators: [Get, Post, Put, Patch, Delete, All, Head, Options]

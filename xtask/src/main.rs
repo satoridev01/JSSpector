@@ -1,5 +1,7 @@
 //! Development tasks for JSSpector. Run with `cargo xtask <task>`.
 
+mod replay;
+
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -16,11 +18,49 @@ struct Cli {
 enum Task {
     /// Run the same checks as CI: rustfmt, clippy (warnings are errors) and the test suite.
     Ci,
+    /// Score `jsspector scan` against the verified CVE-replay pairs (fetches repositories).
+    Replay {
+        /// Where repositories are fetched (blobless, sparse; reused between runs).
+        #[arg(long, default_value = "target/replay")]
+        cache: std::path::PathBuf,
+        /// Score at most this many pairs.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Only this repository (`owner/name`).
+        #[arg(long)]
+        repo: Option<String>,
+        /// Write the JSON report here instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().task {
         Task::Ci => ci(),
+        Task::Replay {
+            cache,
+            limit,
+            repo,
+            out,
+        } => {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("workspace root")?
+                .to_path_buf();
+            let cache = if cache.is_absolute() {
+                cache
+            } else {
+                root.join(cache)
+            };
+            replay::run(&replay::Options {
+                root,
+                cache,
+                limit,
+                repo,
+                out,
+            })
+        }
     }
 }
 

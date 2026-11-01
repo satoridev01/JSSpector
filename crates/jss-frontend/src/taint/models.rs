@@ -200,6 +200,12 @@ pub struct RouteSpec {
     /// Conventional names of routers and apps (lower case; also matched as a suffix).
     #[serde(default)]
     pub names: Vec<String>,
+    /// Class decorators that make a controller with a path prefix: `@Controller('users')`.
+    #[serde(default)]
+    pub controller_decorators: Vec<String>,
+    /// Method decorators that register a route: `@Get(':id')`.
+    #[serde(default)]
+    pub route_decorators: Vec<String>,
     #[serde(default)]
     pub path_keys: Vec<String>,
 }
@@ -435,6 +441,8 @@ pub struct Model {
     pub mount_methods: Vec<String>,
     pub router_factories: Vec<String>,
     pub router_names: Vec<String>,
+    pub controller_decorators: Vec<String>,
+    pub route_decorators: Vec<String>,
     pub route_path_keys: Vec<String>,
     /// Packs that failed to load, with the reason.
     pub errors: Vec<String>,
@@ -546,6 +554,9 @@ impl Model {
         self.mount_methods.extend(pack.routes.mount_methods);
         self.router_factories.extend(pack.routes.factories);
         self.router_names.extend(pack.routes.names);
+        self.controller_decorators
+            .extend(pack.routes.controller_decorators);
+        self.route_decorators.extend(pack.routes.route_decorators);
         self.route_path_keys.extend(pack.routes.path_keys);
     }
 

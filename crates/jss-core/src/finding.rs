@@ -116,4 +116,31 @@ pub struct Finding {
     pub trace: Vec<TraceStep>,
     /// Line-independent identity: `class|file|function|sink api|source expr|ordinal`.
     pub key: String,
+    /// A short stable hash of `key` (16 hex digits), for baselines and deduplication.
+    pub fingerprint: String,
+}
+
+/// FNV-1a (64-bit) of `text`, as 16 hex digits: stable across runs, platforms and versions.
+pub fn fingerprint(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprints_are_stable() {
+        assert_eq!(fingerprint(""), "cbf29ce484222325");
+        assert_eq!(fingerprint("a"), "af63dc4c8601ec8c");
+        assert_ne!(
+            fingerprint("sql|a.js|f|db.query|req.query|0"),
+            fingerprint("sql|a.js|f|db.query|req.query|1")
+        );
+    }
 }

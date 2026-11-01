@@ -163,6 +163,9 @@ pub fn scan_file_program(
         pending_auth: Auth::NoneDetected,
         router_auth: BTreeMap::new(),
         routers: BTreeSet::new(),
+        injected: BTreeMap::new(),
+        route_templates: BTreeMap::new(),
+        record_only: false,
         modules: BTreeMap::new(),
         relative: BTreeMap::new(),
         result: ScanResult::default(),
@@ -227,6 +230,16 @@ pub struct RouteFact {
     pub kind: &'static str,
 }
 
+/// A route registered from a function's parameters, instantiated at each call.
+#[derive(Debug, Clone)]
+struct RouteTemplate {
+    receiver: Option<String>,
+    /// The method, or the index of the parameter holding it.
+    method: Result<String, usize>,
+    path_param: usize,
+    auth: Auth,
+}
+
 /// `router.use('/prefix', child)`: `child` is mounted under `prefix`.
 #[derive(Debug, Clone)]
 pub struct MountFact {
@@ -277,6 +290,12 @@ struct Env {
     inputs: BTreeMap<String, &'static str>,
     /// Authentication recognized for this function's entry point.
     auth: Auth,
+    /// This function's parameter names, in order.
+    params: Vec<String>,
+    /// Arrays of object literals (route tables): name -> rows of field -> text.
+    tables: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    /// The row a table loop variable stands for in this walk: `r` -> fields.
+    rows: BTreeMap<String, BTreeMap<String, String>>,
     /// Variables bound to an object literal: the taint of each field.
     fields: BTreeMap<String, BTreeMap<String, Origin>>,
     /// Access paths a guard validated: no longer tainted.
@@ -315,6 +334,9 @@ impl Env {
             inputs: BTreeMap::new(),
             fields: BTreeMap::new(),
             auth: Auth::NoneDetected,
+            params: Vec::new(),
+            tables: BTreeMap::new(),
+            rows: BTreeMap::new(),
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
             branch: 0,
@@ -330,6 +352,9 @@ impl Env {
             inputs: self.inputs.clone(),
             fields: self.fields.clone(),
             auth: self.auth,
+            params: Vec::new(),
+            tables: self.tables.clone(),
+            rows: self.rows.clone(),
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
             branch: 0,
@@ -418,6 +443,12 @@ struct Walker<'e> {
     router_auth: BTreeMap<String, Auth>,
     /// Variables bound to a router or app from a factory: `const router = express.Router()`.
     routers: BTreeSet<String>,
+    /// Constructor-injected fields of the class being walked: `this.users` -> `UsersService`.
+    injected: BTreeMap<String, String>,
+    /// Functions that register a route from their parameters: `add(path, handler)`.
+    route_templates: BTreeMap<String, Vec<RouteTemplate>>,
+    /// Re-walking a route-table loop for one row: record routes, emit no findings.
+    record_only: bool,
     modules: BTreeMap<String, Imported>,
     /// Local names bound to relative modules: name -> (specifier, export or None).
     relative: BTreeMap<String, (String, Option<String>)>,
@@ -457,6 +488,30 @@ fn spec_names_file(spec: &str, file: &str) -> bool {
     let stem = parts.next().unwrap_or("").split('.').next().unwrap_or("");
     let dir = parts.next().unwrap_or("");
     !last.is_empty() && (last == stem || (stem == "index" && last == dir))
+}
+
+/// The rows of an array of object literals: each field as text (a literal, or a name).
+fn table_rows(array: &oxc_ast::ast::ArrayExpression<'_>) -> Vec<BTreeMap<String, String>> {
+    let mut rows = Vec::new();
+    for element in array.elements.iter().take(200) {
+        let Some(Expression::ObjectExpression(object)) = element
+            .as_expression()
+            .map(Expression::get_inner_expression)
+        else {
+            return Vec::new();
+        };
+        let mut row = BTreeMap::new();
+        for property in &object.properties {
+            if let ObjectPropertyKind::ObjectProperty(p) = property
+                && let Some(key) = prop_name(&p.key)
+                && let Some(value) = literal_path(&p.value).or_else(|| callee_name(&p.value))
+            {
+                row.insert(key, value);
+            }
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// A route path written as a literal, or built from literals: `urljoin(base, 'api/x')`,
@@ -687,6 +742,23 @@ impl Walker<'_> {
                 self.for_left(&s.left, taint, env);
                 self.statement(&s.body, env);
                 env.branch -= 1;
+                // `for (const r of routes) router[r.method](r.path, r.handler)`: one record-only
+                // walk per known row.
+                if !self.summarize
+                    && let Expression::Identifier(table) = s.right.get_inner_expression()
+                    && let Some(rows) = env.tables.get(table.name.as_str()).cloned()
+                    && let ForStatementLeft::VariableDeclaration(d) = &s.left
+                    && let Some(BindingPattern::BindingIdentifier(var)) =
+                        d.declarations.first().map(|d| &d.id)
+                {
+                    for row in rows.into_iter().take(100) {
+                        let mut inner = env.clone();
+                        inner.rows.insert(var.name.as_str().to_owned(), row);
+                        let saved = std::mem::replace(&mut self.record_only, true);
+                        self.statement(&s.body, &mut inner);
+                        self.record_only = saved;
+                    }
+                }
             }
             Statement::ForInStatement(s) => {
                 // Keys of a tainted object are attacker-chosen too.
@@ -901,6 +973,15 @@ impl Walker<'_> {
                 BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
                 _ => None,
             };
+            // `const routes = [{ method: 'get', path: '/x', handler: list }]`
+            if let (Some(name), Expression::ArrayExpression(array)) =
+                (&name_hint, init.get_inner_expression())
+            {
+                let rows = table_rows(array);
+                if !rows.is_empty() {
+                    env.tables.insert(name.clone(), rows);
+                }
+            }
             // `const router = express.Router()`, `const app = fastify()`
             if let Some(name) = &name_hint {
                 let factory = match init.get_inner_expression() {
@@ -1085,7 +1166,79 @@ impl Walker<'_> {
                 .max()
         };
         let class_auth = guarded(&class.decorators).unwrap_or_default();
+        // NestJS-style controller prefix: `@Controller('users')`.
+        let controller_prefix = class.decorators.iter().find_map(|d| {
+            let Expression::CallExpression(call) = &d.expression else {
+                return None;
+            };
+            let name = callee_name(&call.callee)?;
+            has(&m().controller_decorators, &name).then(|| {
+                call.arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .and_then(literal_path)
+                    .unwrap_or_default()
+            })
+        });
+        // Constructor injection: `constructor(private readonly users: UsersService)`.
+        let saved_injected = std::mem::take(&mut self.injected);
         for element in &class.body.body {
+            if let ClassElement::MethodDefinition(method) = element
+                && method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+            {
+                for param in &method.value.params.items {
+                    let (BindingPattern::BindingIdentifier(id), Some(annotation)) =
+                        (&param.pattern, &param.type_annotation)
+                    else {
+                        continue;
+                    };
+                    if let oxc_ast::ast::TSType::TSTypeReference(reference) =
+                        &annotation.type_annotation
+                        && let oxc_ast::ast::TSTypeName::IdentifierReference(type_name) =
+                            &reference.type_name
+                    {
+                        self.injected.insert(
+                            id.name.as_str().to_owned(),
+                            type_name.name.as_str().to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+        for element in &class.body.body {
+            // `@Get(':id')` on a method of a controller: a route.
+            if let (Some(prefix), ClassElement::MethodDefinition(method)) =
+                (&controller_prefix, element)
+                && !self.summarize
+            {
+                for decorator in &method.decorators {
+                    let Expression::CallExpression(call) = &decorator.expression else {
+                        continue;
+                    };
+                    let Some(verb) = callee_name(&call.callee) else {
+                        continue;
+                    };
+                    if !has(&m().route_decorators, &verb) {
+                        continue;
+                    }
+                    let sub = call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(literal_path)
+                        .unwrap_or_default();
+                    let key = prop_name(&method.key).unwrap_or_default();
+                    self.facts.routes.push(RouteFact {
+                        receiver: None,
+                        method: verb.to_ascii_uppercase(),
+                        path: format!("/{}/{}", prefix.trim_matches('/'), sub.trim_matches('/')),
+                        handler: format!("{}.{key}", class_name.as_deref().unwrap_or("<class>")),
+                        span: method.span,
+                        auth: class_auth.max(guarded(&method.decorators).unwrap_or_default()),
+                        kind: "http",
+                    });
+                }
+            }
             match element {
                 ClassElement::MethodDefinition(method) => {
                     let name = prop_name(&method.key).map(|key| match &class_name {
@@ -1109,6 +1262,7 @@ impl Walker<'_> {
                 _ => {}
             }
         }
+        self.injected = saved_injected;
     }
 
     // ----- functions --------------------------------------------------------------------
@@ -1148,6 +1302,7 @@ impl Walker<'_> {
             env.requests.remove(*name);
         }
         let first = names.first().copied().flatten();
+        env.params = names.iter().map(|n| n.unwrap_or("").to_owned()).collect();
         // NestJS: `@Body() dto`, `@Query('q') q`, `@Param('id') id`, `@Headers() h`.
         for param in &params.items {
             let decorated = param.decorators.iter().any(|d| match &d.expression {
@@ -1571,12 +1726,60 @@ impl Walker<'_> {
                                             let field_name = prop_name(&f.key).map(|n| {
                                                 format!("{} {n}", name.as_deref().unwrap_or(""))
                                             });
+                                            if !self.summarize
+                                                && let Some(field_key) = prop_name(&f.key)
+                                            {
+                                                self.facts.routes.push(RouteFact {
+                                                    receiver: None,
+                                                    method: name
+                                                        .as_deref()
+                                                        .unwrap_or("")
+                                                        .to_ascii_uppercase(),
+                                                    path: field_key,
+                                                    handler: field_name.clone().unwrap_or_default(),
+                                                    span: f.span,
+                                                    auth: env.auth,
+                                                    kind: source.kind.as_str(),
+                                                });
+                                            }
                                             self.maybe_function(&f.value, env, field_name, role);
                                         }
                                     }
                                     None
                                 }
-                                _ => self.expr_named(&p.value, env, name),
+                                _ => {
+                                    // tRPC: `{ getUser: t.procedure.input(...).query(fn) }`
+                                    if !self.summarize
+                                        && let (Some(key), Expression::CallExpression(c)) =
+                                            (&name, p.value.get_inner_expression())
+                                        && let Some(method) = c
+                                            .callee
+                                            .get_inner_expression()
+                                            .as_member_expression()
+                                            .and_then(|m| m.static_property_name())
+                                            .and_then(|n| n.as_str().map(str::to_owned))
+                                        && let Some(source) = m().client_sources.iter().find(|s| {
+                                            s.params == "input"
+                                                && has(&s.methods, &method)
+                                                && s.arity.is_none_or(|a| a == c.arguments.len())
+                                        })
+                                    {
+                                        self.facts.routes.push(RouteFact {
+                                            receiver: None,
+                                            method: format!(
+                                                "{}.{}",
+                                                source.kind.to_ascii_uppercase(),
+                                                method.to_ascii_uppercase()
+                                            ),
+                                            path: key.clone(),
+                                            handler: key.clone(),
+                                            span: p.span,
+                                            auth: env.auth,
+                                            kind: source.kind.as_str(),
+                                        });
+                                    }
+                                    self.expr_named(&p.value, env, name)
+                                }
                             }
                         }
                         ObjectPropertyKind::SpreadProperty(s) => self.expr(&s.argument, env),
@@ -1997,6 +2200,12 @@ impl Walker<'_> {
                     None => {
                         let object_name = match object {
                             Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                            // `this.users.find(...)` on an injected `UsersService`.
+                            Expression::StaticMemberExpression(field)
+                                if matches!(field.object, Expression::ThisExpression(_)) =>
+                            {
+                                self.injected.get(field.property.name.as_str()).cloned()
+                            }
                             _ => None,
                         };
                         // `Buffer.from`, `JSON.parse`, `util.format` as globals.
@@ -2081,8 +2290,40 @@ impl Walker<'_> {
                 *entry = (*entry).max(level);
             }
         }
-        if !self.summarize {
-            self.record_entry(&callee, call, role, route_auth);
+        // Routes are kept from the final pass only (facts reset before it); templates from any.
+        {
+            self.record_entry(&callee, call, role, route_auth, env);
+            // `routes.forEach((r) => router[r.method](r.path, r.handler))`: one record-only
+            // walk of the callback per known row.
+            if let Callee::Method {
+                object: Some(table),
+                method,
+            } = &callee
+                && method == "forEach"
+                && let Some(rows) = env.tables.get(table).cloned()
+                && let Some(callback) = call.arguments.first().and_then(Argument::as_expression)
+            {
+                let params = match callback.get_inner_expression() {
+                    Expression::ArrowFunctionExpression(f) => Some(&f.params),
+                    Expression::FunctionExpression(f) => Some(&f.params),
+                    _ => None,
+                };
+                let var = params
+                    .and_then(|p| p.items.first())
+                    .and_then(|p| match &p.pattern {
+                        BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
+                        _ => None,
+                    });
+                if let Some(var) = var {
+                    for row in rows.into_iter().take(100) {
+                        let mut inner = env.clone();
+                        inner.rows.insert(var.clone(), row);
+                        let saved = std::mem::replace(&mut self.record_only, true);
+                        self.maybe_function(callback, &inner, None, Role::Plain);
+                        self.record_only = saved;
+                    }
+                }
+            }
         }
         let mut taints = Vec::with_capacity(call.arguments.len());
         for (index, argument) in call.arguments.iter().enumerate() {
@@ -2147,6 +2388,28 @@ impl Walker<'_> {
                             .unwrap_or_default()
                     )
                 });
+                if let (Some(route), false) = (&route, self.summarize)
+                    && let Some((verb, path)) = route.split_once(' ')
+                    && !path.is_empty()
+                {
+                    let receiver = match &callee {
+                        Callee::Method { object, .. } => object.clone(),
+                        _ => None,
+                    };
+                    self.facts.routes.push(RouteFact {
+                        receiver,
+                        method: if verb.is_empty() {
+                            "ANY".to_owned()
+                        } else {
+                            verb.to_owned()
+                        },
+                        path: path.to_owned(),
+                        handler: route.clone(),
+                        span: call.span,
+                        auth: Auth::NoneDetected,
+                        kind: "http",
+                    });
+                }
                 for property in &object.properties {
                     let ObjectPropertyKind::ObjectProperty(p) = property else {
                         continue;
@@ -2223,11 +2486,17 @@ impl Walker<'_> {
             Callee::Method {
                 object: Some(object),
                 method,
-            } if !method.is_empty() => self
-                .relative
-                .get(object)
-                .filter(|(_, export)| export.is_none())
-                .map(|(spec, _)| (spec.clone(), method.clone())),
+            } if !method.is_empty() => {
+                self.relative
+                    .get(object)
+                    .map(|(spec, export)| match export {
+                        // `import { UsersService } ...; users.find()`: the class's method.
+                        Some(class) if class != "default" => {
+                            (spec.clone(), format!("{class}.{method}"))
+                        }
+                        _ => (spec.clone(), method.clone()),
+                    })
+            }
             _ => None,
         };
         let helper = helper.or_else(|| {
@@ -2515,18 +2784,118 @@ impl Walker<'_> {
     }
 
     /// Records the entry point or mount a registration call makes.
-    fn record_entry(&mut self, callee: &Callee, call: &CallExpression<'_>, role: Role, auth: Auth) {
-        let Callee::Method { object, method } = callee else {
+    fn record_entry(
+        &mut self,
+        callee: &Callee,
+        call: &CallExpression<'_>,
+        role: Role,
+        auth: Auth,
+        env: &Env,
+    ) {
+        // A helper registered earlier: `add('/x', handler)` instantiates its route.
+        if let Callee::Global(name) = callee
+            && let Some(templates) = self.route_templates.get(name).cloned()
+        {
+            for template in templates {
+                let text = |index: usize| {
+                    call.arguments
+                        .get(index)
+                        .and_then(Argument::as_expression)
+                        .and_then(|e| self.resolve_text(e, env))
+                };
+                let (Some(path), Some(method)) = (
+                    text(template.path_param),
+                    match &template.method {
+                        Ok(method) => Some(method.clone()),
+                        Err(index) => text(*index),
+                    },
+                ) else {
+                    continue;
+                };
+                self.facts.routes.push(RouteFact {
+                    receiver: template.receiver.clone(),
+                    method: method.to_ascii_uppercase(),
+                    path,
+                    handler: format!("{name}()"),
+                    span: call.span,
+                    auth: template.auth.max(auth),
+                    kind: "http",
+                });
+            }
+            return;
+        }
+        // `router.get(...)`, or `router[r.method](...)` with the method from a table row or a
+        // parameter.
+        let computed = match call.callee.get_inner_expression() {
+            Expression::ComputedMemberExpression(c) => Some(c),
+            _ => None,
+        };
+        let (object, method, method_param) = match (callee, computed) {
+            (Callee::Method { object, method }, _) if !method.is_empty() => {
+                (object.clone(), method.clone(), None)
+            }
+            (_, Some(c)) => {
+                let object = match c.object.get_inner_expression() {
+                    Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                    _ => None,
+                };
+                match self.resolve_text(&c.expression, env) {
+                    Some(method) => (object, method, None),
+                    None => {
+                        let param = match c.expression.get_inner_expression() {
+                            Expression::Identifier(id) => {
+                                env.params.iter().position(|p| p == id.name.as_str())
+                            }
+                            _ => None,
+                        };
+                        let Some(param) = param else { return };
+                        (object, String::new(), Some(param))
+                    }
+                }
+            }
+            _ => return,
+        };
+        let role = if role == Role::Plain
+            && (has(&m().route_methods, &method) || method_param.is_some())
+            && call.arguments.len() >= 2
+        {
+            Role::Route
+        } else {
+            role
+        };
+        let first = call.arguments.first().and_then(Argument::as_expression);
+        // `function add(path, h) { router.get(path, h) }`: a template, not a route.
+        let path_param = first.and_then(|e| match e.get_inner_expression() {
+            Expression::Identifier(id) => env.params.iter().position(|p| p == id.name.as_str()),
+            _ => None,
+        });
+        if role == Role::Route
+            && env.function != "<anonymous>"
+            && env.function != "<module>"
+            && let Some(path_param) = path_param
+        {
+            self.route_templates
+                .entry(env.function.clone())
+                .or_default()
+                .push(RouteTemplate {
+                    receiver: object.clone(),
+                    method: match method_param {
+                        Some(index) => Err(index),
+                        None => Ok(method.clone()),
+                    },
+                    path_param,
+                    auth,
+                });
+            return;
+        }
+        if method_param.is_some() {
+            return;
+        }
+        let Some(path) = first.and_then(|e| self.resolve_text(e, env)) else {
             return;
         };
-        let Some(path) = call
-            .arguments
-            .first()
-            .and_then(Argument::as_expression)
-            .and_then(literal_path)
-        else {
-            return;
-        };
+        let object = &object;
+        let method = &method;
         // Only registrations on a router or app: not `$http.get('/x', config)` in a client.
         let is_router = object.as_deref().is_some_and(|o| {
             self.routers.contains(o) || {
@@ -2634,6 +3003,15 @@ impl Walker<'_> {
         })
     }
 
+    /// Text an expression stands for: a literal path, or a field of the current table row.
+    fn resolve_text(&self, expr: &Expression<'_>, env: &Env) -> Option<String> {
+        literal_path(expr).or_else(|| {
+            let key = guards::path_key(expr)?;
+            let (var, field) = key.split_once('.')?;
+            env.rows.get(var)?.get(field).cloned()
+        })
+    }
+
     /// Whether the relative import `spec` names `file`: resolved exactly when the scan root's
     /// files are known, by name otherwise (a single file scanned alone).
     fn names_file(&self, spec: &str, file: &str) -> bool {
@@ -2717,6 +3095,9 @@ impl Walker<'_> {
 
     /// Records a finding, or in the summary pass, a summary of a parameter that reaches a sink.
     fn emit(&mut self, mut finding: RawFinding, env: &Env) {
+        if self.record_only {
+            return;
+        }
         finding.auth = finding.auth.max(env.auth);
         // Reachable by admins only: one level lower.
         if finding.auth == Auth::Admin {

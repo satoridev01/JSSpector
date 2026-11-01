@@ -341,6 +341,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
         },
         trace,
         key: String::new(),
+        fingerprint: String::new(),
     }
 }
 
@@ -376,6 +377,7 @@ pub fn finalize(findings: &mut [Finding]) {
         );
         let ordinal = seen.entry(base.clone()).or_insert(0);
         finding.key = format!("{base}|{ordinal}");
+        finding.fingerprint = jss_core::finding::fingerprint(&finding.key);
         *ordinal += 1;
     }
 }

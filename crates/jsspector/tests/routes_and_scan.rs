@@ -129,3 +129,95 @@ fn scan_links_a_route_to_a_sink_two_files_away() {
     assert_eq!(findings[0]["file"], "src/routes/users.js");
     assert_eq!(findings[0]["sink"]["file"], "src/services/users.js");
 }
+
+#[test]
+fn nestjs_controllers_route_and_injected_services_are_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/users/users.controller.ts",
+        "import { Controller, Get, Query, UseGuards } from '@nestjs/common';\n\
+         import { UsersService } from './users.service';\n\
+         @Controller('users')\nexport class UsersController {\n  constructor(private readonly users: UsersService) {}\n\
+         @Get('search')\n  search(@Query('q') q: string) { return this.users.find(q); }\n\
+         @UseGuards(AuthGuard)\n  @Get(':id')\n  one(@Query('id') id: string) { return id; }\n}\n",
+    );
+    write(
+        root,
+        "src/users/users.service.ts",
+        "export class UsersService {\n  constructor(private readonly db: any) {}\n\
+         find(q: string) { return this.db.query(`SELECT * FROM users WHERE name = '${q}'`); }\n}\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<(String, String, String)> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["method"].as_str().unwrap().to_owned(),
+                r["path"].as_str().unwrap().to_owned(),
+                r["auth"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        list.contains(&("GET".into(), "/users/search".into(), "none-detected".into())),
+        "{list:?}"
+    );
+    assert!(
+        list.contains(&("GET".into(), "/users/{id}".into(), "user".into())),
+        "{list:?}"
+    );
+
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["class"], "sql-injection");
+    assert_eq!(findings[0]["sink"]["file"], "src/users/users.service.ts");
+}
+
+#[test]
+fn route_tables_helpers_fastify_graphql_and_trpc_are_inventoried() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "server.js",
+        "const express = require('express');\nconst router = express.Router();\n\
+         const routes = [\n  { method: 'get', path: '/a', handler: listA },\n  { method: 'post', path: '/b', handler: makeB },\n];\n\
+         routes.forEach((r) => router[r.method](r.path, r.handler));\n\
+         for (const r of [{ method: 'delete', path: '/c', handler: delC }]) { router[r.method](r.path, r.handler); }\n\
+         function add(path, handler) { router.put(path, handler); }\nadd('/d', putD);\n\
+         const fastify = require('fastify')();\nfastify.route({ method: 'PATCH', url: '/e', handler: async (request, reply) => 1 });\n\
+         const resolvers = { Query: { user(parent, args) { return args.id; } } };\n\
+         const appRouter = t.router({ getUser: t.procedure.input(z.string()).query(({ input }) => input) });\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for expected in [
+        "GET /a",
+        "POST /b",
+        "PUT /d",
+        "PATCH /e",
+        "QUERY user",
+        "TRPC.QUERY getUser",
+    ] {
+        assert!(
+            list.iter().any(|r| r == expected),
+            "{expected} missing from {list:?}"
+        );
+    }
+}

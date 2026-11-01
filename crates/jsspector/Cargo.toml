@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -25,3 +26,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+# The workspace is `publish = false` (nothing goes to crates.io), which hides binaries from dist.
+[package.metadata.dist]
+dist = true

@@ -1,0 +1,27 @@
+[workspace]
+members = ["cargo:."]
+
+# Releases: `dist` builds the `jsspector` binary for each target when a version tag (v0.1.0) is
+# pushed, publishes the archives and a shell installer on GitHub Releases, and pushes a Homebrew
+# formula to the tap. Check the plan locally with `dist plan`; nothing is published from here.
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# The Homebrew tap the formula is pushed to (needs the HOMEBREW_TAP_TOKEN secret).
+tap = "satoridev01/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax). CI tests Linux and macOS.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+# Changes go straight to main: no release plan on pull requests.
+pr-run-mode = "skip"

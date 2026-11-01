@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.97"            # oxc 0.156 MSRV
 license = "Apache-2.0"
 repository = "https://github.com/satoridev01/JSSpector"
+homepage = "https://github.com/satoridev01/JSSpector"
 publish = false
 
 [workspace.dependencies]
@@ -61,3 +62,8 @@ lto = "thin"
 
 [profile.dev.package."*"]
 opt-level = 2                  # optimize dependencies (oxc) in dev builds so local corpus runs stay fast
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

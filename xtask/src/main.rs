@@ -173,7 +173,10 @@ fn ci() -> Result<()> {
 }
 
 /// Engine files that must not hold framework or library knowledge.
-const ENGINE_FILES: &[&str] = &["crates/jss-frontend/src/taint/mod.rs"];
+const ENGINE_FILES: &[&str] = &[
+    "crates/jss-frontend/src/taint/mod.rs",
+    "crates/jss-frontend/src/taint/guards.rs",
+];
 
 /// Generic labels the engine may use although a pack also mentions them.
 const ENGINE_LABELS: &[&str] = &[
@@ -182,8 +185,10 @@ const ENGINE_LABELS: &[&str] = &[
     "socket",
     "param",
     "context",
-    // JavaScript itself (CommonJS).
+    // JavaScript itself (CommonJS, dynamic import).
     "exports",
+    "require",
+    "import",
     // Pack schema vocabulary.
     "all",
     "first",

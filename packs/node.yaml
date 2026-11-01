@@ -39,6 +39,8 @@ sinks:
   - {module: child_process, exports: [fork], class: path-traversal, severity: high, args: ["any:0"],
      also: [{args: ["start:1"], severity: medium}]}
   - {module: shelljs, exports: [exec], class: command-injection, severity: critical, args: ["any:0"]}
+  # A module path the attacker chooses loads and runs that code (`require(x)`, `import(x)`).
+  - {global: [require, import], class: code-injection, severity: high, args: ["any:0"]}
   - {module: execa, exports: [execaCommand, execaCommandSync, command, commandSync], class: command-injection, severity: critical, args: ["any:0"]}
   - {module: execa, exports: ["", execa, execaSync], class: command-injection, severity: high, args: ["any:0"]}
   - {module: vm, exports: [runInNewContext, runInThisContext, runInContext, compileFunction, Script], class: code-injection, severity: critical, args: ["any:0"]}
@@ -105,6 +107,16 @@ propagation:
   # Schema validation (zod, yup, joi): the result is the input, its leaves typed by the schema.
   validating_methods: [parse, safeParse, parseAsync, safeParseAsync, cast, attempt]
   validation_clean_fields: [success, error, issues]
+  # `re.exec(s)` returns parts of `s`; `s.match(re)` parts of `s`.
+  regex_methods: [exec]
+  match_methods: [match, matchAll]
+  # `Object.entries(o)`: `[key, value]` tuples.
+  entry_globals: [Object.entries]
+  # The result starts with the first argument: `path.join(root, x)` (not `path.resolve`).
+  root_joins: [path.join]
+  # `f.call(that, a)`, `f.apply(that, [a])`: `f(a)`.
+  call_methods: [call]
+  apply_methods: [apply]
   # Functions that call a function argument with the arguments after it.
   forwarders:
     - {functions: [setImmediate, queueMicrotask, process.nextTick], callback: 0, from: 1}
@@ -128,6 +140,13 @@ sanitizers:
   # ...or rejecters (true = bad), which clean their argument when they returned false.
   rejecter_words: [traversal, malicious, unsafe, invalid, dangerous, forbidden, blocked, blacklisted, denylisted, private, internal, outside]
   receiver_rejecters: [includes, match, test]
+  # `if (p.startsWith('-')) throw`: no option smuggled in as an argument.
+  leading_dash_checks: [startsWith]
+  # Function names that read as yes/no questions (lower case prefixes), their negations, and
+  # the prefixes of throwing assertions.
+  predicate_prefixes: [is, has, can, check, validate, verify, ensure, assert]
+  negations: [not, un, invalid]
+  assertion_prefixes: [assert, ensure]
   rejected_markers: ["..", "\\0", "%2e"]
   # Checks and clearing calls that are safe for some classes only (names, and words of names
   # matched as predicates). `none`: format checks that only prove a string.
@@ -146,4 +165,5 @@ severity_caps:
   cli: low
 implicit_modules: [child_process, fs, vm, path]
 module_namespaces: [promises]
-module_pass: [path.join, path.resolve, path.normalize, path.format, path.relative, util.format]
+module_pass: [path.join, path.resolve, path.normalize, path.format, path.relative, util.format,
+  path.dirname, path.parse, path.extname, path.toNamespacedPath]

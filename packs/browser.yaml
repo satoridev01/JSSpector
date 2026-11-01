@@ -6,6 +6,12 @@ client_sources:
 html_props: [innerHTML, outerHTML]
 # Objects of these classes are never DOM nodes or jQuery sets: `params.append(k, v)` is no sink.
 plain_constructors: [URLSearchParams, FormData, Headers, URL, Map, Set, WeakMap, Array, Blob, File]
+# A service worker: its `request`s are the page's own (browser-side data).
+service_worker:
+  registrations: [self.addEventListener, addEventListener]
+  events: [fetch, install, activate]
+  calls: [self.skipWaiting, self.clients.claim]
+  kind: dom
 # Calls that create a DOM node: appending it inserts that node, not markup.
 node_factories: [document.createElement, document.createElementNS, document.createTextNode,
   document.createDocumentFragment, document.importNode]

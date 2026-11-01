@@ -89,6 +89,9 @@ pub struct Pack {
     /// HTML injection, whatever its attributes hold.
     #[serde(default)]
     pub node_factories: Vec<String>,
+    /// What makes a file a service worker, whose `request`s are the page's.
+    #[serde(default)]
+    pub service_worker: Option<ServiceWorkerSpec>,
     /// Query operators whose operand is compared as a value (`{ email: { $eq: x } }`), and
     /// ORM option keys that wrap the filter (`{ where: { email } }`): not NoSQL injection points.
     #[serde(default)]
@@ -306,6 +309,9 @@ pub struct RouteSpec {
     /// Methods that take the HTTP method first: `router.route('POST', '/users', handler)`.
     #[serde(default)]
     pub verb_first_methods: Vec<String>,
+    /// HTTP method names (as `route('POST', ...)` takes them, any case).
+    #[serde(default)]
+    pub verbs: Vec<String>,
     /// Options keys that give a router (or a mounted plugin) its path prefix:
     /// `new Router({ prefix: '/api' })`, `fastify.register(users, { prefix: '/users' })`.
     #[serde(default)]
@@ -466,6 +472,43 @@ pub struct Propagation {
     /// Fields of a validation result that are no input (`r.success`, `r.error`).
     #[serde(default)]
     pub validation_clean_fields: Vec<String>,
+    /// Methods of a regular expression that return parts of their argument (`re.exec(s)`).
+    #[serde(default)]
+    pub regex_methods: Vec<String>,
+    /// String methods taking a regular expression that return parts of the receiver
+    /// (`s.match(re)`).
+    #[serde(default)]
+    pub match_methods: Vec<String>,
+    /// Globals that return `[key, value]` tuples of their argument (`Object.entries(o)`).
+    #[serde(default)]
+    pub entry_globals: Vec<String>,
+    /// Module functions whose result starts with their first argument (`path.join(root, x)`).
+    #[serde(default)]
+    pub root_joins: Vec<String>,
+    /// Function methods that call the function with the arguments after `this`
+    /// (`f.call(that, a, b)`) ...
+    #[serde(default)]
+    pub call_methods: Vec<String>,
+    /// ... or with the elements of an array (`f.apply(that, [a, b])`).
+    #[serde(default)]
+    pub apply_methods: Vec<String>,
+}
+
+/// A service worker (see [`Pack::service_worker`]): `self.addEventListener('fetch', ...)`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceWorkerSpec {
+    /// Listener registrations (`self.addEventListener`) ...
+    #[serde(default)]
+    pub registrations: Vec<String>,
+    /// ... for these events.
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// Calls only a service worker makes (`self.skipWaiting`).
+    #[serde(default)]
+    pub calls: Vec<String>,
+    /// The source kind of a `request` there.
+    pub kind: String,
 }
 
 /// A function that forwards arguments to a callback (see [`Propagation::forwarders`]).
@@ -549,6 +592,19 @@ pub struct Sanitizers {
     /// Methods that, false for a marker, clean their receiver: `p.includes('..')`.
     #[serde(default)]
     pub receiver_rejecters: Vec<String>,
+    /// Methods that, true for `-`, reject an option: `p.startsWith('-')` (no argument
+    /// injection after it).
+    #[serde(default)]
+    pub leading_dash_checks: Vec<String>,
+    /// Name prefixes that make a function a yes/no question (`isSafe`, `checkPath`).
+    #[serde(default)]
+    pub predicate_prefixes: Vec<String>,
+    /// After such a prefix, words that negate it (`isNotValid`, `isUnsafe`, `isInvalid`).
+    #[serde(default)]
+    pub negations: Vec<String>,
+    /// Prefixes of statements that throw on bad input (`assertSafe(x)`, `ensureValid(x)`).
+    #[serde(default)]
+    pub assertion_prefixes: Vec<String>,
     #[serde(default)]
     pub rejected_markers: Vec<String>,
     /// Calls that escape for one class only: `class: [calls]`.
@@ -698,6 +754,18 @@ pub struct Model {
     pub forwarders: Vec<ForwarderSpec>,
     pub validating_methods: Vec<String>,
     pub validation_clean_fields: Vec<String>,
+    pub regex_methods: Vec<String>,
+    pub match_methods: Vec<String>,
+    pub entry_globals: Vec<String>,
+    pub root_joins: Vec<String>,
+    pub call_methods: Vec<String>,
+    pub apply_methods: Vec<String>,
+    pub leading_dash_checks: Vec<String>,
+    pub predicate_prefixes: Vec<String>,
+    pub negations: Vec<String>,
+    pub assertion_prefixes: Vec<String>,
+    pub route_verbs: Vec<String>,
+    pub service_worker: ServiceWorkerSpec,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -870,6 +938,29 @@ impl Model {
             .extend(pack.propagation.validating_methods);
         self.validation_clean_fields
             .extend(pack.propagation.validation_clean_fields);
+        self.regex_methods.extend(pack.propagation.regex_methods);
+        self.match_methods.extend(pack.propagation.match_methods);
+        self.entry_globals.extend(pack.propagation.entry_globals);
+        self.root_joins.extend(pack.propagation.root_joins);
+        self.call_methods.extend(pack.propagation.call_methods);
+        self.apply_methods.extend(pack.propagation.apply_methods);
+        self.leading_dash_checks
+            .extend(pack.sanitizers.leading_dash_checks);
+        self.predicate_prefixes
+            .extend(pack.sanitizers.predicate_prefixes);
+        self.negations.extend(pack.sanitizers.negations);
+        self.assertion_prefixes
+            .extend(pack.sanitizers.assertion_prefixes);
+        self.route_verbs
+            .extend(pack.routes.verbs.iter().map(|v| v.to_ascii_lowercase()));
+        if let Some(worker) = pack.service_worker {
+            self.service_worker
+                .registrations
+                .extend(worker.registrations);
+            self.service_worker.events.extend(worker.events);
+            self.service_worker.calls.extend(worker.calls);
+            self.service_worker.kind = worker.kind;
+        }
         self.jsx_html_props.extend(pack.jsx.html_props);
         self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
         if pack.jsx.props_kind.is_some() {

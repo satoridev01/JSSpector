@@ -438,11 +438,11 @@ pub fn is_predicate(lower: &str) -> bool {
 }
 
 fn predicate_prefix(lower: &str) -> Option<&'static str> {
-    [
-        "is", "has", "can", "check", "validate", "verify", "ensure", "assert",
-    ]
-    .into_iter()
-    .find(|p| lower.starts_with(p))
+    model()
+        .predicate_prefixes
+        .iter()
+        .find(|p| lower.starts_with(p.as_str()))
+        .map(String::as_str)
 }
 
 /// The validator word a predicate name starts with after its prefix: `isvalidname` -> `valid`.
@@ -450,7 +450,11 @@ fn predicate_prefix(lower: &str) -> Option<&'static str> {
 fn predicate_word(lower: &str) -> Option<&'static str> {
     let prefix = predicate_prefix(lower)?;
     let rest = lower.get(prefix.len()..)?;
-    if rest.starts_with("not") || rest.starts_with("un") || rest.starts_with("invalid") {
+    if model()
+        .negations
+        .iter()
+        .any(|n| rest.starts_with(n.as_str()))
+    {
         return None;
     }
     if model()
@@ -503,7 +507,7 @@ fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String,
         return;
     }
     // `p.startsWith('-')` was false: no option can be smuggled in as an argument.
-    if name == "startsWith"
+    if has(&model().leading_dash_checks, &name)
         && matches!(call.arguments.first(), Some(Argument::StringLiteral(dash)) if dash.value.as_str() == Some("-"))
         && let Some(member) = callee.as_member_expression()
         && let Some(key) = path_key(member.object())
@@ -556,7 +560,10 @@ pub fn assertion(statement: &Statement<'_>, out: &mut Vec<(String, Fact)>) {
     // An assertion throws (`assertSafe(x)`, `ensureValid(x)`); a boolean whose result is
     // dropped (`validate(x);`, `isSafe(x);`) proves nothing.
     let lower = name.to_ascii_lowercase();
-    if (lower.starts_with("assert") || lower.starts_with("ensure"))
+    if model()
+        .assertion_prefixes
+        .iter()
+        .any(|p| lower.starts_with(p.as_str()))
         && (has(&model().validators, name) || predicate_word(&lower).is_some())
     {
         validator_call(call, out);

@@ -1525,10 +1525,7 @@ fn object_prop<'a, 'e>(expr: &'e Expression<'a>, names: &[&str]) -> Option<&'e E
 
 /// `GET`, `post`, `Delete`: an HTTP method name, as `router.route('POST', path, h)` takes it.
 fn is_http_verb(text: &str) -> bool {
-    matches!(
-        text.to_ascii_lowercase().as_str(),
-        "get" | "post" | "put" | "patch" | "delete" | "del" | "head" | "options" | "all"
-    )
+    has(&m().route_verbs, &text.to_ascii_lowercase())
 }
 
 /// `prefix` and `path` joined with one `/` between them (`path` alone without a prefix).
@@ -3138,11 +3135,13 @@ impl Walker<'_> {
                             "http"
                         };
                         // In a service worker, a `request` is the page's (browser-side data).
-                        let kind = if self.service_worker && kind == "http" {
-                            "dom"
-                        } else {
-                            kind
-                        };
+                        let worker_kind = m().service_worker.kind.as_str();
+                        let kind =
+                            if self.service_worker && kind == "http" && !worker_kind.is_empty() {
+                                worker_kind
+                            } else {
+                                kind
+                            };
                         env.requests.insert(first.to_owned(), kind);
                     }
                 } else if role == Role::Route
@@ -3897,7 +3896,30 @@ impl Walker<'_> {
                 None
             }
             Expression::ImportExpression(import) => {
-                self.expr(&import.source, env);
+                let taint = self.expr(&import.source, env);
+                // `import(x)`: the module a computed specifier names runs.
+                if let Some(origin) = taint
+                    && let Some(sink) = m().global_sink("import")
+                    && !has(&sink.ignore_kinds, origin.kind)
+                    && !cleared(&origin, sink.class, sink)
+                {
+                    let severity = m().cap(origin.kind, sink.severity);
+                    self.emit(
+                        RawFinding {
+                            class: sink.class,
+                            severity,
+                            api: "import".to_owned(),
+                            arg: import.source.span(),
+                            call: import.span,
+                            function: env.function.clone(),
+                            origin,
+                            ext: None,
+                            auth: Auth::NoneDetected,
+                            start: false,
+                        },
+                        env,
+                    );
+                }
                 None
             }
             Expression::JSXElement(element) => {
@@ -4710,13 +4732,15 @@ impl Walker<'_> {
         // `self.addEventListener('fetch', ...)`, `self.skipWaiting()`: a service worker.
         if !self.service_worker
             && let Some(name) = guards::path_key(&call.callee)
-            && (matches!(name.as_str(), "self.skipWaiting" | "self.clients.claim")
-                || (matches!(name.as_str(), "self.addEventListener" | "addEventListener")
-                    && matches!(call.arguments.first(),
-                        Some(Argument::StringLiteral(event))
-                            if matches!(event.value.as_str(), Some("fetch" | "install" | "activate")))))
         {
-            self.service_worker = true;
+            let worker = &m().service_worker;
+            let registers = has(&worker.registrations, &name)
+                && matches!(call.arguments.first(),
+                    Some(Argument::StringLiteral(event))
+                        if event.value.as_str().is_some_and(|e| has(&worker.events, e)));
+            if registers || has(&worker.calls, &name) {
+                self.service_worker = true;
+            }
         }
         let callee = self.callee(&call.callee);
         // Receiver taint (for pass-through methods), walking the callee once.
@@ -5679,9 +5703,7 @@ impl Walker<'_> {
                     });
                 }
                 // `v.replace(/'/g, "''")`: quotes doubled, safe inside a quoted SQL string.
-                if matches!(method.as_str(), "replace" | "replaceAll")
-                    && doubles_quotes(&call.arguments)
-                {
+                if has(&m().strip_methods, method) && doubles_quotes(&call.arguments) {
                     return receiver.map(|mut o| {
                         o.escaped |= class_bit(VulnClass::SqlInjection);
                         o.step(call.span.start, "quotes doubled".to_owned())
@@ -5689,7 +5711,7 @@ impl Walker<'_> {
                 }
                 // `/a(.*)/.exec(s)`: the match and its groups are parts of `s` (only characters
                 // an anchored allowlist admits: `/^(\d+)\.png$/` leaves nothing to attack).
-                if method == "exec"
+                if has(&m().regex_methods, method)
                     && let Some(member) = call.callee.get_inner_expression().as_member_expression()
                     && let Some(classes) = match member.object().get_inner_expression() {
                         Expression::Identifier(id) => self.regexes.get(id.name.as_str()).copied(),
@@ -5710,7 +5732,7 @@ impl Walker<'_> {
                     });
                 }
                 // `s.match(/^(\d+)$/)`: likewise.
-                if (method == "match" || method == "matchAll")
+                if has(&m().match_methods, method)
                     && let Some(regex) = call.arguments.first().and_then(Argument::as_expression)
                     && is_regex(regex)
                 {
@@ -5801,7 +5823,7 @@ impl Walker<'_> {
                     let built = has(&m().build_methods, export);
                     // `path.join(root, x)` starts with a clean `root` (unlike `path.resolve`,
                     // where an absolute `x` wins): the attacker no longer chooses the start.
-                    let fixed_start = qualified == "path.join"
+                    let fixed_start = has(&m().root_joins, &qualified)
                         && call.arguments.len() > 1
                         && taints.first().is_some_and(Option::is_none);
                     return any_arg().map(|mut o| {
@@ -6143,7 +6165,8 @@ impl Walker<'_> {
         match expr.get_inner_expression() {
             Expression::Identifier(id) => env.tuples.get(id.name.as_str()).cloned(),
             Expression::CallExpression(call)
-                if guards::path_key(&call.callee).as_deref() == Some("Object.entries") =>
+                if guards::path_key(&call.callee)
+                    .is_some_and(|callee| has(&m().entry_globals, &callee)) =>
             {
                 let object = call.arguments.first().and_then(Argument::as_expression)?;
                 let saved = std::mem::replace(&mut self.record_only, true);
@@ -6300,8 +6323,10 @@ impl Walker<'_> {
                     .and_then(|n| n.as_str())
                     .map(|n| (m, n))
             }) {
-            Some((member, "call")) => (member.object(), taints.iter().skip(1).cloned().collect()),
-            Some((member, "apply")) => {
+            Some((member, method)) if has(&m().call_methods, method) => {
+                (member.object(), taints.iter().skip(1).cloned().collect())
+            }
+            Some((member, method)) if has(&m().apply_methods, method) => {
                 let forwarded = match call
                     .arguments
                     .get(1)
@@ -8604,6 +8629,26 @@ mod tests {
         assert!(route("db.any('SELECT * FROM t WHERE a = $1', [req.query.a]);").is_empty());
         assert!(route("const v = req.query.a.replace(/'/g, \"''\"); db.query(\"SELECT * FROM t WHERE a = '\" + v + \"'\");").is_empty());
         assert!(!route("const v = req.query.a.replace(/([^'])'/, \"$1''\"); db.query(\"SELECT * FROM t WHERE a = '\" + v + \"'\");").is_empty());
+    }
+
+    #[test]
+    fn computed_module_paths_are_code_injection_and_dirname_passes() {
+        use Severity::*;
+        use VulnClass::*;
+        assert_eq!(route("require(req.query.m);"), vec![(CodeInjection, High)]);
+        assert_eq!(
+            route("await import(req.query.m);"),
+            vec![(CodeInjection, High)]
+        );
+        assert!(route("require('./' + 'x'); require.resolve(req.query.m);").is_empty());
+        assert!(
+            route("for (const n of PLUGINS) require(path.join(__dirname, 'plugins', n));")
+                .is_empty()
+        );
+        assert_eq!(
+            route("fs.mkdirSync(path.dirname(req.query.p));"),
+            vec![(PathTraversal, High)]
+        );
     }
 
     #[test]

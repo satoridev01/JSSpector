@@ -18,6 +18,7 @@ routes:
   chain_methods: [route]
   # `router.route('POST', '/users', handler)` (parse-server's PromiseRouter and the like)
   verb_first_methods: [route]
+  verbs: [get, post, put, patch, delete, del, head, options, all]
   factories: [express, Router, express.Router, createServer, polka, connect]
   names: [app, router, server, api, routes, route, apirouter, application, express]
 sinks:

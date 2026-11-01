@@ -68,6 +68,8 @@ sanitizers:
   receiver_validators: [startsWith, match]
   # A signature check returns trusted claims: jwt.verify, verifySig, verifyToken.
   result_cleaning_prefixes: [verify, unsign]
+  # ...trusted even when the function is in the repository: it checks a signature.
+  signed_words: [sig, signature, token, jwt, hmac, signed, cookie, session]
   # Predicates (isX, hasX, validateX...) named like these are validators (true = safe)...
   validator_words: [valid, safe, allowed, whitelisted, allowlisted, permitted, inside, within, uuid, numeric, alphanumeric]
   # ...or rejecters (true = bad), which clean their argument when they returned false.

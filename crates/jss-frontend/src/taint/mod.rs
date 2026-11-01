@@ -4004,11 +4004,15 @@ impl Walker<'_> {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        if returned.is_none()
-            && m()
-                .result_cleaning_prefixes
-                .iter()
-                .any(|p| last_segment.starts_with(p.as_str()))
+        if m()
+            .result_cleaning_prefixes
+            .iter()
+            .any(|p| last_segment.starts_with(p.as_str()))
+            && (returned.is_none()
+                || m()
+                    .signed_words
+                    .iter()
+                    .any(|w| last_segment.contains(w.as_str())))
         {
             return None;
         }
@@ -4063,9 +4067,23 @@ impl Walker<'_> {
                         o.step(call.span.start, format!("stripped by .{method}()"))
                     });
                 }
+                // `url.replace(/^https?:\/\/[^/]+/, 'https://proxy.example')`: the start of the
+                // value is now that literal origin.
+                let rewrites_start = has(&m().strip_methods, method)
+                    && matches!(
+                        (call.arguments.first(), call.arguments.get(1)),
+                        (Some(Argument::RegExpLiteral(regex)), Some(Argument::StringLiteral(with)))
+                            if regex.regex.pattern.text.as_str().starts_with('^')
+                                && with.value.as_str().is_some_and(guards::fixed_origin)
+                    );
                 if has(&m().pass_methods, method) {
                     let built = has(&m().build_methods, method);
-                    let taint = union(receiver, any_arg());
+                    let taint = union(receiver, any_arg()).map(|mut o| {
+                        if rewrites_start {
+                            o.prefix = false;
+                        }
+                        o
+                    });
                     return taint.map(|mut o| {
                         o.built |= built;
                         o.object = false;

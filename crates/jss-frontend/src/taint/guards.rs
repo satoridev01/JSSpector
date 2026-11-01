@@ -216,12 +216,16 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
     if let Some(member) = callee.as_member_expression()
         && let Expression::RegExpLiteral(regex) = member.object().get_inner_expression()
     {
-        if let Some(set) = anchored_allowlist(
-            regex.regex.pattern.text.as_str(),
-            &regex.regex.flags.to_string(),
-        ) && let Some(key) = first_key(call)
+        let pattern = regex.regex.pattern.text.as_str();
+        let classes = match anchored_allowlist(pattern, &regex.regex.flags.to_string()) {
+            Some(set) => mask(&set),
+            None if fixed_origin_regex(pattern) => class_bit(VulnClass::Ssrf),
+            None => 0,
+        };
+        if classes != 0
+            && let Some(key) = first_key(call)
         {
-            out.push((key, Fact::Clean(mask(&set))));
+            out.push((key, Fact::Clean(classes)));
         }
         return;
     }
@@ -238,7 +242,12 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
         } else {
             word_mask(&lower)
         };
-        let count = if listed { call.arguments.len() } else { 1 };
+        // A containment check (`isInsideDir(base, p)`) relates its arguments: all of them.
+        let count = if listed || classes != ALL {
+            call.arguments.len()
+        } else {
+            1
+        };
         for argument in call.arguments.iter().take(count) {
             let Some(key) = argument.as_expression().and_then(path_key) else {
                 continue;
@@ -285,14 +294,41 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
     }
 }
 
-/// `https://host/...`: a scheme, a host and the start of a path.
-fn fixed_origin(text: &str) -> bool {
+/// `https://host/...` (or `https://host`): a scheme and a fixed host.
+pub fn fixed_origin(text: &str) -> bool {
     text.split_once("://").is_some_and(|(scheme, rest)| {
-        !scheme.is_empty()
-            && rest
-                .split_once('/')
-                .is_some_and(|(host, _)| !host.is_empty() && !host.contains('@'))
+        let host = rest.split('/').next().unwrap_or("");
+        !scheme.is_empty() && !host.is_empty() && !host.contains('@')
     })
+}
+
+/// A regex anchored at the start with a literal scheme and host, then a path:
+/// `^https?:\/\/(?:www\.)?(?:twitter|x)\.com\/`. A value it matches goes to those hosts only.
+fn fixed_origin_regex(pattern: &str) -> bool {
+    let Some(rest) = pattern.strip_prefix('^') else {
+        return false;
+    };
+    let Some((_, after_scheme)) = rest.split_once(r":\/\/") else {
+        return false;
+    };
+    let scheme = rest.len() - after_scheme.len() - r":\/\/".len();
+    if !rest
+        .get(..scheme)
+        .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic() || c == '?'))
+    {
+        return false;
+    }
+    // The host: literal labels, escaped dots, groups of literal alternatives; up to a `\/`.
+    let Some((host, _)) = after_scheme.split_once(r"\/") else {
+        return false;
+    };
+    !host.is_empty()
+        && host.contains(r"\.")
+        && host.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '\\' | '.' | '-' | '(' | ')' | '?' | ':' | '|')
+        })
+        && !host.contains(".*")
+        && !host.contains(".+")
 }
 
 /// `isX`, `hasX`, `canX`, `checkX`...: a name that reads as a yes/no question.
@@ -787,8 +823,15 @@ mod tests {
     #[test]
     fn origins_are_fixed_only_with_a_host() {
         assert!(fixed_origin("https://api.example.com/"));
+        assert!(fixed_origin("https://fxtwitter.com"));
         assert!(!fixed_origin("http"));
         assert!(!fixed_origin("https://"));
         assert!(!fixed_origin("uploads/"));
+        assert!(fixed_origin_regex(
+            r"^https?:\/\/(?:(?:www\.|mobile\.)?(?:twitter|x)\.com)\/\w+\/status\/\d+"
+        ));
+        assert!(!fixed_origin_regex(r"^https?:\/\/"));
+        assert!(!fixed_origin_regex(r"^https?:\/\/.*\.example\.com\/"));
+        assert!(!fixed_origin_regex(r"https:\/\/api\.example\.com\/"));
     }
 }

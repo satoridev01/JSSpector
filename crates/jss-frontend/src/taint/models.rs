@@ -416,6 +416,11 @@ pub struct Sanitizers {
     /// `jwt.verify(token)`, `verifySig(cookie)`.
     #[serde(default)]
     pub result_cleaning_prefixes: Vec<String>,
+    /// Of those, names with one of these words are signature checks whose result is trusted
+    /// even when the function is ours (`verifySig(token)`); others (`verifyRequired(x)`) only
+    /// when we cannot see them.
+    #[serde(default)]
+    pub signed_words: Vec<String>,
     /// Words that make a predicate (`isX`, `hasX`, `validateX`) a validator: true means safe.
     #[serde(default)]
     pub validator_words: Vec<String>,
@@ -570,6 +575,7 @@ pub struct Model {
     pub scoped_sanitizers: BTreeMap<String, Vec<String>>,
     pub validator_words: Vec<String>,
     pub result_cleaning_prefixes: Vec<String>,
+    pub signed_words: Vec<String>,
     pub rejecter_words: Vec<String>,
     pub receiver_rejecters: Vec<String>,
     pub rejected_markers: Vec<String>,
@@ -721,6 +727,7 @@ impl Model {
         self.validator_words.extend(pack.sanitizers.validator_words);
         self.result_cleaning_prefixes
             .extend(pack.sanitizers.result_cleaning_prefixes);
+        self.signed_words.extend(pack.sanitizers.signed_words);
         self.rejecter_words.extend(pack.sanitizers.rejecter_words);
         self.receiver_rejecters
             .extend(pack.sanitizers.receiver_rejecters);

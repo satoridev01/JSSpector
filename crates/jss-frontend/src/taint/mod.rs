@@ -450,6 +450,7 @@ pub fn scan_file_program(
         call_fields: BTreeMap::new(),
         fn_tables: BTreeMap::new(),
         promised: BTreeSet::new(),
+        keyed_entries: BTreeMap::new(),
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -1109,6 +1110,9 @@ struct Walker<'e> {
     /// Calls whose result is a promise (`api.get(url).then(...)`, `await api.put(url, data)`),
     /// by span: requests a client sends, never route registrations.
     promised: BTreeSet<(u32, u32)>,
+    /// Registrations listed under an object key (`{ list: publicProcedure.query(fn) }`), by
+    /// call span: the entry they are, which also names their callback.
+    keyed_entries: BTreeMap<(u32, u32), String>,
     /// The fields each call that returns an object literal gave this walk: (call span) ->
     /// field -> taint (a field it does not list is clean).
     call_fields: BTreeMap<(u32, u32), BTreeMap<String, Origin>>,
@@ -1542,6 +1546,43 @@ fn handler_like(call: &CallExpression<'_>) -> bool {
             ) && !e.is_null()
                 && !e.is_undefined()
         })
+}
+
+/// One of `names` (a receiver's name, class or chain) contains one of `needles` (lower case).
+fn any_contains<'n>(mut names: impl Iterator<Item = &'n str>, needles: &[String]) -> bool {
+    names.any(|name| {
+        let lower = name.to_ascii_lowercase();
+        needles.iter().any(|n| lower.contains(n.as_str()))
+    })
+}
+
+/// The names a callee's receiver is built from, outermost first: `input`, `procedure`, `t` for
+/// `t.procedure.input(schema).query`; `server`, `this` for `this.server.tool`.
+fn receiver_chain(callee: &Expression<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(member) = callee.get_inner_expression().as_member_expression() else {
+        return names;
+    };
+    let mut current = member.object().get_inner_expression();
+    for _ in 0..32 {
+        match current {
+            Expression::Identifier(id) => {
+                names.push(id.name.as_str().to_owned());
+                break;
+            }
+            Expression::CallExpression(call) => current = call.callee.get_inner_expression(),
+            other => match other.as_member_expression() {
+                Some(inner) => {
+                    if let Some(name) = inner.static_property_name().and_then(|n| n.as_str()) {
+                        names.push(name.to_owned());
+                    }
+                    current = inner.object().get_inner_expression();
+                }
+                None => break,
+            },
+        }
+    }
+    names
 }
 
 /// The name of a path part known only at run time: `mount` for `mounts[mount]`, `base` for
@@ -5027,10 +5068,10 @@ impl Walker<'_> {
                                     None
                                 }
                                 _ => {
-                                    // tRPC: `{ getUser: t.procedure.input(...).query(fn) }`
-                                    if !self.summarize
-                                        && let (Some(key), Expression::CallExpression(c)) =
-                                            (&name, p.value.get_inner_expression())
+                                    // tRPC: `{ getUser: t.procedure.input(...).query(fn) }`: listed (and its
+                                    // callback named) by its key.
+                                    if let (Some(key), Expression::CallExpression(c)) =
+                                        (&name, p.value.get_inner_expression())
                                         && let Some(method) = c
                                             .callee
                                             .get_inner_expression()
@@ -5041,22 +5082,37 @@ impl Walker<'_> {
                                             s.params == "input"
                                                 && has(&s.methods, &method)
                                                 && s.arity.is_none_or(|a| a == c.arguments.len())
+                                                // On a procedure, not RTK Query's
+                                                // `builder.mutation({ query })`.
+                                                && (s.object_contains.is_empty()
+                                                    || any_contains(
+                                                        receiver_chain(&c.callee)
+                                                            .iter()
+                                                            .map(String::as_str),
+                                                        &s.object_contains,
+                                                    ))
                                         })
                                     {
-                                        self.facts.routes.push(RouteFact {
-                                            receiver: None,
-                                            receiver_file: None,
-                                            method: format!(
-                                                "{}.{}",
-                                                source.kind.to_ascii_uppercase(),
-                                                method.to_ascii_uppercase()
-                                            ),
-                                            path: key.clone(),
-                                            handler: key.clone(),
-                                            span: p.span,
-                                            auth: env.auth,
-                                            kind: source.kind.as_str(),
-                                        });
+                                        let verb = format!(
+                                            "{}.{}",
+                                            source.kind.to_ascii_uppercase(),
+                                            method.to_ascii_uppercase()
+                                        );
+                                        let entry = format!("{verb} {key}");
+                                        self.keyed_entries
+                                            .insert((c.span.start, c.span.end), entry.clone());
+                                        if !self.summarize {
+                                            self.facts.routes.push(RouteFact {
+                                                receiver: None,
+                                                receiver_file: None,
+                                                method: verb,
+                                                path: key.clone(),
+                                                handler: entry,
+                                                span: p.span,
+                                                auth: env.auth,
+                                                kind: source.kind.as_str(),
+                                            });
+                                        }
                                     }
                                     self.expr_named(&p.value, env, name)
                                 }
@@ -6405,8 +6461,13 @@ impl Walker<'_> {
         // findings in it are linked to that entry.
         let client_name = match (&role, &callee) {
             (Role::Client(kind, _), Callee::Method { object, .. }) => self
-                .client_event(&call.arguments, object.as_deref())
-                .map(|event| format!("{} {event}", kind.to_ascii_uppercase())),
+                .keyed_entries
+                .get(&(call.span.start, call.span.end))
+                .cloned()
+                .or_else(|| {
+                    self.client_event(&call.arguments, object.as_deref())
+                        .map(|event| format!("{} {event}", kind.to_ascii_uppercase()))
+                }),
             _ => None,
         };
         let last = call.arguments.len().saturating_sub(1);
@@ -7789,21 +7850,20 @@ impl Walker<'_> {
         for source in &model.client_sources {
             if !has(&source.methods, method)
                 || source.object.as_deref().is_some_and(|o| object != Some(o))
-                // The receiver's name or class: `emailQueue`, `q = new Queue('emails')`.
-                || (!source.object_contains.is_empty()
-                    && !object.is_some_and(|o| {
-                        let class = env.local_instances.get(o).or_else(|| env.instances.get(o));
-                        [Some(o), class.map(String::as_str)]
+                // The receiver's name, class or chain: `emailQueue`, `q = new Queue('emails')`,
+                // `t.procedure.input(schema).query(..)`.
+                || (!source.object_contains.is_empty() && {
+                    let class = object
+                        .and_then(|o| env.local_instances.get(o).or_else(|| env.instances.get(o)));
+                    let chain = receiver_chain(callee_expr);
+                    !any_contains(
+                        object
                             .into_iter()
-                            .flatten()
-                            .any(|name| {
-                                let lower = name.to_ascii_lowercase();
-                                source
-                                    .object_contains
-                                    .iter()
-                                    .any(|n| lower.contains(n.as_str()))
-                            })
-                    }))
+                            .chain(class.map(String::as_str))
+                            .chain(chain.iter().map(String::as_str)),
+                        &source.object_contains,
+                    )
+                })
                 || source.family.as_deref().is_some_and(|f| family != Some(f))
                 || source.event.as_deref().is_some_and(|e| event != Some(e))
                 || (!source.via.is_empty() && !via.as_deref().is_some_and(|v| has(&source.via, v)))
@@ -9072,6 +9132,13 @@ impl Walker<'_> {
         // A client source: an event, channel or schema name (`socket.on('join', ...)`,
         // `server.setRequestHandler(CallToolRequestSchema, ...)`), never the callback itself.
         if let Role::Client(kind, _) = role {
+            // Listed under its object key already (`{ list: publicProcedure.query(fn) }`).
+            if self
+                .keyed_entries
+                .contains_key(&(call.span.start, call.span.end))
+            {
+                return;
+            }
             if let Some(event) = self.client_event(&call.arguments, object.as_deref()) {
                 let handler = call
                     .arguments
@@ -11723,6 +11790,10 @@ mod tests {
         assert_eq!(trpc.len(), 1, "{trpc:?}");
         let trpc_opts = one("const r = t.procedure.query((opts) => exec('ls ' + opts.input.dir));");
         assert_eq!(trpc_opts.len(), 1, "{trpc_opts:?}");
+        // A query on anything but a procedure is none: `connection.query(...)`.
+        assert!(
+            one("const r = connection.query((opts) => exec('ls ' + opts.input.dir));").is_empty()
+        );
         let queue =
             one("queue.process('convert', async (job) => { exec('convert ' + job.data.file); });");
         assert_eq!(queue.len(), 1, "{queue:?}");

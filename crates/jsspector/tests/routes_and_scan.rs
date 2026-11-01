@@ -1899,11 +1899,12 @@ fn route_tables_called_by_computed_key_are_instantiated() {
     assert_eq!(pages, 140, "{routes:?}");
 }
 
-/// Queue and MCP registrations go by their receiver: a queue's `process`, BullMQ's `Worker`, a
-/// server's `tool`. A Web Worker, `posthtml().process(..)`, `bootbox.prompt(..)` and Fluent's
-/// `bundle.addResource(..)` are no entries.
+/// Queue, MCP and tRPC registrations go by their receiver: a queue's `process`, BullMQ's
+/// `Worker`, a server's `tool`, a procedure's `query`. A Web Worker, `posthtml().process(..)`,
+/// `bootbox.prompt(..)`, Fluent's `bundle.addResource(..)`, `connection.query(sql)` and RTK
+/// Query's `builder.mutation(..)` are no entries.
 #[test]
-fn queue_and_mcp_registrations_need_their_receiver() {
+fn queue_mcp_and_trpc_registrations_need_their_receiver() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -1930,6 +1931,13 @@ fn queue_and_mcp_registrations_need_their_receiver() {
          bootbox.prompt('[[name]]', (name) => { document.body.innerHTML = name; });\n\
          bundle.addResource(resource);\n",
     );
+    write(
+        root,
+        "src/api.ts",
+        "export const api = createApi({ endpoints: (builder) => ({ exchange: builder.mutation({ query: (body) => ({ url: '/x', body }) }) }) });\n\
+         connection.query(rawQuery);\n\
+         export const appRouter = router({ list: publicProcedure.query(() => []) });\n",
+    );
     let routes: Vec<String> = run(&["routes", "--json", root.to_str().unwrap()])
         .as_array()
         .unwrap()
@@ -1948,7 +1956,8 @@ fn queue_and_mcp_registrations_need_their_receiver() {
         vec![
             "MCP run src/mcp.js",
             "QUEUE reports src/jobs.js",
-            "QUEUE {emailQueue} src/jobs.js"
+            "QUEUE {emailQueue} src/jobs.js",
+            "TRPC.QUERY list src/api.ts"
         ]
     );
 }

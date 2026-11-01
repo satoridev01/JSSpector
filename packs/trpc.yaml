@@ -1,5 +1,8 @@
-# tRPC: `.query(({ input }) => ...)` / `.mutation(...)`; `input` is client data.
+# tRPC: `.query(({ input }) => ...)` / `.mutation(...)`; `input` is client data. Procedures are
+# built on a procedure (`publicProcedure`, `t.procedure.input(schema)`, `authedAdminProcedure`):
+# never `connection.query(sql)`, `queryRunner.query(sql)` or Strapi's `db.query(uid)`.
 name: trpc
 client_sources:
-  - {methods: [query, mutation, subscription], shape: callback, arity: 1, params: input, kind: trpc}
+  - {methods: [query, mutation, subscription], object_contains: [procedure], shape: callback, arity: 1, params: input,
+     kind: trpc}
 input_fields: [input]

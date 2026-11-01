@@ -432,9 +432,10 @@ pub struct ClientSource {
     /// The receiver must be `X.<via>` for one of these.
     #[serde(default)]
     pub via: Vec<String>,
-    /// The receiver's name or class must contain one of these (lower case):
-    /// `emailQueue.process(..)`, `q.process(..)` on a `new Queue()`, `this.mcpServer.tool(..)`;
-    /// never `posthtml().process(..)` or `bootbox.prompt(..)`.
+    /// The receiver's name, class or chain must contain one of these (lower case):
+    /// `emailQueue.process(..)`, `q.process(..)` on a `new Queue()`, `this.mcpServer.tool(..)`,
+    /// `t.procedure.input(schema).query(..)`; never `posthtml().process(..)`,
+    /// `bootbox.prompt(..)` or `connection.query(sql)`.
     #[serde(default)]
     pub object_contains: Vec<String>,
     /// The callee must be an export of a module of this family: BullMQ's `new Worker(..)`,

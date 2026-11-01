@@ -73,7 +73,7 @@ sanitizers:
   receiver_rejecters: [includes, match, test]
   rejected_markers: ["..", "\\0", "%2e"]
   escapers:
-    sql-injection: [escape, escapeId, format, mysql.escape, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
+    sql-injection: [escape, escapeId, mysql.escape, mysql.format, SqlString.format, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
     xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss]
     command-injection: [quote, shellescape, shellEscape, escapeShellArg]
 member_sources:

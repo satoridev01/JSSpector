@@ -54,6 +54,14 @@ pub struct Origin {
     pub param: Option<usize>,
     /// Can be an object (JSON body, qs query, socket payload), not only a string.
     pub object: bool,
+    /// Escaped for these classes (bit [`class_bit`]) by an escaper from the packs: an HTML
+    /// escaper makes a value safe in HTML, not in a shell command.
+    pub escaped: u8,
+}
+
+/// The bit of `class` in [`Origin::escaped`].
+fn class_bit(class: VulnClass) -> u8 {
+    1 << (class as u8)
 }
 
 /// The `param` of a return summary whose value is client data, whatever the arguments.
@@ -75,6 +83,7 @@ impl Origin {
             built: false,
             prefix: true,
             sqlish: false,
+            escaped: 0,
             param: None,
             object: true,
         }
@@ -384,6 +393,9 @@ struct Env {
     clean: BTreeSet<String>,
     /// Access paths a guard proved scalar: never an object.
     scalars: BTreeSet<String>,
+    /// Names bound to `new C()` of a class whose objects hold no HTML (`URLSearchParams`):
+    /// method sinks such as `.append()` do not apply to them.
+    plain: BTreeSet<String>,
     /// Inside a branch or loop: assignments only add taint.
     branch: u32,
     function: String,
@@ -421,6 +433,7 @@ impl Env {
             rows: BTreeMap::new(),
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
+            plain: BTreeSet::new(),
             branch: 0,
             function,
         }
@@ -439,6 +452,7 @@ impl Env {
             rows: self.rows.clone(),
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
+            plain: self.plain.clone(),
             branch: 0,
             function,
         }
@@ -561,10 +575,47 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
         (Some(a), Some(b)) => Some(Origin {
             built: a.built || b.built,
             sqlish: a.sqlish || b.sqlish,
+            // Escaped only if every part is.
+            escaped: a.escaped & b.escaped,
             ..a
         }),
         (a, b) => a.or(b),
     }
+}
+
+/// The classes a call escapes for, from the packs' escapers: `escapeHtml`, `mysql.escape`, a
+/// method `.escape()` on any receiver, `he.encode`.
+fn escaper_classes(callee: &Callee) -> u8 {
+    let names: Vec<String> = match callee {
+        Callee::Global(name) => vec![name.clone()],
+        Callee::Method { object, method } => {
+            let mut names = vec![method.clone()];
+            if let Some(object) = object {
+                names.push(format!("{object}.{method}"));
+            }
+            names
+        }
+        Callee::Module { family, export } => match export.as_deref() {
+            Some(export) if !export.is_empty() => {
+                vec![export.to_owned(), format!("{family}.{export}")]
+            }
+            _ => vec![(*family).to_owned()],
+        },
+    };
+    let model = m();
+    [
+        VulnClass::CommandInjection,
+        VulnClass::CodeInjection,
+        VulnClass::SqlInjection,
+        VulnClass::NosqlInjection,
+        VulnClass::PathTraversal,
+        VulnClass::Ssrf,
+        VulnClass::Xss,
+        VulnClass::PrototypePollution,
+    ]
+    .into_iter()
+    .filter(|class| names.iter().any(|name| model.escapes(*class, name)))
+    .fold(0, |bits, class| bits | class_bit(class))
 }
 
 fn contains(list: &[&str], name: &str) -> bool {
@@ -1199,6 +1250,18 @@ impl Walker<'_> {
                 }) {
                     self.routers.insert(name.clone());
                 }
+                // `const params = new URLSearchParams()`: never a DOM node or jQuery set.
+                let plain = match init.get_inner_expression() {
+                    Expression::NewExpression(n) => {
+                        callee_name(&n.callee).is_some_and(|c| has(&m().plain_constructors, &c))
+                    }
+                    _ => false,
+                };
+                if plain {
+                    env.plain.insert(name.clone());
+                } else {
+                    env.plain.remove(name);
+                }
             }
             self.last_returned_fields = None;
             let taint = self.expr_named(init, env, name_hint.clone());
@@ -1356,6 +1419,7 @@ impl Walker<'_> {
                                 built: false,
                                 prefix: true,
                                 sqlish: false,
+                                escaped: 0,
                                 param: None,
                                 object: true,
                             })
@@ -1634,6 +1698,7 @@ impl Walker<'_> {
                     built: false,
                     prefix: true,
                     sqlish: false,
+                    escaped: 0,
                     param: None,
                     object: true,
                 };
@@ -1667,6 +1732,7 @@ impl Walker<'_> {
                     built: false,
                     prefix: true,
                     sqlish: false,
+                    escaped: 0,
                     param: Some(index),
                     object: true,
                 };
@@ -1714,6 +1780,7 @@ impl Walker<'_> {
                         built: false,
                         prefix: true,
                         sqlish: false,
+                        escaped: 0,
                         param: None,
                         object: true,
                     };
@@ -2573,6 +2640,7 @@ impl Walker<'_> {
                 built: false,
                 prefix: true,
                 sqlish: false,
+                escaped: 0,
                 param: None,
                 object: property
                     .as_deref()
@@ -3071,6 +3139,11 @@ impl Walker<'_> {
                 object: Some(object),
                 method,
             } if self.own_function_followed(object, method) => None,
+            // `params.append(k, v)` on a `new URLSearchParams()`.
+            Callee::Method {
+                object: Some(object),
+                ..
+            } if env.plain.contains(object) => None,
             Callee::Method { method, .. } => {
                 // `document.write(...)` before any `write(...)`.
                 let qualified = call
@@ -3179,9 +3252,17 @@ impl Walker<'_> {
                         None => arg,
                     }
                 };
-                let Some(origin) =
-                    origin.map(|o| o.step(call.span.start, format!("returned by `{name}()`")))
-                else {
+                // What the helper did to the value on its way out: built into a string,
+                // put after a prefix, converted to a string, escaped.
+                let at = &s.at_sink;
+                let Some(origin) = origin.map(|mut o| {
+                    o.built |= at.built;
+                    o.sqlish |= at.sqlish;
+                    o.prefix &= at.prefix;
+                    o.object &= at.object;
+                    o.escaped |= at.escaped;
+                    o.step(call.span.start, format!("returned by `{name}()`"))
+                }) else {
                     continue;
                 };
                 if let Some(field) = &s.out_field {
@@ -3241,6 +3322,7 @@ impl Walker<'_> {
                             built: false,
                             prefix: true,
                             sqlish: false,
+                            escaped: 0,
                             param: None,
                             object: true,
                         })
@@ -3265,6 +3347,16 @@ impl Walker<'_> {
         {
             return None;
         }
+        // A helper named like an escaper from the packs (`function escapeHtml(s) {...}`): what it
+        // returns is safe for that class only, though its return summary passes the value on.
+        // (A library escaper has no summary: its result is not followed at all.)
+        let escaped = escaper_classes(&callee);
+        if escaped != 0
+            && let Some(mut origin) = returned.clone()
+        {
+            origin.escaped |= escaped;
+            return Some(origin.step(call.span.start, format!("escaped by `{callee_text}()`")));
+        }
         if returned.is_some() {
             return returned;
         }
@@ -3284,6 +3376,7 @@ impl Walker<'_> {
                         built: false,
                         prefix: true,
                         sqlish: false,
+                        escaped: 0,
                         param: None,
                         object: true,
                     });
@@ -4111,7 +4204,8 @@ impl Walker<'_> {
 
     /// Records a finding, or in the summary pass, a summary of a parameter that reaches a sink.
     fn emit(&mut self, mut finding: RawFinding, env: &Env) {
-        if self.record_only {
+        // Escaped for this class on the way (every sink kind ends here).
+        if self.record_only || finding.origin.escaped & class_bit(finding.class) != 0 {
             return;
         }
         finding.auth = finding.auth.max(env.auth);
@@ -4299,7 +4393,8 @@ impl Walker<'_> {
                     }
                 };
             let Some(origin) = origin else { continue };
-            if has(&sink.ignore_kinds, origin.kind) {
+            if has(&sink.ignore_kinds, origin.kind) || origin.escaped & class_bit(sink.class) != 0 {
+                // Another rule of the group may still match an unescaped argument.
                 continue;
             }
             // The CLI is the user's own machine: never above low.
@@ -4981,6 +5076,78 @@ mod tests {
             "server.addTool({ name: 'read', execute: async (args) => fs.readFileSync(args.file) });",
         );
         assert_eq!(fastmcp.len(), 1, "{fastmcp:?}");
+    }
+
+    #[test]
+    fn a_local_escaper_makes_values_safe_for_its_class_only() {
+        let classes =
+            |body: &str| -> Vec<VulnClass> { one(body).into_iter().map(|f| f.0).collect() };
+        let helper = "function escapeHtml(s) { return String(s).replace(/</g, '&lt;'); }\n";
+        assert!(
+            classes(&format!(
+                "{helper}app.get('/p', (req, res) => {{ document.body.innerHTML = '<b>' + escapeHtml(req.query.n); }});"
+            ))
+            .is_empty()
+        );
+        // Escaped for HTML is not escaped for a shell.
+        assert_eq!(
+            classes(&format!(
+                "{helper}app.get('/p', (req, res) => {{ exec('echo ' + escapeHtml(req.query.n)); }});"
+            )),
+            vec![VulnClass::CommandInjection]
+        );
+        // A helper that is no escaper still passes the value on.
+        assert_eq!(
+            classes(
+                "function bold(s) { return '<b>' + s; }\n\
+                 app.get('/p', (req, res) => { document.body.innerHTML = bold(req.query.n); });"
+            ),
+            vec![VulnClass::Xss]
+        );
+    }
+
+    #[test]
+    fn method_sinks_skip_objects_that_hold_no_html() {
+        assert!(
+            one(
+                "app.get('/p', (req, res) => { const out = new URLSearchParams(); \
+                 out.append('q', '<b>' + req.query.n); res.json(out.toString()); });"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            one("app.get('/p', (req, res) => { const out = $('#list'); \
+                 out.append('<b>' + req.query.n); });")
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn return_summaries_keep_what_the_helper_did() {
+        // The helper puts a fixed base before the value: no attacker-chosen host.
+        assert!(
+            one(
+                "function apiUrl(p) { return 'https://api.example.com/items/' + p; }\n\
+                 app.get('/p', async (req, res) => { await axios.get(apiUrl(req.query.id)); });"
+            )
+            .is_empty()
+        );
+        // The helper builds SQL text around the value.
+        let sql = one("function byTable(t) { return 'SELECT * FROM ' + t; }\n\
+             app.get('/p', (req, res) => { db.query(byTable(req.query.t)); });");
+        assert_eq!(
+            sql.iter().map(|f| f.0).collect::<Vec<_>>(),
+            vec![VulnClass::SqlInjection],
+            "{sql:?}"
+        );
+        // A plain pass-through helper changes nothing.
+        assert_eq!(
+            one("function id(u) { return u; }\n\
+                 app.get('/p', async (req, res) => { await axios.get(id(req.query.u)); });")
+            .len(),
+            1
+        );
     }
 
     #[test]

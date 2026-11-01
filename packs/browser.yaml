@@ -4,6 +4,8 @@ client_sources:
   - {methods: [addEventListener], event: message, params: first, kind: postmessage}
   - {methods: [addListener], via: [onMessage, onMessageExternal, onConnectExternal], params: first, kind: ext-message}
 html_props: [innerHTML, outerHTML]
+# Objects of these classes are never DOM nodes or jQuery sets: `params.append(k, v)` is no sink.
+plain_constructors: [URLSearchParams, FormData, Headers, URL, Map, Set, WeakMap, Array, Blob, File]
 sinks:
   - {methods: [insertAdjacentHTML], class: xss, severity: high, args: ["any:1"]}
   - {methods: [html, append, prepend, after, before, replaceWith, writeln], class: xss, severity: high, args: ["html:0"]}

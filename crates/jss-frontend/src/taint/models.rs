@@ -77,6 +77,10 @@ pub struct Pack {
     pub sanitizers: Sanitizers,
     #[serde(default)]
     pub html_props: Vec<String>,
+    /// Classes whose objects hold no HTML and are no DOM node: method sinks (`append`, `html`)
+    /// do not apply to `new C()` of them.
+    #[serde(default)]
+    pub plain_constructors: Vec<String>,
     #[serde(default)]
     pub sql_keywords: Vec<String>,
     /// Member reads that are client data: `process.argv`.
@@ -529,6 +533,7 @@ pub struct Model {
     pub rejected_markers: Vec<String>,
     pub escapers: BTreeMap<String, Vec<String>>,
     pub html_props: Vec<String>,
+    pub plain_constructors: Vec<String>,
     pub sql_keywords: Vec<String>,
     pub sub_objects: Vec<String>,
     pub upload_objects: Vec<String>,
@@ -673,6 +678,7 @@ impl Model {
             self.escapers.entry(class).or_default().extend(calls);
         }
         self.html_props.extend(pack.html_props);
+        self.plain_constructors.extend(pack.plain_constructors);
         self.sql_keywords.extend(pack.sql_keywords);
         self.sub_objects.extend(r.sub_objects);
         self.upload_objects.extend(r.upload_objects);

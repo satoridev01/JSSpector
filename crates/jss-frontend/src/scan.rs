@@ -14,7 +14,7 @@ use crate::parse::{parse_options, source_type, typed_fallbacks};
 use crate::process::{
     ParseFailure, ParsePool, guarded, on_parser_stack, read_capped, template_tag,
 };
-use crate::taint::{self, RawFinding};
+use crate::taint::{self, ExtSink, RawFinding, Summaries};
 
 /// What happened to one scanned file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,22 +34,62 @@ pub struct ScanReport {
     /// The walker hit its depth cap somewhere in the file.
     pub truncated: bool,
     pub findings: Vec<Finding>,
+    /// This file's functions whose parameters reach a sink, located for other files.
+    summaries: Summaries,
 }
 
 impl ParsePool {
     /// Scans every file of a class in `selection`, in parallel. Reports come back in input
     /// order; files that are not scanned have no report.
+    ///
+    /// Two passes: the first collects every file's helper summaries, the second scans with
+    /// them, so a call into another file's function reaches its sinks. Functions are linked by
+    /// name, and only names that are unique in the scan root are used.
     pub fn scan(&self, files: &[SourceFile], selection: ClassSet) -> Vec<ScanReport> {
-        self.install(|| {
-            files
-                .par_iter()
-                .filter_map(|file| match guarded(|| scan_file(file, selection)) {
-                    Ok(report) => report,
-                    Err(panic) => Some(report(file, ScanStatus::Panicked(panic))),
-                })
-                .collect()
-        })
+        let run = |external: &Summaries| -> Vec<ScanReport> {
+            self.install(|| {
+                files
+                    .par_iter()
+                    .filter_map(
+                        |file| match guarded(|| scan_file(file, selection, external)) {
+                            Ok(report) => report,
+                            Err(panic) => Some(report(file, ScanStatus::Panicked(panic))),
+                        },
+                    )
+                    .collect()
+            })
+        };
+        let first = run(&Summaries::new());
+        let external = merge(first);
+        if external.is_empty() {
+            return run(&external);
+        }
+        run(&external)
     }
+}
+
+/// Merges per-file summaries, dropping any name defined in more than one file.
+fn merge(reports: Vec<ScanReport>) -> Summaries {
+    let mut merged = Summaries::new();
+    let mut owner: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for report in reports {
+        for (name, list) in report.summaries {
+            match owner.get(&name) {
+                Some(file) if *file != report.rel_path => {
+                    ambiguous.insert(name);
+                }
+                _ => {
+                    owner.insert(name.clone(), report.rel_path.clone());
+                    merged.entry(name).or_default().extend(list);
+                }
+            }
+        }
+    }
+    for name in ambiguous {
+        merged.remove(&name);
+    }
+    merged
 }
 
 fn report(file: &SourceFile, status: ScanStatus) -> ScanReport {
@@ -58,10 +98,11 @@ fn report(file: &SourceFile, status: ScanStatus) -> ScanReport {
         status,
         truncated: false,
         findings: Vec::new(),
+        summaries: Summaries::new(),
     }
 }
 
-fn scan_file(file: &SourceFile, selection: ClassSet) -> Option<ScanReport> {
+fn scan_file(file: &SourceFile, selection: ClassSet, external: &Summaries) -> Option<ScanReport> {
     if !matches!(file.work(selection), Work::Parse) {
         return None;
     }
@@ -84,13 +125,14 @@ fn scan_file(file: &SourceFile, selection: ClassSet) -> Option<ScanReport> {
         Ok(text) => text,
         Err(skip) => return Some(report(file, ScanStatus::Skipped(skip.message))),
     };
-    let outcome = on_parser_stack(text, |allocator| scan_text(allocator, file, text));
+    let outcome = on_parser_stack(text, |allocator| scan_text(allocator, file, text, external));
     Some(match outcome {
-        Ok(Ok((findings, truncated))) => ScanReport {
+        Ok(Ok((findings, truncated, summaries))) => ScanReport {
             rel_path: file.rel_path.clone(),
             status: ScanStatus::Scanned,
             truncated,
             findings,
+            summaries,
         },
         Ok(Err(reason)) => report(file, ScanStatus::Skipped(reason)),
         Err(ParseFailure::Panicked(panic)) => report(file, ScanStatus::Panicked(panic)),
@@ -107,7 +149,8 @@ fn scan_text(
     allocator: &Allocator,
     file: &SourceFile,
     text: &str,
-) -> Result<(Vec<Finding>, bool), String> {
+    external: &Summaries,
+) -> Result<(Vec<Finding>, bool, Summaries), String> {
     let primary = source_type(file.kind, file.package_type);
     let mut candidates = vec![primary];
     if let Some(fallbacks) = typed_fallbacks(file.kind, file.package_type) {
@@ -142,14 +185,34 @@ fn scan_text(
             }
             continue;
         }
-        let result = taint::scan_program(&ret.program, text);
+        let result = taint::scan_program_with(&ret.program, text, external);
         let index = LineIndex::new(text);
         let findings = result
             .findings
             .iter()
             .map(|raw| to_finding(raw, &file.rel_path, text, &index))
             .collect();
-        return Ok((findings, result.truncated));
+        let mut summaries = result.summaries;
+        for summary in summaries.values_mut().flatten() {
+            if summary.ext.is_none() {
+                let at = index.line_col(summary.call.start);
+                summary.ext = Some(ExtSink {
+                    file: file.rel_path.clone(),
+                    line: at.line,
+                    col: at.column,
+                    arg: snippet(text, summary.arg),
+                    steps: summary
+                        .steps
+                        .iter()
+                        .map(|(offset, note)| {
+                            let step = index.line_col(*offset);
+                            format!("{}:{}: {note}", file.rel_path, step.line)
+                        })
+                        .collect(),
+                });
+            }
+        }
+        return Ok((findings, result.truncated, summaries));
     }
     Err(format!(
         "fatal syntax error: {}",
@@ -176,14 +239,45 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
     let source_at = at(raw.origin.span.start);
     let sink_at = at(raw.call.start);
     let source_expr = snippet(text, raw.origin.span);
-    Finding {
-        file: file.to_owned(),
-        sink: SinkLoc {
+    let sink = match &raw.ext {
+        Some(ext) => SinkLoc {
+            file: Some(ext.file.clone()),
+            api: raw.api.clone(),
+            arg: ext.arg.clone(),
+            line: ext.line,
+            col: ext.col,
+        },
+        None => SinkLoc {
+            file: None,
             api: raw.api.clone(),
             arg: snippet(text, raw.arg),
             line: sink_at.line,
             col: sink_at.column,
         },
+    };
+    let mut trace: Vec<TraceStep> = raw
+        .origin
+        .steps
+        .iter()
+        .map(|(offset, note)| {
+            let step = at(*offset);
+            TraceStep {
+                line: step.line,
+                col: step.column,
+                note: note.clone(),
+            }
+        })
+        .collect();
+    if let Some(ext) = &raw.ext {
+        trace.extend(ext.steps.iter().map(|note| TraceStep {
+            line: 0,
+            col: 0,
+            note: note.clone(),
+        }));
+    }
+    Finding {
+        file: file.to_owned(),
+        sink,
         class: raw.class,
         severity: raw.severity,
         confidence: "heuristic",
@@ -195,19 +289,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
             line: source_at.line,
             col: source_at.column,
         },
-        trace: raw
-            .origin
-            .steps
-            .iter()
-            .map(|(offset, note)| {
-                let step = at(*offset);
-                TraceStep {
-                    line: step.line,
-                    col: step.column,
-                    note: note.clone(),
-                }
-            })
-            .collect(),
+        trace,
         key: String::new(),
     }
 }

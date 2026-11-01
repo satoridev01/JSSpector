@@ -62,6 +62,9 @@ pub const REQUEST_METHODS: &[&str] = &[
 /// Conventional names of a handler's request parameter.
 pub const REQUEST_NAMES: &[&str] = &["req", "request"];
 
+/// NestJS parameter decorators that inject request data.
+pub const NEST_PARAM_DECORATORS: &[&str] = &["Body", "Query", "Param", "Headers"];
+
 /// Methods that register a route handler: `app.post('/x', handler)`.
 pub const ROUTE_METHODS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "del", "all", "use", "options", "head", "route",
@@ -166,7 +169,13 @@ pub enum ArgRule {
     /// The argument at this index is a URL whose start (scheme and host) is tainted, or an
     /// options object whose url/host is.
     UrlPrefix(usize),
+    /// The argument at this index is tainted and was built (string HTML), not a bare value
+    /// (jQuery `.append(node)` with an element is common and safe).
+    Html(usize),
 }
+
+/// Properties whose assignment parses HTML.
+pub const HTML_PROPS: &[&str] = &["innerHTML", "outerHTML"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct Sink {
@@ -183,9 +192,9 @@ const fn sink(class: VulnClass, severity: Severity, args: &'static [ArgRule]) ->
     }
 }
 
-use ArgRule::{Any, Built, UrlPrefix};
+use ArgRule::{Any, Built, Html, UrlPrefix};
 use Severity::{Critical, High};
-use VulnClass::{CodeInjection, CommandInjection, PathTraversal, SqlInjection, Ssrf};
+use VulnClass::{CodeInjection, CommandInjection, PathTraversal, SqlInjection, Ssrf, Xss};
 
 /// A function exported by a module family: `(family, export)`. An empty export is the module
 /// itself called as a function (`axios(url)`).
@@ -209,7 +218,8 @@ pub fn module_sink(family: &str, export: &str) -> Option<Sink> {
             | "appendFileSync" | "createReadStream" | "createWriteStream" | "unlink" | "unlinkSync"
             | "rm" | "rmSync" | "rmdir" | "rmdirSync" | "readdir" | "readdirSync" | "open"
             | "openSync" | "outputFile" | "outputFileSync" | "remove" | "removeSync" | "readJson"
-            | "readJsonSync" | "writeJson" | "writeJsonSync",
+            | "readJsonSync" | "writeJson" | "writeJsonSync" | "mkdir" | "mkdirSync" | "ensureDir"
+            | "ensureDirSync" | "mkdirp" | "mkdirs",
         ) => sink(PathTraversal, High, &[Any(0)]),
         (
             "fs",
@@ -240,6 +250,13 @@ pub fn method_sink(method: &str) -> Option<Sink> {
         "query" | "execute" | "raw" | "whereRaw" | "orderByRaw" | "havingRaw" | "joinRaw"
         | "$queryRawUnsafe" | "$executeRawUnsafe" | "unsafe" | "exec" | "all" | "run" | "get"
         | "prepare" | "each" => sink(SqlInjection, High, &[Built(0)]),
+        // HTML sinks (DOM and jQuery).
+        "insertAdjacentHTML" => sink(Xss, High, &[Any(1)]),
+        "html" | "append" | "prepend" | "after" | "before" | "replaceWith" | "writeln" => {
+            sink(Xss, High, &[Html(0)])
+        }
+        // Electron: a URL the attacker controls opens any registered protocol handler.
+        "openExternal" => sink(CommandInjection, High, &[UrlPrefix(0)]),
         // A `root` option makes these safe; the walker checks for it.
         "sendFile" | "download" => sink(PathTraversal, High, &[Any(0)]),
         _ => return None,

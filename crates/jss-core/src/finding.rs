@@ -14,6 +14,8 @@ pub enum VulnClass {
     SqlInjection,
     PathTraversal,
     Ssrf,
+    Xss,
+    PrototypePollution,
 }
 
 impl VulnClass {
@@ -24,6 +26,8 @@ impl VulnClass {
             Self::SqlInjection => "sql-injection",
             Self::PathTraversal => "path-traversal",
             Self::Ssrf => "ssrf",
+            Self::Xss => "xss",
+            Self::PrototypePollution => "prototype-pollution",
         }
     }
 }
@@ -52,6 +56,9 @@ pub struct SourceLoc {
 /// The dangerous call.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct SinkLoc {
+    /// Set when the sink is in another file than the finding's source (repo-wide link).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     pub api: String,
     /// Source text of the tainted argument (truncated).
     pub arg: String,

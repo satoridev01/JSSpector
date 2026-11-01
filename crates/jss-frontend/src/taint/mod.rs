@@ -12,7 +12,7 @@
 
 pub mod models;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jss_core::{Severity, VulnClass};
 use oxc_ast::ast::{
@@ -67,20 +67,45 @@ pub struct RawFinding {
     pub call: Span,
     pub function: String,
     pub origin: Origin,
+    /// The sink is in another file (reached through a repo-wide summary).
+    pub ext: Option<ExtSink>,
 }
+
+/// A sink in another file, already resolved to a location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtSink {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+    pub arg: String,
+    /// The helper's own steps, as text.
+    pub steps: Vec<String>,
+}
+
+/// Repo-wide summaries: function name -> parameters that reach a sink.
+pub type Summaries = BTreeMap<String, Vec<Summary>>;
 
 /// Result of scanning one program.
 #[derive(Debug, Default)]
 pub struct ScanResult {
     pub findings: Vec<RawFinding>,
     pub truncated: bool,
+    /// This file's named functions whose parameters reach a sink.
+    pub summaries: Summaries,
 }
 
 /// Scans a parsed program.
 pub fn scan_program(program: &Program<'_>, text: &str) -> ScanResult {
+    scan_program_with(program, text, &Summaries::new())
+}
+
+/// Scans a parsed program, with summaries of the repository's other files.
+pub fn scan_program_with(program: &Program<'_>, text: &str, external: &Summaries) -> ScanResult {
     let _ = text;
     let mut walker = Walker {
+        external,
         modules: BTreeMap::new(),
+        relative: BTreeMap::new(),
         result: ScanResult::default(),
         depth: 0,
         summarize: true,
@@ -97,22 +122,30 @@ pub fn scan_program(program: &Program<'_>, text: &str) -> ScanResult {
     walker.result = ScanResult {
         findings: Vec::new(),
         truncated: walker.result.truncated,
+        summaries: Summaries::new(),
     };
     let mut env = Env::new("<module>".to_owned());
     walker.statements(&program.body, &mut env);
-    walker.result
+    let mut result = walker.result;
+    result.summaries = walker.summaries;
+    result
 }
 
-/// A named function's parameter that reaches a sink in its body (same file).
+/// A named function's parameter that reaches a sink in its body.
 #[derive(Debug, Clone)]
-struct Summary {
-    param: usize,
-    class: VulnClass,
-    severity: Severity,
-    api: String,
-    arg: Span,
-    call: Span,
-    steps: Vec<(u32, String)>,
+pub struct Summary {
+    pub param: usize,
+    pub class: VulnClass,
+    pub severity: Severity,
+    pub api: String,
+    pub arg: Span,
+    pub call: Span,
+    pub steps: Vec<(u32, String)>,
+    /// State of the parameter's value at the sink, so the caller's value can be checked
+    /// against the sink's rule (URL start, built SQL/HTML).
+    pub at_sink: Origin,
+    /// Set once the summary leaves its file (spans are then meaningless).
+    pub ext: Option<ExtSink>,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -129,6 +162,8 @@ struct Env {
     vars: BTreeMap<String, Origin>,
     /// Names bound to request objects, with the source kind they produce.
     requests: BTreeMap<String, &'static str>,
+    /// Names bound to a connected client socket (`io.on('connection', (s) => ...)`).
+    sockets: BTreeSet<String>,
     /// Inside a branch or loop: assignments only add taint.
     branch: u32,
     function: String,
@@ -139,6 +174,7 @@ impl Env {
         Self {
             vars: BTreeMap::new(),
             requests: BTreeMap::new(),
+            sockets: BTreeSet::new(),
             branch: 0,
             function,
         }
@@ -148,6 +184,7 @@ impl Env {
         Self {
             vars: self.vars.clone(),
             requests: self.requests.clone(),
+            sockets: self.sockets.clone(),
             branch: 0,
             function,
         }
@@ -175,10 +212,19 @@ enum Role {
     /// A socket.io event callback: its parameters are client data.
     /// Client data: every parameter is tainted with this source kind.
     Client(&'static str),
+    /// A server's connection callback: the first parameter is a client socket.
+    SocketConnection,
+    /// Only the first parameter is client data.
+    ClientFirst(&'static str),
+    /// Every parameter but the first (an event object) is client data.
+    ClientAfterFirst(&'static str),
 }
 
-struct Walker {
+struct Walker<'e> {
+    external: &'e Summaries,
     modules: BTreeMap<String, Imported>,
+    /// Local names bound to relative modules: name -> (specifier, export or None).
+    relative: BTreeMap<String, (String, Option<String>)>,
     result: ScanResult,
     depth: u32,
     /// Summary pass: parameters of named functions are tainted, and findings become summaries.
@@ -204,6 +250,17 @@ fn contains(list: &[&str], name: &str) -> bool {
 fn prop_name(key: &PropertyKey<'_>) -> Option<String> {
     key.static_name()
         .and_then(|name| name.as_str().map(str::to_owned))
+}
+
+/// Whether a relative import specifier (`./lib/db`, `../service.js`) can name `file`
+/// (root-relative): the last segment matches the file's stem, or the directory of an index.
+fn spec_names_file(spec: &str, file: &str) -> bool {
+    let last = spec.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let last = last.split('.').next().unwrap_or("");
+    let mut parts = file.rsplit('/');
+    let stem = parts.next().unwrap_or("").split('.').next().unwrap_or("");
+    let dir = parts.next().unwrap_or("");
+    !last.is_empty() && (last == stem || (stem == "index" && last == dir))
 }
 
 /// `require('x')` → `x`.
@@ -238,7 +295,7 @@ fn object_prop<'a, 'e>(expr: &'e Expression<'a>, names: &[&str]) -> Option<&'e E
         })
 }
 
-impl Walker {
+impl Walker<'_> {
     /// Enters one recursion level; false when the cap is reached.
     fn enter(&mut self) -> bool {
         if self.depth >= MAX_DEPTH {
@@ -383,8 +440,24 @@ impl Walker {
     fn module_decl(&mut self, module: &ModuleDeclaration<'_>, env: &mut Env) {
         match module {
             ModuleDeclaration::ImportDeclaration(import) => {
-                let Some(family) = import.source.value.as_str().and_then(models::module_family)
-                else {
+                let spec = import.source.value.as_str().unwrap_or("");
+                if spec.starts_with('.') {
+                    for specifier in import.specifiers.iter().flatten() {
+                        use oxc_ast::ast::ImportDeclarationSpecifier as S;
+                        let (local, export) = match specifier {
+                            S::ImportSpecifier(s) => (
+                                s.local.name.as_str(),
+                                Some(s.imported.name().as_str().to_owned()),
+                            ),
+                            S::ImportDefaultSpecifier(s) => (s.local.name.as_str(), None),
+                            S::ImportNamespaceSpecifier(s) => (s.local.name.as_str(), None),
+                        };
+                        self.relative
+                            .insert(local.to_owned(), (spec.to_owned(), export));
+                    }
+                    return;
+                }
+                let Some(family) = models::module_family(spec) else {
                     return;
                 };
                 for specifier in import.specifiers.iter().flatten() {
@@ -493,6 +566,28 @@ impl Walker {
 
     /// Binds `const x = require(spec)` and `const { a, b: c } = require(spec)`.
     fn bind_require(&mut self, pattern: &BindingPattern<'_>, spec: &str, export: Option<String>) {
+        if spec.starts_with('.') {
+            match pattern {
+                BindingPattern::BindingIdentifier(id) => {
+                    self.relative
+                        .insert(id.name.as_str().to_owned(), (spec.to_owned(), export));
+                }
+                BindingPattern::ObjectPattern(object) => {
+                    for property in &object.properties {
+                        if let (Some(key), BindingPattern::BindingIdentifier(local)) =
+                            (prop_name(&property.key), &property.value)
+                        {
+                            self.relative.insert(
+                                local.name.as_str().to_owned(),
+                                (spec.to_owned(), Some(key)),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(family) = models::module_family(spec) else {
             return;
         };
@@ -639,6 +734,29 @@ impl Walker {
             env.requests.remove(*name);
         }
         let first = names.first().copied().flatten();
+        // NestJS: `@Body() dto`, `@Query('q') q`, `@Param('id') id`, `@Headers() h`.
+        for param in &params.items {
+            let decorated = param.decorators.iter().any(|d| match &d.expression {
+                Expression::CallExpression(call) => matches!(
+                    call.callee.get_inner_expression(),
+                    Expression::Identifier(id)
+                        if contains(models::NEST_PARAM_DECORATORS, id.name.as_str())
+                ),
+                _ => false,
+            });
+            if decorated {
+                let origin = Origin {
+                    kind: "http",
+                    span: param.span,
+                    steps: Vec::new(),
+                    built: false,
+                    prefix: true,
+                    sqlish: false,
+                    param: None,
+                };
+                self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
+            }
+        }
         if self.summarize && role == Role::Plain && env.function != "<anonymous>" {
             for (index, param) in params.items.iter().enumerate() {
                 let origin = Origin {
@@ -654,8 +772,16 @@ impl Walker {
             }
         }
         match role {
-            Role::Client(kind) => {
-                for (param, name) in params.items.iter().zip(&names) {
+            Role::Client(kind) | Role::ClientFirst(kind) | Role::ClientAfterFirst(kind) => {
+                for (index, (param, name)) in params.items.iter().zip(&names).enumerate() {
+                    let wanted = match role {
+                        Role::ClientFirst(_) => index == 0,
+                        Role::ClientAfterFirst(_) => index > 0,
+                        _ => true,
+                    };
+                    if !wanted {
+                        continue;
+                    }
                     if name.is_some_and(|n| contains(models::SOCKET_ACK_NAMES, n)) {
                         continue;
                     }
@@ -671,15 +797,21 @@ impl Walker {
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
             }
+            Role::SocketConnection => {
+                if let Some(first) = first {
+                    env.sockets.insert(first.to_owned());
+                }
+            }
             Role::Route | Role::Plain => {
                 let conventional = first.is_some_and(|n| contains(models::REQUEST_NAMES, n))
                     && (names.len() >= 2 || role == Role::Route);
                 if let Some(first) = first {
                     if first == "ctx" && (role == Role::Route || names.len() <= 2) {
                         env.requests.insert("ctx".to_owned(), "koa");
-                    } else if conventional
-                        || (role == Role::Route && (names.len() >= 2 || first == "c"))
-                    {
+                    } else if role == Role::Route && names.len() == 1 && first == "c" {
+                        // Hono: the context; request data is under `c.req`.
+                        env.requests.insert("c".to_owned(), "hono");
+                    } else if conventional || (role == Role::Route && names.len() >= 2) {
                         env.requests.insert(first.to_owned(), "http");
                     }
                 } else if role == Role::Route
@@ -746,7 +878,16 @@ impl Walker {
         env: &mut Env,
         name: Option<String>,
     ) -> Option<Origin> {
-        if self.maybe_function(expr, env, name, Role::Plain) {
+        // `export const POST = async (request) => ...` (Next.js route handlers)
+        let role = if name
+            .as_deref()
+            .is_some_and(|n| contains(models::ROUTE_EXPORTS, n))
+        {
+            Role::Route
+        } else {
+            Role::Plain
+        };
+        if self.maybe_function(expr, env, name, role) {
             return None;
         }
         self.expr(expr, env)
@@ -986,6 +1127,57 @@ impl Walker {
                     .as_simple_assignment_target()
                     .and_then(SimpleAssignmentTarget::as_member_expression)
                 {
+                    // `target[key][key2] = value` with attacker-chosen keys.
+                    if let oxc_ast::ast::MemberExpression::ComputedMemberExpression(outer) = member
+                        && let Expression::ComputedMemberExpression(inner) =
+                            outer.object.get_inner_expression()
+                    {
+                        let mut probe = env.clone();
+                        let outer_key = self.expr(&outer.expression, &mut probe);
+                        let inner_key = self.expr(&inner.expression, &mut probe);
+                        if let (Some(origin), Some(_)) = (inner_key, outer_key)
+                            && origin.param.is_none() == !self.summarize
+                        {
+                            self.emit(
+                                RawFinding {
+                                    class: VulnClass::PrototypePollution,
+                                    severity: Severity::High,
+                                    api: "obj[key][key] =".to_owned(),
+                                    arg: outer.span,
+                                    call: outer.span,
+                                    function: env.function.clone(),
+                                    origin,
+                                    ext: None,
+                                },
+                                env,
+                            );
+                        }
+                    }
+                    // `el.innerHTML = tainted`
+                    if let Some(origin) = &taint
+                        && member
+                            .static_property_name()
+                            .is_some_and(|p| contains(models::HTML_PROPS, p.as_str().unwrap_or("")))
+                        && (origin.built || origin.kind != "param")
+                    {
+                        let property = member
+                            .static_property_name()
+                            .and_then(|p| p.as_str().map(str::to_owned))
+                            .unwrap_or_default();
+                        self.emit(
+                            RawFinding {
+                                class: VulnClass::Xss,
+                                severity: Severity::High,
+                                api: format!(".{property} ="),
+                                arg: member.span(),
+                                call: member.span(),
+                                function: env.function.clone(),
+                                origin: origin.clone(),
+                                ext: None,
+                            },
+                            env,
+                        );
+                    }
                     // `obj.x = tainted` taints `obj` (coarse: fields are not tracked).
                     if let (Some(origin), Expression::Identifier(root)) =
                         (taint, member.object().get_inner_expression())
@@ -1066,12 +1258,19 @@ impl Walker {
     /// The source kind when `expr` is a request object: a request parameter, or `ctx.request`.
     fn request_kind(&self, expr: &Expression<'_>, env: &Env) -> Option<&'static str> {
         match expr {
-            Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
+            Expression::Identifier(id) => env
+                .requests
+                .get(id.name.as_str())
+                .copied()
+                .filter(|kind| *kind != "hono"),
             Expression::StaticMemberExpression(m)
                 if m.property.name == "request" || m.property.name == "req" =>
             {
                 match m.object.get_inner_expression() {
-                    Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
+                    Expression::Identifier(id) => env
+                        .requests
+                        .get(id.name.as_str())
+                        .map(|kind| if *kind == "hono" { "http" } else { kind }),
                     _ => None,
                 }
             }
@@ -1183,6 +1382,9 @@ impl Walker {
         let role = match &callee {
             Callee::Method { method, object } if method == "on" || method == "once" => {
                 let socketish = object.as_deref().is_some_and(|o| {
+                    if env.sockets.contains(o) {
+                        return true;
+                    }
                     let o = o.to_ascii_lowercase();
                     o.contains("socket") || o == "client" || o == "ws"
                 });
@@ -1190,12 +1392,57 @@ impl Walker {
                     Some(Argument::StringLiteral(lit)) => lit.value.as_str(),
                     _ => None,
                 };
-                if socketish && event.is_some_and(|e| !contains(models::SOCKET_BUILTIN_EVENTS, e)) {
+                if matches!(event, Some("connection" | "connect")) {
+                    Role::SocketConnection
+                } else if matches!(event, Some("entry")) {
+                    // yauzl / unzipper / tar: an archive entry, named by the archive's author.
+                    Role::ClientFirst("archive")
+                } else if socketish
+                    && event.is_some_and(|e| !contains(models::SOCKET_BUILTIN_EVENTS, e))
+                {
                     Role::Client("socket")
                 } else {
                     Role::Plain
                 }
             }
+            // Electron: `ipcMain.on(channel, (event, ...args) => ...)`
+            Callee::Method {
+                method,
+                object: Some(object),
+            } if object == "ipcMain"
+                && matches!(method.as_str(), "on" | "handle" | "once" | "handleOnce") =>
+            {
+                Role::ClientAfterFirst("ipc")
+            }
+            // `window.addEventListener('message', (event) => ...)`
+            Callee::Method { method, .. } | Callee::Global(method)
+                if method == "addEventListener"
+                    && matches!(call.arguments.first(), Some(Argument::StringLiteral(l)) if l.value.as_str() == Some("message")) =>
+            {
+                Role::ClientFirst("postmessage")
+            }
+            // `chrome.runtime.onMessage.addListener((message, sender, reply) => ...)`
+            Callee::Method { method, .. }
+                if method == "addListener"
+                    && call
+                        .callee
+                        .get_inner_expression()
+                        .as_member_expression()
+                        .is_some_and(|m| {
+                            m.object()
+                                .as_member_expression()
+                                .and_then(|o| o.static_property_name())
+                                .is_some_and(|p| {
+                                    p == "onMessage"
+                                        || p == "onMessageExternal"
+                                        || p == "onConnectExternal"
+                                })
+                        }) =>
+            {
+                Role::ClientFirst("ext-message")
+            }
+            // tar `{ onentry(entry) }` / `{ filter(path, entry) }` options are handled as objects;
+            // adm-zip `zip.forEach((entry) => ...)` is covered by getEntries() below.
             Callee::Method { method, .. }
                 if contains(models::ROUTE_METHODS, method) && call.arguments.len() >= 2 =>
             {
@@ -1276,29 +1523,97 @@ impl Walker {
             }
             _ => None,
         };
+        // Then other files of the repository, by unique name.
+        // Only through a relative import, and only to the file that import names.
+        let linked = match &callee {
+            Callee::Global(name) => self
+                .relative
+                .get(name)
+                .and_then(|(spec, export)| export.clone().map(|e| (spec.clone(), e))),
+            Callee::Method {
+                object: Some(object),
+                method,
+            } if !method.is_empty() => self
+                .relative
+                .get(object)
+                .filter(|(_, export)| export.is_none())
+                .map(|(spec, _)| (spec.clone(), method.clone())),
+            _ => None,
+        };
+        let helper = helper.or_else(|| {
+            let (spec, name) = linked?;
+            let suffix = format!(".{name}");
+            let mut matching = self.external.iter().filter(|(k, list)| {
+                (**k == name || k.ends_with(&suffix))
+                    && list.iter().any(|s| {
+                        s.ext
+                            .as_ref()
+                            .is_some_and(|e| spec_names_file(&spec, &e.file))
+                    })
+            });
+            match (matching.next(), matching.next()) {
+                (Some((k, list)), None) => Some((
+                    k.clone(),
+                    list.iter()
+                        .filter(|s| {
+                            s.ext
+                                .as_ref()
+                                .is_some_and(|e| spec_names_file(&spec, &e.file))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            }
+        });
         if let Some((name, summaries)) = helper {
-            for summary in summaries {
-                let Some(origin) = taints.get(summary.param).cloned().flatten() else {
+            self.apply_summaries(&name, &summaries, &taints, call.span, env);
+        }
+        // Handlers passed by reference: `socket.on('ev', onEvent)`, `ipcMain.handle(ch, fn)`.
+        if let Role::Client(kind) | Role::ClientFirst(kind) | Role::ClientAfterFirst(kind) = role {
+            for argument in &call.arguments {
+                let Some(expr) = argument.as_expression() else {
                     continue;
                 };
-                let mut origin = origin.step(call.span.start, format!("passed to `{name}()`"));
-                for step in &summary.steps {
-                    if origin.steps.len() < MAX_STEPS {
-                        origin.steps.push(step.clone());
-                    }
-                }
-                self.emit(
-                    RawFinding {
-                        class: summary.class,
-                        severity: summary.severity,
-                        api: summary.api.clone(),
-                        arg: summary.arg,
-                        call: summary.call,
-                        function: env.function.clone(),
-                        origin,
-                    },
-                    env,
-                );
+                let referenced = match expr.get_inner_expression() {
+                    Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                    other => other
+                        .as_member_expression()
+                        .and_then(|m| m.static_property_name())
+                        .and_then(|n| n.as_str().map(str::to_owned)),
+                };
+                let Some(referenced) = referenced else {
+                    continue;
+                };
+                let suffix = format!(".{referenced}");
+                let found = self
+                    .summaries
+                    .iter()
+                    .find(|(k, _)| **k == referenced || k.ends_with(&suffix))
+                    .map(|(k, list)| (k.clone(), list.clone()));
+                let Some((name, summaries)) = found else {
+                    continue;
+                };
+                let most = summaries.iter().map(|s| s.param + 1).max().unwrap_or(0);
+                let synthetic: Vec<Option<Origin>> = (0..most)
+                    .map(|index| {
+                        let wanted = match role {
+                            Role::ClientFirst(_) => index == 0,
+                            Role::ClientAfterFirst(_) => index > 0,
+                            _ => true,
+                        };
+                        wanted.then(|| Origin {
+                            kind,
+                            span: expr.span(),
+                            steps: Vec::new(),
+                            built: false,
+                            prefix: true,
+                            sqlish: false,
+                            param: None,
+                        })
+                    })
+                    .collect();
+                self.apply_summaries(&name, &summaries, &synthetic, call.span, env);
             }
         }
 
@@ -1323,6 +1638,18 @@ impl Walker {
                     });
                 }
                 let _ = object;
+                // adm-zip: `zip.getEntries()` lists entries named by the archive's author.
+                if method == "getEntries" {
+                    return Some(Origin {
+                        kind: "archive",
+                        span: call.span,
+                        steps: Vec::new(),
+                        built: false,
+                        prefix: true,
+                        sqlish: false,
+                        param: None,
+                    });
+                }
                 if contains(models::PASS_METHODS, method) {
                     let built = contains(models::BUILD_METHODS, method);
                     let taint = union(receiver, any_arg());
@@ -1363,6 +1690,64 @@ impl Walker {
         }
     }
 
+    /// Reports each summary whose parameter receives a tainted value at a call.
+    fn apply_summaries(
+        &mut self,
+        name: &str,
+        summaries: &[Summary],
+        taints: &[Option<Origin>],
+        call_span: Span,
+        env: &Env,
+    ) {
+        for summary in summaries {
+            let Some(origin) = taints.get(summary.param).cloned().flatten() else {
+                continue;
+            };
+            let at_sink = &summary.at_sink;
+            let url_rule =
+                summary.class == VulnClass::Ssrf || summary.api.ends_with("openExternal");
+            // The helper used the parameter as the URL start: the caller must control it.
+            if url_rule && at_sink.prefix && !origin.prefix {
+                continue;
+            }
+            let built = at_sink.built || origin.built;
+            let sqlish = at_sink.sqlish || origin.sqlish;
+            if summary.class == VulnClass::SqlInjection && !(built && sqlish) {
+                continue;
+            }
+            if summary.class == VulnClass::Xss && !built {
+                continue;
+            }
+            let mut origin = origin.step(call_span.start, format!("passed to `{name}()`"));
+            for step in summary.steps.iter().filter(|_| summary.ext.is_none()) {
+                if origin.steps.len() < MAX_STEPS {
+                    origin.steps.push(step.clone());
+                }
+            }
+            self.emit(
+                RawFinding {
+                    class: summary.class,
+                    severity: summary.severity,
+                    api: summary.api.clone(),
+                    arg: if summary.ext.is_some() {
+                        call_span
+                    } else {
+                        summary.arg
+                    },
+                    call: if summary.ext.is_some() {
+                        call_span
+                    } else {
+                        summary.call
+                    },
+                    function: env.function.clone(),
+                    origin,
+                    ext: summary.ext.clone(),
+                },
+                env,
+            );
+        }
+    }
+
     /// Records a finding, or in the summary pass, a summary of a parameter that reaches a sink.
     fn emit(&mut self, mut finding: RawFinding, env: &Env) {
         // The CLI is the user's own machine: never above low.
@@ -1383,7 +1768,9 @@ impl Walker {
                         api: finding.api,
                         arg: finding.arg,
                         call: finding.call,
-                        steps: finding.origin.steps,
+                        steps: finding.origin.steps.clone(),
+                        at_sink: finding.origin,
+                        ext: finding.ext,
                     });
                 }
             }
@@ -1448,6 +1835,10 @@ impl Walker {
         for rule in rules {
             let (index, origin) = match rule {
                 ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
+                ArgRule::Html(index) => (
+                    index,
+                    taints.get(index).cloned().flatten().filter(|o| o.built),
+                ),
                 ArgRule::Built(index) => (
                     index,
                     taints
@@ -1501,6 +1892,7 @@ impl Walker {
                     call: span,
                     function: env.function.clone(),
                     origin,
+                    ext: None,
                 },
                 env,
             );
@@ -1703,6 +2095,95 @@ mod tests {
             one("function run(cmd) { exec(cmd); }\napp.post('/r', (req, res) => { run('ls'); });")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn client_side_sources_reach_html_and_open_external() {
+        let pm = scan(
+            "window.addEventListener('message', (e) => { el.innerHTML = '<b>' + e.data.name + '</b>'; });",
+        );
+        assert_eq!(pm.len(), 1, "{pm:?}");
+        assert_eq!(pm[0].0, VulnClass::Xss);
+        let ext = scan(
+            "chrome.runtime.onMessage.addListener((msg, sender, reply) => { $('#x').html(`<i>${msg.t}</i>`); });",
+        );
+        assert_eq!(ext.len(), 1, "{ext:?}");
+        let ipc = scan("ipcMain.handle('open', (event, url) => { shell.openExternal(url); });");
+        assert_eq!(ipc.len(), 1, "{ipc:?}");
+        assert_eq!(ipc[0].3, "ipc");
+        // The IPC event object is not client data; a jQuery node append is not HTML.
+        assert!(
+            scan("ipcMain.on('x', (event) => { shell.openExternal(event.senderFrame.url); });")
+                .is_empty()
+        );
+        assert!(
+            scan("window.addEventListener('message', (e) => { $('#x').append(e.data); });")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nest_decorators_connection_sockets_and_prototype_pollution() {
+        let src = "import { exec } from 'child_process';\nclass C { @Get() find(@Query('p') p) { exec('ls ' + p); } }";
+        let allocator = Allocator::default();
+        let ret = Parser::new(
+            &allocator,
+            src,
+            source_type(SourceKind::Ts, PackageType::CommonJs),
+        )
+        .with_options(parse_options())
+        .parse();
+        assert_eq!(scan_program(&ret.program, src).findings.len(), 1);
+        assert_eq!(
+            one("io.on('connection', (s) => { s.on('cmd', (d) => exec(d)); });").len(),
+            1
+        );
+        let pp =
+            one("app.post('/s', (req, res) => { const { a, b, v } = req.body; cfg[a][b] = v; });");
+        assert_eq!(pp.len(), 1, "{pp:?}");
+        assert_eq!(pp[0].0, VulnClass::PrototypePollution);
+        assert!(one("app.post('/s', (req, res) => { cfg['x'][req.body.k] = 1; });").is_empty());
+    }
+
+    #[test]
+    fn helper_sinks_recheck_the_callers_value() {
+        let fixed = "async function get(url) { return fetch(url); }\n\
+                     app.get('/i/:c', async (req, res) => { await get(`https://x.org/${req.params.c}.png`); });";
+        assert!(one(fixed).is_empty());
+        let open = "async function get(url) { return fetch(url); }\n\
+                    app.get('/i', async (req, res) => { await get(req.query.u); });";
+        assert_eq!(one(open).len(), 1);
+    }
+
+    #[test]
+    fn archive_entry_names_are_sources() {
+        let yauzl = one(
+            "zip.on('entry', (entry) => { fs.createWriteStream(path.join(dest, entry.fileName)); });",
+        );
+        assert_eq!(yauzl.len(), 1, "{yauzl:?}");
+        assert_eq!(yauzl[0].3, "archive");
+        let adm = one(
+            "for (const e of zip.getEntries()) { fs.writeFileSync(path.join(out, e.entryName), e.getData()); }",
+        );
+        assert_eq!(adm.len(), 1, "{adm:?}");
+        assert!(one("for (const e of zip.getEntries()) { fs.writeFileSync(path.join(out, path.basename(e.entryName)), x); }").is_empty());
+    }
+
+    #[test]
+    fn next_const_handlers_and_hono_context_values() {
+        assert_eq!(one("export const POST = async (request) => { const b = await request.json(); exec(b.cmd); };").len(), 1);
+        assert!(
+            one("app.get('/x', async (c) => { exec('ls ' + c.get('session').id); });").is_empty()
+        );
+    }
+
+    #[test]
+    fn handlers_passed_by_reference_get_client_data() {
+        let src = "function onRun(data, cb) { exec('ls ' + data.dir); }\n\
+                   io.on('connection', (socket) => { socket.on('run', onRun); });";
+        assert_eq!(one(src).len(), 1);
+        let ipc = "function openIt(event, url) { exec(url); }\nipcMain.handle('open', openIt);";
+        assert_eq!(one(ipc).len(), 1);
     }
 
     #[test]

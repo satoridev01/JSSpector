@@ -573,6 +573,7 @@ fn analyze(
             .iter()
             .map(|r| ir::Entry {
                 receiver: r.receiver.clone(),
+                receiver_file: r.receiver_file.clone(),
                 method: r.method.clone(),
                 path: r.path.clone(),
                 handler: r.handler.clone(),
@@ -595,6 +596,7 @@ fn analyze(
                 prefix: mount.prefix,
                 target: mount.target,
                 target_file: mount.target_file,
+                target_export: mount.target_export,
                 auth: mount.auth,
             })
             .collect(),

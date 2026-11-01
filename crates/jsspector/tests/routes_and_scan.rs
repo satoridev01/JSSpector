@@ -756,3 +756,139 @@ fn express_major_version_decides_whether_query_values_can_be_objects() {
     assert_eq!(count("^5.3.0"), 1);
     assert_eq!(count("latest"), 2);
 }
+
+/// Monorepo resolution and mounts through barrels: tsconfig `extends`, workspace packages
+/// with build output on disk, `export *` barrels, `api.router` mounts, and routes added through
+/// another file's helper on that file's router.
+#[test]
+fn monorepo_links_and_mounts_through_barrels() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Nx-style path alias declared in the base config, inherited through `extends`.
+    write(
+        root,
+        "tsconfig.base.json",
+        "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"@acme/shell\": [\"libs/shell/src/index.ts\"] } } }",
+    );
+    write(
+        root,
+        "apps/api/tsconfig.json",
+        "{ \"extends\": \"../../tsconfig.base.json\", \"compilerOptions\": { \"outDir\": \"dist\" } }",
+    );
+    write(
+        root,
+        "libs/shell/src/index.ts",
+        "import { exec } from 'child_process';\nexport function run(c: string) { exec('ls ' + c); }\n",
+    );
+    // A workspace package whose `main` is build output: resolved to its sources.
+    write(
+        root,
+        "packages/db/package.json",
+        "{ \"name\": \"@acme/db\", \"main\": \"dist/esm/index.js\", \"types\": \"dist/types/index.d.ts\" }",
+    );
+    write(
+        root,
+        "packages/db/dist/esm/index.js",
+        "exports.query = function query() {};\n",
+    );
+    write(
+        root,
+        "packages/db/src/index.ts",
+        "export function query(sql: string) { return pool.query(sql); }\n",
+    );
+    write(
+        root,
+        "apps/api/src/app.ts",
+        "import express from 'express';\nimport { run } from '@acme/shell';\nimport { query } from '@acme/db';\n\
+         import * as routes from './routes';\nconst app = express();\n\
+         app.get('/run', (req, res) => { run(req.query.c as string); });\n\
+         app.get('/q', (req, res) => { query('SELECT * FROM t WHERE id = ' + req.query.id); });\n\
+         app.use('/api', requireLogin, routes.router);\n",
+    );
+    write(
+        root,
+        "apps/api/src/routes/index.ts",
+        "export * from './users';\n",
+    );
+    write(
+        root,
+        "apps/api/src/routes/users.ts",
+        "import express from 'express';\nexport const router = express.Router();\n\
+         export function addRoute(path: string, handler: any) { router.get(path, handler); }\n\
+         router.get('/users/:id', (req, res) => res.end());\n",
+    );
+    write(
+        root,
+        "apps/api/src/extra.ts",
+        "import express from 'express';\nimport { addRoute } from './routes/users';\n\
+         const router = express.Router();\naddRoute('/reports', listReports);\n",
+    );
+    let report = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let mut found: Vec<String> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["class"].as_str().unwrap().to_owned())
+        .collect();
+    found.sort();
+    assert_eq!(found, ["command-injection", "sql-injection"], "{report}");
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let auth = |path: &str| -> String {
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"] == path)
+            .map(|r| r["auth"].as_str().unwrap().to_owned())
+            .unwrap_or_else(|| format!("missing {path}"))
+    };
+    assert_eq!(auth("/api/users/{id}"), "user");
+    assert_eq!(auth("/api/reports"), "user");
+}
+
+/// TypeScript `import x = require()` and inline `require('./m').f()` link like any import.
+#[test]
+fn import_equals_and_inline_requires_link() {
+    for (name, app) in [
+        (
+            "app.ts",
+            "import shell = require('./shell');\nimport express = require('express');\n\
+             const app = express();\napp.get('/r', (req, res) => { shell.run(req.query.c as string); });\n",
+        ),
+        (
+            "app.js",
+            "const app = require('express')();\n\
+             app.get('/r', (req, res) => { require('./shell').run(req.query.c); });\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), name, app);
+        write(
+            dir.path(),
+            if name.ends_with(".ts") {
+                "shell.ts"
+            } else {
+                "shell.js"
+            },
+            "const { exec } = require('child_process');\nfunction run(c) { exec('ls ' + c); }\nmodule.exports = { run };\n",
+        );
+        let report = run(&[
+            "scan",
+            "--json",
+            "--min-severity",
+            "low",
+            dir.path().to_str().unwrap(),
+        ]);
+        assert_eq!(
+            report["findings"].as_array().unwrap().len(),
+            1,
+            "{name}: {report}"
+        );
+    }
+}

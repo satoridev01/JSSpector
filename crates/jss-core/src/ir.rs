@@ -101,6 +101,9 @@ pub enum FlowTarget {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Entry {
     pub receiver: Option<String>,
+    /// The file that declares `receiver`, when it is another file's router.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_file: Option<String>,
     pub method: String,
     pub path: String,
     pub handler: String,
@@ -117,6 +120,10 @@ pub struct Mount {
     pub prefix: String,
     pub target: Option<String>,
     pub target_file: Option<String>,
+    /// The export of `target_file` that is mounted (`require('./api').router`); its default
+    /// export when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_export: Option<String>,
     /// Authentication middleware applied at the mount.
     pub auth: Auth,
 }
@@ -245,7 +252,20 @@ fn resolve_in(
         Some((head, rest)) => (head, Some(rest)),
         None => (callee, None),
     };
-    let import = imports.get(head)?;
+    let Some(import) = imports.get(head) else {
+        // Neither defined nor imported here: a barrel's `export * from './x'` may re-export it
+        // (followed through every level of barrels).
+        return by_file.get(file)?.reexports.iter().find_map(|barrel| {
+            let module = by_file.get(barrel.as_str())?;
+            let names: BTreeSet<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+            let imports: BTreeMap<&str, &Import> = module
+                .imports
+                .iter()
+                .map(|i| (i.local.as_str(), i))
+                .collect();
+            resolve_in(callee, &names, &imports, by_file, barrel, depth + 1)
+        });
+    };
     let target_file = import.resolved.as_deref()?;
     let target = by_file.get(target_file)?;
     let exported = |name: &str| {

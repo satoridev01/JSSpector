@@ -1,10 +1,10 @@
 # Browser DOM: URL and window sources, script/HTML/navigation sinks.
 name: dom
+# (`location.pathname` is not one: browsers percent-encode the `<`, `>` and quotes an injection needs.)
 member_sources:
   - {object: location, property: hash, kind: dom}
   - {object: location, property: search, kind: dom}
   - {object: location, property: href, kind: dom}
-  - {object: location, property: pathname, kind: dom}
   - {object: window.location, property: hash, kind: dom}
   - {object: window.location, property: search, kind: dom}
   - {object: window.location, property: href, kind: dom}

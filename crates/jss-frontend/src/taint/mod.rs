@@ -221,10 +221,10 @@ impl Linking<'_> {
         if spec.starts_with('.') {
             jss_core::resolve::resolve(self.file, spec, self.files)
         } else {
-            self.workspace.resolve(spec, self.files).or_else(|| {
-                self.workspace
-                    .resolve_typescript(self.file, spec, self.files)
-            })
+            // tsconfig `paths` first, as tsc does, then the workspace's packages.
+            self.workspace
+                .resolve_typescript(self.file, spec, self.files)
+                .or_else(|| self.workspace.resolve(spec, self.files))
         }
     }
 
@@ -334,6 +334,9 @@ pub struct FileFacts {
 pub struct RouteFact {
     /// The router or app it is registered on, when it is a variable.
     pub receiver: Option<String>,
+    /// The file that declares `receiver`, when it is another file's router (a route added
+    /// through a helper that registers on its own module's router).
+    pub receiver_file: Option<String>,
     /// HTTP method (upper case), or `SOCKET`, `IPC`, `QUERY`, `MUTATION`, `TRPC`, `QUEUE`, `ANY`.
     pub method: String,
     pub path: String,
@@ -350,6 +353,8 @@ pub struct RouteFact {
 pub struct RouteTemplate {
     /// The router: a variable of the defining file, or the index of the parameter holding it.
     pub receiver: Result<Option<String>, usize>,
+    /// The file that declares the receiver variable, once the template leaves it.
+    pub receiver_file: Option<String>,
     /// The method, or the index of the parameter holding it.
     pub method: Result<String, usize>,
     pub path: Vec<PathPart>,
@@ -374,6 +379,8 @@ pub struct MountFact {
     /// The mounted router: a local name, or a file when mounted as `require('./x')`.
     pub target: Option<String>,
     pub target_file: Option<String>,
+    /// The export of `target_file` mounted (`require('./api').router`); the default when `None`.
+    pub target_export: Option<String>,
     /// Authentication middleware on the mount (`app.use('/admin', requireAdmin, router)`).
     pub auth: Auth,
 }
@@ -1317,6 +1324,17 @@ impl Walker<'_> {
                 self.statement(&s.body, env);
                 env.join_with(&before);
             }
+            // TypeScript `import shell = require('./shell')`: as `const shell = require(...)`.
+            Statement::TSImportEqualsDeclaration(decl) => {
+                if let oxc_ast::ast::TSModuleReference::ExternalModuleReference(external) =
+                    &decl.module_reference
+                    && let Some(spec) = external.expression.value.as_str()
+                    && self.linking.is_own(spec)
+                {
+                    self.relative
+                        .insert(decl.id.name.as_str().to_owned(), (spec.to_owned(), None));
+                }
+            }
             Statement::TSEnumDeclaration(e) => self.record_enum(e),
             Statement::WithStatement(s) => {
                 self.expr(&s.object, env);
@@ -1418,6 +1436,7 @@ impl Walker<'_> {
                     {
                         self.facts.routes.push(RouteFact {
                             receiver: None,
+                            receiver_file: None,
                             method: name.clone(),
                             path: String::new(),
                             handler: name.clone(),
@@ -1440,6 +1459,7 @@ impl Walker<'_> {
                             if has(&m().route_exports, &name) {
                                 self.facts.routes.push(RouteFact {
                                     receiver: None,
+                                    receiver_file: None,
                                     method: name.clone(),
                                     path: String::new(),
                                     handler: name.clone(),
@@ -1475,6 +1495,7 @@ impl Walker<'_> {
                     if f.params.items.len() >= 2 {
                         self.facts.routes.push(RouteFact {
                             receiver: None,
+                            receiver_file: None,
                             method: "ANY".to_owned(),
                             path: String::new(),
                             handler: name.clone().unwrap_or_else(|| "<default>".to_owned()),
@@ -2025,6 +2046,7 @@ impl Walker<'_> {
                     let key = prop_name(&method.key).unwrap_or_default();
                     self.facts.routes.push(RouteFact {
                         receiver: None,
+                        receiver_file: None,
                         method: verb.to_ascii_uppercase(),
                         path: {
                             let parts: Vec<&str> =
@@ -2796,6 +2818,7 @@ impl Walker<'_> {
                                             {
                                                 self.facts.routes.push(RouteFact {
                                                     receiver: None,
+                                                    receiver_file: None,
                                                     method: name
                                                         .as_deref()
                                                         .unwrap_or("")
@@ -2831,6 +2854,7 @@ impl Walker<'_> {
                                     {
                                         self.facts.routes.push(RouteFact {
                                             receiver: None,
+                                            receiver_file: None,
                                             method: format!(
                                                 "{}.{}",
                                                 source.kind.to_ascii_uppercase(),
@@ -3704,6 +3728,7 @@ impl Walker<'_> {
                     };
                     self.facts.routes.push(RouteFact {
                         receiver,
+                        receiver_file: None,
                         method: if verb.is_empty() {
                             "ANY".to_owned()
                         } else {
@@ -3927,6 +3952,22 @@ impl Walker<'_> {
                     names: vec![export.to_owned()],
                 }
             }),
+            // `require('./shell').run(x)`: that module's `run`.
+            Callee::Method {
+                object: None,
+                method,
+            } if !method.is_empty() => call
+                .callee
+                .get_inner_expression()
+                .as_member_expression()
+                .and_then(|m| require_spec(m.object()))
+                .filter(|spec| self.linking.is_own(spec))
+                .map(|spec| Target {
+                    exact: self.exported_function(&spec, method),
+                    names: vec![method.clone()],
+                    spec,
+                }),
+            // `shell.run()` on `const shell = new ShellService()`: the imported class's method.
             Callee::Method {
                 object: Some(object),
                 method,
@@ -4471,7 +4512,6 @@ impl Walker<'_> {
         }
     }
 
-    /// Records the entry point or mount a registration call makes.
     /// The name of an inline route handler: `GET /items`, or, when another registration in
     /// this file already took that name, with its receiver (`GET / [settings]`).
     fn inline_route_name(
@@ -4495,6 +4535,7 @@ impl Walker<'_> {
         }
     }
 
+    /// Records the entry point or mount a registration call makes.
     fn record_entry(
         &mut self,
         callee: &Callee,
@@ -4506,12 +4547,12 @@ impl Walker<'_> {
         // A helper that registers routes from its parameters: `add('/x', handler)` here or in
         // another file instantiates its routes (or, called with this function's own parameters,
         // makes this function a template too).
-        if let Some((name, templates)) = self.templates_for(callee) {
+        if let Some((name, templates, defining_file)) = self.templates_for(callee) {
             // A helper calling itself (`add(p + '/x')` inside `add`) would derive its templates
             // from its own, without end.
             if name != env.function {
                 for template in templates {
-                    self.instantiate(&name, &template, call, auth, env);
+                    self.instantiate(&name, &template, defining_file.as_deref(), call, auth, env);
                 }
             }
             return;
@@ -4583,6 +4624,7 @@ impl Walker<'_> {
                     .unwrap_or_else(|| format!("{} {event}", kind.to_ascii_uppercase()));
                 self.facts.routes.push(RouteFact {
                     receiver: object.clone(),
+                    receiver_file: None,
                     method: kind.to_ascii_uppercase(),
                     path: event,
                     handler,
@@ -4614,6 +4656,7 @@ impl Walker<'_> {
             && let Some(parts) = parts
         {
             let template = RouteTemplate {
+                receiver_file: None,
                 receiver: match receiver_param {
                     Some(index) => Err(index),
                     None => Ok(object.clone()),
@@ -4646,12 +4689,13 @@ impl Walker<'_> {
                 if !self.mountable(argument) {
                     continue;
                 }
-                let (target, target_file) = self.mount_target(argument);
+                let (target, target_file, target_export) = self.mount_target(argument);
                 self.facts.mounts.push(MountFact {
                     receiver: object.clone(),
                     prefix: String::new(),
                     target,
                     target_file,
+                    target_export,
                     auth,
                 });
             }
@@ -4700,21 +4744,23 @@ impl Walker<'_> {
             {
                 // `router.use('/api', child)`: a mount, unless the last argument is a handler.
                 if has(&m().mount_methods, method) && !is_function {
-                    let (target, target_file) = match last {
+                    let (target, target_file, target_export) = match last {
                         Some(e) => self.mount_target(e),
-                        None => (None, None),
+                        None => (None, None, None),
                     };
                     self.facts.mounts.push(MountFact {
                         receiver: object.clone(),
                         prefix: path,
                         target,
                         target_file,
+                        target_export,
                         auth,
                     });
                     return;
                 }
                 self.facts.routes.push(RouteFact {
                     receiver: object.clone(),
+                    receiver_file: None,
                     method: method.to_ascii_uppercase(),
                     path,
                     handler,
@@ -4848,15 +4894,42 @@ impl Walker<'_> {
             e @ Expression::CallExpression(c) => {
                 require_spec(e).is_some() || require_spec(&c.callee).is_some()
             }
+            // `api.router` of an import, `require('./api').router`.
+            Expression::StaticMemberExpression(member) => {
+                match member.object.get_inner_expression() {
+                    Expression::Identifier(id) => {
+                        self.relative.contains_key(id.name.as_str())
+                            && self.is_router(member.property.name.as_str())
+                    }
+                    object => require_spec(object).is_some(),
+                }
+            }
             _ => false,
         }
     }
 
-    /// What a mount argument names: a local router, or the file of `require('./users')` (or of
-    /// a factory `require('./users')()`).
-    fn mount_target(&self, expr: &Expression<'_>) -> (Option<String>, Option<String>) {
+    /// What a mount argument names: a local router or an import's member (`api.router`, as
+    /// `api.router`), or the file of `require('./users')` (or of a factory
+    /// `require('./users')()`, or its export `require('./users').router`).
+    fn mount_target(
+        &self,
+        expr: &Expression<'_>,
+    ) -> (Option<String>, Option<String>, Option<String>) {
         match expr.get_inner_expression() {
-            Expression::Identifier(id) => (Some(id.name.as_str().to_owned()), None),
+            Expression::Identifier(id) => (Some(id.name.as_str().to_owned()), None, None),
+            Expression::StaticMemberExpression(member) => {
+                let property = member.property.name.as_str().to_owned();
+                match member.object.get_inner_expression() {
+                    Expression::Identifier(id) => {
+                        (Some(format!("{}.{property}", id.name.as_str())), None, None)
+                    }
+                    object => (
+                        None,
+                        require_spec(object).and_then(|spec| self.linking.resolve(&spec)),
+                        Some(property),
+                    ),
+                }
+            }
             e => {
                 let required = match e {
                     Expression::CallExpression(c) if require_spec(e).is_none() => {
@@ -4864,7 +4937,11 @@ impl Walker<'_> {
                     }
                     _ => require_spec(e),
                 };
-                (None, required.and_then(|spec| self.linking.resolve(&spec)))
+                (
+                    None,
+                    required.and_then(|spec| self.linking.resolve(&spec)),
+                    None,
+                )
             }
         }
     }
@@ -4880,15 +4957,26 @@ impl Walker<'_> {
     }
 
     /// The route templates a callee has: this file's, or (through an import) another file's.
-    fn templates_for(&self, callee: &Callee) -> Option<(String, Vec<RouteTemplate>)> {
+    fn templates_for(
+        &self,
+        callee: &Callee,
+    ) -> Option<(String, Vec<RouteTemplate>, Option<String>)> {
         let (local, linked) = match callee {
             Callee::Global(name) => (
                 Some(name.clone()),
                 self.relative.get(name).map(|(spec, export)| {
-                    let key = export
-                        .clone()
-                        .filter(|e| e != "default")
-                        .unwrap_or_else(|| name.clone());
+                    // `const registerPage = require('./helpers')`: the default export's own name.
+                    let export = export.as_deref().unwrap_or("default");
+                    let key = self
+                        .exported_function(spec, export)
+                        .map(|(_, local)| local)
+                        .unwrap_or_else(|| {
+                            if export == "default" {
+                                name.clone()
+                            } else {
+                                export.to_owned()
+                            }
+                        });
                     (spec.clone(), key)
                 }),
             ),
@@ -4907,7 +4995,7 @@ impl Walker<'_> {
         if let Some(name) = local
             && let Some(list) = self.route_templates.get(&name)
         {
-            return Some((name, list.clone()));
+            return Some((name, list.clone(), None));
         }
         let (spec, key) = linked?;
         let file = self.linking.resolve(&spec)?;
@@ -4920,7 +5008,7 @@ impl Walker<'_> {
                 .templates
                 .get(f)
                 .and_then(|by_name| by_name.get(&key))
-                .map(|list| (key.clone(), list.clone()))
+                .map(|list| (key.clone(), list.clone(), Some(f.clone())))
         })
     }
 
@@ -4930,6 +5018,7 @@ impl Walker<'_> {
         &mut self,
         name: &str,
         template: &RouteTemplate,
+        defining_file: Option<&str>,
         call: &CallExpression<'_>,
         auth: Auth,
         env: &Env,
@@ -4964,6 +5053,14 @@ impl Walker<'_> {
                 },
             },
         };
+        // A router variable of another file stays that file's.
+        let receiver_file = match &template.receiver {
+            Ok(Some(_)) => template
+                .receiver_file
+                .clone()
+                .or_else(|| defining_file.map(str::to_owned)),
+            _ => None,
+        };
         let receiver = match &template.receiver {
             Ok(receiver) => Ok(receiver.clone()),
             Err(index) => match param_of(arg(*index)) {
@@ -4984,6 +5081,7 @@ impl Walker<'_> {
             if env.function != "<anonymous>" && env.function != "<module>" {
                 let derived = RouteTemplate {
                     receiver,
+                    receiver_file: receiver_file.clone(),
                     method,
                     path,
                     auth: template.auth.max(auth),
@@ -5008,12 +5106,14 @@ impl Walker<'_> {
         let Ok(method) = method else { return };
         // Registered on a variable of the caller that is not a router: not a route.
         if let Ok(Some(receiver)) = &receiver
+            && receiver_file.is_none()
             && !self.is_router(receiver)
         {
             return;
         }
         self.facts.routes.push(RouteFact {
             receiver: receiver.ok().flatten(),
+            receiver_file,
             method: method.to_ascii_uppercase(),
             path: text,
             handler: call
@@ -5396,85 +5496,91 @@ impl Walker<'_> {
         env: &Env,
     ) -> bool {
         for &rule in rules {
-            let (index, origin) =
-                match rule {
-                    ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
-                    ArgRule::Html(index) => (
-                        index,
-                        taints.get(index).cloned().flatten().filter(|o| o.built),
-                    ),
-                    ArgRule::Object(index) => {
-                        // `find(req.body.filter)` or `find({ email: req.body.email })`: a value that
-                        // JSON or qs can turn into `{ "$ne": null }`.
-                        let arg = arguments.get(index).and_then(Argument::as_expression);
-                        let from_fields = match arg.map(Expression::get_inner_expression) {
-                            Some(Expression::ObjectExpression(object)) => object
-                                .properties
-                                .iter()
-                                .find_map(|property| match property {
-                                    // `{ where: { email } }`: an ORM's filter (TypeORM, Sequelize
-                                    // operators cannot come from JSON); `{ email: { $eq: x } }`:
-                                    // the operand is compared as a value.
-                                    ObjectPropertyKind::ObjectProperty(p)
-                                        if prop_name(&p.key)
-                                            .is_some_and(|k| has(&m().orm_options, &k))
-                                            || literal_comparison(&p.value) =>
-                                    {
-                                        None
-                                    }
-                                    ObjectPropertyKind::ObjectProperty(p) => {
-                                        let mut probe = env.clone();
-                                        self.expr(&p.value, &mut probe)
-                                            .filter(|o| !o.built && o.object)
-                                    }
-                                    ObjectPropertyKind::SpreadProperty(_) => None,
-                                }),
-                            _ => None,
-                        };
-                        let direct = taints.get(index).cloned().flatten().filter(|o| {
-                            !o.built
-                                && o.object
-                                && !matches!(
-                                    arg.map(Expression::get_inner_expression),
-                                    Some(Expression::ObjectExpression(_))
-                                )
+            let (index, origin) = match rule {
+                ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
+                // A helper's parameter passed straight to the sink (`function query(sql) {
+                // return pool.query(sql) }`): a summary, whose callers must build the text.
+                ArgRule::Html(index) => (
+                    index,
+                    taints
+                        .get(index)
+                        .cloned()
+                        .flatten()
+                        .filter(|o| o.built || (self.summarize && o.param.is_some())),
+                ),
+                ArgRule::Object(index) => {
+                    // `find(req.body.filter)` or `find({ email: req.body.email })`: a value that
+                    // JSON or qs can turn into `{ "$ne": null }`.
+                    let arg = arguments.get(index).and_then(Argument::as_expression);
+                    let from_fields = match arg.map(Expression::get_inner_expression) {
+                        Some(Expression::ObjectExpression(object)) => object
+                            .properties
+                            .iter()
+                            .find_map(|property| match property {
+                                // `{ where: { email } }`: an ORM's filter (TypeORM, Sequelize
+                                // operators cannot come from JSON); `{ email: { $eq: x } }`:
+                                // the operand is compared as a value.
+                                ObjectPropertyKind::ObjectProperty(p)
+                                    if prop_name(&p.key)
+                                        .is_some_and(|k| has(&m().orm_options, &k))
+                                        || literal_comparison(&p.value) =>
+                                {
+                                    None
+                                }
+                                ObjectPropertyKind::ObjectProperty(p) => {
+                                    let mut probe = env.clone();
+                                    self.expr(&p.value, &mut probe)
+                                        .filter(|o| !o.built && o.object)
+                                }
+                                ObjectPropertyKind::SpreadProperty(_) => None,
+                            }),
+                        _ => None,
+                    };
+                    let direct = taints.get(index).cloned().flatten().filter(|o| {
+                        !o.built
+                            && o.object
+                            && !matches!(
+                                arg.map(Expression::get_inner_expression),
+                                Some(Expression::ObjectExpression(_))
+                            )
+                    });
+                    (index, from_fields.or(direct))
+                }
+                ArgRule::Built(index) => (
+                    index,
+                    taints.get(index).cloned().flatten().filter(|o| {
+                        o.built && (o.sqlish || sink.class != VulnClass::SqlInjection)
+                            || (self.summarize && o.param.is_some())
+                    }),
+                ),
+                ArgRule::UrlPrefix(index) => {
+                    let is_object = arguments
+                        .get(index)
+                        .and_then(Argument::as_expression)
+                        .is_some_and(|e| {
+                            matches!(e.get_inner_expression(), Expression::ObjectExpression(_))
                         });
-                        (index, from_fields.or(direct))
-                    }
-                    ArgRule::Built(index) => (
-                        index,
-                        taints.get(index).cloned().flatten().filter(|o| {
-                            o.built && (o.sqlish || sink.class != VulnClass::SqlInjection)
-                        }),
-                    ),
-                    ArgRule::UrlPrefix(index) => {
-                        let is_object = arguments
-                            .get(index)
-                            .and_then(Argument::as_expression)
-                            .is_some_and(|e| {
-                                matches!(e.get_inner_expression(), Expression::ObjectExpression(_))
-                            });
-                        let direct = taints
-                            .get(index)
-                            .cloned()
-                            .flatten()
-                            .filter(|o| o.prefix && !is_object);
-                        let from_options = arguments
-                            .get(index)
-                            .and_then(Argument::as_expression)
-                            .and_then(|e| {
-                                let keys: Vec<&str> =
-                                    m().url_option_keys.iter().map(String::as_str).collect();
-                                object_prop(e, &keys)
-                            })
-                            .and_then(|value| {
-                                let mut probe = env.clone();
-                                self.expr(value, &mut probe)
-                            })
-                            .filter(|o| o.prefix);
-                        (index, direct.or(from_options))
-                    }
-                };
+                    let direct = taints
+                        .get(index)
+                        .cloned()
+                        .flatten()
+                        .filter(|o| o.prefix && !is_object);
+                    let from_options = arguments
+                        .get(index)
+                        .and_then(Argument::as_expression)
+                        .and_then(|e| {
+                            let keys: Vec<&str> =
+                                m().url_option_keys.iter().map(String::as_str).collect();
+                            object_prop(e, &keys)
+                        })
+                        .and_then(|value| {
+                            let mut probe = env.clone();
+                            self.expr(value, &mut probe)
+                        })
+                        .filter(|o| o.prefix);
+                    (index, direct.or(from_options))
+                }
+            };
             let Some(origin) = origin else { continue };
             if has(&sink.ignore_kinds, origin.kind) || origin.escaped & class_bit(sink.class) != 0 {
                 // Another rule of the group may still match an unescaped argument.

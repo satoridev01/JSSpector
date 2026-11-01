@@ -58,9 +58,10 @@ impl Workspace {
             .build();
         for entry in walker.flatten() {
             let name = entry.file_name().to_string_lossy();
-            if name == "tsconfig.json" || name == "jsconfig.json" {
-                if let Some((dir, config)) = read_tsconfig(root, entry.path()) {
-                    // tsconfig.json wins over jsconfig.json in the same directory.
+            if name == "tsconfig.json" || name == "jsconfig.json" || name == "tsconfig.base.json" {
+                if let Some((dir, config)) = read_tsconfig(root, entry.path(), 0) {
+                    // tsconfig.json wins over tsconfig.base.json and jsconfig.json in the same
+                    // directory (Nx keeps the workspace's paths in a root tsconfig.base.json).
                     if name == "tsconfig.json" {
                         tsconfigs.insert(dir, config);
                     } else {
@@ -119,10 +120,13 @@ impl Workspace {
         spec: &str,
         files: &BTreeSet<String>,
     ) -> Option<String> {
-        // The nearest config whose directory contains `from`.
+        // The nearest config whose directory contains `from` and that maps anything (one with
+        // neither `baseUrl` nor `paths` leaves resolution to the configs above it).
         let mut dir = from.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
         let config = loop {
-            if let Some(config) = self.tsconfigs.get(&dir) {
+            if let Some(config) = self.tsconfigs.get(&dir)
+                && (config.base.is_some() || !config.paths.is_empty())
+            {
                 break config;
             }
             if dir.is_empty() {
@@ -176,18 +180,43 @@ impl Workspace {
         let subpath = spec.get(name.len()..).unwrap_or("").trim_start_matches('/');
         let mut bases = Vec::new();
         if subpath.is_empty() {
+            // Sources first: the build output (`dist/esm/index.js`) is generated and not
+            // analyzed, and points back at `src/index.ts`.
+            let mut built_entries = Vec::new();
             for entry in entries {
                 let entry = entry.trim_end_matches(".d.ts");
-                bases.push(join(entry));
-                // Built output points back at the sources: dist/index.js -> src/index.ts.
+                let mut mapped = false;
                 for built in ["dist/", "lib/", "build/", "out/"] {
                     if let Some(rest) = entry.strip_prefix(built) {
+                        // `dist/esm/index.js`, `dist/types/index.d.ts` -> `src/index`.
+                        let mut rest = rest;
+                        while let Some(inner) = [
+                            "esm/",
+                            "cjs/",
+                            "es/",
+                            "types/",
+                            "umd/",
+                            "module/",
+                            "commonjs/",
+                            "src/",
+                        ]
+                        .iter()
+                        .find_map(|format| rest.strip_prefix(format))
+                        {
+                            rest = inner;
+                        }
                         bases.push(join(&format!("src/{rest}")));
+                        built_entries.push(join(entry));
+                        mapped = true;
                     }
+                }
+                if !mapped {
+                    bases.push(join(entry));
                 }
             }
             bases.push(join("src/index"));
             bases.push(join("index"));
+            bases.extend(built_entries);
         } else {
             bases.push(join(subpath));
             bases.push(join(&format!("src/{subpath}")));
@@ -211,8 +240,9 @@ impl Workspace {
 }
 
 /// Reads a tsconfig (JSON with comments and trailing commas): its directory and settings, both
-/// root-relative.
-fn read_tsconfig(root: &Path, path: &Path) -> Option<(String, TsConfig)> {
+/// root-relative. Settings it does not set come from the configs it `extends` (relative files,
+/// followed up to 8 levels), each resolved against the config that declares it.
+fn read_tsconfig(root: &Path, path: &Path, depth: usize) -> Option<(String, TsConfig)> {
     let text = std::fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&strip_jsonc(&text)).ok()?;
     let dir = path
@@ -221,7 +251,38 @@ fn read_tsconfig(root: &Path, path: &Path) -> Option<(String, TsConfig)> {
         .ok()?
         .to_string_lossy()
         .replace('\\', "/");
-    let options = json.get("compilerOptions")?;
+    // `"extends": "../../tsconfig.base.json"` (or a list of them; package configs such as
+    // `@tsconfig/node20` hold no paths of ours).
+    let mut inherited = TsConfig {
+        base: None,
+        paths: Vec::new(),
+    };
+    if depth < 8 {
+        let parents: Vec<&str> = match json.get("extends") {
+            Some(serde_json::Value::String(one)) => vec![one.as_str()],
+            Some(serde_json::Value::Array(list)) => {
+                list.iter().filter_map(|v| v.as_str()).collect()
+            }
+            _ => Vec::new(),
+        };
+        for parent in parents.into_iter().filter(|p| p.starts_with('.')) {
+            let mut target = path.parent()?.join(parent);
+            if target.extension().is_none() {
+                target.set_extension("json");
+            }
+            if let Some((_, config)) = read_tsconfig(root, &target, depth + 1) {
+                if config.base.is_some() {
+                    inherited.base = config.base;
+                }
+                if !config.paths.is_empty() {
+                    inherited.paths = config.paths;
+                }
+            }
+        }
+    }
+    let Some(options) = json.get("compilerOptions") else {
+        return Some((dir, inherited));
+    };
     let in_dir = |relative: &str| {
         let joined = if dir.is_empty() {
             relative.to_owned()
@@ -233,9 +294,10 @@ fn read_tsconfig(root: &Path, path: &Path) -> Option<(String, TsConfig)> {
     let base = options
         .get("baseUrl")
         .and_then(|b| b.as_str())
-        .and_then(in_dir);
-    let paths_base = base.clone().or_else(|| Some(dir.clone()))?;
-    let paths = options
+        .and_then(in_dir)
+        .or(inherited.base);
+    let paths_base = base.clone().unwrap_or_else(|| dir.clone());
+    let own_paths: Vec<(String, Vec<String>)> = options
         .get("paths")
         .and_then(|p| p.as_object())
         .map(|object| {
@@ -263,6 +325,12 @@ fn read_tsconfig(root: &Path, path: &Path) -> Option<(String, TsConfig)> {
                 .collect()
         })
         .unwrap_or_default();
+    // A config's own `paths` replace the inherited ones (as tsc merges compilerOptions).
+    let paths = if own_paths.is_empty() {
+        inherited.paths
+    } else {
+        own_paths
+    };
     Some((dir, TsConfig { base, paths }))
 }
 

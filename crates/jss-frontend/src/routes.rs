@@ -104,7 +104,12 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
             };
             let child = match (&mount.target, &mount.target_file) {
                 (Some(local), _) => resolve_local(&by_file, file, local),
-                (None, Some(target_file)) => default_export(&by_file, target_file),
+                (None, Some(target_file)) => locate_export(
+                    &by_file,
+                    target_file,
+                    mount.target_export.as_deref().unwrap_or("default"),
+                    0,
+                ),
                 (None, None) => None,
             };
             if let Some(child) = child {
@@ -122,8 +127,10 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
     for (file, report) in &by_file {
         for entry in &report.module.entries {
             let prefixes = match &entry.receiver {
+                // A route added through another file's helper is on that file's router.
                 Some(receiver) => {
-                    prefixes(&parents, &(file.to_string(), receiver.clone()), &mut memo)
+                    let owner = entry.receiver_file.as_deref().unwrap_or(file);
+                    prefixes(&parents, &(owner.to_string(), receiver.clone()), &mut memo)
                 }
                 None => vec![(String::new(), Auth::NoneDetected)],
             };
@@ -171,22 +178,51 @@ fn resolve_local(
     local: &str,
 ) -> Option<RouterId> {
     let report = by_file.get(file)?;
-    match report.module.imports.iter().find(|i| i.local == local) {
+    // `api.router` with `api` an import: that module's `router` export.
+    let (head, member) = match local.split_once('.') {
+        Some((head, member)) => (head, Some(member)),
+        None => (local, None),
+    };
+    match report.module.imports.iter().find(|i| i.local == head) {
         Some(import) => {
             let target_file = import.resolved.as_ref()?;
-            let target = by_file.get(target_file.as_str())?;
-            let name = import.export.as_deref().unwrap_or("default");
-            let exported = target.module.exports.get(name)?;
-            Some((target_file.clone(), product(target, exported)))
+            let name = match (member, import.export.as_deref()) {
+                (Some(member), _) => member,
+                (None, export) => export.unwrap_or("default"),
+            };
+            locate_export(by_file, target_file, name, 0)
         }
         None => Some((file.to_owned(), local.to_owned())),
     }
 }
 
-fn default_export(by_file: &BTreeMap<&str, &ScanReport>, file: &str) -> Option<RouterId> {
+/// The router a module exports as `name`, followed through barrels: `export * from './users'`
+/// and `export { usersRouter as users } from './users'` (up to 8 levels).
+fn locate_export(
+    by_file: &BTreeMap<&str, &ScanReport>,
+    file: &str,
+    name: &str,
+    depth: usize,
+) -> Option<RouterId> {
     let report = by_file.get(file)?;
-    let exported = report.module.exports.get("default")?;
-    Some((file.to_owned(), product(report, exported)))
+    let reexports = &report.module.reexports;
+    match report.module.exports.get(name) {
+        // Defined here, unless this file only re-exports it from another one.
+        Some(local) => {
+            if depth < 8 {
+                for barrel in reexports {
+                    if let Some(found) = locate_export(by_file, barrel, local, depth + 1) {
+                        return Some(found);
+                    }
+                }
+            }
+            Some((file.to_owned(), product(report, local)))
+        }
+        None if depth < 8 => reexports
+            .iter()
+            .find_map(|barrel| locate_export(by_file, barrel, name, depth + 1)),
+        None => None,
+    }
 }
 
 /// The router an export stands for: itself, or what it returns when it is a factory

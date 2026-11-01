@@ -159,6 +159,7 @@ fn main() -> ExitCode {
 }
 
 fn scan(args: &ScanArgs) -> ExitCode {
+    let started = Instant::now();
     let pool = match ParsePool::new(args.threads) {
         Ok(pool) => pool,
         Err(err) => return fail(EXIT_ENGINE, err),
@@ -207,7 +208,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
             .map_err(io::Error::from)
             .and_then(|()| writeln!(out))
     } else {
-        write_text(&mut out, &output, &discovery.root)
+        write_text(&mut out, &output, &discovery.root, started.elapsed())
     }
     .and_then(|()| out.flush());
     if let Err(err) = written {
@@ -283,7 +284,12 @@ fn describe(class: jss_core::VulnClass) -> &'static str {
 }
 
 /// Semgrep-style output: findings grouped by the file of their sink, with the code lines.
-fn write_text(out: &mut impl Write, output: &ScanOutput, root: &std::path::Path) -> io::Result<()> {
+fn write_text(
+    out: &mut impl Write,
+    output: &ScanOutput,
+    root: &std::path::Path,
+    elapsed: std::time::Duration,
+) -> io::Result<()> {
     use std::io::IsTerminal;
     let st = Style::new(io::stdout().is_terminal());
     let mut by_file: std::collections::BTreeMap<&str, Vec<&Finding>> = Default::default();
@@ -373,12 +379,13 @@ fn write_text(out: &mut impl Write, output: &ScanOutput, root: &std::path::Path)
     }
     writeln!(
         out,
-        "\n{}{} finding(s){} in {} file(s) scanned ({} skipped)",
+        "\n{}{} finding(s){} in {} file(s) scanned ({} skipped) in {:.2}s",
         st.bold,
         output.findings.len(),
         st.reset,
         output.files_scanned,
-        output.skipped.len()
+        output.skipped.len(),
+        elapsed.as_secs_f64()
     )
 }
 

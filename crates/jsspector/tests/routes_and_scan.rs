@@ -1306,3 +1306,51 @@ fn commonjs_namespaces_and_reexports_link() {
     );
     assert!(!got.iter().any(|(_, e)| e == "POST /csv"), "{got:?}");
 }
+
+/// Instances of a class from another file: through a field set in the constructor, through
+/// `new Svc().run()`, and through a TypeScript annotation.
+#[test]
+fn imported_instances_link_through_fields_new_and_annotations() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/svc.ts",
+        "import { exec } from 'child_process';\nexport class Svc { run(x: string) { exec('ls ' + x); } }\n",
+    );
+    write(
+        root,
+        "src/ctl.ts",
+        "import { Svc } from './svc';\n\
+         class Ctl { private svc: Svc; constructor() { this.svc = new Svc(); } h(req: any) { this.svc.run(req.query.a); } }\n\
+         const c = new Ctl();\n\
+         app.get('/a', (req, res) => c.h(req));\n\
+         app.get('/b', (req, res) => new Svc().run(req.query.b));\n\
+         function go(s: Svc, v: string) { s.run(v); }\n\
+         app.get('/c', (req, res) => go(make(), req.query.c));\n",
+    );
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let found: Vec<(String, String)> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["class"] == "command-injection")
+        .map(|f| {
+            (
+                f["function"].as_str().unwrap_or("").to_owned(),
+                f["entry"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    // Through the field, in the controller's method, linked to its route through `c.h(req)`.
+    assert!(
+        found.iter().any(|(f, e)| f == "Ctl.h" && e == "GET /a"),
+        "{found:?}"
+    );
+    for entry in ["GET /b", "GET /c"] {
+        assert!(
+            found.iter().any(|(_, e)| e == entry),
+            "{entry} missing from {found:?}"
+        );
+    }
+}

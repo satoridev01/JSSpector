@@ -375,6 +375,7 @@ pub fn scan_file_program(
         callback_returns: None,
         closure_writes: Vec::new(),
         pending_param_props: None,
+        field_types: BTreeMap::new(),
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -959,6 +960,9 @@ struct Walker<'e> {
     callback_returns: Option<Origin>,
     /// What the function walked last wrote to its parent's names: (name, field, taint).
     closure_writes: Vec<(String, Option<String>, Origin)>,
+    /// Instance fields known to hold one of our classes: (class, field) -> class
+    /// (`this.svc = new Svc()`, `private svc: Svc`).
+    field_types: BTreeMap<(String, String), String>,
     /// TypeScript parameter properties of the constructor about to be entered
     /// (`constructor(private readonly cfg: Config)`): (class, parameter names), stored as
     /// instance fields at entry.
@@ -1247,6 +1251,21 @@ fn doubles_quotes(arguments: &[Argument<'_>]) -> bool {
             Some(Argument::StringLiteral(quote)) => quote.value.as_str() == Some("'"),
             _ => false,
         }
+}
+
+/// The class a `: C` type annotation names (a PascalCase type reference).
+fn annotated_class(annotation: Option<&oxc_ast::ast::TSTypeAnnotation<'_>>) -> Option<String> {
+    let oxc_ast::ast::TSType::TSTypeReference(reference) = &annotation?.type_annotation else {
+        return None;
+    };
+    let oxc_ast::ast::TSTypeName::IdentifierReference(name) = &reference.type_name else {
+        return None;
+    };
+    let name = name.name.as_str();
+    name.chars()
+        .next()
+        .is_some_and(char::is_uppercase)
+        .then(|| name.to_owned())
 }
 
 /// A regular expression: `/a(.*)/` or `new RegExp(...)`.
@@ -2301,19 +2320,13 @@ impl Walker<'_> {
                     env.server_fields.remove(name);
                 }
             }
-            // `const shell = new ShellService()`, with `ShellService` imported from our files.
+            // `const shell = new ShellService()`, with `ShellService` imported from our files; an
+            // alias of a typed variable or field; a `: ShellService` annotation.
             if let Some(name) = &name_hint {
-                let class = match init.get_inner_expression() {
-                    Expression::NewExpression(n) => match n.callee.get_inner_expression() {
-                        Expression::Identifier(id)
-                            if self.relative.contains_key(id.name.as_str()) =>
-                        {
-                            Some(id.name.as_str().to_owned())
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                };
+                let typed = self.instance_class(init, declarator.type_annotation.as_deref(), env);
+                let class = typed
+                    .clone()
+                    .filter(|class| self.relative.contains_key(class.as_str()));
                 match class {
                     Some(class) => {
                         env.instances.insert(name.clone(), class);
@@ -2323,17 +2336,7 @@ impl Walker<'_> {
                     }
                 }
                 // `const store = new SnapshotStore()` with the class in this file.
-                let local = match init.get_inner_expression() {
-                    Expression::NewExpression(n) => match n.callee.get_inner_expression() {
-                        Expression::Identifier(id)
-                            if !self.relative.contains_key(id.name.as_str()) =>
-                        {
-                            Some(id.name.as_str().to_owned())
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                };
+                let local = typed.filter(|class| !self.relative.contains_key(class.as_str()));
                 match local {
                     Some(class) => {
                         env.local_instances.insert(name.clone(), class);
@@ -2826,6 +2829,18 @@ impl Walker<'_> {
                     self.pending_param_props = None;
                 }
                 ClassElement::PropertyDefinition(property) => {
+                    // `private svc: Svc;`, `svc = new Svc();`: the field's class.
+                    if let (Some(class), Some(field)) = (&class_name, prop_name(&property.key)) {
+                        let typed = match &property.value {
+                            Some(value) => {
+                                self.instance_class(value, property.type_annotation.as_deref(), env)
+                            }
+                            None => annotated_class(property.type_annotation.as_deref()),
+                        };
+                        if let Some(typed) = typed {
+                            self.field_types.insert((class.clone(), field), typed);
+                        }
+                    }
                     if let Some(value) = &property.value {
                         let name = prop_name(&property.key);
                         self.expr_named(value, env, name);
@@ -2886,6 +2901,19 @@ impl Walker<'_> {
         env.params = names.iter().map(|n| n.unwrap_or("").to_owned()).collect();
         for param in &params.items {
             pattern_names(&param.pattern, &mut env.locals);
+            // `function f(svc: Svc)`: an instance of `Svc` (a parameter shadows outer types).
+            if let BindingPattern::BindingIdentifier(id) = &param.pattern {
+                let name = id.name.as_str().to_owned();
+                env.instances.remove(&name);
+                env.local_instances.remove(&name);
+                if let Some(class) = annotated_class(param.type_annotation.as_deref()) {
+                    if self.relative.contains_key(class.as_str()) {
+                        env.instances.insert(name, class);
+                    } else {
+                        env.local_instances.insert(name, class);
+                    }
+                }
+            }
         }
         if let Some(rest) = &params.rest {
             pattern_names(&rest.rest.argument, &mut env.locals);
@@ -3615,6 +3643,18 @@ impl Walker<'_> {
                             }
                         }
                     }
+                }
+                // `this.svc = new Svc()`: the field holds a `Svc` in every method.
+                if let Some(member) = assign
+                    .left
+                    .as_simple_assignment_target()
+                    .and_then(SimpleAssignmentTarget::as_member_expression)
+                    && matches!(member.object(), Expression::ThisExpression(_))
+                    && let Some(field) = member.static_property_name().and_then(|n| n.as_str())
+                    && let Some(class) = self.current_class.clone()
+                    && let Some(typed) = self.instance_class(&assign.right, None, env)
+                {
+                    self.field_types.insert((class, field.to_owned()), typed);
                 }
                 // `C.prototype.run = function () {}` and `C.prototype = { run() {} }`: methods
                 // of the ES5 class `C`, walked as `C.run` with `this` an instance of `C`.
@@ -4703,7 +4743,7 @@ impl Walker<'_> {
                             Expression::StaticMemberExpression(field)
                                 if matches!(field.object, Expression::ThisExpression(_)) =>
                             {
-                                self.injected.get(field.property.name.as_str()).cloned()
+                                self.this_field_class(field.property.name.as_str())
                             }
                             _ => None,
                         };
@@ -5176,10 +5216,12 @@ impl Walker<'_> {
             }
         }
 
-        // Lowering: the call, its callee and what each argument is.
+        // Lowering: the call, its callee and what each argument is. A method of a typed
+        // receiver is recorded by its class (`c.h()` on a `Ctl` is `Ctl.h`), so the call graph
+        // links it.
         if !self.summarize
             && !self.record_only
-            && let Some(callee_text) = callee_name(&call.callee)
+            && let Some(callee_text) = self.typed_callee(&callee, call, env)
         {
             let args = call
                 .arguments
@@ -5313,6 +5355,26 @@ impl Walker<'_> {
                     .map(|c| format!("{c}.{method}"))
                     .and_then(|key| self.summaries.get(&key).map(|s| (key, s.clone())))
             }
+            // `new Svc(cfg).run(x)` with `Svc` a class of this file.
+            Callee::Method {
+                object: None,
+                method,
+            } if !method.is_empty() => call
+                .callee
+                .get_inner_expression()
+                .as_member_expression()
+                .and_then(|m| match m.object().get_inner_expression() {
+                    Expression::NewExpression(n) => match n.callee.get_inner_expression() {
+                        Expression::Identifier(id)
+                            if !self.relative.contains_key(id.name.as_str()) =>
+                        {
+                            Some(format!("{}.{method}", id.name.as_str()))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .and_then(|key| self.summaries.get(&key).map(|s| (key, s.clone()))),
             _ => None,
         };
         // Then other files of the repository, by unique name.
@@ -5359,20 +5421,34 @@ impl Walker<'_> {
                 }
             }),
             // `require('./shell').run(x)`: that module's `run`; `api.users.gen(x)`: the `gen` of
-            // the module `api` exports as its `users` namespace.
+            // the module `api` exports as its `users` namespace; `new Svc().run(x)` with `Svc`
+            // imported: its method.
             Callee::Method {
                 object: None,
                 method,
             } if !method.is_empty() => {
                 let member = call.callee.get_inner_expression().as_member_expression();
-                match member.and_then(|m| require_spec(m.object())) {
-                    Some(spec) if self.linking.is_own(&spec) => Some(Target {
+                let constructed = member.and_then(|m| match m.object().get_inner_expression() {
+                    Expression::NewExpression(n) => match n.callee.get_inner_expression() {
+                        Expression::Identifier(id) => self
+                            .relative
+                            .get(id.name.as_str())
+                            .map(|r| (id.name.as_str().to_owned(), r.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                match (constructed, member.and_then(|m| require_spec(m.object()))) {
+                    (Some((class, (spec, export))), _) => {
+                        Some(class_target(self, &spec, export.as_deref(), &class, method))
+                    }
+                    (None, Some(spec)) if self.linking.is_own(&spec) => Some(Target {
                         exact: self.exported_function(&spec, method),
                         names: vec![method.clone()],
                         spec,
                     }),
-                    Some(_) => None,
-                    None => member
+                    (None, Some(_)) => None,
+                    (None, None) => member
                         .and_then(|m| self.namespace_file(m.object()))
                         .and_then(|file| self.exported_function_in(&file, method))
                         .map(|exact| Target {
@@ -6428,6 +6504,89 @@ impl Walker<'_> {
             .get(&file)?
             .get(member.property.name.as_str())?;
         local.strip_prefix(NAMESPACE).map(str::to_owned)
+    }
+
+    /// The class of ours a value is an instance of: `new C(..)`, an alias of a typed variable,
+    /// a typed field (`this.svc`), or what a `: C` annotation says.
+    fn instance_class(
+        &self,
+        init: &Expression<'_>,
+        annotation: Option<&oxc_ast::ast::TSTypeAnnotation<'_>>,
+        env: &Env,
+    ) -> Option<String> {
+        let from_value = match init.get_inner_expression() {
+            Expression::NewExpression(n) => match n.callee.get_inner_expression() {
+                Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                _ => None,
+            },
+            Expression::AwaitExpression(a) => {
+                return self.instance_class(&a.argument, annotation, env);
+            }
+            Expression::Identifier(id) => {
+                let name = id.name.as_str();
+                env.instances
+                    .get(name)
+                    .or_else(|| env.local_instances.get(name))
+                    .cloned()
+            }
+            Expression::StaticMemberExpression(field)
+                if matches!(field.object, Expression::ThisExpression(_)) =>
+            {
+                self.this_field_class(field.property.name.as_str())
+            }
+            _ => None,
+        };
+        from_value.or_else(|| annotated_class(annotation))
+    }
+
+    /// A call's callee as the call graph should see it: `Class.method` for a typed receiver
+    /// (a variable, `this.field`, `new Class()`), else as written.
+    fn typed_callee(
+        &self,
+        callee: &Callee,
+        call: &CallExpression<'_>,
+        env: &Env,
+    ) -> Option<String> {
+        if let Callee::Method { object, method } = callee
+            && !method.is_empty()
+        {
+            let receiver = call
+                .callee
+                .get_inner_expression()
+                .as_member_expression()
+                .map(|m| m.object().get_inner_expression());
+            let class = match (object, receiver) {
+                (Some(object), Some(Expression::Identifier(_))) => env
+                    .local_instances
+                    .get(object)
+                    .or_else(|| env.instances.get(object))
+                    .cloned(),
+                // `this.svc.run()`: `object` is already the field's class.
+                (Some(object), Some(Expression::StaticMemberExpression(field)))
+                    if matches!(field.object, Expression::ThisExpression(_)) =>
+                {
+                    Some(object.clone())
+                }
+                (None, Some(Expression::NewExpression(n))) => match n.callee.get_inner_expression()
+                {
+                    Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(class) = class {
+                return Some(format!("{class}.{method}"));
+            }
+        }
+        callee_name(&call.callee)
+    }
+
+    /// The class `this.<field>` holds: constructor injection, or a typed field.
+    fn this_field_class(&self, field: &str) -> Option<String> {
+        self.injected.get(field).cloned().or_else(|| {
+            let class = self.current_class.clone()?;
+            self.field_types.get(&(class, field.to_owned())).cloned()
+        })
     }
 
     /// A router's own path prefix (`""` without one).
@@ -8649,6 +8808,44 @@ mod tests {
             route("fs.mkdirSync(path.dirname(req.query.p));"),
             vec![(PathTraversal, High)]
         );
+    }
+
+    #[test]
+    fn instances_typed_by_fields_aliases_annotations_and_new() {
+        use VulnClass::*;
+        let svc = "class Svc { run(x) { exec('ls ' + x); } }\nclass Safe { run(x) { exec('ls ' + parseInt(x, 10)); } }\n";
+        // A field set in the constructor.
+        let found = one(&format!(
+            "{svc}class Ctl {{ constructor() {{ this.svc = new Svc(); }} h(req) {{ this.svc.run(req.query.x); }} }}\n\
+             const c = new Ctl();\napp.get('/x', (req, res) => c.h(req));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        // `new Svc().run(x)`; an alias.
+        let found = one(&format!(
+            "{svc}app.get('/x', (req, res) => new Svc().run(req.query.x));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        let found = one(&format!(
+            "{svc}const a = new Svc();\nconst b = a;\napp.get('/x', (req, res) => b.run(req.query.x));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        // Only the constructed class's method.
+        assert!(
+            one(&format!(
+                "{svc}app.get('/x', (req, res) => new Safe().run(req.query.x));"
+            ))
+            .is_empty()
+        );
+        // A TypeScript annotation, on a variable and on a parameter.
+        let head = "const { exec } = require('child_process');\nclass Svc { run(x: string) { exec('ls ' + x); } }\n";
+        let found = scan_ts(&format!(
+            "{head}const s: Svc = make();\napp.get('/x', (req, res) => s.run(req.query.x));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        let found = scan_ts(&format!(
+            "{head}function go(s: Svc, v: string) {{ s.run(v); }}\napp.get('/x', (req, res) => go(make(), req.query.x));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
     }
 
     #[test]

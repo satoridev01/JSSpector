@@ -42,6 +42,10 @@ pub struct Origin {
     pub built: bool,
     /// The tainted data is (still) at the start of the string.
     pub prefix: bool,
+    /// Concatenated with literal text that looks like SQL.
+    pub sqlish: bool,
+    /// Summary pass only: this is the value of the enclosing function's parameter `n`.
+    pub param: Option<usize>,
 }
 
 impl Origin {
@@ -79,10 +83,36 @@ pub fn scan_program(program: &Program<'_>, text: &str) -> ScanResult {
         modules: BTreeMap::new(),
         result: ScanResult::default(),
         depth: 0,
+        summarize: true,
+        summaries: BTreeMap::new(),
+    };
+    // Two summary passes: the second sees the first's summaries (helpers calling helpers).
+    for _ in 0..2 {
+        walker.modules.clear();
+        let mut env = Env::new("<module>".to_owned());
+        walker.statements(&program.body, &mut env);
+    }
+    walker.summarize = false;
+    walker.modules.clear();
+    walker.result = ScanResult {
+        findings: Vec::new(),
+        truncated: walker.result.truncated,
     };
     let mut env = Env::new("<module>".to_owned());
     walker.statements(&program.body, &mut env);
     walker.result
+}
+
+/// A named function's parameter that reaches a sink in its body (same file).
+#[derive(Debug, Clone)]
+struct Summary {
+    param: usize,
+    class: VulnClass,
+    severity: Severity,
+    api: String,
+    arg: Span,
+    call: Span,
+    steps: Vec<(u32, String)>,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -143,19 +173,24 @@ enum Role {
     /// Registered as a route handler (`app.post(path, fn)`).
     Route,
     /// A socket.io event callback: its parameters are client data.
-    Socket,
+    /// Client data: every parameter is tainted with this source kind.
+    Client(&'static str),
 }
 
 struct Walker {
     modules: BTreeMap<String, Imported>,
     result: ScanResult,
     depth: u32,
+    /// Summary pass: parameters of named functions are tainted, and findings become summaries.
+    summarize: bool,
+    summaries: BTreeMap<String, Vec<Summary>>,
 }
 
 fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
     match (a, b) {
         (Some(a), Some(b)) => Some(Origin {
             built: a.built || b.built,
+            sqlish: a.sqlish || b.sqlish,
             ..a
         }),
         (a, b) => a.or(b),
@@ -513,6 +548,8 @@ impl Walker {
                                 steps: Vec::new(),
                                 built: false,
                                 prefix: true,
+                                sqlish: false,
+                                param: None,
                             })
                         }
                         (Some(_), _) => None,
@@ -602,18 +639,34 @@ impl Walker {
             env.requests.remove(*name);
         }
         let first = names.first().copied().flatten();
+        if self.summarize && role == Role::Plain && env.function != "<anonymous>" {
+            for (index, param) in params.items.iter().enumerate() {
+                let origin = Origin {
+                    kind: "param",
+                    span: param.span,
+                    steps: Vec::new(),
+                    built: false,
+                    prefix: true,
+                    sqlish: false,
+                    param: Some(index),
+                };
+                self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
+            }
+        }
         match role {
-            Role::Socket => {
+            Role::Client(kind) => {
                 for (param, name) in params.items.iter().zip(&names) {
                     if name.is_some_and(|n| contains(models::SOCKET_ACK_NAMES, n)) {
                         continue;
                     }
                     let origin = Origin {
-                        kind: "socket",
+                        kind,
                         span: param.span,
                         steps: Vec::new(),
                         built: false,
                         prefix: true,
+                        sqlish: false,
+                        param: None,
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -624,7 +677,9 @@ impl Walker {
                 if let Some(first) = first {
                     if first == "ctx" && (role == Role::Route || names.len() <= 2) {
                         env.requests.insert("ctx".to_owned(), "koa");
-                    } else if conventional || (role == Role::Route && names.len() >= 2) {
+                    } else if conventional
+                        || (role == Role::Route && (names.len() >= 2 || first == "c"))
+                    {
                         env.requests.insert(first.to_owned(), "http");
                     }
                 } else if role == Role::Route
@@ -717,6 +772,10 @@ impl Walker {
                 for (index, expression) in template.expressions.iter().enumerate() {
                     if let Some(mut origin) = self.expr(expression, env) {
                         origin.built = true;
+                        origin.sqlish |= template
+                            .quasis
+                            .iter()
+                            .any(|q| models::looks_like_sql(q.value.raw.as_str()));
                         let leading = index == 0
                             && template.quasis.first().is_some_and(|q| {
                                 q.value
@@ -747,12 +806,18 @@ impl Walker {
                 let left = self.expr(&binary.left, env);
                 let right = self.expr(&binary.right, env);
                 if binary.operator == BinaryOperator::Addition {
+                    let sqlish = [&binary.left, &binary.right].iter().any(|side| {
+                        matches!(side.get_inner_expression(), Expression::StringLiteral(lit)
+                            if lit.value.as_str().is_some_and(models::looks_like_sql))
+                    });
                     let left = left.map(|mut o| {
                         o.built = true;
+                        o.sqlish |= sqlish;
                         o
                     });
                     let right = right.map(|mut o| {
                         o.built = true;
+                        o.sqlish |= sqlish;
                         o.prefix = false;
                         o.step(binary.span.start, "concatenated".to_owned())
                     });
@@ -965,6 +1030,8 @@ impl Walker {
                 steps: Vec::new(),
                 built: false,
                 prefix: true,
+                sqlish: false,
+                param: None,
             });
         }
         if object.is_specific_id("process") && property.as_deref() == Some("argv") {
@@ -974,7 +1041,23 @@ impl Walker {
                 steps: Vec::new(),
                 built: false,
                 prefix: true,
+                sqlish: false,
+                param: None,
             });
+        }
+        // multer: the server chooses where an upload is stored.
+        if let Some(inner) = object.as_member_expression()
+            && inner
+                .static_property_name()
+                .is_some_and(|p| p == "file" || p == "files")
+            && property
+                .as_deref()
+                .is_some_and(|p| contains(models::UPLOAD_SERVER_FIELDS, p))
+            && self
+                .request_kind(inner.object().get_inner_expression(), env)
+                .is_some()
+        {
+            return None;
         }
         // Any property of a tainted object is tainted.
         self.expr(member.object(), env)
@@ -984,7 +1067,9 @@ impl Walker {
     fn request_kind(&self, expr: &Expression<'_>, env: &Env) -> Option<&'static str> {
         match expr {
             Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
-            Expression::StaticMemberExpression(m) if m.property.name == "request" => {
+            Expression::StaticMemberExpression(m)
+                if m.property.name == "request" || m.property.name == "req" =>
+            {
                 match m.object.get_inner_expression() {
                     Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
                     _ => None,
@@ -1106,16 +1191,14 @@ impl Walker {
                     _ => None,
                 };
                 if socketish && event.is_some_and(|e| !contains(models::SOCKET_BUILTIN_EVENTS, e)) {
-                    Role::Socket
+                    Role::Client("socket")
                 } else {
                     Role::Plain
                 }
             }
             Callee::Method { method, .. }
-            | Callee::Module {
-                export: Some(method),
-                ..
-            } if contains(models::ROUTE_METHODS, method) && call.arguments.len() >= 2 => {
+                if contains(models::ROUTE_METHODS, method) && call.arguments.len() >= 2 =>
+            {
                 Role::Route
             }
             _ => Role::Plain,
@@ -1147,6 +1230,27 @@ impl Walker {
             taints.push(taint);
         }
 
+        // `Meteor.methods({ name(args) { ... } })`: method arguments come from any client.
+        if let Callee::Method {
+            object: Some(object),
+            method,
+        } = &callee
+            && object == "Meteor"
+            && method == "methods"
+            && let Some(Expression::ObjectExpression(methods)) = call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .map(Expression::get_inner_expression)
+        {
+            for property in &methods.properties {
+                if let ObjectPropertyKind::ObjectProperty(p) = property {
+                    let name = prop_name(&p.key).map(|n| format!("Meteor.methods {n}"));
+                    self.maybe_function(&p.value, env, name, Role::Client("meteor"));
+                }
+            }
+        }
+
         // Sinks.
         let sink = match &callee {
             Callee::Module { family, export } => {
@@ -1157,6 +1261,45 @@ impl Walker {
         };
         if let Some(sink) = sink {
             self.check_sink(sink, &callee, &call.arguments, &taints, call.span, env);
+        }
+
+        // Same-file helpers whose parameters reach a sink.
+        let helper = match &callee {
+            Callee::Global(name) => self.summaries.get(name).map(|s| (name.clone(), s.clone())),
+            Callee::Method { method, .. } if !method.is_empty() => {
+                let suffix = format!(".{method}");
+                let mut matching = self.summaries.iter().filter(|(k, _)| k.ends_with(&suffix));
+                match (matching.next(), matching.next()) {
+                    (Some((k, s)), None) => Some((k.clone(), s.clone())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((name, summaries)) = helper {
+            for summary in summaries {
+                let Some(origin) = taints.get(summary.param).cloned().flatten() else {
+                    continue;
+                };
+                let mut origin = origin.step(call.span.start, format!("passed to `{name}()`"));
+                for step in &summary.steps {
+                    if origin.steps.len() < MAX_STEPS {
+                        origin.steps.push(step.clone());
+                    }
+                }
+                self.emit(
+                    RawFinding {
+                        class: summary.class,
+                        severity: summary.severity,
+                        api: summary.api.clone(),
+                        arg: summary.arg,
+                        call: summary.call,
+                        function: env.function.clone(),
+                        origin,
+                    },
+                    env,
+                );
+            }
         }
 
         // Result taint.
@@ -1175,6 +1318,8 @@ impl Walker {
                         steps: Vec::new(),
                         built: false,
                         prefix: true,
+                        sqlish: false,
+                        param: None,
                     });
                 }
                 let _ = object;
@@ -1215,6 +1360,35 @@ impl Walker {
                 }
                 None
             }
+        }
+    }
+
+    /// Records a finding, or in the summary pass, a summary of a parameter that reaches a sink.
+    fn emit(&mut self, mut finding: RawFinding, env: &Env) {
+        // The CLI is the user's own machine: never above low.
+        if finding.origin.kind == "cli" {
+            finding.severity = Severity::Low;
+        }
+        match (self.summarize, finding.origin.param) {
+            (true, Some(param)) => {
+                let list = self.summaries.entry(env.function.clone()).or_default();
+                let duplicate = list
+                    .iter()
+                    .any(|s| s.param == param && s.call == finding.call && s.api == finding.api);
+                if !duplicate {
+                    list.push(Summary {
+                        param,
+                        class: finding.class,
+                        severity: finding.severity,
+                        api: finding.api,
+                        arg: finding.arg,
+                        call: finding.call,
+                        steps: finding.origin.steps,
+                    });
+                }
+            }
+            (false, None) => self.result.findings.push(finding),
+            _ => {}
         }
     }
 
@@ -1276,10 +1450,24 @@ impl Walker {
                 ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
                 ArgRule::Built(index) => (
                     index,
-                    taints.get(index).cloned().flatten().filter(|o| o.built),
+                    taints
+                        .get(index)
+                        .cloned()
+                        .flatten()
+                        .filter(|o| o.built && o.sqlish),
                 ),
                 ArgRule::UrlPrefix(index) => {
-                    let direct = taints.get(index).cloned().flatten().filter(|o| o.prefix);
+                    let is_object = arguments
+                        .get(index)
+                        .and_then(Argument::as_expression)
+                        .is_some_and(|e| {
+                            matches!(e.get_inner_expression(), Expression::ObjectExpression(_))
+                        });
+                    let direct = taints
+                        .get(index)
+                        .cloned()
+                        .flatten()
+                        .filter(|o| o.prefix && !is_object);
                     let from_options = arguments
                         .get(index)
                         .and_then(Argument::as_expression)
@@ -1304,15 +1492,18 @@ impl Walker {
             let Some(arg) = arguments.get(index) else {
                 continue;
             };
-            self.result.findings.push(RawFinding {
-                class: sink.class,
-                severity,
-                api: api.clone(),
-                arg: arg.span(),
-                call: span,
-                function: env.function.clone(),
-                origin,
-            });
+            self.emit(
+                RawFinding {
+                    class: sink.class,
+                    severity,
+                    api: api.clone(),
+                    arg: arg.span(),
+                    call: span,
+                    function: env.function.clone(),
+                    origin,
+                },
+                env,
+            );
             break;
         }
     }
@@ -1462,6 +1653,56 @@ mod tests {
         // `(a, b)` callbacks that are not route registrations carry no request.
         assert!(one("list.forEach((item, i) => exec(item.cmd));").is_empty());
         assert!(one("function helper(cmd) { exec(cmd); }").is_empty());
+    }
+
+    #[test]
+    fn options_objects_count_only_through_their_url_fields() {
+        assert!(scan("const http = require('http');\napp.get('/p', (req, res) => { http.request({ host: 'w', path: '/', headers: { ...req.headers } }); });").is_empty());
+        assert_eq!(scan("const http = require('http');\napp.get('/p', (req, res) => { http.request({ host: req.query.h }); });").len(), 1);
+    }
+
+    #[test]
+    fn multer_storage_fields_are_not_client_data() {
+        assert!(
+            one("app.post('/u', up.single('f'), (req, res) => { fs.unlinkSync(req.file.path); });")
+                .is_empty()
+        );
+        assert_eq!(one("app.post('/u', up.single('f'), (req, res) => { fs.unlinkSync(req.file.originalname); });").len(), 1);
+    }
+
+    #[test]
+    fn sql_needs_sql_looking_text() {
+        assert_eq!(one("app.get('/u', (req, res) => { db.exec('SELECT * FROM t WHERE id = ' + req.query.id); });").len(), 1);
+        assert!(
+            one("app.get('/u', (req, res) => { cache.get('user:' + req.query.id); });").is_empty()
+        );
+    }
+
+    #[test]
+    fn meteor_methods_and_hono_context_are_sources() {
+        let meteor = one("Meteor.methods({ run(cmd) { exec('ls ' + cmd); } });");
+        assert_eq!(meteor.len(), 1);
+        assert_eq!(meteor[0].3, "meteor");
+        assert_eq!(
+            one("app.get('/x', async (c) => { const q = c.req.query('d'); exec(`ls ${q}`); });")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_file_helpers_are_followed_two_levels() {
+        let src = "function run(cmd) { exec('sh -c ' + cmd); }\n\
+                   const wrap = (x) => run(x);\n\
+                   app.post('/r', (req, res) => { wrap(req.body.c); });";
+        let found = one(src);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].3, "http");
+        // A helper alone is not a finding, and a literal argument is not tainted.
+        assert!(
+            one("function run(cmd) { exec(cmd); }\napp.post('/r', (req, res) => { run('ls'); });")
+                .is_empty()
+        );
     }
 
     #[test]

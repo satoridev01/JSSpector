@@ -23,9 +23,41 @@ pub const REQUEST_PROPS: &[&str] = &[
     "path",
 ];
 
+/// Fields of `req.file` / `req.files[i]` (multer) that the server chooses, not the client.
+pub const UPLOAD_SERVER_FIELDS: &[&str] = &["path", "filename", "destination", "size"];
+
+/// Literal text that looks like part of an SQL statement (a keyword as a whole word).
+pub fn looks_like_sql(text: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "select", "insert", "update", "delete", "where", "from", "values", "order by", "group by",
+        "limit", "join", "set",
+    ];
+    let lower = text.to_ascii_lowercase();
+    KEYWORDS.iter().any(|keyword| {
+        lower.match_indices(keyword).any(|(at, _)| {
+            let before = lower.get(..at).and_then(|s| s.chars().next_back());
+            let after = lower
+                .get(at + keyword.len()..)
+                .and_then(|s| s.chars().next());
+            let boundary =
+                |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+            boundary(before) && boundary(after)
+        })
+    })
+}
+
 /// Methods of a request object whose result is attacker-controlled (`req.get('x')`,
 /// `await request.json()` in Next.js/fetch-style handlers).
-pub const REQUEST_METHODS: &[&str] = &["get", "param", "header", "json", "text", "formData"];
+pub const REQUEST_METHODS: &[&str] = &[
+    "get",
+    "param",
+    "header",
+    "json",
+    "text",
+    "formData",
+    "query",
+    "parseBody",
+];
 
 /// Conventional names of a handler's request parameter.
 pub const REQUEST_NAMES: &[&str] = &["req", "request"];
@@ -206,9 +238,8 @@ pub fn global_sink(name: &str) -> Option<Sink> {
 pub fn method_sink(method: &str) -> Option<Sink> {
     Some(match method {
         "query" | "execute" | "raw" | "whereRaw" | "orderByRaw" | "havingRaw" | "joinRaw"
-        | "$queryRawUnsafe" | "$executeRawUnsafe" | "unsafe" => {
-            sink(SqlInjection, High, &[Built(0)])
-        }
+        | "$queryRawUnsafe" | "$executeRawUnsafe" | "unsafe" | "exec" | "all" | "run" | "get"
+        | "prepare" | "each" => sink(SqlInjection, High, &[Built(0)]),
         // A `root` option makes these safe; the walker checks for it.
         "sendFile" | "download" => sink(PathTraversal, High, &[Any(0)]),
         _ => return None,

@@ -263,6 +263,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
     let templates = Templates::new();
     let constants = BTreeMap::new();
     let exports = BTreeMap::new();
+    let subclasses = BTreeMap::new();
     let names = BTreeMap::new();
     let linking = Linking {
         file: "",
@@ -272,6 +273,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
         templates: &templates,
         constants: &constants,
         exports: &exports,
+        subclasses: &subclasses,
         scalar_props: &[],
         packages: None,
         external_names: &names,
@@ -295,6 +297,8 @@ pub struct Linking<'a> {
     pub constants: &'a BTreeMap<String, BTreeMap<String, String>>,
     /// Exports of every file (from the previous round): file -> export name -> local name.
     pub exports: &'a BTreeMap<String, BTreeMap<String, String>>,
+    /// Every class extending or implementing each class or interface (see `scan.rs`).
+    pub subclasses: &'a BTreeMap<(String, String), Vec<(String, String)>>,
     /// Request props that hold only strings and arrays in this file's package (`query` with
     /// Express 5).
     pub scalar_props: &'a [String],
@@ -462,6 +466,8 @@ pub struct FileFacts {
     pub functions: BTreeMap<String, (u32, Vec<String>)>,
     /// Calls each function makes: (callee, offset, arguments).
     pub calls: BTreeMap<String, Vec<(String, u32, Vec<jss_core::ir::Value>)>>,
+    /// Classes declared here, with their bases.
+    pub classes: Vec<jss_core::ir::ClassDecl>,
 }
 
 /// One entry point registered in this file.
@@ -2612,6 +2618,31 @@ impl Walker<'_> {
 
     fn class(&mut self, class: &Class<'_>, env: &mut Env) {
         let class_name = class.id.as_ref().map(|id| id.name.as_str().to_owned());
+        // `class MongoMem extends Mem implements Store`: its bases, for dispatch on a `Mem`.
+        if let Some(name) = &class_name {
+            let mut bases = Vec::new();
+            if let Some(Expression::Identifier(base)) = class
+                .heritage
+                .as_ref()
+                .map(|heritage| heritage.expression.get_inner_expression())
+                && let Some(resolved) = self.class_ref(base.name.as_str())
+            {
+                bases.push(resolved);
+            }
+            for implemented in &class.implements {
+                if let oxc_ast::ast::TSTypeName::IdentifierReference(id) = &implemented.expression
+                    && let Some(resolved) = self.class_ref(id.name.as_str())
+                {
+                    bases.push(resolved);
+                }
+            }
+            if !bases.is_empty() {
+                self.facts.classes.push(jss_core::ir::ClassDecl {
+                    name: name.clone(),
+                    bases,
+                });
+            }
+        }
         // `@UseGuards(AuthGuard)` on the class or a method: every request passes the guard.
         // Rated by the guards it names (`@UseGuards(ThrottlerGuard)` is no login check,
         // `@UseGuards(AdminGuard)` an admin one); a bare auth decorator (`@Authorized()`) is a
@@ -5545,6 +5576,15 @@ impl Walker<'_> {
         // What the helper returns: the taint of the arguments its return summaries name, field
         // by field when it returns an object literal.
         let mut returned_fields: BTreeMap<String, Origin> = BTreeMap::new();
+        // `m.get(id)` on an `m: Mem` with no `Mem.get` of its own (an abstract class or an
+        // interface): the `get` of every class that extends or implements `Mem`.
+        let dispatched: Vec<(String, Vec<Summary>)> = match (&helper, &callee) {
+            (None, Callee::Method { method, .. }) => self
+                .receiver_class(&callee, call, env)
+                .map(|class| self.dispatch_candidates(&class, method))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let returned = helper.as_ref().and_then(|(name, summaries)| {
             let mut whole = None;
             for s in summaries.iter().filter(|s| s.api == RETURNS) {
@@ -5637,6 +5677,21 @@ impl Walker<'_> {
                 Some(&call.arguments),
                 call.span,
                 env,
+            );
+        }
+        let mut returned = returned;
+        for (name, summaries) in &dispatched {
+            self.apply_summaries(
+                name,
+                summaries,
+                &taints,
+                Some(&call.arguments),
+                call.span,
+                env,
+            );
+            returned = union(
+                returned,
+                summary_returns(name, summaries, &taints, call.span),
             );
         }
         // Handlers passed by reference: `socket.on('ev', onEvent)`, `ipcMain.handle(ch, fn)`.
@@ -6587,6 +6642,90 @@ impl Walker<'_> {
             let class = self.current_class.clone()?;
             self.field_types.get(&(class, field.to_owned())).cloned()
         })
+    }
+
+    /// Where a class or interface named here is defined: (file, its name there).
+    fn class_ref(&self, name: &str) -> Option<(String, String)> {
+        match self.relative.get(name) {
+            Some((spec, export)) => {
+                let file = self.linking.resolve(spec)?;
+                let export = export.as_deref().unwrap_or("default");
+                Some(
+                    self.exported_function_in(&file, export)
+                        .unwrap_or((file, export.to_owned())),
+                )
+            }
+            None => Some((self.linking.file.to_owned(), name.to_owned())),
+        }
+    }
+
+    /// `m.get(id)` on an `m: Mem` with no `Mem.get` of its own: the `get` of every class that
+    /// extends or implements `Mem` (at most 16), as (name, summaries).
+    fn dispatch_candidates(&self, class: &str, method: &str) -> Vec<(String, Vec<Summary>)> {
+        let Some(base) = self.class_ref(class) else {
+            return Vec::new();
+        };
+        let Some(classes) = self.linking.subclasses.get(&base) else {
+            return Vec::new();
+        };
+        if classes.len() > 16 {
+            return Vec::new();
+        }
+        classes
+            .iter()
+            .filter_map(|(file, name)| {
+                let key = format!("{name}.{method}");
+                let list: Vec<Summary> = if file == self.linking.file {
+                    self.summaries.get(&key)?.clone()
+                } else {
+                    self.external
+                        .get(&key)?
+                        .iter()
+                        .filter(|s| s.defined_in.as_deref() == Some(file.as_str()))
+                        .cloned()
+                        .collect()
+                };
+                (!list.is_empty()).then_some((key, list))
+            })
+            .collect()
+    }
+
+    /// The class a method call's receiver is typed with: a typed variable, `this.field`, or
+    /// `new C()`.
+    fn receiver_class(
+        &self,
+        callee: &Callee,
+        call: &CallExpression<'_>,
+        env: &Env,
+    ) -> Option<String> {
+        let Callee::Method { object, method } = callee else {
+            return None;
+        };
+        if method.is_empty() {
+            return None;
+        }
+        let receiver = call
+            .callee
+            .get_inner_expression()
+            .as_member_expression()
+            .map(|m| m.object().get_inner_expression());
+        match (object, receiver) {
+            (Some(object), Some(Expression::Identifier(_))) => env
+                .local_instances
+                .get(object)
+                .or_else(|| env.instances.get(object))
+                .cloned(),
+            (Some(object), Some(Expression::StaticMemberExpression(field)))
+                if matches!(field.object, Expression::ThisExpression(_)) =>
+            {
+                Some(object.clone())
+            }
+            (None, Some(Expression::NewExpression(n))) => match n.callee.get_inner_expression() {
+                Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// A router's own path prefix (`""` without one).

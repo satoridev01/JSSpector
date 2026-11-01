@@ -1354,3 +1354,56 @@ fn imported_instances_link_through_fields_new_and_annotations() {
         );
     }
 }
+
+/// A call on a receiver typed with an abstract class (or interface) reaches the classes that
+/// extend (or implement) it, and only those.
+#[test]
+fn calls_on_a_base_type_dispatch_to_its_implementations() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/base.ts",
+        "export abstract class Mem { abstract get(id: string): any; }\nexport interface Store { put(k: string): void; }\n",
+    );
+    write(
+        root,
+        "src/mongo.ts",
+        "import { Mem, Store } from './base';\n\
+         export class MongoMem extends Mem { get(id: string) { return coll.findOne({ s: id }); } }\n\
+         export class FileStore implements Store { put(k: string) { require('fs').writeFileSync('/data/' + k, ''); } }\n\
+         export class Other { get(id: string) { return require('child_process').exec('ls ' + id); } }\n",
+    );
+    write(
+        root,
+        "src/svc.ts",
+        "import { Mem, Store } from './base';\n\
+         app.post('/m', async (req, res) => { const m: Mem = await load(); m.get(req.body.id); });\n\
+         app.post('/s', async (req, res) => { const s: Store = pick(); s.put(req.body.k); });\n",
+    );
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let found: Vec<(String, String)> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["class"].as_str().unwrap_or("").to_owned(),
+                f["sink"]["file"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        found.contains(&("nosql-injection".to_owned(), "src/mongo.ts".to_owned())),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&("path-traversal".to_owned(), "src/mongo.ts".to_owned())),
+        "{found:?}"
+    );
+    // `Other.get` shares the name but neither extends nor implements `Mem`.
+    assert!(
+        !found.iter().any(|(class, _)| class == "command-injection"),
+        "{found:?}"
+    );
+}

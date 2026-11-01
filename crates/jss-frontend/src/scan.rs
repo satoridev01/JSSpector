@@ -69,6 +69,9 @@ struct Context<'a> {
     templates: taint::Templates,
     constants: BTreeMap<String, BTreeMap<String, String>>,
     exports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every class extending or implementing a class or interface, transitively:
+    /// (file, name) -> [(file, name)].
+    subclasses: BTreeMap<(String, String), Vec<(String, String)>>,
     /// Request props that hold no objects, per directory of a scanned file.
     scalar: &'a BTreeMap<String, Vec<String>>,
     /// Packages sinks require that the scanned project depends on (`None`: no manifest).
@@ -101,7 +104,8 @@ impl ParsePool {
                    reexports: BTreeMap<String, BTreeSet<String>>,
                    templates: taint::Templates,
                    constants: BTreeMap<String, BTreeMap<String, String>>,
-                   exports: BTreeMap<String, BTreeMap<String, String>>|
+                   exports: BTreeMap<String, BTreeMap<String, String>>,
+                   subclasses: BTreeMap<(String, String), Vec<(String, String)>>|
          -> Vec<ScanReport> {
             let context = Context {
                 all: &all,
@@ -110,6 +114,7 @@ impl ParsePool {
                 templates,
                 constants,
                 exports,
+                subclasses,
                 scalar: &scalar,
                 packages: packages.as_ref(),
                 external_names: taint::index_names(external),
@@ -136,6 +141,7 @@ impl ParsePool {
             &external,
             BTreeMap::new(),
             taint::Templates::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
         );
@@ -175,7 +181,10 @@ impl ParsePool {
             }
             known = now;
             external = merged;
-            reports = run(&external, reexports, templates, constants, exports);
+            let subclasses = subclass_closure(&reports);
+            reports = run(
+                &external, reexports, templates, constants, exports, subclasses,
+            );
         }
         reports
     }
@@ -317,6 +326,39 @@ fn major_version(spec: &str) -> Option<u64> {
 /// Most files a value is followed across: route -> controller -> registry -> service ->
 /// storage -> adapter -> helper. Rounds stop earlier once a round learns nothing new.
 pub const CROSS_FILE_HOPS: usize = 8;
+
+/// Every class that extends or implements each class or interface, transitively (at most 64
+/// per base), from every module's class declarations.
+fn subclass_closure(reports: &[ScanReport]) -> BTreeMap<(String, String), Vec<(String, String)>> {
+    let mut direct: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+    for report in reports {
+        for class in &report.module.classes {
+            for base in &class.bases {
+                direct
+                    .entry(base.clone())
+                    .or_default()
+                    .push((report.rel_path.clone(), class.name.clone()));
+            }
+        }
+    }
+    let mut closure = BTreeMap::new();
+    for base in direct.keys() {
+        let mut found: Vec<(String, String)> = Vec::new();
+        let mut queue: Vec<(String, String)> = direct.get(base).cloned().unwrap_or_default();
+        while let Some(class) = queue.pop() {
+            if found.contains(&class) || found.len() >= 64 {
+                continue;
+            }
+            if let Some(more) = direct.get(&class) {
+                queue.extend(more.iter().cloned());
+            }
+            found.push(class);
+        }
+        found.sort();
+        closure.insert(base.clone(), found);
+    }
+    closure
+}
 
 /// File -> every file it re-exports, followed through chains of barrels.
 fn reexport_closure(reports: &[ScanReport]) -> BTreeMap<String, BTreeSet<String>> {
@@ -509,6 +551,7 @@ fn analyze(
         templates: &context.templates,
         constants: &context.constants,
         exports: &context.exports,
+        subclasses: &context.subclasses,
         scalar_props: context
             .scalar
             .get(parent_dir(&file.rel_path))
@@ -656,6 +699,7 @@ fn analyze(
             })
             .collect(),
         reexports: facts.reexports,
+        classes: facts.classes,
         mounts: facts
             .mounts
             .into_iter()

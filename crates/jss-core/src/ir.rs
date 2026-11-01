@@ -28,6 +28,16 @@ pub struct Module {
     pub mounts: Vec<Mount>,
     /// Files re-exported from here (`export * from './x'`).
     pub reexports: Vec<String>,
+    /// Classes declared here with the classes and interfaces they extend or implement.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<ClassDecl>,
+}
+
+/// A class and its bases (`extends`, `implements`), each as (defining file, name there).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ClassDecl {
+    pub name: String,
+    pub bases: Vec<(String, String)>,
 }
 
 /// `import x from './y'` / `const x = require('./y')`.

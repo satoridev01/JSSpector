@@ -689,7 +689,12 @@ fn routes(args: &RoutesArgs) -> ExitCode {
     discovery
         .files
         .retain(|file| !excludes.matches(&file.rel_path));
-    let selection = discovery.selection(ClassSet::default());
+    // The config's `include` (tests, examples, ...) applies to the inventory as to `scan`.
+    let include = match classes(&[], &loaded) {
+        Ok(include) => include,
+        Err(code) => return code,
+    };
+    let selection = discovery.selection(include);
     let reports = pool.scan(&discovery.files, selection);
     let routes = jss_frontend::inventory(&reports);
     let mut out = BufWriter::new(io::stdout().lock());

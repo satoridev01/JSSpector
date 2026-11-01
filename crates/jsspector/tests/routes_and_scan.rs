@@ -1700,3 +1700,51 @@ fn routes_registered_on_a_handed_router_are_linked() {
         .collect();
     assert_eq!(entries, vec!["POST /api/v1/admin/file"]);
 }
+
+/// Routers held in fields (`FastifyWorker.fastify = Fastify()`, `this.app = express()`) register
+/// routes like variables do, and `routes` honors the config's `include` (tests, examples).
+#[test]
+fn routers_in_fields_and_included_classes_are_inventoried() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/worker.ts",
+        "import Fastify from 'fastify';\nclass FastifyWorker {\n  static fastify: any;\n  \
+         static start() {\n    FastifyWorker.fastify = Fastify({ logger: true });\n    \
+         FastifyWorker.fastify.all('/api/echo', (request) => request.body);\n  }\n}\n\
+         class App {\n  app: any;\n  constructor() {\n    this.app = express();\n    \
+         this.app.post('/api/items', (req, res) => res.json(req.body));\n  }\n}\n",
+    );
+    write(
+        root,
+        "test/server.test.js",
+        "const Fastify = require('fastify');\ntest('x', async () => {\n  const fastify = Fastify();\n  \
+         fastify.get('/from-test', (request) => request.query);\n});\n",
+    );
+    let listed = |args: &[&str]| -> Vec<String> {
+        run(args)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r["method"].as_str().unwrap(),
+                    r["path"].as_str().unwrap()
+                )
+            })
+            .collect()
+    };
+    let routes = listed(&["routes", "--json", root.to_str().unwrap()]);
+    for route in ["ALL /api/echo", "POST /api/items"] {
+        assert!(
+            routes.iter().any(|r| r == route),
+            "{route} missing from {routes:?}"
+        );
+    }
+    assert!(!routes.iter().any(|r| r == "GET /from-test"), "{routes:?}");
+    write(root, ".jsspector.yml", "include: [tests]\n");
+    let routes = listed(&["routes", "--json", root.to_str().unwrap()]);
+    assert!(routes.iter().any(|r| r == "GET /from-test"), "{routes:?}");
+}

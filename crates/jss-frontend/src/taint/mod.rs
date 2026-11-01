@@ -1488,6 +1488,20 @@ fn returned_object<'a, 'b>(expr: &'b Expression<'a>) -> Option<&'b ObjectExpress
     }
 }
 
+/// A member chain as written: `FastifyWorker.fastify`, `this.app`, `server.api.router`.
+fn member_path(expr: &Expression<'_>) -> Option<String> {
+    match expr.get_inner_expression() {
+        Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+        Expression::ThisExpression(_) => Some("this".to_owned()),
+        Expression::StaticMemberExpression(member) => Some(format!(
+            "{}.{}",
+            member_path(&member.object)?,
+            member.property.name.as_str()
+        )),
+        _ => None,
+    }
+}
+
 /// `"--"`: the end of a command's options; what follows is positional.
 fn ends_options(expr: Option<&Expression<'_>>) -> bool {
     matches!(
@@ -4746,16 +4760,35 @@ impl Walker<'_> {
                 }
                 // `mstream = express()` on a `let mstream;` declared earlier: a router, for the
                 // routes registered on it here and in the helpers it is handed to.
-                if assign.operator.is_assign()
-                    && let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left
-                {
+                if assign.operator.is_assign() {
                     let factory = match chain_root(&assign.right) {
                         Expression::CallExpression(c) => callee_name(&c.callee),
                         Expression::NewExpression(n) => callee_name(&n.callee),
                         _ => None,
                     };
-                    if factory.as_deref().is_some_and(is_router_factory) {
-                        self.routers.insert(id.name.as_str().to_owned());
+                    // ... or a field: `FastifyWorker.fastify = Fastify()`, `this.app = express()`.
+                    let target = match &assign.left {
+                        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                            Some(id.name.as_str().to_owned())
+                        }
+                        other => other
+                            .as_simple_assignment_target()
+                            .and_then(SimpleAssignmentTarget::as_member_expression)
+                            .and_then(|m| match m {
+                                oxc_ast::ast::MemberExpression::StaticMemberExpression(s) => {
+                                    Some(format!(
+                                        "{}.{}",
+                                        member_path(&s.object)?,
+                                        s.property.name.as_str()
+                                    ))
+                                }
+                                _ => None,
+                            }),
+                    };
+                    if factory.as_deref().is_some_and(is_router_factory)
+                        && let Some(target) = target
+                    {
+                        self.routers.insert(target);
                     }
                 }
                 self.assign_target(&assign.left, taint.clone(), env);
@@ -6061,11 +6094,16 @@ impl Walker<'_> {
                             Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
                             // `this.users.find(...)` on an injected `UsersService`.
                             Expression::StaticMemberExpression(field)
-                                if matches!(field.object, Expression::ThisExpression(_)) =>
+                                if matches!(field.object, Expression::ThisExpression(_))
+                                    && self
+                                        .this_field_class(field.property.name.as_str())
+                                        .is_some() =>
                             {
                                 self.this_field_class(field.property.name.as_str())
                             }
-                            _ => None,
+                            // `FastifyWorker.fastify.all('/x', h)`, `this.app.get(..)` on a router
+                            // held in a field.
+                            other => member_path(other).filter(|path| self.routers.contains(path)),
                         };
                         // `Buffer.from`, `JSON.parse`, `Object.keys`, `Object.assign` as globals.
                         if let Some(object) = &object_name {
@@ -6478,7 +6516,8 @@ impl Walker<'_> {
                         m().route_method_keys
                             .iter()
                             .find_map(|k| text(k))
-                            .unwrap_or_default()
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| "ANY".to_owned())
                             .to_ascii_uppercase(),
                         m().route_path_keys
                             .iter()

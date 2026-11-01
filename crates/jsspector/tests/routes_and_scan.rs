@@ -757,7 +757,9 @@ fn express_major_version_decides_whether_query_values_can_be_objects() {
         write(
             dir.path(),
             "package.json",
-            &format!("{{\"name\": \"x\", \"dependencies\": {{\"express\": \"{express}\"}}}}"),
+            &format!(
+                "{{\"name\": \"x\", \"dependencies\": {{\"express\": \"{express}\", \"mongoose\": \"^8.0.0\"}}}}"
+            ),
         );
         write(dir.path(), "src/app.js", app);
         let report = run(&[
@@ -1163,4 +1165,65 @@ fn a_value_is_followed_across_six_files() {
     assert_eq!(findings[0]["class"], "command-injection");
     assert_eq!(findings[0]["sink"]["file"], "s5.js");
     assert_eq!(findings[0]["entry"], "GET /x");
+}
+
+/// `.find()` is a MongoDB query only where the project has a MongoDB driver (or is a Meteor app);
+/// elsewhere it is an ORM's or the app's own method.
+#[test]
+fn nosql_sinks_need_a_mongodb_project() {
+    let app = "const express = require('express');\nconst app = express();\n\
+               app.post('/b', async (req, res) => { res.json(await Shipment.find(req.body)); });\n";
+    let count = |manifest: Option<(&str, &str)>, meteor: bool| -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some((path, deps)) = manifest {
+            write(
+                dir.path(),
+                path,
+                &format!("{{\"name\": \"x\", \"dependencies\": {{{deps}}}}}"),
+            );
+        }
+        if meteor {
+            write(dir.path(), ".meteor/packages", "mongo\n");
+        }
+        write(dir.path(), "server/app.js", app);
+        write(dir.path(), "server/core/db.js", "module.exports = {};\n");
+        let report = run(&["scan", "--json", dir.path().to_str().unwrap()]);
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["class"] == "nosql-injection")
+            .count()
+    };
+    // A SQL app's own `find`.
+    assert_eq!(
+        count(
+            Some((
+                "package.json",
+                "\"express\": \"^4.21.2\", \"mysql2\": \"^3.0.0\""
+            )),
+            false
+        ),
+        0
+    );
+    // A MongoDB driver, in the root manifest above a package without one.
+    assert_eq!(
+        count(Some(("package.json", "\"mongodb\": \"^6.0.0\"")), false),
+        1
+    );
+    // ...or in another package of the monorepo (the core package that hands out collections).
+    assert_eq!(
+        count(
+            Some(("server/core/package.json", "\"mongodb\": \"^6.0.0\"")),
+            false
+        ),
+        1
+    );
+    // A Meteor app's collections.
+    assert_eq!(
+        count(Some(("package.json", "\"express\": \"^4.21.2\"")), true),
+        1
+    );
+    // No manifest at all: nothing is held back.
+    assert_eq!(count(None, false), 1);
 }

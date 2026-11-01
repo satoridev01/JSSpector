@@ -71,6 +71,8 @@ struct Context<'a> {
     exports: BTreeMap<String, BTreeMap<String, String>>,
     /// Request props that hold no objects, per directory of a scanned file.
     scalar: &'a BTreeMap<String, Vec<String>>,
+    /// Packages sinks require that the scanned project depends on (`None`: no manifest).
+    packages: Option<&'a BTreeSet<String>>,
     /// The round's summary names by last segment.
     external_names: BTreeMap<String, Vec<String>>,
 }
@@ -94,6 +96,7 @@ impl ParsePool {
             .map(|r| jss_core::resolve::Workspace::load(r))
             .unwrap_or_default();
         let scalar = scalar_props_by_dir(files, root.as_deref());
+        let packages = project_packages(files, root.as_deref());
         let run = |external: &Summaries,
                    reexports: BTreeMap<String, BTreeSet<String>>,
                    templates: taint::Templates,
@@ -108,6 +111,7 @@ impl ParsePool {
                 constants,
                 exports,
                 scalar: &scalar,
+                packages: packages.as_ref(),
                 external_names: taint::index_names(external),
             };
             self.install(|| {
@@ -236,6 +240,68 @@ fn scalar_props_by_dir(
         by_dir.insert(dir.to_owned(), props);
     }
     by_dir
+}
+
+/// The packages some sink `requires` that the scanned project depends on: from every
+/// `package.json` between a scanned file and the scan root (a monorepo's packages share their
+/// drivers: the core package often holds the database client the others are handed), plus
+/// `meteor` for a Meteor app. `None` when the scan has no manifest at all (nothing is held
+/// back then).
+fn project_packages(
+    files: &[SourceFile],
+    root: Option<&std::path::Path>,
+) -> Option<BTreeSet<String>> {
+    let wanted = &taint::models::model().sink_packages;
+    let root = root?;
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    if root.join(".meteor").is_dir() {
+        found.insert("meteor".to_owned());
+    }
+    let mut manifests: BTreeMap<std::path::PathBuf, Option<BTreeSet<String>>> = BTreeMap::new();
+    let mut dirs_done: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_manifest = false;
+    for file in files {
+        let dir = parent_dir(&file.rel_path);
+        if !dirs_done.insert(dir) {
+            continue;
+        }
+        let mut cursor = root.join(dir);
+        loop {
+            let deps = manifests
+                .entry(cursor.join("package.json"))
+                .or_insert_with_key(|path| {
+                    let bytes = std::fs::read(path).ok().filter(|b| b.len() < 1 << 20)?;
+                    let manifest: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                    let mut deps = BTreeSet::new();
+                    for section in [
+                        "dependencies",
+                        "devDependencies",
+                        "peerDependencies",
+                        "optionalDependencies",
+                    ] {
+                        if let Some(map) = manifest.get(section).and_then(|s| s.as_object()) {
+                            deps.extend(map.keys().filter(|k| wanted.contains(*k)).cloned());
+                        }
+                    }
+                    Some(deps)
+                });
+            if let Some(deps) = deps {
+                seen_manifest = true;
+                found.extend(deps.iter().cloned());
+            }
+            if cursor.as_path() == root {
+                break;
+            }
+            match cursor.parent() {
+                Some(parent) if parent.starts_with(root) => cursor = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+    }
+    seen_manifest.then_some(found)
 }
 
 /// The major version a dependency spec starts from: `^5.3.0` -> 5, `~4.18` -> 4, `5.x` -> 5.
@@ -447,6 +513,7 @@ fn analyze(
             .scalar
             .get(parent_dir(&file.rel_path))
             .map_or(&[], Vec::as_slice),
+        packages: context.packages,
         external_names: &context.external_names,
     };
     let result = taint::scan_file_program(program, &linking, external);

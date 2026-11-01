@@ -23,7 +23,7 @@ use oxc_ast::ast::{
     ObjectPropertyKind, Program, PropertyKey, Statement, UnaryOperator, VariableDeclaration,
     VariableDeclarationKind,
 };
-use oxc_ast::ast::{BinaryOperator, SimpleAssignmentTarget};
+use oxc_ast::ast::{BinaryOperator, LogicalOperator, ObjectExpression, SimpleAssignmentTarget};
 use oxc_span::{GetSpan, Span};
 
 use models::{ArgRule, Model, has};
@@ -57,6 +57,68 @@ pub struct Origin {
     /// Escaped for these classes (bit [`class_bit`]) by an escaper from the packs: an HTML
     /// escaper makes a value safe in HTML, not in a shell command.
     pub escaped: u8,
+    /// Summary pass only: other parameters the value also carries, as (index, span start of
+    /// their origin, for its field, whether that parameter's data can be at the start of the
+    /// value), at most [`MAX_ALSO`]: `exec(b + a)` carries both, `a` after `b`.
+    pub also: Vec<(usize, u32, bool)>,
+}
+
+/// The key under which a tracked object keeps what its fields of unknown name may hold
+/// (spreads of unknown shape, computed keys).
+const REST_FIELD: &str = "<rest>";
+
+/// Most extra parameters an [`Origin`] remembers.
+const MAX_ALSO: usize = 4;
+
+impl Origin {
+    /// Every parameter this value carries, with the span start that names its field and
+    /// whether its data can be at the start of the value: its own, then the others it was
+    /// merged with (never at the start once the whole value is not).
+    fn contributors(&self) -> Vec<(usize, u32, bool)> {
+        let mut all: Vec<(usize, u32, bool)> = self
+            .param
+            .map(|p| (p, self.span.start, self.prefix))
+            .into_iter()
+            .collect();
+        for &(param, at, prefix) in &self.also {
+            if !all.iter().any(|&(p, a, _)| (p, a) == (param, at)) {
+                all.push((param, at, prefix && self.prefix));
+            }
+        }
+        all
+    }
+
+    /// Remembers `other`'s parameters as carried by this value too.
+    fn absorb(&mut self, other: &Origin) {
+        let own = self.param.map(|p| (p, self.span.start));
+        for (param, at, prefix) in other.contributors() {
+            if own == Some((param, at)) {
+                continue;
+            }
+            if let Some(entry) = self
+                .also
+                .iter_mut()
+                .find(|(p, a, _)| (*p, *a) == (param, at))
+            {
+                // Seen on two paths: at the start if either put it there.
+                entry.2 |= prefix;
+            } else if self.also.len() < MAX_ALSO {
+                self.also.push((param, at, prefix));
+            }
+        }
+    }
+}
+
+/// Whether a sink of `class` reached through `api` takes a URL whose start matters: SSRF, or
+/// a sink with a `url:N` argument rule (`location.href =`, `window.open`).
+fn url_rule(class: VulnClass, api: &str) -> bool {
+    class == VulnClass::Ssrf || {
+        let last = api.trim_end_matches(" =").rsplit('.').next().unwrap_or("");
+        m().method_sink(last)
+            .or_else(|| m().global_sink(last))
+            .or_else(|| m().assign_sink(api.trim_end_matches(" =")))
+            .is_some_and(|s| s.args.iter().any(|r| matches!(r, ArgRule::UrlPrefix(_))))
+    }
 }
 
 /// The bit of `class` in [`Origin::escaped`].
@@ -96,6 +158,7 @@ impl Origin {
             escaped: 0,
             param: None,
             object: true,
+            also: Vec::new(),
         }
     }
 
@@ -121,6 +184,9 @@ pub struct RawFinding {
     pub ext: Option<ExtSink>,
     /// Authentication recognized on the way (set when the finding is recorded).
     pub auth: Auth,
+    /// Found by a rule that needs the attacker to choose the start of the value (`url:N`,
+    /// `start:N`): a summary of it applies only to values that are at the start.
+    pub start: bool,
 }
 
 /// A sink in another file, already resolved to a location.
@@ -176,6 +242,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
         constants: &constants,
         exports: &exports,
         scalar_props: &[],
+        packages: None,
         external_names: &names,
     };
     scan_file_program(program, &linking, external)
@@ -200,6 +267,9 @@ pub struct Linking<'a> {
     /// Request props that hold only strings and arrays in this file's package (`query` with
     /// Express 5).
     pub scalar_props: &'a [String],
+    /// The packages sinks require that the file's project depends on (`None`: the scan saw no
+    /// manifest, so no sink is held back).
+    pub packages: Option<&'a BTreeSet<String>>,
     /// The repository's summary names by their last segment (`find` -> `UsersService.find`,
     /// `find`): built once per round, so a lookup never scans every summary.
     pub external_names: &'a BTreeMap<String, Vec<String>>,
@@ -433,6 +503,9 @@ pub struct Summary {
     /// The file that defines the function (set once the summary leaves its file). Imports
     /// are matched against it; `ext` says where the sink is, which can be files further away.
     pub defined_in: Option<String>,
+    /// The sink's rule needs the attacker to choose the start of the value (see
+    /// [`RawFinding::start`]).
+    pub start: bool,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -506,6 +579,7 @@ struct PathState {
 /// The value after two paths meet: tainted if either path left it tainted, with the weaker
 /// state (attacker-controlled start, possibly an object, built) and escaped only if both are.
 fn join(a: &mut Origin, b: &Origin) {
+    a.absorb(b);
     a.object |= b.object;
     a.prefix |= b.prefix;
     a.built |= b.built;
@@ -591,9 +665,30 @@ impl Env {
                 .all(|p| has(&m().request_props, p) || has(&m().sub_objects, p))
     }
 
+    /// Whether `key` holds attacker data here: a request object, or a value tainted by a
+    /// source (a parameter's value in a summary is the caller's business).
+    fn attacker_data(&self, key: &str) -> bool {
+        let root = key.split('.').next().unwrap_or(key);
+        self.requests.contains_key(root)
+            || [key, root]
+                .into_iter()
+                .filter_map(|k| self.vars.get(k))
+                .any(|origin| origin.param.is_none())
+    }
+
     /// Records what a guard established.
     fn learn(&mut self, facts: Vec<(String, guards::Fact)>) {
         for (key, fact) in facts {
+            let fact = match fact {
+                // A base the attacker chose confines nothing.
+                guards::Fact::Contained(_, bases)
+                    if bases.iter().any(|b| self.attacker_data(b)) =>
+                {
+                    continue;
+                }
+                guards::Fact::Contained(classes, _) => guards::Fact::Clean(classes),
+                other => other,
+            };
             match fact {
                 guards::Fact::Clean(_) if self.is_request_object(&key) => {}
                 guards::Fact::Clean(guards::ALL) => {
@@ -613,6 +708,7 @@ impl Env {
                     }
                     self.scalars.insert(key);
                 }
+                guards::Fact::Contained(..) => {}
             }
         }
     }
@@ -797,13 +893,16 @@ struct Walker<'e> {
 
 fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(Origin {
-            built: a.built || b.built,
-            sqlish: a.sqlish || b.sqlish,
-            // Escaped only if every part is.
-            escaped: a.escaped & b.escaped,
-            ..a
-        }),
+        (Some(mut a), Some(b)) => {
+            a.absorb(&b);
+            Some(Origin {
+                built: a.built || b.built,
+                sqlish: a.sqlish || b.sqlish,
+                // Escaped only if every part is.
+                escaped: a.escaped & b.escaped,
+                ..a
+            })
+        }
         (a, b) => a.or(b),
     }
 }
@@ -994,6 +1093,16 @@ fn table_rows(array: &oxc_ast::ast::ArrayExpression<'_>) -> Vec<BTreeMap<String,
 }
 
 /// The pack sink a finding's `api` names: `fetch`, `http-client.get`, `.query`, `db.query`.
+/// Whether `origin` is safe for a sink of `class`: escaped or checked for that class, or for a
+/// class the sink lists in `cleared_by`.
+fn cleared(origin: &Origin, class: VulnClass, sink: &models::Sink) -> bool {
+    origin.escaped & class_bit(class) != 0
+        || sink
+            .cleared_by
+            .iter()
+            .any(|other| origin.escaped & class_bit(*other) != 0)
+}
+
 fn sink_for_api(api: &str) -> Option<&'static models::Sink> {
     let model = m();
     if let Some((family, export)) = api.split_once('.')
@@ -1417,8 +1526,9 @@ impl Walker<'_> {
                 }
             }
             Statement::ForInStatement(s) => {
-                // Keys of a tainted object are attacker-chosen too.
+                // Keys of a tainted object are attacker-chosen too (not an object literal's).
                 let taint = self.expr(&s.right, env);
+                let taint = self.keys_taint(&s.right, taint.as_ref(), env);
                 env.branch += 1;
                 let before = env.save();
                 self.for_left(&s.left, taint, env);
@@ -1758,6 +1868,16 @@ impl Walker<'_> {
                 BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
                 _ => None,
             };
+            // `const fsApi = options.fs || fs`: an injected module (tests pass a stand-in) is
+            // that module, not data: `fsApi.readFileSync(p)` is `fs.readFileSync(p)`.
+            if let Some(name) = &name_hint
+                && let Some(imported) = self.module_fallback(init)
+            {
+                self.walk_only(init, env);
+                self.modules.insert(name.clone(), imported);
+                env.vars.remove(name);
+                continue;
+            }
             // `const PREFIX = '/api'`, `const ROUTES = { users: '/users' }`: constants.
             if let (Some(name), VariableDeclarationKind::Const) = (&name_hint, declaration.kind) {
                 if let Some(text) = literal_path(init).filter(|_| {
@@ -1986,30 +2106,13 @@ impl Walker<'_> {
                     _ => {}
                 }
             }
-            // `const opts = { table: 'x', ids: req.body.ids }`: remember each field's taint.
+            // `const opts = { table: 'x', ids: req.body.ids }`: remember each field's taint
+            // (with spreads: their known fields, and the rest under `REST_FIELD`).
             if let (Some(name), Expression::ObjectExpression(object)) =
                 (&name_hint, init.get_inner_expression())
             {
-                let mut fields = BTreeMap::new();
-                let mut spread = false;
-                for property in &object.properties {
-                    match property {
-                        ObjectPropertyKind::ObjectProperty(p) => {
-                            if let Some(key) = prop_name(&p.key) {
-                                let mut probe = env.clone();
-                                if let Some(origin) = self.expr(&p.value, &mut probe) {
-                                    fields.insert(key, origin);
-                                }
-                            }
-                        }
-                        ObjectPropertyKind::SpreadProperty(_) => spread = true,
-                    }
-                }
-                if spread {
-                    env.fields.remove(name);
-                } else {
-                    env.fields.insert(name.clone(), fields);
-                }
+                let fields = self.literal_fields(object, env);
+                env.fields.insert(name.clone(), fields);
             } else if let Some(name) = &name_hint {
                 env.fields.remove(name);
             }
@@ -2116,6 +2219,7 @@ impl Walker<'_> {
                                 // As for `req.body`: only a parsed body or query can hold objects.
                                 object: has(&m().object_props, key)
                                     && !has(self.linking.scalar_props, key),
+                                also: Vec::new(),
                             })
                         }
                         (Some(_), _) => None,
@@ -2460,6 +2564,7 @@ impl Walker<'_> {
                     param: None,
                     // `@Param('id')`, `@Headers()`: strings.
                     object: !has(&m().scalar_decorators, name),
+                    also: Vec::new(),
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -2494,6 +2599,7 @@ impl Walker<'_> {
                     escaped: 0,
                     param: Some(index),
                     object: true,
+                    also: Vec::new(),
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -2547,6 +2653,7 @@ impl Walker<'_> {
                         param: None,
                         // GraphQL arguments are typed by the schema.
                         object: !has(&m().scalar_kinds, kind),
+                        also: Vec::new(),
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -2655,6 +2762,7 @@ impl Walker<'_> {
                 field: None,
                 out_field: None,
                 defined_in: None,
+                start: false,
             });
         }
     }
@@ -2671,29 +2779,46 @@ impl Walker<'_> {
         if !self.summarize || env.function == "<anonymous>" || env.function == "<module>" {
             return;
         }
-        // `function getDir(req) { return req.query.dir }`: returns client data itself.
-        let param = origin.param.unwrap_or(RETURNS_SOURCE);
-        let field = self.field_of.get(&origin.span.start).cloned();
-        let list = self.summaries.entry(env.function.clone()).or_default();
-        if list.iter().any(|s| {
-            s.api == RETURNS && s.param == param && s.field == field && s.out_field == out_field
-        }) {
-            return;
+        // `function getDir(req) { return req.query.dir }`: returns client data itself. A value
+        // built from several parameters returns each of them.
+        let contributors: Vec<(usize, u32, bool)> = match origin.param {
+            Some(_) => origin.contributors(),
+            None => std::iter::once((RETURNS_SOURCE, origin.span.start, origin.prefix))
+                .chain(
+                    origin
+                        .also
+                        .iter()
+                        .map(|&(p, a, prefix)| (p, a, prefix && origin.prefix)),
+                )
+                .collect(),
+        };
+        for (param, at, prefix) in contributors {
+            let field = self.field_of.get(&at).cloned();
+            let list = self.summaries.entry(env.function.clone()).or_default();
+            if list.iter().any(|s| {
+                s.api == RETURNS && s.param == param && s.field == field && s.out_field == out_field
+            }) {
+                continue;
+            }
+            list.push(Summary {
+                param,
+                class: VulnClass::CodeInjection,
+                severity: Severity::Low,
+                api: RETURNS.to_owned(),
+                arg: span,
+                call: span,
+                steps: origin.steps.clone(),
+                at_sink: Origin {
+                    prefix,
+                    ..origin.clone()
+                },
+                ext: None,
+                field,
+                out_field: out_field.clone(),
+                defined_in: None,
+                start: false,
+            });
         }
-        list.push(Summary {
-            param,
-            class: VulnClass::CodeInjection,
-            severity: Severity::Low,
-            api: RETURNS.to_owned(),
-            arg: span,
-            call: span,
-            steps: origin.steps.clone(),
-            at_sink: origin,
-            ext: None,
-            field,
-            out_field,
-            defined_in: None,
-        });
     }
 
     /// Records what a returned value carries: per field for an object literal
@@ -2848,6 +2973,10 @@ impl Walker<'_> {
             Expression::LogicalExpression(logical) => {
                 let left = self.expr(&logical.left, env);
                 let right = self.expr(&logical.right, env);
+                // `options.path || path`: a module object, not data.
+                if self.module_fallback(expr).is_some() {
+                    return None;
+                }
                 union(left, right)
             }
             Expression::ConditionalExpression(c) => {
@@ -3020,6 +3149,7 @@ impl Walker<'_> {
                                 origin: origin.clone(),
                                 ext: None,
                                 auth: Auth::NoneDetected,
+                                start: url_rule,
                             },
                             env,
                         );
@@ -3266,6 +3396,7 @@ impl Walker<'_> {
                                             origin,
                                             ext: None,
                                             auth: Auth::NoneDetected,
+                                            start: false,
                                         },
                                         env,
                                     );
@@ -3303,6 +3434,145 @@ impl Walker<'_> {
                 }
                 JSXChild::Text(_) => {}
             }
+        }
+    }
+
+    /// The fields of an object literal with their taint: written ones, those of spread object
+    /// literals (`...(c ? { a } : {})`) and of tracked locals, and under [`REST_FIELD`] what
+    /// spreads of unknown shape (`...req.body`) or computed keys may hold.
+    fn literal_fields(
+        &mut self,
+        object: &ObjectExpression<'_>,
+        env: &Env,
+    ) -> BTreeMap<String, Origin> {
+        let mut fields: BTreeMap<String, Origin> = BTreeMap::new();
+        let add = |fields: &mut BTreeMap<String, Origin>, key: String, origin: Origin| {
+            let merged = union(fields.remove(&key), Some(origin.clone())).unwrap_or(origin);
+            fields.insert(key, merged);
+        };
+        for property in &object.properties {
+            match property {
+                ObjectPropertyKind::ObjectProperty(p) => {
+                    let mut probe = env.clone();
+                    let Some(origin) = self.expr(&p.value, &mut probe) else {
+                        continue;
+                    };
+                    let key = prop_name(&p.key).unwrap_or_else(|| REST_FIELD.to_owned());
+                    add(&mut fields, key, origin);
+                }
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    for (key, origin) in self.spread_fields(&spread.argument, env) {
+                        add(&mut fields, key, origin);
+                    }
+                }
+            }
+        }
+        fields
+    }
+
+    /// The fields a spread brings into an object literal (see [`Self::literal_fields`]).
+    fn spread_fields(&mut self, expr: &Expression<'_>, env: &Env) -> BTreeMap<String, Origin> {
+        match expr.get_inner_expression() {
+            Expression::ObjectExpression(object) => self.literal_fields(object, env),
+            Expression::ConditionalExpression(c) => {
+                let mut fields = self.spread_fields(&c.consequent, env);
+                for (key, origin) in self.spread_fields(&c.alternate, env) {
+                    let merged = union(fields.remove(&key), Some(origin.clone())).unwrap_or(origin);
+                    fields.insert(key, merged);
+                }
+                fields
+            }
+            Expression::LogicalExpression(l) if l.operator == LogicalOperator::And => {
+                self.spread_fields(&l.right, env)
+            }
+            Expression::Identifier(id) if env.fields.contains_key(id.name.as_str()) => env
+                .fields
+                .get(id.name.as_str())
+                .cloned()
+                .unwrap_or_default(),
+            other => {
+                let mut probe = env.clone();
+                self.expr(other, &mut probe)
+                    .map(|origin| BTreeMap::from([(REST_FIELD.to_owned(), origin)]))
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// The taint of an object's keys, given the object's own taint: attacker-chosen when the
+    /// object can be an attacker's (a parsed body or query, a parameter), never for an object
+    /// or array literal or a tracked local, whose keys are written in the code.
+    fn keys_taint(
+        &self,
+        expr: &Expression<'_>,
+        taint: Option<&Origin>,
+        env: &Env,
+    ) -> Option<Origin> {
+        let taint = taint.filter(|o| o.object)?;
+        match expr.get_inner_expression() {
+            // `{ ...req.body }` brings the body's keys; `{ a: req.query.x }` has only `a`.
+            Expression::ObjectExpression(object) => object
+                .properties
+                .iter()
+                .any(|p| matches!(p, ObjectPropertyKind::SpreadProperty(_)))
+                .then(|| taint.clone()),
+            Expression::ArrayExpression(_) => None,
+            Expression::Identifier(id) if env.fields.contains_key(id.name.as_str()) => env
+                .fields
+                .get(id.name.as_str())
+                .and_then(|fields| fields.get(REST_FIELD))
+                .filter(|o| o.object)
+                .cloned(),
+            _ => Some(taint.clone()),
+        }
+    }
+
+    /// Stores `value` in what `target` names, as a weak update (`args.push(x)`,
+    /// `Object.assign(o, src)`): a variable, a field of `this`, or a field of a tracked object.
+    fn store_into(&mut self, target: &Expression<'_>, value: Origin, at: u32, env: &mut Env) {
+        match target.get_inner_expression() {
+            Expression::Identifier(id) => {
+                let name = id.name.as_str();
+                if env.requests.contains_key(name) {
+                    return;
+                }
+                let value = value.step(at, format!("stored in `{name}`"));
+                // Its fields are no longer the ones written in the code.
+                env.fields.remove(name);
+                env.forget(name);
+                let merged = union(env.vars.get(name).cloned(), Some(value));
+                if let Some(merged) = merged {
+                    env.vars.insert(name.to_owned(), merged);
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                let field = member.property.name.as_str().to_owned();
+                match member.object.get_inner_expression() {
+                    Expression::ThisExpression(_) => {
+                        let Some(class) = self.current_class.clone() else {
+                            return;
+                        };
+                        let value = value.step(at, format!("stored in `this.{field}`"));
+                        let fields = self.class_fields.entry(class).or_default();
+                        let merged = union(fields.get(&field).cloned(), Some(value));
+                        if let Some(merged) = merged {
+                            fields.insert(field, merged);
+                        }
+                    }
+                    Expression::Identifier(root) if env.fields.contains_key(root.name.as_str()) => {
+                        let root = root.name.as_str().to_owned();
+                        env.forget(&format!("{root}.{field}"));
+                        if let Some(fields) = env.fields.get_mut(&root) {
+                            let merged = union(fields.get(&field).cloned(), Some(value));
+                            if let Some(merged) = merged {
+                                fields.insert(field, merged);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3350,6 +3620,7 @@ impl Walker<'_> {
                                     origin,
                                     ext: None,
                                     auth: Auth::NoneDetected,
+                                    start: false,
                                 },
                                 env,
                             );
@@ -3376,6 +3647,7 @@ impl Walker<'_> {
                                 origin: origin.clone(),
                                 ext: None,
                                 auth: Auth::NoneDetected,
+                                start: false,
                             },
                             env,
                         );
@@ -3426,6 +3698,8 @@ impl Walker<'_> {
                         return;
                     }
                     // `obj.x = tainted` taints `obj` (coarse: other objects' fields are not tracked).
+                    // A weak update: an `obj` that already carried data keeps its own origin
+                    // (`properties.x = fromConfig` leaves `properties` the caller's argument).
                     if let (Some(origin), Expression::Identifier(root)) =
                         (taint, member.object().get_inner_expression())
                     {
@@ -3433,7 +3707,15 @@ impl Walker<'_> {
                             member.span().start,
                             format!("stored in a field of `{}`", root.name),
                         );
-                        env.vars.insert(root.name.as_str().to_owned(), origin);
+                        let merged = match env.vars.get(root.name.as_str()) {
+                            Some(existing) => {
+                                let mut merged = existing.clone();
+                                join(&mut merged, &origin);
+                                merged
+                            }
+                            None => origin,
+                        };
+                        env.vars.insert(root.name.as_str().to_owned(), merged);
                     }
                 }
             }
@@ -3509,6 +3791,7 @@ impl Walker<'_> {
                 object: property.as_deref().is_some_and(|p| {
                     has(&m().object_props, p) && !has(self.linking.scalar_props, p)
                 }),
+                also: Vec::new(),
             });
         }
         // `this.url` in a class method: what another method stored there.
@@ -3533,7 +3816,9 @@ impl Walker<'_> {
                 .iter()
                 .find(|s| s.object == path && s.property == property)
         {
-            return Some(Origin::source(source.kind.as_str(), member.span()));
+            let mut origin = Origin::source(source.kind.as_str(), member.span());
+            origin.prefix = !source.fixed_start;
+            return Some(origin);
         }
         // multer: the server chooses where an upload is stored (`req.file.path`,
         // `req.files[0].path`, `req.files.avatar[0].path`).
@@ -3574,11 +3859,17 @@ impl Walker<'_> {
                 .or_default()
                 .insert((location, name.to_owned()));
         }
-        // A field of an object literal we tracked: only that field's taint.
+        // A field of an object literal we tracked: only that field's taint, or what its unknown
+        // spreads may hold (read below as a field of that value).
+        let mut rest = None;
         if let (Expression::Identifier(id), Some(property)) = (object, property.as_deref())
             && let Some(fields) = env.fields.get(id.name.as_str())
         {
-            return fields.get(property).cloned();
+            match (fields.get(property), fields.get(REST_FIELD)) {
+                (Some(origin), _) => return Some(origin.clone()),
+                (None, None) => return None,
+                (None, Some(origin)) => rest = Some(origin.clone()),
+            }
         }
         // `file.path` of an upload event: chosen by the server.
         if let (Expression::Identifier(id), Some(property)) = (object, property.as_deref())
@@ -3592,7 +3883,10 @@ impl Walker<'_> {
         // Any property of a tainted object is tainted. In the summary pass, `opts.cmd` of a
         // parameter is recorded as that field: a call then passes only that field of its
         // argument (`run({ cmd: 'ls', user })`, `discard(req.file)` reading `file.path`).
-        let whole = self.expr(member.object(), env);
+        let whole = match rest {
+            Some(rest) => Some(rest),
+            None => self.expr(member.object(), env),
+        };
         if self.summarize
             && let (Expression::Identifier(_), Some(property)) = (object, property.as_deref())
             && let Some(origin) = &whole
@@ -3757,11 +4051,16 @@ impl Walker<'_> {
                             }
                             _ => None,
                         };
-                        // `Buffer.from`, `JSON.parse`, `util.format` as globals.
-                        if let Some(object) = &object_name
-                            && has(&m().pass_globals, &format!("{object}.{method}"))
-                        {
-                            return Callee::Global(format!("{object}.{method}"));
+                        // `Buffer.from`, `JSON.parse`, `Object.keys`, `Object.assign` as globals.
+                        if let Some(object) = &object_name {
+                            let qualified = format!("{object}.{method}");
+                            let model = m();
+                            if has(&model.pass_globals, &qualified)
+                                || has(&model.key_globals, &qualified)
+                                || has(&model.store_globals, &qualified)
+                            {
+                                return Callee::Global(qualified);
+                            }
                         }
                         Callee::Method {
                             object: object_name,
@@ -4055,6 +4354,30 @@ impl Walker<'_> {
                     };
                     self.maybe_function(&p.value, env, name, role);
                 }
+            }
+        }
+
+        // `args.push(x)`, `map.set(k, v)`, `Object.assign(target, src)`: the value is stored in
+        // the receiver (a weak update: it never clears).
+        let stored = match &callee {
+            Callee::Method { method, .. } => m().store_methods.get(method).and_then(|&from| {
+                let member = call.callee.get_inner_expression().as_member_expression()?;
+                Some((member.object(), from))
+            }),
+            Callee::Global(name) if has(&m().store_globals, name) => call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .map(|target| (target, 1)),
+            _ => None,
+        };
+        if let Some((target, from)) = stored {
+            let value = taints
+                .iter()
+                .skip(from)
+                .fold(None, |acc, t| union(acc, t.clone()));
+            if let Some(value) = value {
+                self.store_into(target, value, call.span.start, env);
             }
         }
 
@@ -4468,6 +4791,7 @@ impl Walker<'_> {
                             escaped: 0,
                             param: None,
                             object: true,
+                            also: Vec::new(),
                         })
                     })
                     .collect();
@@ -4527,11 +4851,18 @@ impl Walker<'_> {
                         escaped: 0,
                         param: None,
                         object: true,
+                        also: Vec::new(),
                     });
                 }
                 // Pack result sources: `zip.getEntries()`.
                 if let Some(source) = m().result_sources.iter().find(|s| has(&s.methods, method)) {
                     return Some(Origin::source(source.kind.as_str(), call.span));
+                }
+                // `items.find(..)`, `list.filter(..)`, `args.pop()`: elements of the receiver,
+                // never the arguments (`User.find({ name })` is a query, not its result).
+                if has(&m().element_methods, method) {
+                    return receiver
+                        .map(|o| o.step(call.span.start, format!("element of .{method}()")));
                 }
                 // `s.replace(/[^a-z0-9_-]/gi, '')`: an allowlist strip leaves only the characters
                 // it keeps, safe for the classes they cannot attack.
@@ -4573,7 +4904,21 @@ impl Walker<'_> {
             }
             Callee::Module { family, export } => {
                 let export = export.as_deref().unwrap_or("");
-                let qualified = format!("{family}.{export}");
+                // `deepcopy(x)`: the module's own (default) function goes by the module's name.
+                let qualified = if export.is_empty() {
+                    (*family).to_owned()
+                } else {
+                    format!("{family}.{export}")
+                };
+                // `_.cloneDeep(o)`, `_.get(o, path)`: the first argument, objects included (the
+                // path picks a part of it; a clean object gives a clean part).
+                if has(&m().object_module_pass, &qualified) {
+                    return taints
+                        .first()
+                        .cloned()
+                        .flatten()
+                        .map(|o| o.step(call.span.start, format!("through {qualified}()")));
+                }
                 if has(&m().clearing, &qualified) {
                     // `path.basename(p)`: safe as a file name, not in a shell or a query.
                     let classes = guards::named_mask(export, Some(&qualified));
@@ -4588,16 +4933,43 @@ impl Walker<'_> {
                 }
                 if has(&m().module_pass, &qualified) {
                     let built = has(&m().build_methods, export);
+                    // `path.join(root, x)` starts with a clean `root` (unlike `path.resolve`,
+                    // where an absolute `x` wins): the attacker no longer chooses the start.
+                    let fixed_start = qualified == "path.join"
+                        && call.arguments.len() > 1
+                        && taints.first().is_some_and(Option::is_none);
                     return any_arg().map(|mut o| {
                         o.built |= built;
                         // `path.join(...)`, `util.format(...)`: a string.
                         o.object = false;
+                        if fixed_start {
+                            o.prefix = false;
+                        }
                         o.step(call.span.start, format!("through {qualified}()"))
                     });
                 }
                 None
             }
             Callee::Global(name) => {
+                // `Object.keys(req.body)`: attacker-chosen keys; `Object.entries` adds the values.
+                if has(&m().key_globals, name) {
+                    let keys = call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|e| {
+                            self.keys_taint(e, taints.first().and_then(Option::as_ref), env)
+                        });
+                    let values = if has(&m().pass_globals, name) {
+                        taints.first().cloned().flatten()
+                    } else {
+                        None
+                    };
+                    return union(keys, values).map(|mut o| {
+                        o.object = has(&m().object_globals, name);
+                        o.step(call.span.start, format!("through {name}()"))
+                    });
+                }
                 if has(&m().clearing, name) {
                     // `encodeURIComponent(x)`: safe in a URL, not in a quoted SQL string.
                     let classes = guards::named_mask(name, None);
@@ -4778,7 +5150,18 @@ impl Walker<'_> {
         {
             return None;
         }
-        match expr {
+        self.field_taint_expr(expr, field, env, whole)
+    }
+
+    /// [`Self::field_taint`] of an expression whose own taint is `whole`.
+    fn field_taint_expr(
+        &mut self,
+        expr: &Expression<'_>,
+        field: &str,
+        env: &Env,
+        whole: Option<Origin>,
+    ) -> Option<Origin> {
+        match expr.get_inner_expression() {
             Expression::ObjectExpression(object) => {
                 let mut taint = None;
                 for property in &object.properties {
@@ -4789,18 +5172,45 @@ impl Walker<'_> {
                             let mut probe = env.clone();
                             taint = union(taint, self.expr(&p.value, &mut probe));
                         }
-                        // `{ ...opts }` may carry the field.
+                        // `{ ...opts }` may carry the field: what `opts` has under it.
                         ObjectPropertyKind::SpreadProperty(spread) => {
                             let mut probe = env.clone();
-                            taint = union(taint, self.expr(&spread.argument, &mut probe));
+                            let spread_whole = self.expr(&spread.argument, &mut probe);
+                            taint = union(
+                                taint,
+                                self.field_taint_expr(&spread.argument, field, env, spread_whole),
+                            );
                         }
                         ObjectPropertyKind::ObjectProperty(_) => {}
                     }
                 }
                 taint
             }
+            // `...(cond ? { a } : {})`, `...(cond && { a })`
+            Expression::ConditionalExpression(c) => {
+                let mut probe = env.clone();
+                let consequent = self.expr(&c.consequent, &mut probe);
+                let alternate = self.expr(&c.alternate, &mut probe);
+                let a = self.field_taint_expr(&c.consequent, field, env, consequent);
+                let b = self.field_taint_expr(&c.alternate, field, env, alternate);
+                union(a, b)
+            }
+            Expression::LogicalExpression(l) => {
+                let mut probe = env.clone();
+                let right = self.expr(&l.right, &mut probe);
+                let right = self.field_taint_expr(&l.right, field, env, right);
+                if l.operator == LogicalOperator::And {
+                    right
+                } else {
+                    let left = self.expr(&l.left, &mut probe);
+                    union(self.field_taint_expr(&l.left, field, env, left), right)
+                }
+            }
             Expression::Identifier(id) => match env.fields.get(id.name.as_str()) {
-                Some(fields) => fields.get(field).cloned(),
+                Some(fields) => fields
+                    .get(field)
+                    .or_else(|| fields.get(REST_FIELD))
+                    .cloned(),
                 None => whole,
             },
             _ => whole,
@@ -4828,6 +5238,33 @@ impl Walker<'_> {
                 None => base,
             },
         }
+    }
+
+    /// The module a `x || module` / `x ?? module` fallback stands for (`options.fs || fs`), whole
+    /// modules only (not `opts.join || join`).
+    fn module_fallback(&self, expr: &Expression<'_>) -> Option<Imported> {
+        let Expression::LogicalExpression(logical) = expr.get_inner_expression() else {
+            return None;
+        };
+        if logical.operator == LogicalOperator::And {
+            return None;
+        }
+        [&logical.right, &logical.left]
+            .into_iter()
+            .find_map(|side| {
+                let Expression::Identifier(id) = side.get_inner_expression() else {
+                    return None;
+                };
+                self.modules
+                    .get(id.name.as_str())
+                    .filter(|imported| imported.export.is_none())
+                    .cloned()
+            })
+    }
+
+    /// Walks an expression for what it records, discarding its taint.
+    fn walk_only(&mut self, expr: &Expression<'_>, env: &mut Env) {
+        self.expr(expr, env);
     }
 
     /// A router's own path prefix (`""` without one).
@@ -5954,14 +6391,12 @@ impl Walker<'_> {
                 continue;
             };
             let at_sink = &summary.at_sink;
-            let url_rule = summary.class == VulnClass::Ssrf || {
-                let last = summary.api.rsplit('.').next().unwrap_or("");
-                m().method_sink(last)
-                    .or_else(|| m().global_sink(last))
-                    .is_some_and(|s| s.args.iter().any(|r| matches!(r, ArgRule::UrlPrefix(_))))
-            };
-            // The helper used the parameter as the URL start: the caller must control it.
-            if url_rule && at_sink.prefix && !origin.prefix {
+            // A URL sink (or an argument that must start with `-`) is reached only when the
+            // parameter is the value's start in the helper (not `${base}?key=${param}`) and the
+            // caller controls the start of its value.
+            if (summary.start || url_rule(summary.class, &summary.api))
+                && !(at_sink.prefix && origin.prefix)
+            {
                 continue;
             }
             let built = at_sink.built || origin.built;
@@ -6005,6 +6440,7 @@ impl Walker<'_> {
                     origin,
                     ext: summary.ext.clone(),
                     auth: Auth::NoneDetected,
+                    start: summary.start,
                 },
                 env,
             );
@@ -6013,8 +6449,13 @@ impl Walker<'_> {
 
     /// Records a finding, or in the summary pass, a summary of a parameter that reaches a sink.
     fn emit(&mut self, mut finding: RawFinding, env: &Env) {
-        // Escaped for this class on the way (every sink kind ends here).
-        if self.record_only || finding.origin.escaped & class_bit(finding.class) != 0 {
+        // Escaped for this class on the way (every sink kind ends here), or checked for a class
+        // the sink is safe with (`shell.openPath` on a path confined to a directory).
+        if self.record_only
+            || finding.origin.escaped & class_bit(finding.class) != 0
+            || sink_for_api(&finding.api)
+                .is_some_and(|sink| cleared(&finding.origin, finding.class, sink))
+        {
             return;
         }
         finding.auth = finding.auth.max(env.auth);
@@ -6028,36 +6469,50 @@ impl Walker<'_> {
         }
         // The CLI is the user's own machine: never above low.
         finding.severity = m().cap(finding.origin.kind, finding.severity);
-        match (self.summarize, finding.origin.param) {
-            (true, Some(param)) => {
+        if self.summarize {
+            // One summary per parameter the value carries (`exec(b + a)`: both).
+            let url_sink = finding.start || url_rule(finding.class, &finding.api);
+            for (param, at, prefix) in finding.origin.contributors() {
+                // A parameter after the start of a URL does not choose where it goes.
+                if url_sink && !prefix {
+                    continue;
+                }
                 // Reached through an instance field set from a constructor parameter.
-                let owner = match self.ctor_params.get(&finding.origin.span.start) {
+                let owner = match self.ctor_params.get(&at) {
                     Some(class) => format!("{class}.constructor"),
                     None => env.function.clone(),
                 };
+                let field = self.field_of.get(&at).cloned();
                 let list = self.summaries.entry(owner).or_default();
-                let duplicate = list
-                    .iter()
-                    .any(|s| s.param == param && s.call == finding.call && s.api == finding.api);
+                let duplicate = list.iter().any(|s| {
+                    s.param == param
+                        && s.call == finding.call
+                        && s.api == finding.api
+                        && s.field == field
+                });
                 if !duplicate {
                     list.push(Summary {
                         param,
                         class: finding.class,
                         severity: finding.severity,
-                        api: finding.api,
+                        api: finding.api.clone(),
                         arg: finding.arg,
                         call: finding.call,
                         steps: finding.origin.steps.clone(),
-                        field: self.field_of.get(&finding.origin.span.start).cloned(),
-                        at_sink: finding.origin,
-                        ext: finding.ext,
+                        field,
+                        at_sink: Origin {
+                            prefix,
+                            ..finding.origin.clone()
+                        },
+                        ext: finding.ext.clone(),
                         out_field: None,
                         defined_in: None,
+                        start: finding.start || url_sink,
                     });
                 }
             }
-            (false, None) => self.result.findings.push(finding),
-            _ => {}
+        } else if finding.origin.param.is_none() {
+            self.result.findings.push(finding);
         }
     }
 
@@ -6070,6 +6525,13 @@ impl Walker<'_> {
         span: Span,
         env: &Env,
     ) {
+        // A MongoDB query where the project has no MongoDB driver is another `.find()`.
+        if !sink.requires.is_empty()
+            && let Some(packages) = self.linking.packages
+            && !sink.requires.iter().any(|p| packages.contains(p))
+        {
+            return;
+        }
         let api = match callee {
             Callee::Module { family, export } => match export.as_deref() {
                 Some(export) if !export.is_empty() => format!("{family}.{export}"),
@@ -6135,6 +6597,12 @@ impl Walker<'_> {
         for &rule in rules {
             let (index, origin) = match rule {
                 ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
+                // `spawn('git', ['clone', x])`: `x` can start with `-` only if the attacker
+                // chooses its start.
+                ArgRule::Start(index) => (
+                    index,
+                    taints.get(index).cloned().flatten().filter(|o| o.prefix),
+                ),
                 // A helper's parameter passed straight to the sink (`function query(sql) {
                 // return pool.query(sql) }`): a summary, whose callers must build the text.
                 ArgRule::Html(index) => (
@@ -6219,7 +6687,7 @@ impl Walker<'_> {
                 }
             };
             let Some(origin) = origin else { continue };
-            if has(&sink.ignore_kinds, origin.kind) || origin.escaped & class_bit(sink.class) != 0 {
+            if has(&sink.ignore_kinds, origin.kind) || cleared(&origin, sink.class, sink) {
                 // Another rule of the group may still match an unescaped argument.
                 continue;
             }
@@ -6239,6 +6707,7 @@ impl Walker<'_> {
                     origin,
                     ext: None,
                     auth: Auth::NoneDetected,
+                    start: matches!(rule, ArgRule::UrlPrefix(_) | ArgRule::Start(_)),
                 },
                 env,
             );
@@ -6353,6 +6822,310 @@ mod tests {
             found.iter().any(|f| f.0 == VulnClass::CodeInjection),
             "{found:?}"
         );
+    }
+
+    /// The classes and severities of `body`'s findings, in a route.
+    fn route(body: &str) -> Vec<(VulnClass, Severity)> {
+        one(&format!(
+            "const _ = require('lodash');\nconst deepcopy = require('deepcopy');\n\
+             app.post('/x', async (req, res) => {{ {body} }});"
+        ))
+        .into_iter()
+        .map(|f| (f.0, f.1))
+        .collect()
+    }
+
+    #[test]
+    fn stores_taint_their_target() {
+        use Severity::*;
+        use VulnClass::*;
+        assert_eq!(
+            route("const a = ['--json']; a.push(req.query.p); spawn('rg', a);"),
+            vec![(CommandInjection, Medium)]
+        );
+        assert_eq!(
+            route(
+                "const w = []; w.push('id = ' + req.query.id); db.query('SELECT * FROM t WHERE ' + w.join(' AND '));"
+            ),
+            vec![(SqlInjection, High)]
+        );
+        assert_eq!(
+            route("const o = {}; Object.assign(o, req.body); exec(o.cmd);"),
+            vec![(CommandInjection, Critical)]
+        );
+        assert_eq!(
+            route(
+                "const list = []; list.push(...req.body.files); for (const f of list) fs.readFileSync(f.path);"
+            ),
+            vec![(PathTraversal, High)]
+        );
+        // Nothing attacker-controlled stored.
+        assert!(route("const a = ['ls']; a.push('-l'); spawn(a[0], a);").is_empty());
+        assert!(
+            route("const a = ['--v']; a.push(String(Number(req.query.n))); spawn('node', a);")
+                .is_empty()
+        );
+        assert!(route("const s = new Set(); s.add(req.query.id); exec('ls');").is_empty());
+    }
+
+    #[test]
+    fn a_field_write_keeps_the_object_its_own_origin() {
+        // `props` stays the route's body after a field is set from configuration: the helper's
+        // summary must name `props` (argument 2), not `pub` (argument 1).
+        let found = one(
+            "function create(cfg, pub, props) {\n  const { targets } = pub;\n  \
+             const t = targets.find((x) => x.ok);\n  props['mp'] = t;\n  \
+             return db.collection('posts').findOne({ type: props.type });\n}\n\
+             app.post('/x', (req, res) => create(CFG, PUB, req.body));\n",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::NosqlInjection),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn every_contributing_parameter_gets_a_summary() {
+        use Severity::*;
+        use VulnClass::*;
+        // The second parameter, after the first, in a concatenation.
+        assert_eq!(
+            one(
+                "function g1(a, b) { exec(b + a); }\napp.get('/x', (req, res) => g1(req.query.x, 'y'));"
+            ),
+            vec![(
+                CommandInjection,
+                Critical,
+                "child_process.exec".to_owned(),
+                "http"
+            )]
+        );
+        assert!(
+            one("function g1(a, b) { exec(b + a); }\napp.get('/x', (req, res) => g1('x', 'y'));")
+                .is_empty()
+        );
+        // A helper returning an object it set from a second parameter returns both.
+        let found = one(
+            "function add(object, additions) { object.extra = additions; return object; }\n\
+             app.post('/x', (req, res) => { const o = add(CONFIG, req.body); exec(o.cmd); });",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+    }
+
+    #[test]
+    fn a_parameter_after_a_fixed_base_is_not_at_the_start() {
+        // `route` comes after the configured base URL: no SSRF; the base itself would be.
+        let found = one(
+            "function target(session, route) { return session.baseUrl + route; }\n\
+             app.post('/x', async (req, res) => { await axios.get(target(SESSION, req.path)); });",
+        );
+        assert!(!found.iter().any(|f| f.0 == VulnClass::Ssrf), "{found:?}");
+        let found = one(
+            "function target(session, route) { return session.baseUrl + route; }\n\
+             app.post('/x', async (req, res) => { await axios.get(target(req.body, '/v1')); });",
+        );
+        assert!(found.iter().any(|f| f.0 == VulnClass::Ssrf), "{found:?}");
+    }
+
+    #[test]
+    fn spread_objects_keep_their_known_fields() {
+        // `endpoint` only ever comes from the environment; `url` is the client's.
+        let found = route(
+            "const o = { url: req.body.url, ...(process.env.E ? { endpoint: process.env.E } : {}) };\n\
+             await axios.get(o.endpoint);\nawait send({ ...o, weeks: req.body.weeks });",
+        );
+        assert!(found.is_empty(), "{found:?}");
+        // A spread of the body brings any field.
+        assert_eq!(
+            route("const o = { a: 1, ...req.body }; exec(o.cmd);"),
+            vec![(VulnClass::CommandInjection, Severity::Critical)]
+        );
+        // Through a helper that reads one field of its argument.
+        let found = one(
+            "async function send({ endpoint, url }) { await axios.get(endpoint, { params: { url } }); }\n\
+             app.post('/x', async (req, res) => { const o = { url: req.body.url, ...(E ? { endpoint: E } : {}) }; await send({ ...o, w: 1 }); });",
+        );
+        assert!(found.is_empty(), "{found:?}");
+        let found = one(
+            "async function send({ endpoint, url }) { await axios.get(endpoint, { params: { url } }); }\n\
+             app.post('/x', async (req, res) => { const o = { endpoint: req.body.u }; await send({ ...o, w: 1 }); });",
+        );
+        assert!(found.iter().any(|f| f.0 == VulnClass::Ssrf), "{found:?}");
+    }
+
+    #[test]
+    fn equal_to_the_base_or_under_it_is_confined() {
+        // `if (p !== dir && !p.startsWith(dir + sep)) continue;`: p is dir or inside it.
+        let found = route(
+            "const dir = '/srv/logs';\nfor (const name of req.body.names) {\n  \
+             const p = path.resolve(path.join(dir, name));\n  \
+             if (p !== dir && !p.startsWith(dir + path.sep)) continue;\n  fs.readFileSync(p);\n}",
+        );
+        assert!(found.is_empty(), "{found:?}");
+        // An equality alone proves nothing.
+        assert_eq!(
+            route("const p = req.body.p; if (p !== other) return; fs.readFileSync(p);"),
+            vec![(VulnClass::PathTraversal, Severity::High)]
+        );
+    }
+
+    #[test]
+    fn injected_modules_are_modules() {
+        // `options.path || path` is the path module (or a test's stand-in), not data.
+        let found = one(
+            "function open(options) {\n  const pathApi = options.path || path;\n  const fsApi = options.fs || fs;\n  \
+             const p = pathApi.join('/srv/logs', 'app.log');\n  return fsApi.readFileSync(p);\n}\n\
+             app.post('/x', (req, res) => open({ requested: req.body.name }));",
+        );
+        assert!(found.is_empty(), "{found:?}");
+        // ...and its sinks are the module's sinks.
+        let found = one(
+            "function read(options, name) { const fsApi = options.fs || fs; return fsApi.readFileSync(name); }\n\
+             app.post('/x', (req, res) => read({}, req.body.name));",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::PathTraversal),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_confined_to_a_directory_is_safe_to_open() {
+        let head = "const { shell } = require('electron');\nconst path = require('path');\n";
+        // `shell.openPath` opens the file a path names: a path confined to a directory is safe.
+        let found = scan(&format!(
+            "{head}ipcMain.handle('open', (_e, name) => {{ const p = path.resolve(path.join(LOGS, name));\n  \
+             if (!p.startsWith(LOGS + path.sep)) return;\n  shell.openPath(p);\n}});"
+        ));
+        assert!(found.is_empty(), "{found:?}");
+        let found = scan(&format!(
+            "{head}ipcMain.handle('open', (_e, name) => {{ shell.openPath(name); }});"
+        ));
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::CommandInjection),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_base_the_attacker_chose_confines_nothing() {
+        // The base itself comes from a header: the containment check proves nothing.
+        assert_eq!(
+            route(
+                "const base = path.resolve(path.join(ROOT, req.headers.blog));\n\
+                 const p = path.resolve(path.join(base, req.body.p));\n\
+                 if (p !== base && !p.startsWith(`${base}${path.sep}`)) return;\nfs.readFileSync(p);"
+            ),
+            vec![(VulnClass::PathTraversal, Severity::High)]
+        );
+        // A fixed base confines.
+        assert!(
+            route(
+                "const base = path.resolve(ROOT);\nconst p = path.resolve(path.join(base, req.body.p));\n\
+                 if (p !== base && !p.startsWith(`${base}${path.sep}`)) return;\nfs.readFileSync(p);"
+            )
+            .is_empty()
+        );
+        // A helper's base parameter is the caller's: the helper still confines its path.
+        let found = one(
+            "function safeJoin(base, p) { const r = path.resolve(base, p);\n  \
+             if (!r.startsWith(base + path.sep)) throw new Error('x');\n  return r; }\n\
+             app.get('/x', (req, res) => fs.readFileSync(safeJoin(UPLOADS, req.query.p)));",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_field_read_through_a_spread_parameter_stays_that_field() {
+        // `cfg.url` is the `url` of the caller's `overrides`, which it set from the body.
+        let found = one(
+            "async function test(overrides) { const cfg = { ...defaults(), ...overrides }; await fetch(cfg.url); }\n\
+             app.post('/t', async (req, res) => { const o = {}; if (req.body.url) o.url = req.body.url; await test(o); });",
+        );
+        assert!(found.iter().any(|f| f.0 == VulnClass::Ssrf), "{found:?}");
+    }
+
+    #[test]
+    fn the_page_url_starts_with_the_pages_own_origin() {
+        // `location.href` cannot be a `javascript:` URL; its hash, sliced, can.
+        assert!(scan("const to = new URL('/next', window.location.href).toString(); window.location.assign(window.location.href);").is_empty());
+        let found =
+            scan("window.location.assign(decodeURIComponent(window.location.hash.slice(1)));");
+        assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn a_joined_path_starts_with_its_root() {
+        use Severity::*;
+        use VulnClass::*;
+        // Under a root, an argument cannot start with `-`: no argument injection.
+        assert!(!route("const args = ['-i']; args.push(path.join(LIBRARY, req.params.file)); spawn('ffmpeg', args);")
+            .contains(&(CommandInjection, Medium)));
+        assert_eq!(
+            route("const args = ['-i']; args.push(req.params.file); spawn('ffmpeg', args);"),
+            vec![(CommandInjection, Medium)]
+        );
+        // Still a path traversal.
+        assert_eq!(
+            route("fs.readFileSync(path.join(LIBRARY, req.params.file));"),
+            vec![(PathTraversal, High)]
+        );
+    }
+
+    #[test]
+    fn element_methods_carry_their_receiver() {
+        use Severity::*;
+        use VulnClass::*;
+        assert_eq!(
+            route("const f = req.body.items.find((x) => x.ok); exec(f.cmd);"),
+            vec![(CommandInjection, Critical)]
+        );
+        assert_eq!(
+            route("const f = req.body.list.filter(Boolean).pop(); exec(f);"),
+            vec![(CommandInjection, Critical)]
+        );
+        // A query's arguments are not its result; a constant table's element is clean.
+        assert!(
+            !route("const u = await User.find({ name: req.body.name }); exec(u.cmd);")
+                .contains(&(CommandInjection, Critical))
+        );
+        assert!(
+            route("const t = TYPES.find((v) => v === req.query.t); knex.raw('SELECT ' + t);")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn collections_clones_and_keys() {
+        use Severity::*;
+        use VulnClass::*;
+        let critical = vec![(CommandInjection, Critical)];
+        assert_eq!(
+            route("for (const [k, v] of Object.entries(req.body)) exec(v);"),
+            critical
+        );
+        assert_eq!(
+            route("const v = await Promise.all([req.query.a]); exec(v[0]);"),
+            critical
+        );
+        assert_eq!(route("exec(structuredClone(req.body).c);"), critical);
+        assert_eq!(route("exec(_.cloneDeep(req.body).c);"), critical);
+        assert_eq!(route("exec(deepcopy(req.body).c);"), critical);
+        assert_eq!(
+            route("for (const k of Object.keys(req.body)) exec('ls ' + k);"),
+            critical
+        );
+        assert_eq!(
+            route("for (const k of Object.keys(req.body)) _.set(obj, k, 1);"),
+            vec![(PrototypePollution, Medium)]
+        );
+        // Keys written in the code; a clean object picked by a tainted path.
+        assert!(
+            route("const o = { a: req.query.x }; for (const k in o) exec('ls ' + k);").is_empty()
+        );
+        assert!(route("Object.keys(CONFIG).forEach((k) => exec('ls ' + k));").is_empty());
+        assert!(route("exec(_.get(SETTINGS, req.query.p));").is_empty());
+        assert!(route("for (const k of Object.keys({ a: req.query.x })) exec(k);").is_empty());
     }
 
     #[test]

@@ -18,6 +18,10 @@ modules:
   util: util
   shelljs: shelljs
   execa: execa
+  deepcopy: deepcopy
+  klona: klona
+  klona/full: klona
+  clone: clone
 sinks:
   - {module: child_process, exports: [exec, execSync], class: command-injection, severity: critical, args: ["any:0"]}
   # A tainted program name; `shell: true` makes every argument shell text (engine rule).
@@ -28,8 +32,9 @@ sinks:
     args: ["any:0"]
     # `shell: true` makes every argument shell text.
     escalate: {option: shell, severity: critical, args: ["any:0", "any:1"]}
-    # A tainted element of the argument list: argument injection (`--upload-pack=...`).
-    also: [{args: ["any:1"], severity: medium}]
+    # An element of the argument list whose start the attacker chooses: argument injection
+    # (`--upload-pack=...`).
+    also: [{args: ["start:1"], severity: medium}]
   - {module: shelljs, exports: [exec], class: command-injection, severity: critical, args: ["any:0"]}
   - {module: execa, exports: [execaCommand, execaCommandSync, command, commandSync], class: command-injection, severity: critical, args: ["any:0"]}
   - {module: execa, exports: ["", execa, execaSync], class: command-injection, severity: high, args: ["any:0"]}
@@ -56,9 +61,24 @@ propagation:
   build_methods: [concat, join, format]
   strip_methods: [replace, replaceAll]
   pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, JSON.stringify, util.format,
-    URL, encodeURI, encodeURL, normalizeUrl, url.parse, url.resolve, querystring.parse]
+    URL, encodeURI, encodeURL, normalizeUrl, url.parse, url.resolve, querystring.parse,
+    Object.assign, Object.values, Object.entries, Object.fromEntries, Array.from, Array.of,
+    Promise.all, Promise.allSettled, Promise.race, Promise.any, Promise.resolve, structuredClone]
   # Of those, the ones whose result can be an object (a NoSQL operator object); the others give strings.
-  object_globals: [JSON.parse, querystring.parse, url.parse]
+  object_globals: [JSON.parse, querystring.parse, url.parse,
+    Object.assign, Object.values, Object.entries, Object.fromEntries, Array.from, Array.of,
+    Promise.all, Promise.allSettled, Promise.race, Promise.any, Promise.resolve, structuredClone]
+  # Array methods whose result is (elements of) the receiver: `items.find(...)`, `args.pop()`.
+  element_methods: [find, findLast, filter, sort, toSorted, reverse, toReversed, flat, values, pop, shift,
+    toSpliced, with]
+  # Methods that store their arguments (from the given index on) in the receiver: `args.push(x)`.
+  store_methods: {push: 0, unshift: 0, splice: 2, fill: 0, set: 1, add: 0}
+  store_globals: [Object.assign]
+  # Globals whose result holds the keys of their argument (attacker-chosen for a parsed body).
+  key_globals: [Object.keys, Object.entries, Object.getOwnPropertyNames]
+  # Module functions returning (part of) their first argument, objects included.
+  object_module_pass: [lodash.clone, lodash.cloneDeep, lodash.omit, lodash.pick, lodash.get, lodash.castArray,
+    lodash.toArray, lodash.flatten, lodash.head, lodash.last, deepcopy, klona, clone]
 sanitizers:
   calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN]
   # Used as a guard (`if (!isValid(x)) return;`), these clear their argument on the passing path.

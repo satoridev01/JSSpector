@@ -4,6 +4,8 @@ client_sources:
   - {object: ipcMain, methods: [on, handle, once, handleOnce], params: after-first, kind: ipc}
 sinks:
   - {methods: [openExternal], class: command-injection, severity: high, args: ["url:0"]}
-  - {methods: [openPath, shell.openPath, showItemInFolder], class: command-injection, severity: high, args: ["any:0"]}
+  # Opening the file a path names: a path confined to a directory is safe.
+  - {methods: [openPath, shell.openPath, showItemInFolder], class: command-injection, severity: high, args: ["any:0"],
+     cleared_by: [path-traversal]}
   - {methods: [executeJavaScript, webContents.executeJavaScript], class: code-injection, severity: critical, args: ["any:0"]}
   - {methods: [loadURL], class: ssrf, severity: medium, args: ["url:0"]}

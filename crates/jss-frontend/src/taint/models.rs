@@ -168,6 +168,10 @@ pub struct MemberSource {
     pub object: String,
     pub property: String,
     pub kind: String,
+    /// The value starts with something the attacker does not choose (`location.href` starts
+    /// with the page's own origin): no URL-start rule (`javascript:`, open redirects) applies.
+    #[serde(default)]
+    pub fixed_start: bool,
 }
 
 /// An option that raises a sink's severity and the arguments it checks: `spawn(.., { shell: true })`.
@@ -211,6 +215,14 @@ pub struct SinkSpec {
     /// Source kinds this sink does not apply to: a browser page's URL is no SSRF.
     #[serde(default)]
     pub ignore_kinds: Vec<String>,
+    /// Other classes whose checks and escapers make a value safe here too: `shell.openPath`
+    /// opens the file a path names, so a path confined to a directory is safe for it.
+    #[serde(default)]
+    pub cleared_by: Vec<VulnClassName>,
+    /// Packages one of which the file's project must depend on for the sink to apply
+    /// (`.find()` is a MongoDB query only where a MongoDB driver is a dependency).
+    #[serde(default)]
+    pub requires: Vec<String>,
 }
 
 /// A secondary argument rule with its own severity.
@@ -418,6 +430,24 @@ pub struct Propagation {
     /// but an allowlist: `s.replace(/[^a-z0-9]/g, '')`.
     #[serde(default)]
     pub strip_methods: Vec<String>,
+    /// Array methods whose result is (elements of) the receiver, never their arguments:
+    /// `items.find(..)`, `list.filter(..)`, `args.pop()`.
+    #[serde(default)]
+    pub element_methods: Vec<String>,
+    /// Methods that store their arguments, from the given index on, in the receiver:
+    /// `args.push(x)` (0), `list.splice(i, n, x)` (2), `map.set(k, v)` (1).
+    #[serde(default)]
+    pub store_methods: BTreeMap<String, usize>,
+    /// Globals that store their later arguments in the first: `Object.assign(target, src)`.
+    #[serde(default)]
+    pub store_globals: Vec<String>,
+    /// Globals whose result holds the keys of their first argument: `Object.keys(o)`.
+    #[serde(default)]
+    pub key_globals: Vec<String>,
+    /// Module functions that return (part of) their first argument, objects included:
+    /// `_.cloneDeep(o)`, `_.get(o, path)`, `deepcopy(o)`.
+    #[serde(default)]
+    pub object_module_pass: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -531,6 +561,9 @@ pub enum ArgRule {
     Html(usize),
     /// A tainted value that can be an object: a NoSQL query where `{ "$ne": null }` changes it.
     Object(usize),
+    /// A value (or an element of an argument list) whose start the attacker chooses: an
+    /// argument that can begin with `-` (argument injection).
+    Start(usize),
 }
 
 impl ArgRule {
@@ -541,6 +574,7 @@ impl ArgRule {
             "any" => Self::Any(index),
             "built" => Self::Built(index),
             "url" => Self::UrlPrefix(index),
+            "start" => Self::Start(index),
             "html" => Self::Html(index),
             "object" => Self::Object(index),
             _ => return None,
@@ -560,6 +594,10 @@ pub struct Sink {
     /// (severity, rules) tried when `args` match nothing.
     pub also: Vec<(Severity, Vec<ArgRule>)>,
     pub ignore_kinds: Vec<String>,
+    /// See [`SinkSpec::cleared_by`].
+    pub cleared_by: Vec<VulnClass>,
+    /// See [`SinkSpec::requires`].
+    pub requires: Vec<String>,
 }
 
 /// Every pack merged.
@@ -595,6 +633,11 @@ pub struct Model {
     pub build_methods: Vec<String>,
     pub iteration_methods: Vec<String>,
     pub strip_methods: Vec<String>,
+    pub element_methods: Vec<String>,
+    pub store_methods: BTreeMap<String, usize>,
+    pub store_globals: Vec<String>,
+    pub key_globals: Vec<String>,
+    pub object_module_pass: Vec<String>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -626,6 +669,8 @@ pub struct Model {
     pub upload_objects: Vec<String>,
     pub object_props: Vec<String>,
     pub scalar_props_from: Vec<ScalarFrom>,
+    /// Every package a sink `requires` (see [`SinkSpec::requires`]).
+    pub sink_packages: std::collections::BTreeSet<String>,
     pub member_sources: Vec<MemberSource>,
     pub severity_caps: BTreeMap<String, Severity>,
     pub implicit_modules: Vec<String>,
@@ -703,7 +748,10 @@ impl Model {
                     })
                     .collect(),
                 ignore_kinds: spec.ignore_kinds.clone(),
+                cleared_by: spec.cleared_by.iter().map(|c| c.class()).collect(),
+                requires: spec.requires.clone(),
             };
+            self.sink_packages.extend(spec.requires.iter().cloned());
             if let Some(module) = &spec.module {
                 for export in &spec.exports {
                     self.module_sinks
@@ -748,6 +796,13 @@ impl Model {
         self.iteration_methods
             .extend(pack.propagation.iteration_methods);
         self.strip_methods.extend(pack.propagation.strip_methods);
+        self.element_methods
+            .extend(pack.propagation.element_methods);
+        self.store_methods.extend(pack.propagation.store_methods);
+        self.store_globals.extend(pack.propagation.store_globals);
+        self.key_globals.extend(pack.propagation.key_globals);
+        self.object_module_pass
+            .extend(pack.propagation.object_module_pass);
         self.jsx_html_props.extend(pack.jsx.html_props);
         self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
         if pack.jsx.props_kind.is_some() {

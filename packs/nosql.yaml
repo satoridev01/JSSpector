@@ -6,6 +6,10 @@ sinks:
     class: nosql-injection
     severity: high
     args: ["object:0"]
+    # Only where a MongoDB driver (or a Meteor app's collections) is in the project: elsewhere
+    # `.find()` is an ORM's or the app's own method.
+    requires: [mongoose, mongodb, monk, mongojs, mongoist, "@nestjs/mongoose", "@typegoose/typegoose",
+      typegoose, nedb, "@seald-io/nedb", nedb-promises, "@mikro-orm/mongodb", camo, papr, mongorito, meteor]
   - {methods: [$where], class: code-injection, severity: critical, args: ["any:0"]}
 # The operand of these operators is compared as a value: `{ email: { $eq: x } }` is safe.
 literal_operators: [$eq, $ne, $in, $nin, $gt, $gte, $lt, $lte, $all, $size]

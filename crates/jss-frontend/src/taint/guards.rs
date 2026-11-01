@@ -21,11 +21,15 @@ use super::models::{has, model};
 pub const ALL: u8 = u8::MAX;
 
 /// What a guard established about a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fact {
     /// Validated: no longer attacker-controlled in a useful way for these classes
     /// (bits of [`class_bit`]; [`ALL`] for every class).
     Clean(u8),
+    /// Inside a base (`p.startsWith(base + sep)`): clean for these classes, unless one of
+    /// these access paths of the base holds attacker data (a base the attacker chose
+    /// confines nothing).
+    Contained(u8, Vec<String>),
     /// Known to be a string (or number/boolean), never an object.
     Scalar,
 }
@@ -104,6 +108,15 @@ pub fn facts(test: &Expression<'_>, truth: bool, out: &mut Vec<(String, Fact)>) 
                 let (mut left, mut right) = (Vec::new(), Vec::new());
                 facts(&l.left, truth, &mut left);
                 facts(&l.right, truth, &mut right);
+                // `p === base || p.startsWith(base + sep)`: equal to the base is as confined as
+                // under it, so an equality with another value takes the other side's fact
+                // about `p` (it establishes nothing alone).
+                for key in equal_operands(&l.left, truth) {
+                    left.extend(right.iter().filter(|(k, _)| *k == key).cloned());
+                }
+                for key in equal_operands(&l.right, truth) {
+                    right.extend(left.iter().filter(|(k, _)| *k == key).cloned());
+                }
                 out.extend(left.into_iter().filter(|fact| right.contains(fact)));
             }
             _ => {}
@@ -147,6 +160,34 @@ pub fn facts(test: &Expression<'_>, truth: bool, out: &mut Vec<(String, Fact)>) 
             }
         }
         _ => {}
+    }
+}
+
+/// The access paths of both sides of `test` when it establishes, evaluated to `truth`, that two
+/// non-literal values are equal: `p === base`, `!(p !== base)`.
+fn equal_operands(test: &Expression<'_>, truth: bool) -> Vec<String> {
+    match test.get_inner_expression() {
+        Expression::UnaryExpression(u) if u.operator == UnaryOperator::LogicalNot => {
+            equal_operands(&u.argument, !truth)
+        }
+        Expression::BinaryExpression(b) => {
+            let equal = matches!(
+                b.operator,
+                BinaryOperator::StrictEquality | BinaryOperator::Equality
+            );
+            let unequal = matches!(
+                b.operator,
+                BinaryOperator::StrictInequality | BinaryOperator::Inequality
+            );
+            if !(equal && truth || unequal && !truth) {
+                return Vec::new();
+            }
+            [&b.left, &b.right]
+                .into_iter()
+                .filter_map(|side| path_key(side))
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -295,12 +336,59 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
                 .as_str()
                 .filter(|text| fixed_origin(text))
                 .map(|_| class_bit(VulnClass::Ssrf)),
-            // `resolved.startsWith(base + path.sep)`: contained in a base directory or origin.
-            Some(_) => Some(class_bit(VulnClass::PathTraversal) | class_bit(VulnClass::Ssrf)),
+            // `resolved.startsWith(base + path.sep)`: contained in a base directory or origin,
+            // if the base is not the attacker's (checked where the fact is learned).
+            Some(base) => {
+                out.push((
+                    key,
+                    Fact::Contained(
+                        class_bit(VulnClass::PathTraversal) | class_bit(VulnClass::Ssrf),
+                        base_keys(base),
+                    ),
+                ));
+                return;
+            }
             None => None,
         };
         if let Some(classes) = classes.filter(|c| *c != 0) {
             out.push((key, Fact::Clean(classes)));
+        }
+    }
+}
+
+/// The access paths a base expression is built from: `base` and `path.sep` in
+/// `` `${base}${path.sep}` `` or `base + path.sep`, `root` in `path.resolve(root)`.
+fn base_keys(expr: &Expression<'_>) -> Vec<String> {
+    let mut keys = Vec::new();
+    collect_base_keys(expr, &mut keys, 0);
+    keys
+}
+
+fn collect_base_keys(expr: &Expression<'_>, keys: &mut Vec<String>, depth: usize) {
+    if depth > 8 || keys.len() > 8 {
+        return;
+    }
+    match expr.get_inner_expression() {
+        Expression::TemplateLiteral(t) => {
+            for e in &t.expressions {
+                collect_base_keys(e, keys, depth + 1);
+            }
+        }
+        Expression::BinaryExpression(b) => {
+            collect_base_keys(&b.left, keys, depth + 1);
+            collect_base_keys(&b.right, keys, depth + 1);
+        }
+        Expression::CallExpression(call) => {
+            for argument in call.arguments.iter().filter_map(Argument::as_expression) {
+                collect_base_keys(argument, keys, depth + 1);
+            }
+        }
+        other => {
+            if let Some(key) = path_key(other)
+                && !keys.contains(&key)
+            {
+                keys.push(key);
+            }
         }
     }
 }

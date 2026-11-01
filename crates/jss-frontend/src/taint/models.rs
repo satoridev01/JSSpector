@@ -126,6 +126,10 @@ pub struct Pack {
     /// The highest severity a source kind can reach: `cli: low`.
     #[serde(default)]
     pub severity_caps: BTreeMap<String, SeverityName>,
+    /// Caps that hold unless the repository constructs one of `unless_new` (a server only
+    /// reachable locally unless it is also served over HTTP).
+    #[serde(default)]
+    pub local_caps: Vec<LocalCapSpec>,
     /// Module families also usable without an import, by their own name: `fs.readFile(...)`.
     #[serde(default)]
     pub implicit_modules: Vec<String>,
@@ -686,6 +690,24 @@ impl VulnClassName {
     }
 }
 
+/// A severity cap for a source kind that holds unless the repository constructs one of
+/// `unless_new` anywhere (`new StreamableHTTPServerTransport(..)`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCapSpec {
+    pub kind: String,
+    pub cap: SeverityName,
+    pub unless_new: Vec<String>,
+}
+
+/// [`LocalCapSpec`], resolved.
+#[derive(Debug, Clone)]
+pub struct LocalCap {
+    pub kind: String,
+    pub cap: Severity,
+    pub unless_new: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeverityName {
@@ -850,6 +872,7 @@ pub struct Model {
     pub sink_packages: std::collections::BTreeSet<String>,
     pub member_sources: Vec<MemberSource>,
     pub severity_caps: BTreeMap<String, Severity>,
+    pub local_caps: Vec<LocalCap>,
     pub implicit_modules: Vec<String>,
     pub module_namespaces: Vec<String>,
     pub url_option_keys: Vec<String>,
@@ -1065,6 +1088,12 @@ impl Model {
         for (kind, cap) in pack.severity_caps {
             self.severity_caps.insert(kind, cap.severity());
         }
+        self.local_caps
+            .extend(pack.local_caps.into_iter().map(|c| LocalCap {
+                kind: c.kind,
+                cap: c.cap.severity(),
+                unless_new: c.unless_new,
+            }));
         self.implicit_modules.extend(pack.implicit_modules);
         self.module_namespaces.extend(pack.module_namespaces);
         self.url_option_keys.extend(pack.url_option_keys);

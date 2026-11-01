@@ -171,6 +171,22 @@ pub const RETURNS: &str = "<return>";
 /// throw ... }`). After a call returns, the argument is clean.
 pub const VALIDATES: &str = "<validates>";
 
+/// The `api` of a summary that says "the function returns an instance of this class"
+/// ([`Summary::instance_of`]), whole or as one field of a returned object (`out_field`):
+/// factories (`return new PgClient(cfg)`), singleton accessors (`return Registry.instance`) and
+/// functions annotated to return a class. Callers type the receiver of what it returns.
+pub const INSTANCE: &str = "<instance>";
+
+/// Most classes an instance-returning function is known to return (a factory's `switch`).
+const MAX_RETURNED_CLASSES: usize = 4;
+
+/// A class (or interface) where it is declared: (file, name in that file).
+pub type ClassRef = (String, String);
+
+/// An export that is a member of a class declared in another file (`module.exports = {
+/// getRegistry: Registry.getInstance }` with `Registry` imported): `<at>:file#Registry.getInstance`.
+pub const ELSEWHERE: &str = "<at>:";
+
 /// The request-kind marker for a context object whose request data is under `.req`.
 const CONTEXT: &str = "context";
 
@@ -265,6 +281,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
     let exports = BTreeMap::new();
     let subclasses = BTreeMap::new();
     let names = BTreeMap::new();
+    let properties = BTreeMap::new();
     let linking = Linking {
         file: "",
         files: &files,
@@ -277,6 +294,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
         scalar_props: &[],
         packages: None,
         external_names: &names,
+        properties: &properties,
     };
     scan_file_program(program, &linking, external)
 }
@@ -308,6 +326,9 @@ pub struct Linking<'a> {
     /// The repository's summary names by their last segment (`find` -> `UsersService.find`,
     /// `find`): built once per round, so a lookup never scans every summary.
     pub external_names: &'a BTreeMap<String, Vec<String>>,
+    /// Properties every typed assignment in the repository gives the same class
+    /// (`config.database = new DatabaseController(..)`): property name -> class.
+    pub properties: &'a BTreeMap<String, ClassRef>,
 }
 
 /// [`Linking::external_names`] of a summary map.
@@ -380,6 +401,10 @@ pub fn scan_file_program(
         closure_writes: Vec::new(),
         pending_param_props: None,
         field_types: BTreeMap::new(),
+        field_refs: BTreeMap::new(),
+        call_classes: BTreeMap::new(),
+        declared_classes: BTreeSet::new(),
+        caller_kinds: BTreeMap::new(),
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -468,6 +493,11 @@ pub struct FileFacts {
     pub calls: BTreeMap<String, Vec<(String, u32, Vec<jss_core::ir::Value>)>>,
     /// Classes declared here, with their bases.
     pub classes: Vec<jss_core::ir::ClassDecl>,
+    /// Properties assigned an instance of one of our classes: (property, class).
+    pub properties: Vec<(String, ClassRef)>,
+    /// Constructors named by a pack's local cap that this file calls (see
+    /// [`models::LocalCapSpec`]).
+    pub constructed: BTreeSet<String>,
 }
 
 /// One entry point registered in this file.
@@ -555,6 +585,8 @@ pub struct Summary {
     pub start: bool,
     /// The parameter is a rest parameter (`...paths`): every argument from `param` on.
     pub rest: bool,
+    /// [`INSTANCE`] summaries only: the class the function returns an instance of.
+    pub instance_of: Option<ClassRef>,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -603,6 +635,9 @@ struct Env {
     instances: BTreeMap<String, String>,
     /// Variables holding an instance of a class of this file: the class.
     local_instances: BTreeMap<String, String>,
+    /// Variables holding an instance of a class known only by where it is declared: what a
+    /// function returns (`const db = getDBClient(cfg)`, a factory of several classes).
+    remote: BTreeMap<String, Vec<ClassRef>>,
     /// Variables bound to a DOM node created here (`document.createElement('iframe')`).
     nodes: BTreeSet<String>,
     /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
@@ -797,6 +832,7 @@ impl Env {
             auth_vars: BTreeMap::new(),
             instances: BTreeMap::new(),
             local_instances: BTreeMap::new(),
+            remote: BTreeMap::new(),
             tuples: BTreeMap::new(),
             nodes: BTreeSet::new(),
             locals: BTreeSet::new(),
@@ -825,6 +861,7 @@ impl Env {
             auth_vars: self.auth_vars.clone(),
             instances: self.instances.clone(),
             local_instances: self.local_instances.clone(),
+            remote: self.remote.clone(),
             tuples: self.tuples.clone(),
             nodes: self.nodes.clone(),
             locals: BTreeSet::new(),
@@ -969,6 +1006,19 @@ struct Walker<'e> {
     /// Instance fields known to hold one of our classes: (class, field) -> class
     /// (`this.svc = new Svc()`, `private svc: Svc`).
     field_types: BTreeMap<(String, String), String>,
+    /// Instance (and static) fields holding what an instance-returning function returned
+    /// (`this.registry = getRegistry()`): (class, field) -> classes.
+    field_refs: BTreeMap<(String, String), Vec<ClassRef>>,
+    /// The classes each call walked returns an instance of, from its [`INSTANCE`] summaries:
+    /// (call span, returned field) -> classes. Kept across passes (calls do not move).
+    call_classes: BTreeMap<(u32, u32, Option<String>), Vec<ClassRef>>,
+    /// Classes and interfaces declared in this file (and ES5 constructors with prototype
+    /// methods): `new C()` of one of them is an instance worth typing.
+    declared_classes: BTreeSet<String>,
+    /// The request kind this file's calls pass to a function as its first argument
+    /// (`handleToolCall(request)` from an MCP handler): its conventionally named request
+    /// parameter is that kind, not an HTTP request. `http` wins over any other.
+    caller_kinds: BTreeMap<String, &'static str>,
     /// TypeScript parameter properties of the constructor about to be entered
     /// (`constructor(private readonly cfg: Config)`): (class, parameter names), stored as
     /// instance fields at entry.
@@ -1755,6 +1805,11 @@ impl Walker<'_> {
                 }
             }
             Statement::ClassDeclaration(c) => self.class(c, env),
+            // `interface Store { get(id) }`: a type receivers are annotated with, dispatched to
+            // the classes implementing it.
+            Statement::TSInterfaceDeclaration(i) => {
+                self.declared_classes.insert(i.id.name.as_str().to_owned());
+            }
             Statement::BlockStatement(b) => self.statements(&b.body, env),
             Statement::IfStatement(s) => {
                 self.expr(&s.test, env);
@@ -2120,7 +2175,13 @@ impl Walker<'_> {
                                     kind: "file-route",
                                 });
                             }
-                            self.facts.exports.insert(name.clone(), name);
+                            // `export const getRegistry = Registry.getInstance`
+                            let local = declarator
+                                .init
+                                .as_ref()
+                                .and_then(|init| self.member_export(init))
+                                .unwrap_or_else(|| name.clone());
+                            self.facts.exports.insert(name.clone(), local);
                         }
                     }
                     self.var_decl(d, env);
@@ -2134,6 +2195,9 @@ impl Walker<'_> {
                     self.class(c, env);
                 }
                 Declaration::TSEnumDeclaration(e) => self.record_enum(e),
+                Declaration::TSInterfaceDeclaration(i) => {
+                    self.declared_classes.insert(i.id.name.as_str().to_owned());
+                }
                 _ => {}
             },
             ModuleDeclaration::ExportDefaultDeclaration(export) => match &export.declaration {
@@ -2488,6 +2552,49 @@ impl Walker<'_> {
             };
             let taint = self.expr_named(init, env, name_hint.clone());
             self.chain_receiver = saved_receiver;
+            // `const db = getDBClient(cfg)`, `const reg = await Registry.getInstance()`: an
+            // instance of what the function returns, when nothing above typed it by name.
+            if let Some(name) = &name_hint {
+                let refs =
+                    if env.instances.contains_key(name) || env.local_instances.contains_key(name) {
+                        Vec::new()
+                    } else {
+                        self.value_refs(init, env)
+                    };
+                if refs.is_empty() {
+                    env.remote.remove(name);
+                } else {
+                    env.remote.insert(name.clone(), refs);
+                }
+            }
+            // `const { store } = makeServices()`, returning `{ store: new Store(db) }`.
+            if let BindingPattern::ObjectPattern(object) = &declarator.id {
+                let call = match init.get_inner_expression() {
+                    Expression::AwaitExpression(a) => match a.argument.get_inner_expression() {
+                        Expression::CallExpression(c) => Some(c.span),
+                        _ => None,
+                    },
+                    Expression::CallExpression(c) => Some(c.span),
+                    _ => None,
+                };
+                for property in &object.properties {
+                    let BindingPattern::BindingIdentifier(local) = &property.value else {
+                        continue;
+                    };
+                    let local = local.name.as_str();
+                    let classes = call.zip(prop_name(&property.key)).and_then(|(span, key)| {
+                        self.call_classes.get(&(span.start, span.end, Some(key)))
+                    });
+                    match classes {
+                        Some(classes) => {
+                            env.remote.insert(local.to_owned(), classes.clone());
+                        }
+                        None => {
+                            env.remote.remove(local);
+                        }
+                    }
+                }
+            }
             // `const launch = prepare(bin, args)`, returning `{ command, args }`: field by field.
             let is_call = match init.get_inner_expression() {
                 Expression::CallExpression(_) => true,
@@ -2672,6 +2779,9 @@ impl Walker<'_> {
 
     fn class(&mut self, class: &Class<'_>, env: &mut Env) {
         let class_name = class.id.as_ref().map(|id| id.name.as_str().to_owned());
+        if let Some(name) = &class_name {
+            self.declared_classes.insert(name.clone());
+        }
         // `class MongoMem extends Mem implements Store`: its bases, for dispatch on a `Mem`.
         if let Some(name) = &class_name {
             let mut bases = Vec::new();
@@ -2952,6 +3062,12 @@ impl Walker<'_> {
         if self.enter() {
             self.statements(&body.statements, &mut env);
             self.record_validated(&body.statements, f.params.span, &env);
+            // `function pick(): Svc`, `async load(): Promise<Svc>`: returns an instance.
+            if self.summarize
+                && let Some(class) = self.annotated_returns(f.return_type.as_deref())
+            {
+                self.record_instances(vec![class], f.span, &env, None);
+            }
             self.leave();
         }
         self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
@@ -2991,6 +3107,7 @@ impl Walker<'_> {
                 let name = id.name.as_str().to_owned();
                 env.instances.remove(&name);
                 env.local_instances.remove(&name);
+                env.remote.remove(&name);
                 if let Some(class) = annotated_class(param.type_annotation.as_deref()) {
                     if self.relative.contains_key(class.as_str()) {
                         env.instances.insert(name, class);
@@ -3245,7 +3362,10 @@ impl Walker<'_> {
                         let kind = if role == Role::Route {
                             self.pending_request_kind.take().unwrap_or("http")
                         } else {
-                            "http"
+                            self.caller_kinds
+                                .get(&env.function)
+                                .copied()
+                                .unwrap_or("http")
                         };
                         // In a service worker, a `request` is the page's (browser-side data).
                         let worker_kind = m().service_worker.kind.as_str();
@@ -3366,6 +3486,7 @@ impl Walker<'_> {
                 defined_in: None,
                 start: false,
                 rest: false,
+                instance_of: None,
             });
         }
     }
@@ -3421,6 +3542,7 @@ impl Walker<'_> {
                 defined_in: None,
                 start: false,
                 rest: false,
+                instance_of: None,
             });
         }
     }
@@ -3443,12 +3565,298 @@ impl Walker<'_> {
                 {
                     let mut probe = env.clone();
                     let taint = self.expr(&p.value, &mut probe);
+                    let classes = self.value_refs(&p.value, &probe);
+                    self.record_instances(classes, p.span, env, Some(key.clone()));
                     self.record_return(taint, p.span, env, Some(key));
                 }
             }
             return;
         }
+        let classes = self.value_refs(argument, env);
+        self.record_instances(classes, argument.span(), env, None);
         self.record_return(whole, argument.span(), env, None);
+    }
+
+    /// Summary pass: the function returns an instance of each of `classes`, whole or as its
+    /// `out_field` (`return new PgClient(cfg)`, `return { store: new Store(db) }`).
+    fn record_instances(
+        &mut self,
+        classes: Vec<ClassRef>,
+        span: Span,
+        env: &Env,
+        out_field: Option<String>,
+    ) {
+        if !self.summarize
+            || classes.is_empty()
+            || env.function == "<anonymous>"
+            || env.function == "<module>"
+        {
+            return;
+        }
+        let list = self.summaries.entry(env.function.clone()).or_default();
+        for class in classes {
+            let mut known = list
+                .iter()
+                .filter(|s| s.api == INSTANCE && s.out_field == out_field);
+            let count = known.clone().count();
+            if count >= MAX_RETURNED_CLASSES
+                || known.any(|s| s.instance_of.as_ref() == Some(&class))
+            {
+                continue;
+            }
+            list.push(Summary {
+                param: 0,
+                class: VulnClass::CodeInjection,
+                severity: Severity::Low,
+                api: INSTANCE.to_owned(),
+                arg: span,
+                call: span,
+                steps: Vec::new(),
+                at_sink: Origin::source("param", span),
+                ext: None,
+                field: None,
+                out_field: out_field.clone(),
+                defined_in: None,
+                start: false,
+                rest: false,
+                instance_of: Some(class),
+            });
+        }
+    }
+
+    /// The class of ours a return type names: `Svc`, or inside a generic (`Promise<Svc>`).
+    fn annotated_returns(
+        &self,
+        annotation: Option<&oxc_ast::ast::TSTypeAnnotation<'_>>,
+    ) -> Option<ClassRef> {
+        let mut annotated = &annotation?.type_annotation;
+        for _ in 0..4 {
+            let oxc_ast::ast::TSType::TSTypeReference(reference) = annotated else {
+                return None;
+            };
+            let oxc_ast::ast::TSTypeName::IdentifierReference(name) = &reference.type_name else {
+                return None;
+            };
+            if let Some(class) = self.known_class(name.name.as_str()) {
+                return Some(class);
+            }
+            annotated = reference.type_arguments.as_ref()?.params.first()?;
+        }
+        None
+    }
+
+    /// `C` where it is declared, when it names a class (or interface) of ours: imported from
+    /// one of our modules, declared in this file, or the class being walked.
+    fn known_class(&self, name: &str) -> Option<ClassRef> {
+        (self.relative.contains_key(name)
+            || self.declared_classes.contains(name)
+            || self.current_class.as_deref() == Some(name))
+        .then(|| self.class_ref(name))
+        .flatten()
+    }
+
+    /// The export-table entry for a class member exported under another name
+    /// (`getRegistry: Registry.getInstance`): `Registry.getInstance` for a class of this file,
+    /// else the defining file and name behind [`ELSEWHERE`].
+    fn member_export(&self, expr: &Expression<'_>) -> Option<String> {
+        let Expression::StaticMemberExpression(member) = expr.get_inner_expression() else {
+            return None;
+        };
+        let Expression::Identifier(class) = member.object.get_inner_expression() else {
+            return None;
+        };
+        let (file, name) = self.known_class(class.name.as_str())?;
+        let method = member.property.name.as_str();
+        Some(if file == self.linking.file {
+            format!("{name}.{method}")
+        } else {
+            format!("{ELSEWHERE}{file}#{name}.{method}")
+        })
+    }
+
+    /// The classes `expr` holds an instance of, where they are declared: `new C()` of one of
+    /// our classes, `new this()` in a static method, a typed variable or field (static ones
+    /// too: `Registry.instance`), what an instance-returning function returned, or a property
+    /// the repository types by assignment (`this.config.database`). At most
+    /// [`MAX_RETURNED_CLASSES`].
+    fn value_refs(&self, expr: &Expression<'_>, env: &Env) -> Vec<ClassRef> {
+        let mut out = Vec::new();
+        self.collect_refs(expr, env, &mut out, 0);
+        out
+    }
+
+    fn collect_refs(&self, expr: &Expression<'_>, env: &Env, out: &mut Vec<ClassRef>, depth: u8) {
+        fn add(out: &mut Vec<ClassRef>, class: Option<ClassRef>) {
+            if let Some(class) = class
+                && !out.contains(&class)
+                && out.len() < MAX_RETURNED_CLASSES
+            {
+                out.push(class);
+            }
+        }
+        if depth > 6 {
+            return;
+        }
+        match expr.get_inner_expression() {
+            Expression::AwaitExpression(a) => self.collect_refs(&a.argument, env, out, depth + 1),
+            Expression::ConditionalExpression(c) => {
+                self.collect_refs(&c.consequent, env, out, depth + 1);
+                self.collect_refs(&c.alternate, env, out, depth + 1);
+            }
+            Expression::LogicalExpression(l) => {
+                self.collect_refs(&l.left, env, out, depth + 1);
+                self.collect_refs(&l.right, env, out, depth + 1);
+            }
+            Expression::SequenceExpression(s) => {
+                if let Some(last) = s.expressions.last() {
+                    self.collect_refs(last, env, out, depth + 1);
+                }
+            }
+            // `return (Registry.instance = new Registry())`
+            Expression::AssignmentExpression(a) if a.operator.is_assign() => {
+                self.collect_refs(&a.right, env, out, depth + 1);
+            }
+            Expression::CallExpression(c) => {
+                for class in self
+                    .call_classes
+                    .get(&(c.span.start, c.span.end, None))
+                    .into_iter()
+                    .flatten()
+                {
+                    add(out, Some(class.clone()));
+                }
+            }
+            Expression::NewExpression(n) => match n.callee.get_inner_expression() {
+                Expression::Identifier(id) => add(out, self.known_class(id.name.as_str())),
+                // `new this(opts)` in a static factory: the class itself.
+                Expression::ThisExpression(_) => add(
+                    out,
+                    self.current_class
+                        .clone()
+                        .map(|c| (self.linking.file.to_owned(), c)),
+                ),
+                _ => {}
+            },
+            Expression::Identifier(id) => {
+                let name = id.name.as_str();
+                if let Some(classes) = env.remote.get(name) {
+                    for class in classes {
+                        add(out, Some(class.clone()));
+                    }
+                } else if let Some(class) = env.instances.get(name) {
+                    add(out, self.class_ref(class));
+                } else if let Some(class) = env.local_instances.get(name)
+                    && (self.declared_classes.contains(class.as_str())
+                        || self.current_class.as_deref() == Some(class.as_str()))
+                {
+                    add(out, Some((self.linking.file.to_owned(), class.clone())));
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                let field = member.property.name.as_str();
+                let owner = match member.object.get_inner_expression() {
+                    Expression::ThisExpression(_) => {
+                        if let Some(class) = self.this_field_class(field) {
+                            add(out, self.known_class(&class));
+                            return;
+                        }
+                        self.current_class.clone()
+                    }
+                    // `Registry.instance`
+                    Expression::Identifier(id)
+                        if self.declared_classes.contains(id.name.as_str())
+                            || self.current_class.as_deref() == Some(id.name.as_str()) =>
+                    {
+                        Some(id.name.as_str().to_owned())
+                    }
+                    _ => None,
+                };
+                if let Some(owner) = &owner {
+                    let key = (owner.clone(), field.to_owned());
+                    if let Some(class) = self.field_types.get(&key) {
+                        add(out, self.known_class(class));
+                    }
+                    for class in self.field_refs.get(&key).into_iter().flatten() {
+                        add(out, Some(class.clone()));
+                    }
+                }
+                if out.is_empty()
+                    && let Some(class) = self.linking.properties.get(field)
+                {
+                    add(out, Some(class.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Types what an assignment stores: a variable (`db = getDBClient(cfg)`), a field of the
+    /// class being walked or a static one (`this.registry = getRegistry()`,
+    /// `Registry.instance = new Registry()`). In the reporting pass, also records the property
+    /// for the repository-wide table (`config.database = new DatabaseController(..)`).
+    fn type_assignment(
+        &mut self,
+        left: &AssignmentTarget<'_>,
+        right: &Expression<'_>,
+        env: &mut Env,
+    ) {
+        let refs = self.value_refs(right, env);
+        if let AssignmentTarget::AssignmentTargetIdentifier(id) = left {
+            let name = id.name.as_str();
+            if let Some(class) = self.instance_class(right, None, env) {
+                env.remote.remove(name);
+                if self.relative.contains_key(class.as_str()) {
+                    env.local_instances.remove(name);
+                    env.instances.insert(name.to_owned(), class);
+                } else {
+                    env.instances.remove(name);
+                    env.local_instances.insert(name.to_owned(), class);
+                }
+            } else if !refs.is_empty() {
+                env.instances.remove(name);
+                env.local_instances.remove(name);
+                env.remote.insert(name.to_owned(), refs);
+            }
+            return;
+        }
+        if refs.is_empty() {
+            return;
+        }
+        let Some(member) = left
+            .as_simple_assignment_target()
+            .and_then(SimpleAssignmentTarget::as_member_expression)
+        else {
+            return;
+        };
+        let Some(field) = member.static_property_name().and_then(|n| n.as_str()) else {
+            return;
+        };
+        let owner = match member.object().get_inner_expression() {
+            Expression::ThisExpression(_) => self.current_class.clone(),
+            Expression::Identifier(id)
+                if self.declared_classes.contains(id.name.as_str())
+                    || self.current_class.as_deref() == Some(id.name.as_str()) =>
+            {
+                Some(id.name.as_str().to_owned())
+            }
+            _ => None,
+        };
+        if let Some(owner) = owner {
+            let key = (owner, field.to_owned());
+            if !self.field_types.contains_key(&key) {
+                let entry = self.field_refs.entry(key).or_default();
+                for class in &refs {
+                    if !entry.contains(class) && entry.len() < MAX_RETURNED_CLASSES {
+                        entry.push(class.clone());
+                    }
+                }
+            }
+        }
+        if let ([class], false) = (refs.as_slice(), self.summarize) {
+            self.facts
+                .properties
+                .push((field.to_owned(), class.clone()));
+        }
     }
 
     /// Walks a function-valued expression, if it is one. Returns whether it was.
@@ -3657,6 +4065,8 @@ impl Walker<'_> {
                         .and_then(|n| n.as_str().map(str::to_owned));
                     let local = match assign.right.get_inner_expression() {
                         Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                        // `exports.getRegistry = Registry.getInstance`
+                        value @ Expression::StaticMemberExpression(_) => self.member_export(value),
                         Expression::FunctionExpression(f) => {
                             f.id.as_ref()
                                 .map(|id| id.name.as_str().to_owned())
@@ -3718,6 +4128,12 @@ impl Walker<'_> {
                                 Expression::Identifier(v) => {
                                     self.facts.exports.insert(k, v.name.as_str().to_owned());
                                 }
+                                // `getRegistry: Registry.getInstance`
+                                value if self.member_export(value).is_some() => {
+                                    if let Some(local) = self.member_export(value) {
+                                        self.facts.exports.insert(k, local);
+                                    }
+                                }
                                 value => {
                                     if let Some(file) = require_spec(value)
                                         .and_then(|spec| self.linking.resolve(&spec))
@@ -3749,6 +4165,7 @@ impl Walker<'_> {
                     .and_then(SimpleAssignmentTarget::as_member_expression)
                     .and_then(prototype_owner)
                 {
+                    self.declared_classes.insert(class.0.clone());
                     let saved_class = self.current_class.replace(class.0.clone());
                     match (&class.1, assign.right.get_inner_expression()) {
                         (Some(method), right) => {
@@ -3835,6 +4252,11 @@ impl Walker<'_> {
                             env,
                         );
                     }
+                }
+                // `db = getDBClient(cfg)`, `this.registry = getRegistry()`, `Registry.instance =
+                // new Registry()`: what the target now holds an instance of.
+                if assign.operator.is_assign() {
+                    self.type_assignment(&assign.left, &assign.right, env);
                 }
                 self.assign_target(&assign.left, taint.clone(), env);
                 taint
@@ -3960,6 +4382,13 @@ impl Walker<'_> {
             Expression::CallExpression(call) => self.call(call, env),
             Expression::NewExpression(new) => {
                 let callee = self.callee(&new.callee);
+                // `new StreamableHTTPServerTransport(..)`: lifts a pack's local cap repo-wide.
+                if !self.summarize
+                    && let Some(name) = callee_name(&new.callee)
+                    && m().local_caps.iter().any(|c| has(&c.unless_new, &name))
+                {
+                    self.facts.constructed.insert(name);
+                }
                 // `new Worker('jobs', async (job) => ...)`: client callbacks as with calls.
                 let (role, shape) = self.client_role(&callee, &new.callee, &new.arguments, env);
                 let last = new.arguments.len().saturating_sub(1);
@@ -5362,6 +5791,31 @@ impl Walker<'_> {
                 .push((callee_text, call.span.start, args));
         }
 
+        // `handleToolCall(request)` in an MCP handler: the kind of request the first argument is.
+        if let Callee::Global(name) = &callee {
+            let passed = match call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .map(Expression::get_inner_expression)
+            {
+                Some(Expression::Identifier(id)) => env.requests.get(id.name.as_str()).copied(),
+                _ => None,
+            }
+            .or_else(|| {
+                taints
+                    .first()
+                    .and_then(Option::as_ref)
+                    .filter(|o| o.param.is_none())
+                    .map(|o| o.kind)
+            });
+            if let Some(kind) = passed {
+                let entry = self.caller_kinds.entry(name.clone()).or_insert(kind);
+                if kind == "http" {
+                    *entry = kind;
+                }
+            }
+        }
         // Sinks.
         let sink = match &callee {
             Callee::Module { family, export } => {
@@ -5648,14 +6102,38 @@ impl Walker<'_> {
         // by field when it returns an object literal.
         let mut returned_fields: BTreeMap<String, Origin> = BTreeMap::new();
         // `m.get(id)` on an `m: Mem` with no `Mem.get` of its own (an abstract class or an
-        // interface): the `get` of every class that extends or implements `Mem`.
+        // interface): the `get` of every class that extends or implements `Mem`. A receiver
+        // known only by what a function returned (`getDBClient(cfg).runQuery(sql)`): the
+        // method of each class it returns.
         let dispatched: Vec<(String, Vec<Summary>)> = match (&helper, &callee) {
-            (None, Callee::Method { method, .. }) => self
-                .receiver_class(&callee, call, env)
-                .map(|class| self.dispatch_candidates(&class, method))
-                .unwrap_or_default(),
+            (None, Callee::Method { method, .. }) => {
+                match self.receiver_class(&callee, call, env) {
+                    Some(class) => self.dispatch_candidates(&class, method),
+                    None => {
+                        let classes = self.receiver_refs(&callee, call, env);
+                        self.class_method_summaries(&classes, method)
+                    }
+                }
+            }
             _ => Vec::new(),
         };
+        // `getDBClient(cfg)` returning `new PgClient(cfg)`: the classes the call returns, for
+        // `.m()` on it and the names it is bound to.
+        let mut returned_classes: BTreeMap<Option<String>, Vec<ClassRef>> = BTreeMap::new();
+        for (_, summaries) in helper.iter().chain(&dispatched) {
+            for s in summaries.iter().filter(|s| s.api == INSTANCE) {
+                if let Some(class) = &s.instance_of {
+                    let entry = returned_classes.entry(s.out_field.clone()).or_default();
+                    if !entry.contains(class) && entry.len() < MAX_RETURNED_CLASSES {
+                        entry.push(class.clone());
+                    }
+                }
+            }
+        }
+        for (field, classes) in returned_classes {
+            self.call_classes
+                .insert((call.span.start, call.span.end, field), classes);
+        }
         let returned = helper.as_ref().and_then(|(name, summaries)| {
             let mut whole = None;
             for s in summaries.iter().filter(|s| s.api == RETURNS) {
@@ -6227,9 +6705,12 @@ impl Walker<'_> {
         whole: Option<Origin>,
     ) -> Option<Origin> {
         let expr = argument?.as_expression()?.get_inner_expression();
-        // The server chose this field: an upload's `path` (`move(req.file)`), or a field a
-        // client source lists as the server's.
-        if has(&m().upload_server_fields, field) && self.is_upload_object(expr, env) {
+        // The server chose this field: an upload's `path` (`move(req.file)`, or of an upload
+        // that went through an array or a loop: `for (const file of req.files) move(file)`), or
+        // a field a client source lists as the server's.
+        if has(&m().upload_server_fields, field)
+            && (whole.as_ref().is_some_and(|o| o.upload) || self.is_upload_object(expr, env))
+        {
             return None;
         }
         if let Expression::Identifier(id) = expr
@@ -6750,6 +7231,10 @@ impl Walker<'_> {
             if let Some(class) = class {
                 return Some(format!("{class}.{method}"));
             }
+            // `getRegistry().addServer(..)`, `db.runQuery(..)` on what a factory returned.
+            if let Some((_, class)) = self.receiver_refs(callee, call, env).first() {
+                return Some(format!("{class}.{method}"));
+            }
         }
         callee_name(&call.callee)
     }
@@ -6783,7 +7268,12 @@ impl Walker<'_> {
         let Some(base) = self.class_ref(class) else {
             return Vec::new();
         };
-        let Some(classes) = self.linking.subclasses.get(&base) else {
+        self.dispatch_from(&base, method)
+    }
+
+    /// [`Self::dispatch_candidates`] of a class known by where it is declared.
+    fn dispatch_from(&self, base: &ClassRef, method: &str) -> Vec<(String, Vec<Summary>)> {
+        let Some(classes) = self.linking.subclasses.get(base) else {
             return Vec::new();
         };
         if classes.len() > 16 {
@@ -6806,6 +7296,79 @@ impl Walker<'_> {
                 (!list.is_empty()).then_some((key, list))
             })
             .collect()
+    }
+
+    /// The summaries of `method` on each of `classes`: this file's own for a class declared
+    /// here, else the defining file's; for a class without its own `method` (an interface, an
+    /// abstract base), that of every class extending or implementing it.
+    fn class_method_summaries(
+        &self,
+        classes: &[ClassRef],
+        method: &str,
+    ) -> Vec<(String, Vec<Summary>)> {
+        let mut found = Vec::new();
+        for (file, class) in classes {
+            let key = format!("{class}.{method}");
+            let list: Vec<Summary> = if file == self.linking.file {
+                self.summaries.get(&key).cloned().unwrap_or_default()
+            } else {
+                self.external
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| s.defined_in.as_deref() == Some(file.as_str()))
+                    .cloned()
+                    .collect()
+            };
+            if list.is_empty() {
+                found.extend(self.dispatch_from(&(file.clone(), class.clone()), method));
+            } else {
+                found.push((key, list));
+            }
+        }
+        found
+    }
+
+    /// The classes a method call's receiver holds when only where they are declared is known:
+    /// a variable bound to what an instance-returning function returned, the call itself
+    /// (`getRegistry().addServer(..)`), `new this()`, a field typed that way, or a property the
+    /// repository types by assignment (`this.config.database.find(..)`).
+    fn receiver_refs(
+        &self,
+        callee: &Callee,
+        call: &CallExpression<'_>,
+        env: &Env,
+    ) -> Vec<ClassRef> {
+        let Callee::Method { object, method } = callee else {
+            return Vec::new();
+        };
+        if method.is_empty() {
+            return Vec::new();
+        }
+        let Some(receiver) = call
+            .callee
+            .get_inner_expression()
+            .as_member_expression()
+            .map(|m| m.object().get_inner_expression())
+        else {
+            return Vec::new();
+        };
+        match (object, receiver) {
+            (Some(name), Expression::Identifier(_)) => {
+                env.remote.get(name).cloned().unwrap_or_default()
+            }
+            (Some(_), _) => Vec::new(),
+            // `new C().m()` is typed by name; `new this().m()` here.
+            (None, Expression::NewExpression(n))
+                if !matches!(
+                    n.callee.get_inner_expression(),
+                    Expression::ThisExpression(_)
+                ) =>
+            {
+                Vec::new()
+            }
+            (None, receiver) => self.value_refs(receiver, env),
+        }
     }
 
     /// The class a method call's receiver is typed with: a typed variable, `this.field`, or
@@ -7908,6 +8471,11 @@ impl Walker<'_> {
             .map(|set| set.iter().collect())
             .unwrap_or_default();
         match table(&file).and_then(|t| t.get(export)) {
+            // `{ getRegistry: Registry.getInstance }` with `Registry` declared elsewhere.
+            Some(local) if local.starts_with(ELSEWHERE) => {
+                let (file, name) = local.strip_prefix(ELSEWHERE)?.split_once('#')?;
+                Some((file.to_owned(), name.to_owned()))
+            }
             // A barrel's `export { default as runDefault } from './shell'`: the name it maps to
             // is an export of the file it re-exports.
             Some(local) => Some(
@@ -7963,7 +8531,7 @@ impl Walker<'_> {
     ) {
         for summary in summaries
             .iter()
-            .filter(|s| s.api != RETURNS && s.api != VALIDATES)
+            .filter(|s| s.api != RETURNS && s.api != VALIDATES && s.api != INSTANCE)
         {
             let whole = argument_taint(taints, summary.param, summary.rest);
             let origin = match (&summary.field, arguments) {
@@ -8099,6 +8667,7 @@ impl Walker<'_> {
                         defined_in: None,
                         start: finding.start || url_sink,
                         rest: self.rest_params.contains(&at),
+                        instance_of: None,
                     });
                 }
             }
@@ -8919,6 +9488,22 @@ mod tests {
             found.iter().any(|f| f.0 == VulnClass::PathTraversal),
             "{found:?}"
         );
+        // Each upload of a loop handed to a helper keeps its server-chosen fields.
+        let helpers = "function stage(file, name = file.filename) { fs.renameSync(path.join(path.dirname(file.path), name), '/srv/x'); }\n\
+             function keep(file) { fs.writeFileSync('/up/' + file.originalname, ''); }\n";
+        assert!(
+            one(&format!(
+                "{helpers}app.post('/u', (req, res) => {{ for (const file of req.files) {{ stage(file); }} }});"
+            ))
+            .is_empty()
+        );
+        let found = one(&format!(
+            "{helpers}app.post('/u', (req, res) => {{ for (const file of req.files) {{ keep(file); }} }});"
+        ));
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::PathTraversal),
+            "{found:?}"
+        );
     }
 
     #[test]
@@ -9127,6 +9712,77 @@ mod tests {
         assert!(scan("class L { execute() { let location = this.getNodeParameter('loc', 0); location = location.trim(); } }").is_empty());
         assert!(scan("class Q { async execute() { const q = this.getNodeParameter('query', 0); await conn.query(q); } }").is_empty());
         assert!(scan("const { exec } = require('child_process');\nclass E { execute() { exec('ls ' + parseInt(this.getNodeParameter('n', 0), 10)); } }").is_empty());
+    }
+
+    #[test]
+    fn instances_returned_by_functions_type_their_receivers() {
+        use VulnClass::*;
+        let classes = "class A { run(x) { exec('ls ' + x); } }\n\
+            class B { run(x) { fs.readFileSync('/d/' + x); } }\n\
+            class Safe { run(x) { exec('ls ' + parseInt(x, 10)); } }\n";
+        // A factory of two classes: the method of each.
+        let found = one(&format!(
+            "{classes}function make(k) {{ switch (k) {{ case 'a': return new A(); default: return new B(); }} }}\n\
+             app.get('/x', (req, res) => make(req.query.k).run(req.query.x));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        assert!(found.iter().any(|f| f.0 == PathTraversal), "{found:?}");
+        // Bound to a variable, through `await`; reassigned.
+        let found = one(&format!(
+            "{classes}async function make() {{ return new A(); }}\n\
+             app.get('/x', async (req, res) => {{ const c = await make(); c.run(req.query.x); }});"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        let found = one(&format!(
+            "{classes}function make() {{ return new A(); }}\n\
+             app.get('/x', (req, res) => {{ let c = null; c = make(); c.run(req.query.x); }});"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        // Only the class it returns.
+        assert!(
+            one(&format!(
+                "{classes}function make() {{ return new Safe(); }}\n\
+                 app.get('/x', (req, res) => make().run(req.query.x));"
+            ))
+            .is_empty()
+        );
+        // A singleton accessor, `new this()` in a static factory.
+        let found = one(&format!(
+            "{classes}class R {{ static get() {{ if (!R.inst) {{ R.inst = new R(); }} return R.inst; }} add(c) {{ exec(c); }} }}\n\
+             app.get('/x', (req, res) => R.get().add(req.query.c));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        let found = one(&format!(
+            "{classes}class F {{ static create() {{ return new this(); }} go(p) {{ fs.readFileSync(p); }} }}\n\
+             app.get('/x', (req, res) => F.create().go(req.query.p));"
+        ));
+        assert!(found.iter().any(|f| f.0 == PathTraversal), "{found:?}");
+        // A field holding what a factory returned.
+        let found = one(&format!(
+            "{classes}function make() {{ return new A(); }}\n\
+             class Ctl {{ constructor() {{ this.c = make(); }} h(req) {{ this.c.run(req.query.x); }} }}\n\
+             const ctl = new Ctl();\napp.get('/x', (req, res) => ctl.h(req));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        // A field of a returned object, destructured.
+        let services = "function services() { return { a: new A(), safe: new Safe() }; }\n";
+        let found = one(&format!(
+            "{classes}{services}app.get('/x', (req, res) => {{ const {{ a }} = services(); a.run(req.query.x); }});"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        assert!(
+            one(&format!(
+                "{classes}{services}app.get('/x', (req, res) => {{ const {{ safe }} = services(); safe.run(req.query.x); }});"
+            ))
+            .is_empty()
+        );
+        // A TypeScript return type names the class.
+        let head = "const { exec } = require('child_process');\nclass Svc { run(x: string) { exec('ls ' + x); } }\n";
+        let found = scan_ts(&format!(
+            "{head}function pick(): Svc {{ return lookup(); }}\n\
+             app.get('/x', (req, res) => pick().run(req.query.x));"
+        ));
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
     }
 
     #[test]
@@ -9822,6 +10478,19 @@ mod tests {
             "server.addTool({ name: 'read', execute: async (args) => fs.readFileSync(args.file) });",
         );
         assert_eq!(fastmcp.len(), 1, "{fastmcp:?}");
+        // A helper with a conventionally named `request` parameter takes the kind its callers
+        // here pass it: an MCP request, not an HTTP one.
+        let helper = one(
+            "async function handleToolCall(request) { return fs.readFileSync(request.params.arguments.path); }\n\
+             server.setRequestHandler(CallToolRequestSchema, async (request) => handleToolCall(request));",
+        );
+        assert!(!helper.is_empty(), "{helper:?}");
+        assert!(helper.iter().all(|f| f.3 == "mcp"), "{helper:?}");
+        let http = one(
+            "function getFile(request) { return fs.readFileSync(request.query.path); }\n\
+             app.get('/f', (req, res) => res.send(getFile(req)));",
+        );
+        assert!(http.iter().any(|f| f.3 == "http"), "{http:?}");
     }
 
     #[test]

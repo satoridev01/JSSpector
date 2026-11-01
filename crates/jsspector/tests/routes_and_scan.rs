@@ -1407,3 +1407,171 @@ fn calls_on_a_base_type_dispatch_to_its_implementations() {
         "{found:?}"
     );
 }
+
+/// Instances returned by functions in other files: a factory of several classes (the method
+/// of each class it returns, and only those), a singleton accessor exported under another
+/// name, `new this()` in a static factory, and a property every typed assignment in the
+/// repository gives the same class.
+#[test]
+fn instances_returned_by_factories_singletons_and_typed_properties() {
+    let tree = |root: &Path, conflicting: bool| {
+        write(
+            root,
+            "src/a.js",
+            "const { exec } = require('child_process');\nclass A { run(x) { exec('ls ' + x); } }\nmodule.exports = { A };\n",
+        );
+        write(
+            root,
+            "src/b.js",
+            "const fs = require('fs');\nclass B { run(x) { fs.readFileSync('/data/' + x); } }\nmodule.exports = { B };\n",
+        );
+        write(
+            root,
+            "src/safe.js",
+            "const { exec } = require('child_process');\nclass Safe { run(x) { exec('ls ' + parseInt(x, 10)); } }\nmodule.exports = { Safe };\n",
+        );
+        write(
+            root,
+            "src/factory.js",
+            "const { A } = require('./a');\nconst { B } = require('./b');\nconst { Safe } = require('./safe');\n\
+             function getClient(kind) { switch (kind) { case 'a': return new A(); default: return new B(); } }\n\
+             function getSafe() { return new Safe(); }\nmodule.exports = { getClient, getSafe };\n",
+        );
+        write(
+            root,
+            "src/registry.ts",
+            "import { exec } from 'child_process';\n\
+             export class Registry {\n  private static instance: Registry;\n\
+             static getInstance(): Registry { if (!Registry.instance) { Registry.instance = new Registry(); } return Registry.instance; }\n\
+             add(cmd: string) { exec(cmd); }\n}\n\
+             export class Maker { static create() { return new this(); } go(p: string) { require('fs').readFileSync(p); } }\n",
+        );
+        write(
+            root,
+            "src/config.js",
+            "const { Registry, Maker } = require('./registry');\n\
+             module.exports = { getRegistry: Registry.getInstance, makeOne: Maker.create };\n",
+        );
+        write(
+            root,
+            "src/db.js",
+            "const { exec } = require('child_process');\nclass Database { find(w) { exec('grep ' + w); } }\nmodule.exports = { Database };\n",
+        );
+        write(
+            root,
+            "src/setup.js",
+            "const { Database } = require('./db');\nfunction setup(config) { config.database = new Database(); }\nmodule.exports = { setup };\n",
+        );
+        if conflicting {
+            write(
+                root,
+                "src/other.js",
+                "const { Safe } = require('./safe');\nfunction init(o) { o.database = new Safe(); }\nmodule.exports = { init };\n",
+            );
+        }
+        write(
+            root,
+            "src/query.js",
+            "class Query { constructor(config) { this.config = config; } execute(w) { this.config.database.find(w); } }\nmodule.exports = { Query };\n",
+        );
+        write(
+            root,
+            "src/routes.js",
+            "const { getClient, getSafe } = require('./factory');\n\
+             const { getRegistry, makeOne } = require('./config');\nconst { Query } = require('./query');\n\
+             app.get('/f', (req, res) => getClient(req.query.k).run(req.query.x));\n\
+             app.get('/v', async (req, res) => { const c = await getClient('a'); c.run(req.query.v); });\n\
+             app.get('/s', (req, res) => getSafe().run(req.query.s));\n\
+             app.get('/r', (req, res) => getRegistry().add(req.query.r));\n\
+             app.get('/n', (req, res) => makeOne().go(req.query.n));\n\
+             app.get('/q', (req, res) => new Query(cfg).execute(req.query.q));\n",
+        );
+    };
+    let found = |root: &Path| -> Vec<(String, String, String)> {
+        let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+        scan["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["class"].as_str().unwrap_or("").to_owned(),
+                    f["sink"]["file"].as_str().unwrap_or("").to_owned(),
+                    f["entry"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    tree(dir.path(), false);
+    let got = found(dir.path());
+    let has = |class: &str, file: &str, entry: &str| {
+        got.iter()
+            .any(|(c, f, e)| c == class && f == file && e == entry)
+    };
+    for (class, file, entry) in [
+        ("command-injection", "src/a.js", "GET /f"),
+        ("path-traversal", "src/b.js", "GET /f"),
+        ("command-injection", "src/a.js", "GET /v"),
+        ("command-injection", "src/registry.ts", "GET /r"),
+        ("path-traversal", "src/registry.ts", "GET /n"),
+        ("command-injection", "src/db.js", "GET /q"),
+    ] {
+        assert!(
+            has(class, file, entry),
+            "{class} {file} {entry} missing from {got:?}"
+        );
+    }
+    // The factory that returns `Safe` reaches no sink.
+    assert!(!got.iter().any(|(_, f, _)| f == "src/safe.js"), "{got:?}");
+    // A property assigned two different classes is typed by neither.
+    let dir = tempfile::tempdir().unwrap();
+    tree(dir.path(), true);
+    let got = found(dir.path());
+    assert!(!got.iter().any(|(_, f, _)| f == "src/db.js"), "{got:?}");
+    assert!(!got.iter().any(|(_, f, _)| f == "src/safe.js"), "{got:?}");
+}
+
+/// An MCP server reachable only over stdio answers the client that launched it: its tool
+/// arguments are capped at medium. Served over HTTP too, they are not.
+#[test]
+fn stdio_only_mcp_servers_are_capped() {
+    let server = |root: &Path, http: bool| {
+        let extra = if http {
+            "app.post('/mcp', async (req, res) => { const t = new StreamableHTTPServerTransport({}); await server.connect(t); });\n"
+        } else {
+            ""
+        };
+        write(
+            root,
+            "src/server.js",
+            &format!(
+                "const {{ Server }} = require('@modelcontextprotocol/sdk/server/index.js');\n\
+                 const {{ StdioServerTransport }} = require('@modelcontextprotocol/sdk/server/stdio.js');\n\
+                 const {{ exec }} = require('child_process');\n\
+                 const server = new Server({{ name: 'x', version: '1' }}, {{ capabilities: {{}} }});\n\
+                 server.setRequestHandler(CallToolRequestSchema, async (request) => {{ exec('git log ' + request.params.arguments.ref); }});\n\
+                 server.connect(new StdioServerTransport());\n{extra}"
+            ),
+        );
+    };
+    for (http, expected) in [(false, "medium"), (true, "critical")] {
+        let dir = tempfile::tempdir().unwrap();
+        server(dir.path(), http);
+        let scan = run(&[
+            "scan",
+            "--json",
+            "--min-severity",
+            "low",
+            dir.path().to_str().unwrap(),
+        ]);
+        let severities: Vec<&str> = scan["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["source"]["kind"] == "mcp")
+            .map(|f| f["severity"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(severities, vec![expected], "http: {http}");
+    }
+}

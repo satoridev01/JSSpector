@@ -14,3 +14,8 @@ client_sources:
   - {methods: [setRequestHandler], shape: last-callback, params: first, kind: mcp}
   # FastMCP: server.addTool({ name, parameters, execute: async (args) => ... })
   - {methods: [addTool, addPrompt, addResource, addResourceTemplate], shape: object-of-functions, params: first, kind: mcp}
+# Over stdio a server answers the client that launched it: its arguments are what the model chose,
+# reached only through text the model read (as with llm-tool). Served over HTTP, any client can
+# call it.
+local_caps:
+  - {kind: mcp, cap: medium, unless_new: [StreamableHTTPServerTransport, SSEServerTransport]}

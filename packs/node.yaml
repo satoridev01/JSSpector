@@ -136,7 +136,7 @@ sanitizers:
   # ...trusted even when the function is in the repository: it checks a signature.
   signed_words: [sig, signature, token, jwt, hmac, signed, cookie, session]
   # Predicates (isX, hasX, validateX...) named like these are validators (true = safe)...
-  validator_words: [valid, safe, allowed, whitelisted, allowlisted, permitted, inside, within, uuid, numeric, alphanumeric]
+  validator_words: [valid, safe, allowed, whitelisted, allowlisted, permitted, inside, within, contained, uuid, numeric, alphanumeric]
   # ...or rejecters (true = bad), which clean their argument when they returned false.
   rejecter_words: [traversal, malicious, unsafe, invalid, dangerous, forbidden, blocked, blacklisted, denylisted, private, internal, outside]
   receiver_rejecters: [includes, match, test]

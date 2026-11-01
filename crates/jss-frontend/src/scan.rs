@@ -28,6 +28,7 @@ type Analysis = (
     ir::Module,
     Templates,
     BTreeMap<String, String>,
+    BTreeSet<String>,
 );
 use jss_core::ir;
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +60,8 @@ pub struct ScanReport {
     templates: BTreeMap<String, Vec<taint::RouteTemplate>>,
     /// Constants of this file (enum members, `const` strings).
     constants: BTreeMap<String, String>,
+    /// Constructors that lift a pack's local cap, called in this file.
+    constructed: BTreeSet<String>,
 }
 
 /// What every file's scan needs to know about the scan root.
@@ -78,6 +81,8 @@ struct Context<'a> {
     packages: Option<&'a BTreeSet<String>>,
     /// The round's summary names by last segment.
     external_names: BTreeMap<String, Vec<String>>,
+    /// Properties every typed assignment gives the same class (see [`property_types`]).
+    properties: BTreeMap<String, taint::ClassRef>,
 }
 
 impl ParsePool {
@@ -105,7 +110,8 @@ impl ParsePool {
                    templates: taint::Templates,
                    constants: BTreeMap<String, BTreeMap<String, String>>,
                    exports: BTreeMap<String, BTreeMap<String, String>>,
-                   subclasses: BTreeMap<(String, String), Vec<(String, String)>>|
+                   subclasses: BTreeMap<(String, String), Vec<(String, String)>>,
+                   properties: BTreeMap<String, taint::ClassRef>|
          -> Vec<ScanReport> {
             let context = Context {
                 all: &all,
@@ -118,6 +124,7 @@ impl ParsePool {
                 scalar: &scalar,
                 packages: packages.as_ref(),
                 external_names: taint::index_names(external),
+                properties,
             };
             self.install(|| {
                 files
@@ -141,6 +148,7 @@ impl ParsePool {
             &external,
             BTreeMap::new(),
             taint::Templates::new(),
+            BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -182,11 +190,41 @@ impl ParsePool {
             known = now;
             external = merged;
             let subclasses = subclass_closure(&reports);
+            let properties = property_types(&reports);
             reports = run(
-                &external, reexports, templates, constants, exports, subclasses,
+                &external, reexports, templates, constants, exports, subclasses, properties,
             );
         }
+        apply_local_caps(&mut reports);
         reports
+    }
+}
+
+/// Caps findings of the source kinds a pack caps unless the repository constructs one of the
+/// listed classes (an MCP server reachable only over stdio: its arguments are the model's).
+fn apply_local_caps(reports: &mut [ScanReport]) {
+    let caps = &taint::models::model().local_caps;
+    if caps.is_empty() {
+        return;
+    }
+    let constructed: BTreeSet<&str> = reports
+        .iter()
+        .flat_map(|r| r.constructed.iter().map(String::as_str))
+        .collect();
+    let holding: Vec<&taint::models::LocalCap> = caps
+        .iter()
+        .filter(|c| {
+            !c.unless_new
+                .iter()
+                .any(|n| constructed.contains(n.as_str()))
+        })
+        .collect();
+    for finding in reports.iter_mut().flat_map(|r| r.findings.iter_mut()) {
+        for cap in &holding {
+            if finding.source.kind == cap.kind && finding.severity < cap.cap {
+                finding.severity = cap.cap;
+            }
+        }
     }
 }
 
@@ -327,6 +365,25 @@ fn major_version(spec: &str) -> Option<u64> {
 /// storage -> adapter -> helper. Rounds stop earlier once a round learns nothing new.
 pub const CROSS_FILE_HOPS: usize = 8;
 
+/// Properties typed by assignment across the repository (`config.database = new
+/// DatabaseController(..)`): those whose every typed assignment names the same class. A
+/// property assigned two different classes anywhere is left out.
+fn property_types(reports: &[ScanReport]) -> BTreeMap<String, taint::ClassRef> {
+    let mut seen: BTreeMap<&str, BTreeSet<&taint::ClassRef>> = BTreeMap::new();
+    for report in reports {
+        for (property, class) in &report.module.properties {
+            seen.entry(property.as_str()).or_default().insert(class);
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, classes)| classes.len() == 1)
+        .filter_map(|(property, classes)| {
+            let class = classes.into_iter().next()?;
+            Some((property.to_owned(), class.clone()))
+        })
+        .collect()
+}
+
 /// Every class that extends or implements each class or interface, transitively (at most 64
 /// per base), from every module's class declarations.
 fn subclass_closure(reports: &[ScanReport]) -> BTreeMap<(String, String), Vec<(String, String)>> {
@@ -415,6 +472,7 @@ fn report(file: &SourceFile, status: ScanStatus) -> ScanReport {
         module: ir::Module::default(),
         templates: BTreeMap::new(),
         constants: BTreeMap::new(),
+        constructed: BTreeSet::new(),
     }
 }
 
@@ -450,16 +508,19 @@ fn scan_file(
         scan_text(allocator, file, text, external, context)
     });
     Some(match outcome {
-        Ok(Ok((findings, truncated, summaries, module, templates, constants))) => ScanReport {
-            rel_path: file.rel_path.clone(),
-            status: ScanStatus::Scanned,
-            truncated,
-            findings,
-            summaries,
-            module,
-            templates,
-            constants,
-        },
+        Ok(Ok((findings, truncated, summaries, module, templates, constants, constructed))) => {
+            ScanReport {
+                rel_path: file.rel_path.clone(),
+                status: ScanStatus::Scanned,
+                truncated,
+                findings,
+                summaries,
+                module,
+                templates,
+                constants,
+                constructed,
+            }
+        }
         Ok(Err(reason)) => report(file, ScanStatus::Skipped(reason)),
         Err(ParseFailure::Panicked(panic)) => report(file, ScanStatus::Panicked(panic)),
         Err(ParseFailure::NoStack { bytes, error }) => report(
@@ -558,6 +619,7 @@ fn analyze(
             .map_or(&[], Vec::as_slice),
         packages: context.packages,
         external_names: &context.external_names,
+        properties: &context.properties,
     };
     let result = taint::scan_file_program(program, &linking, external);
     let index = LineIndex::new(text);
@@ -651,7 +713,10 @@ fn analyze(
                 name: name.clone(),
                 ..ir::Function::default()
             });
-        for summary in list.iter().filter(|s| s.api != taint::VALIDATES) {
+        for summary in list
+            .iter()
+            .filter(|s| s.api != taint::VALIDATES && s.api != taint::INSTANCE)
+        {
             let to = if summary.api == taint::RETURNS {
                 ir::FlowTarget::Return
             } else {
@@ -700,6 +765,7 @@ fn analyze(
             .collect(),
         reexports: facts.reexports,
         classes: facts.classes,
+        properties: facts.properties,
         mounts: facts
             .mounts
             .into_iter()
@@ -720,6 +786,7 @@ fn analyze(
         module,
         result.templates,
         result.constants,
+        facts.constructed,
     )
 }
 

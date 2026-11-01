@@ -31,6 +31,10 @@ pub struct Module {
     /// Classes declared here with the classes and interfaces they extend or implement.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub classes: Vec<ClassDecl>,
+    /// Properties assigned an instance of one of our classes here (`config.database = new
+    /// DatabaseController(..)`): (property, (defining file, class)).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<(String, (String, String))>,
 }
 
 /// A class and its bases (`extends`, `implements`), each as (defining file, name there).

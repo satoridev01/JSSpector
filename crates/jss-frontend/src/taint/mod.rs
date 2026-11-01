@@ -405,6 +405,9 @@ pub fn scan_file_program(
         call_classes: BTreeMap::new(),
         declared_classes: BTreeSet::new(),
         caller_kinds: BTreeMap::new(),
+        emit_field: None,
+        field_slots: BTreeMap::new(),
+        field_reads: BTreeMap::new(),
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -642,6 +645,8 @@ struct Env {
     nodes: BTreeSet<String>,
     /// Those nodes' tags, when the factory named one (`document.createElement('a')`).
     node_tags: BTreeMap<String, String>,
+    /// Argument arrays that already hold `"--"`: what is pushed after it is positional.
+    options_ended: BTreeSet<String>,
     /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
     /// bindings, inner functions): writes to any other name are writes to its parent's.
     locals: BTreeSet<String>,
@@ -838,6 +843,7 @@ impl Env {
             tuples: BTreeMap::new(),
             nodes: BTreeSet::new(),
             node_tags: BTreeMap::new(),
+            options_ended: BTreeSet::new(),
             locals: BTreeSet::new(),
             branch: 0,
             function,
@@ -868,6 +874,7 @@ impl Env {
             tuples: self.tuples.clone(),
             nodes: self.nodes.clone(),
             node_tags: self.node_tags.clone(),
+            options_ended: self.options_ended.clone(),
             locals: BTreeSet::new(),
             branch: 0,
             function,
@@ -1019,6 +1026,16 @@ struct Walker<'e> {
     /// Classes and interfaces declared in this file (and ES5 constructors with prototype
     /// methods): `new C()` of one of them is an instance worth typing.
     declared_classes: BTreeSet<String>,
+    /// The first read of each field of a parameter while summarizing: (parameter position,
+    /// field) -> that read's position, which every later read of it shares.
+    field_reads: BTreeMap<(u32, String), u32>,
+    /// Positions that name a field a call returns when the call's own start already names
+    /// another (see [`Self::field_slot`]): (call start, field) -> position.
+    field_slots: BTreeMap<(u32, String), u32>,
+    /// While summarizing a call that hands the function's own parameter on whole to a helper
+    /// whose summary needs one field of it (`new this(basic)` reaching `basic.serverConfig`):
+    /// (that parameter's origin offset, the field), for the summary [`Self::emit`] derives.
+    emit_field: Option<(u32, String)>,
     /// The request kind this file's calls pass to a function as its first argument
     /// (`handleToolCall(request)` from an MCP handler): its conventionally named request
     /// parameter is that kind, not an HTTP request. `http` wins over any other.
@@ -1251,7 +1268,7 @@ fn table_rows(array: &oxc_ast::ast::ArrayExpression<'_>) -> Vec<BTreeMap<String,
 /// (`/^(\d{15,25})\.(png|gif)$/`) admits only its characters; anything else, none.
 fn capture_mask(expr: &Expression<'_>) -> u8 {
     match expr.get_inner_expression() {
-        Expression::RegExpLiteral(regex) => guards::anchored_allowlist(
+        Expression::RegExpLiteral(regex) => guards::match_charset(
             regex.regex.pattern.text.as_str(),
             &regex.regex.flags.to_string(),
         )
@@ -1297,6 +1314,14 @@ fn prototype_owner(
         return None;
     }
     Some((class.to_owned(), method))
+}
+
+/// `"--"`: the end of a command's options; what follows is positional.
+fn ends_options(expr: Option<&Expression<'_>>) -> bool {
+    matches!(
+        expr.map(Expression::get_inner_expression),
+        Some(Expression::StringLiteral(l)) if l.value.as_str() == Some("--")
+    )
 }
 
 /// `v.replace(/'/g, "''")` (or `replaceAll("'", "''")`): every single quote doubled.
@@ -2544,6 +2569,17 @@ impl Walker<'_> {
                 } else {
                     env.nodes.remove(name);
                 }
+                // `const args = ['--json', '--']`: pushes after it are positional.
+                let ended = matches!(
+                    init.get_inner_expression(),
+                    Expression::ArrayExpression(array)
+                        if array.elements.iter().any(|e| ends_options(e.as_expression()))
+                );
+                if ended {
+                    env.options_ended.insert(name.clone());
+                } else {
+                    env.options_ended.remove(name);
+                }
                 // `document.createElement('a')`: an anchor, whose `href` is a URL sink.
                 let tag = match init.get_inner_expression() {
                     Expression::CallExpression(c) if node => c
@@ -3648,6 +3684,22 @@ impl Walker<'_> {
         }
     }
 
+    /// The position that names `field` of what the call at `call` returns: the call's start,
+    /// unless that already names another field; then a position past the end of any file
+    /// (it never names code), the same one in every pass.
+    fn field_slot(&mut self, call: u32, field: &str) -> u32 {
+        match self.field_of.get(&call) {
+            Some(named) if named != field => {
+                let next = u32::MAX - u32::try_from(self.field_slots.len()).unwrap_or(u32::MAX / 2);
+                *self
+                    .field_slots
+                    .entry((call, field.to_owned()))
+                    .or_insert(next)
+            }
+            _ => call,
+        }
+    }
+
     /// The class of ours a return type names: `Svc`, or inside a generic (`Promise<Svc>`).
     fn annotated_returns(
         &self,
@@ -4308,12 +4360,22 @@ impl Walker<'_> {
             }
             Expression::ArrayExpression(array) => {
                 let mut taint = None;
+                // `['--json', '--', pattern]`: after `--`, arguments are positional.
+                let mut ended = false;
                 for element in &array.elements {
+                    if ends_options(element.as_expression()) {
+                        ended = true;
+                        continue;
+                    }
                     let t = match element {
                         ArrayExpressionElement::SpreadElement(s) => self.expr(&s.argument, env),
                         ArrayExpressionElement::Elision(_) => None,
                         other => other.as_expression().and_then(|e| self.expr(e, env)),
                     };
+                    let t = t.map(|mut o| {
+                        o.dash_free |= ended;
+                        o
+                    });
                     taint = union(taint, t);
                 }
                 taint
@@ -4637,6 +4699,59 @@ impl Walker<'_> {
         self.leave();
     }
 
+    /// The first value of a query written as a literal (`{ email: x }`, an aggregation
+    /// pipeline `[{ $match: { type: t } }]`) that JSON or qs could turn into an operator
+    /// object. Not an ORM's options (`{ where: { email } }`: its operators cannot come from
+    /// JSON), nor the operand of a comparison (`{ url: { $ne: x } }`: compared as a value).
+    fn query_values(&mut self, expr: &Expression<'_>, env: &Env, depth: u8) -> Option<Origin> {
+        if depth > 6 {
+            return None;
+        }
+        match expr.get_inner_expression() {
+            Expression::ObjectExpression(object) => {
+                object
+                    .properties
+                    .iter()
+                    .find_map(|property| match property {
+                        ObjectPropertyKind::ObjectProperty(p)
+                            if prop_name(&p.key).is_some_and(|k| has(&m().orm_options, &k))
+                                || literal_comparison(&p.value) =>
+                        {
+                            None
+                        }
+                        ObjectPropertyKind::ObjectProperty(p) => {
+                            match p.value.get_inner_expression() {
+                                nested @ (Expression::ObjectExpression(_)
+                                | Expression::ArrayExpression(_)) => {
+                                    self.query_values(nested, env, depth + 1)
+                                }
+                                value => {
+                                    let mut probe = env.clone();
+                                    self.expr(value, &mut probe)
+                                        .filter(|o| !o.built && o.object)
+                                }
+                            }
+                        }
+                        ObjectPropertyKind::SpreadProperty(_) => None,
+                    })
+            }
+            Expression::ArrayExpression(array) => array.elements.iter().find_map(|element| {
+                let element = element.as_expression()?;
+                match element.get_inner_expression() {
+                    nested @ (Expression::ObjectExpression(_) | Expression::ArrayExpression(_)) => {
+                        self.query_values(nested, env, depth + 1)
+                    }
+                    value => {
+                        let mut probe = env.clone();
+                        self.expr(value, &mut probe)
+                            .filter(|o| !o.built && o.object)
+                    }
+                }
+            }),
+            _ => None,
+        }
+    }
+
     /// A URL sink (`<a href={v}>`, `a.href = v` on an anchor): reported when the attacker
     /// chooses the start of the URL, and so its scheme (`javascript:`).
     fn url_sink(
@@ -4865,8 +4980,18 @@ impl Walker<'_> {
                     .and_then(SimpleAssignmentTarget::as_member_expression)
                 {
                     // `job.name = req.body.name`: what a guard said about `job.name` is gone.
+                    // `properties["post-type"] = type` (server data, on every path): that field
+                    // of the object is clean now, whatever the rest of it holds.
                     if let Some(key) = guards::member_key(member) {
                         env.forget(&key);
+                        if taint.is_none()
+                            && env.branch == 0
+                            && let Some((root, _)) = key.split_once('.')
+                            && env.vars.contains_key(root)
+                            && !env.requests.contains_key(root)
+                        {
+                            env.clean.insert(key);
+                        }
                     }
                     // `target[key][key2] = value` with attacker-chosen keys.
                     if let oxc_ast::ast::MemberExpression::ComputedMemberExpression(outer) = member
@@ -4944,6 +5069,24 @@ impl Walker<'_> {
                         }
                         return;
                     }
+                    // `properties["post-type"] = type` on an object we do not track field by
+                    // field: track it from here, the rest of it as it was.
+                    let mut newly_tracked = false;
+                    if env.branch == 0
+                        && let (Expression::Identifier(root), Some(_)) = (
+                            member.object().get_inner_expression(),
+                            member.static_property_name(),
+                        )
+                        && !env.fields.contains_key(root.name.as_str())
+                        && !env.requests.contains_key(root.name.as_str())
+                        && let Some(whole) = env.vars.get(root.name.as_str()).cloned()
+                    {
+                        env.fields.insert(
+                            root.name.as_str().to_owned(),
+                            BTreeMap::from([(REST_FIELD.to_owned(), whole)]),
+                        );
+                        newly_tracked = true;
+                    }
                     // `opts.ids = tainted` on a tracked object: that field only.
                     if let (Expression::Identifier(root), Some(property)) = (
                         member.object().get_inner_expression(),
@@ -4954,6 +5097,26 @@ impl Walker<'_> {
                     {
                         let strong = env.branch == 0;
                         env.forget(&format!("{}.{property}", root.name.as_str()));
+                        // An object with parts we do not know (tracked from a write on, or with
+                        // spreads) still carries what is written to it, as a whole
+                        // (`object.extra = additions; return object`).
+                        if let Some(origin) = &taint
+                            && (newly_tracked
+                                || env
+                                    .fields
+                                    .get(root.name.as_str())
+                                    .is_some_and(|f| f.contains_key(REST_FIELD)))
+                        {
+                            let origin = origin.clone().step(
+                                member.span().start,
+                                format!("stored in a field of `{}`", root.name),
+                            );
+                            if let Some(existing) = env.vars.get_mut(root.name.as_str()) {
+                                join(existing, &origin);
+                            }
+                        }
+                        let clean = format!("{}.{property}", root.name.as_str());
+                        let cleared = taint.is_none() && strong;
                         if let Some(fields) = env.fields.get_mut(root.name.as_str()) {
                             match taint {
                                 Some(origin) => {
@@ -4964,6 +5127,11 @@ impl Walker<'_> {
                                 }
                                 None => {}
                             }
+                        }
+                        // A clean value written on every path: the field is clean, not what the
+                        // rest of the object may hold.
+                        if cleared {
+                            env.clean.insert(clean);
                         }
                         return;
                     }
@@ -5213,18 +5381,28 @@ impl Walker<'_> {
             && origin.param.is_some()
             && !self.field_of.contains_key(&origin.span.start)
         {
+            // Every read of the same field of the same parameter is one contributor (the first
+            // read's position), so a value built from many reads of one field still has room
+            // for the other fields it carries.
+            let start = *self
+                .field_reads
+                .entry((origin.span.start, property.to_owned()))
+                .or_insert(member.span().start);
             let mut field = origin.clone();
-            field.span = member.span();
-            self.field_of
-                .insert(member.span().start, property.to_owned());
+            field.span = if start == member.span().start {
+                member.span()
+            } else {
+                Span::new(start, start)
+            };
+            self.field_of.insert(start, property.to_owned());
             if let Some(class) = self.ctor_params.get(&origin.span.start).cloned() {
-                self.ctor_params.insert(member.span().start, class);
+                self.ctor_params.insert(start, class);
             }
             if let Some(owner) = self.param_owner.get(&origin.span.start).cloned() {
-                self.param_owner.insert(member.span().start, owner);
+                self.param_owner.insert(start, owner);
             }
             if self.rest_params.contains(&origin.span.start) {
-                self.rest_params.insert(member.span().start);
+                self.rest_params.insert(start);
             }
             return Some(field);
         }
@@ -5839,10 +6017,30 @@ impl Walker<'_> {
                     }
                 }
             }
-            let value = taints
-                .iter()
-                .skip(from)
-                .fold(None, |acc, t| union(acc, t.clone()));
+            // `args.push('--', pattern)`: what follows the end of options (in this call or an
+            // earlier one) is positional, never an option.
+            let target_name = match target.get_inner_expression() {
+                Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                _ => None,
+            };
+            let mut ended = target_name
+                .as_ref()
+                .is_some_and(|n| env.options_ended.contains(n));
+            let mut value = None;
+            for (argument, taint) in call.arguments.iter().zip(&taints).skip(from) {
+                if ends_options(argument.as_expression()) {
+                    ended = true;
+                    continue;
+                }
+                let taint = taint.clone().map(|mut o| {
+                    o.dash_free |= ended;
+                    o
+                });
+                value = union(value, taint);
+            }
+            if let (true, Some(name)) = (ended, target_name) {
+                env.options_ended.insert(name);
+            }
             if let Some(value) = value {
                 self.store_into(target, value, call.span.start, env);
             }
@@ -6279,21 +6477,27 @@ impl Walker<'_> {
                                 Some(mut origin)
                                     if self.summarize
                                         && origin.param.is_some()
-                                        && !self.field_of.contains_key(&origin.span.start)
-                                        && !self.field_of.contains_key(&call.span.start) =>
+                                        && !self.field_of.contains_key(&origin.span.start) =>
                                 {
+                                    // Each field it returns gets its own position, so a value
+                                    // built from several of them (`${o.a} ${o.b}`) names each.
+                                    let slot = self.field_slot(call.span.start, field);
                                     if let Some(class) =
                                         self.ctor_params.get(&origin.span.start).cloned()
                                     {
-                                        self.ctor_params.insert(call.span.start, class);
+                                        self.ctor_params.insert(slot, class);
                                     }
                                     if let Some(owner) =
                                         self.param_owner.get(&origin.span.start).cloned()
                                     {
-                                        self.param_owner.insert(call.span.start, owner);
+                                        self.param_owner.insert(slot, owner);
                                     }
-                                    origin.span = call.span;
-                                    self.field_of.insert(call.span.start, field.clone());
+                                    origin.span = if slot == call.span.start {
+                                        call.span
+                                    } else {
+                                        Span::new(slot, slot)
+                                    };
+                                    self.field_of.insert(slot, field.clone());
                                     Some(origin)
                                 }
                                 other => other,
@@ -6852,6 +7056,13 @@ impl Walker<'_> {
                 .server_fields
                 .get(id.name.as_str())
                 .is_some_and(|fields| has(fields, field))
+        {
+            return None;
+        }
+        // `if (!isSafe(opts.path)) return; helper(opts)`, `opts.type = 'note'; helper(opts)`:
+        // that field is clean here.
+        if let Expression::Identifier(id) = expr
+            && env.clean.contains(&format!("{}.{field}", id.name.as_str()))
         {
             return None;
         }
@@ -8677,6 +8888,27 @@ impl Walker<'_> {
             let Some(origin) = origin else {
                 continue;
             };
+            // Summarizing a function that hands its own parameter on whole (`new this(basic)`,
+            // `create(options)`): what reaches the sink is that parameter's `field`, not all of
+            // it (so a caller's other fields, `{ serverName, serverConfig }`, stay out).
+            let handed_on = match (&summary.field, arguments) {
+                (Some(field), Some(arguments))
+                    if self.summarize
+                        && origin.param.is_some()
+                        && !self.field_of.contains_key(&origin.span.start)
+                        && matches!(
+                            arguments
+                                .get(summary.param)
+                                .and_then(Argument::as_expression)
+                                .map(Expression::get_inner_expression),
+                            Some(Expression::Identifier(id))
+                                if env.params.iter().any(|p| p == id.name.as_str())
+                        ) =>
+                {
+                    Some((origin.span.start, field.clone()))
+                }
+                _ => None,
+            };
             let at_sink = &summary.at_sink;
             // A URL sink (or an argument that must start with `-`) is reached only when the
             // parameter is the value's start in the helper (not `${base}?key=${param}`) and the
@@ -8708,6 +8940,7 @@ impl Walker<'_> {
                     origin.steps.push(step.clone());
                 }
             }
+            self.emit_field = handed_on;
             self.emit(
                 RawFinding {
                     class: summary.class,
@@ -8731,6 +8964,7 @@ impl Walker<'_> {
                 },
                 env,
             );
+            self.emit_field = None;
         }
     }
 
@@ -8774,7 +9008,12 @@ impl Walker<'_> {
                         .cloned()
                         .unwrap_or_else(|| env.function.clone()),
                 };
-                let field = self.field_of.get(&at).cloned();
+                let field = self.field_of.get(&at).cloned().or_else(|| {
+                    self.emit_field
+                        .as_ref()
+                        .filter(|(offset, _)| *offset == at)
+                        .map(|(_, field)| field.clone())
+                });
                 let list = self.summaries.entry(owner).or_default();
                 let duplicate = list.iter().any(|s| {
                     s.param == param
@@ -8932,38 +9171,18 @@ impl Walker<'_> {
                     // `find(req.body.filter)` or `find({ email: req.body.email })`: a value that
                     // JSON or qs can turn into `{ "$ne": null }`.
                     let arg = arguments.get(index).and_then(Argument::as_expression);
-                    let from_fields = match arg.map(Expression::get_inner_expression) {
-                        Some(Expression::ObjectExpression(object)) => object
-                            .properties
-                            .iter()
-                            .find_map(|property| match property {
-                                // `{ where: { email } }`: an ORM's filter (TypeORM, Sequelize
-                                // operators cannot come from JSON); `{ email: { $eq: x } }`:
-                                // the operand is compared as a value.
-                                ObjectPropertyKind::ObjectProperty(p)
-                                    if prop_name(&p.key)
-                                        .is_some_and(|k| has(&m().orm_options, &k))
-                                        || literal_comparison(&p.value) =>
-                                {
-                                    None
-                                }
-                                ObjectPropertyKind::ObjectProperty(p) => {
-                                    let mut probe = env.clone();
-                                    self.expr(&p.value, &mut probe)
-                                        .filter(|o| !o.built && o.object)
-                                }
-                                ObjectPropertyKind::SpreadProperty(_) => None,
-                            }),
-                        _ => None,
-                    };
-                    let direct = taints.get(index).cloned().flatten().filter(|o| {
-                        !o.built
-                            && o.object
-                            && !matches!(
-                                arg.map(Expression::get_inner_expression),
-                                Some(Expression::ObjectExpression(_))
-                            )
-                    });
+                    let literal = matches!(
+                        arg.map(Expression::get_inner_expression),
+                        Some(Expression::ObjectExpression(_) | Expression::ArrayExpression(_))
+                    );
+                    let from_fields = arg
+                        .filter(|_| literal)
+                        .and_then(|arg| self.query_values(arg, env, 0));
+                    let direct = taints
+                        .get(index)
+                        .cloned()
+                        .flatten()
+                        .filter(|o| !o.built && o.object && !literal);
                     (index, from_fields.or(direct))
                 }
                 ArgRule::Built(index) => (
@@ -9524,6 +9743,17 @@ mod tests {
         )
         .is_empty());
         assert!(!route("const m = /^(.+)\\.png$/.exec(req.params.file); res.sendFile(path.join(DIR, m[1]));").is_empty());
+        // What a match holds is made of what the pattern matches, anchored or not.
+        assert!(route(
+            "const m = req.params.file.match(/\\.([a-zA-Z0-9]{2,5})$/); const ext = m ? m[1] : 'bin'; res.sendFile(path.join(DIR, 'f.' + ext));"
+        )
+        .is_empty());
+        assert!(
+            !route(
+                "const m = req.params.file.match(/\\/(.*)$/); res.sendFile(path.join(DIR, m[1]));"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -9748,6 +9978,20 @@ mod tests {
         assert!(route("const p = req.query.p; if (p.startsWith('-')) throw new Error('x'); spawn('rg', ['--json', p]);").is_empty());
         assert_eq!(
             route("spawn('rg', [req.query.p, '--']);"),
+            vec![(CommandInjection, Medium)]
+        );
+        // ... also through an arguments array built with `push`, or held in a variable.
+        assert!(
+            route("const args = ['--json']; args.push('--', req.query.p, '.'); spawn('rg', args);")
+                .is_empty()
+        );
+        assert!(
+            route("const args = ['--json', '--']; args.push(req.query.p); spawn('rg', args);")
+                .is_empty()
+        );
+        assert!(route("const args = ['--json', '--', req.query.p]; spawn('rg', args);").is_empty());
+        assert_eq!(
+            route("const args = ['--json']; args.push(req.query.p, '--', '.'); spawn('rg', args);"),
             vec![(CommandInjection, Medium)]
         );
         assert_eq!(
@@ -10776,6 +11020,56 @@ mod tests {
 
     #[test]
     fn parameter_summaries_follow_the_field_that_reaches_the_sink() {
+        // A function that hands its whole parameter on keeps the field the helper needs: through
+        // a plain call, and through `new this(basic)` in a static factory.
+        let chain = "function use(o) { exec('cmd ' + o.cmd); }\nfunction make(o) { use(o); }\n\
+                     class F { constructor(basic) { this.cfg = basic.cfg; } run() { exec(this.cfg.cmd); } static create(basic) { return new this(basic); } }\n";
+        for quiet in [
+            "app.get('/p', (req, res) => { make({ name: req.query.n, cmd: 'ls' }); });",
+            "app.get('/p', (req, res) => { F.create({ name: req.query.n, cfg: CONFIG }); });",
+        ] {
+            assert!(one(&format!("{chain}{quiet}")).is_empty(), "{quiet}");
+        }
+        for found in [
+            "app.get('/p', (req, res) => { make({ name: 'a', cmd: req.query.c }); });",
+            "app.get('/p', (req, res) => { F.create({ name: 'a', cfg: req.body }); });",
+        ] {
+            assert_eq!(one(&format!("{chain}{found}")).len(), 1, "{found}");
+        }
+        // A field the function overwrote before handing the object on is no longer the
+        // caller's: a constant, or what another parameter held.
+        let count = "function count(p) { coll.find({ type: p.type }); }\n";
+        for quiet in [
+            "function create(p) { p.type = 'note'; count(p); }",
+            "function create(p, cfg) { p['type'] = cfg.kind; count(p); }",
+        ] {
+            let found = one(&format!(
+                "{count}{quiet}\napp.post('/p', (req, res) => {{ create(req.body, CONFIG); }});"
+            ));
+            assert!(found.is_empty(), "{quiet}: {found:?}");
+        }
+        let found = one(&format!(
+            "{count}function create(p) {{ p.other = 1; count(p); }}\napp.post('/p', (req, res) => {{ create(req.body); }});"
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        // SQL a helper builds from several fields of its parameter: each field is followed, so
+        // the one the caller did not overwrite still reaches the query.
+        let build = "function build(o) { return { q: `SELECT IF(${o.a}, ${o.b}, ${o.c}) FROM t` }; }\n\
+                     function run(o) { const { q } = build(o); db.query(q); }\n";
+        assert!(
+            one(&format!(
+                "{build}app.get('/r', (req, res) => {{ const p = req.query; p.a = 1; p.b = 2; p.c = 3; run(p); }});"
+            ))
+            .is_empty()
+        );
+        let found = one(&format!(
+            "{build}app.get('/r', (req, res) => {{ const p = req.query; p.a = 1; p.b = 2; run(p); }});"
+        ));
+        assert_eq!(
+            found.iter().map(|f| f.0).collect::<Vec<_>>(),
+            vec![VulnClass::SqlInjection],
+            "{found:?}"
+        );
         let helper = "function run(opts) { exec('cmd ' + opts.cmd); }\n";
         assert!(
             one(&format!(

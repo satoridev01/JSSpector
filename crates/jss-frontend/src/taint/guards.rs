@@ -687,6 +687,22 @@ pub fn anchored_allowlist(pattern: &str, flags: &str) -> Option<CharSet> {
     Some(set)
 }
 
+/// The characters a match of `pattern` can hold, anchored or not: `s.match(/\.([a-z0-9]+)$/)`
+/// gives a dot and alphanumerics whatever `s` held. (Anchors matter to a `test()` that
+/// validates all of `s`, not to what a match returns.)
+pub fn match_charset(pattern: &str, flags: &str) -> Option<CharSet> {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    let body = match body.strip_suffix('$') {
+        Some(inner) if !inner.ends_with('\\') => inner,
+        _ => body,
+    };
+    let mut set = sequence(body)?;
+    if flags.contains('i') {
+        set.fold_case();
+    }
+    Some(set)
+}
+
 /// `set` with both cases of its letters (the `i` flag).
 pub fn with_both_cases(mut set: CharSet) -> CharSet {
     set.fold_case();
@@ -745,6 +761,15 @@ fn sequence(body: &str) -> Option<CharSet> {
                         Some(':') => {
                             chars.next();
                             chars.next();
+                            depth += 1;
+                        }
+                        // `(?<name>...)`: a named group, which matches what it holds.
+                        Some('<') if !matches!(look.next(), Some('=' | '!')) => {
+                            for skipped in chars.by_ref() {
+                                if skipped == '>' {
+                                    break;
+                                }
+                            }
                             depth += 1;
                         }
                         // `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`: assertions consume
@@ -924,8 +949,14 @@ mod tests {
         assert_eq!(anchored_allowlist(r"^\w+$", "m"), None);
         assert_eq!(classes(r"^a|b$"), None);
         assert!(classes(r"^(png|jpg)$").is_some());
-        // Lookaheads consume nothing.
+        // Lookaheads consume nothing; a named group matches what it holds.
         assert_eq!(classes(r"^(?!\.)[\w]+$").map(|c| c & path != 0), Some(true));
+        assert_eq!(classes(r"^(?<id>.*)$"), None);
+        assert_eq!(classes(r"^(?<id>\d+)$"), Some(ALL));
+        // What a match holds, anchored or not: `s.match(/\.([a-z0-9]{2,5})$/)`.
+        let ext = match_charset(r"\.([a-zA-Z0-9]{2,5})$", "").map(|set| mask(&set));
+        assert_ne!(ext.unwrap_or(0) & path, 0);
+        assert_eq!(match_charset(r"/(.*)$", ""), None);
     }
 
     #[test]

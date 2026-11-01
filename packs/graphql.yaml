@@ -5,3 +5,14 @@ client_sources:
 request:
   # Resolver arguments are typed by the schema: no operator objects.
   scalar_kinds: [graphql]
+tool_objects:
+  # graphql-js field configs: `{ type, args: {...}, resolve(source, args, context) }`.
+  - schema_keys: [args]
+    handler_keys: [resolve]
+    params: second
+    kind: graphql
+  # graphql-relay mutations: `mutationWithClientMutationId({ inputFields, mutateAndGetPayload(input) })`.
+  - schema_keys: [inputFields]
+    handler_keys: [mutateAndGetPayload]
+    params: first
+    kind: graphql

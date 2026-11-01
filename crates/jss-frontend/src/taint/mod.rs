@@ -1546,7 +1546,9 @@ fn annotated_class(annotation: Option<&oxc_ast::ast::TSTypeAnnotation<'_>>) -> O
 /// The handler key and source kind of an object literal that defines an LLM tool: a schema under
 /// one of the pack's schema keys (not an array) and a function under a handler key, and none of
 /// the keys of a route configuration.
-fn tool_object(object: &ObjectExpression<'_>) -> Option<(&'static str, &'static str)> {
+fn tool_object(
+    object: &ObjectExpression<'_>,
+) -> Option<(&'static str, &'static models::ToolObjectSpec)> {
     m().tool_objects.iter().find_map(|spec| {
         let mut schema = false;
         let mut handler: Option<&'static str> = None;
@@ -1580,7 +1582,7 @@ fn tool_object(object: &ObjectExpression<'_>) -> Option<(&'static str, &'static 
                 handler = Some(found.as_str());
             }
         }
-        handler.filter(|_| schema).map(|h| (h, spec.kind.as_str()))
+        handler.filter(|_| schema).map(|h| (h, spec))
     })
 }
 
@@ -4767,13 +4769,16 @@ impl Walker<'_> {
                                 self.expr(key, env);
                             }
                             let name = prop_name(&p.key);
-                            if let (Some((handler, kind)), Some(key)) = (tool, name.as_deref())
+                            if let (Some((handler, spec)), Some(key)) = (tool, name.as_deref())
                                 && key == handler
                                 && self.maybe_function(
                                     &p.value,
                                     env,
                                     name.clone(),
-                                    Role::Client(kind, Params::First),
+                                    Role::Client(
+                                        spec.kind.as_str(),
+                                        spec.params.as_deref().map_or(Params::First, Params::parse),
+                                    ),
                                 )
                             {
                                 continue;
@@ -11136,6 +11141,27 @@ mod tests {
             "fastify.route({ method: 'GET', url: '/x', handler: async (request, reply) => { exec('ls ' + request.query.d); } });",
         );
         assert_eq!(fastify.len(), 1, "{fastify:?}");
+    }
+
+    #[test]
+    fn graphql_js_field_configs_and_relay_mutations_take_client_input() {
+        use VulnClass::*;
+        let found = one(
+            "const Query = new GraphQLObjectType({ name: 'Query', fields: { run: { type: GraphQLString, args: { cmd: { type: GraphQLString } }, resolve: (source, args) => exec('ls ' + args.cmd) } } });",
+        );
+        assert_eq!(
+            found.iter().map(|f| (f.0, f.3)).collect::<Vec<_>>(),
+            vec![(CommandInjection, "graphql")]
+        );
+        let found = one(
+            "const create = mutationWithClientMutationId({ name: 'Create', inputFields: { dir: { type: GraphQLString } }, outputFields: {}, mutateAndGetPayload: async (input) => fs.readFileSync('/srv/' + input.dir) });",
+        );
+        assert_eq!(
+            found.iter().map(|f| (f.0, f.3)).collect::<Vec<_>>(),
+            vec![(PathTraversal, "graphql")]
+        );
+        // The source of a field config is its second parameter, never the parent object.
+        assert!(one("const T = new GraphQLObjectType({ name: 'T', fields: { f: { type: GraphQLString, args: {}, resolve: (source) => exec('ls ' + source.name) } } });").is_empty());
     }
 
     #[test]

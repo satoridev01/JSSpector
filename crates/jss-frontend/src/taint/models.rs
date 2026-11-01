@@ -557,6 +557,10 @@ pub struct ToolObjectSpec {
     /// Keys that make the object something else (a route configuration).
     #[serde(default)]
     pub not_keys: Vec<String>,
+    /// The handler's parameters that hold client data (`first`, `second`, ...): `first` by
+    /// default.
+    #[serde(default)]
+    pub params: Option<String>,
     pub kind: String,
 }
 

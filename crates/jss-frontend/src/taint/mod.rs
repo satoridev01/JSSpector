@@ -3667,8 +3667,8 @@ impl Walker<'_> {
                 Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
             )
         });
-        match role {
-            Role::Route => {
+        if role == Role::Route {
+            {
                 // `router.use('/api', child)`: a mount, unless the last argument is a handler.
                 if has(&m().mount_methods, method) && !is_function {
                     let (target, target_file) = match last.map(Expression::get_inner_expression) {
@@ -3706,7 +3706,6 @@ impl Walker<'_> {
                     kind: "http",
                 });
             }
-            _ => {}
         }
     }
 

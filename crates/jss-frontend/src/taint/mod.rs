@@ -56,7 +56,7 @@ pub struct Origin {
 }
 
 /// The `api` of a summary that says "the function returns this parameter" (not a sink).
-const RETURNS: &str = "<return>";
+pub const RETURNS: &str = "<return>";
 
 /// The request-kind marker for a context object whose request data is under `.req`.
 const CONTEXT: &str = "context";
@@ -200,9 +200,12 @@ pub fn scan_file_program(
     result.summaries = walker.summaries;
     let mut facts = walker.facts;
     for (local, (spec, export)) in &walker.relative {
-        if let Some(file) = jss_core::resolve::resolve(linking.file, spec, linking.files) {
-            facts.imports.insert(local.clone(), (file, export.clone()));
-        }
+        facts.imports.push(jss_core::ir::Import {
+            local: local.clone(),
+            specifier: spec.clone(),
+            export: export.clone(),
+            resolved: jss_core::resolve::resolve(linking.file, spec, linking.files),
+        });
     }
     result.facts = facts;
     result
@@ -215,10 +218,14 @@ pub struct FileFacts {
     pub mounts: Vec<MountFact>,
     /// Export name (`default` for `module.exports =` / `export default`) to local name.
     pub exports: BTreeMap<String, String>,
-    /// Local name to (resolved file, export name or `None` for the whole module).
-    pub imports: BTreeMap<String, (String, Option<String>)>,
+    /// Relative imports, resolved where the file exists in the scan root.
+    pub imports: Vec<jss_core::ir::Import>,
     /// Request inputs each function reads: function -> (location, name).
     pub inputs: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// Named functions: name -> (start offset, parameter names).
+    pub functions: BTreeMap<String, (u32, Vec<String>)>,
+    /// Calls each function makes: (callee, offset, arguments).
+    pub calls: BTreeMap<String, Vec<(String, u32, Vec<jss_core::ir::Value>)>>,
 }
 
 /// One entry point registered in this file.
@@ -1333,6 +1340,12 @@ impl Walker<'_> {
         }
         let first = names.first().copied().flatten();
         env.params = names.iter().map(|n| n.unwrap_or("").to_owned()).collect();
+        if !self.summarize && env.function != "<anonymous>" {
+            self.facts
+                .functions
+                .entry(env.function.clone())
+                .or_insert((params.span.start, env.params.clone()));
+        }
         // A component (`function UserCard(props)` / `const UserCard = ({ name }) => ...`): its
         // props carry stored or user data.
         if role == Role::Plain
@@ -2702,6 +2715,48 @@ impl Walker<'_> {
                     self.maybe_function(&p.value, env, name, role);
                 }
             }
+        }
+
+        // Lowering: the call, its callee and what each argument is.
+        if !self.summarize
+            && !self.record_only
+            && let Some(callee_text) = callee_name(&call.callee)
+        {
+            let args = call
+                .arguments
+                .iter()
+                .zip(&taints)
+                .map(|(argument, taint)| {
+                    let expr = argument
+                        .as_expression()
+                        .map(Expression::get_inner_expression);
+                    match (expr, taint) {
+                        (Some(Expression::StringLiteral(l)), _) => {
+                            jss_core::ir::Value::Literal(l.value.as_str().unwrap_or("").to_owned())
+                        }
+                        (Some(Expression::NumericLiteral(n)), _) => {
+                            jss_core::ir::Value::Literal(n.value.to_string())
+                        }
+                        (Some(Expression::Identifier(id)), _)
+                            if env.params.iter().any(|p| p == id.name.as_str()) =>
+                        {
+                            jss_core::ir::Value::Param(
+                                env.params
+                                    .iter()
+                                    .position(|p| p == id.name.as_str())
+                                    .unwrap_or(0),
+                            )
+                        }
+                        (_, Some(origin)) => jss_core::ir::Value::Source(origin.kind.to_owned()),
+                        _ => jss_core::ir::Value::Other,
+                    }
+                })
+                .collect();
+            self.facts
+                .calls
+                .entry(env.function.clone())
+                .or_default()
+                .push((callee_text, call.span.start, args));
         }
 
         // Sinks.

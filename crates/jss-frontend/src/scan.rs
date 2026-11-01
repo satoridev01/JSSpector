@@ -14,8 +14,8 @@ use crate::parse::{parse_options, source_type, typed_fallbacks};
 use crate::process::{
     ParseFailure, ParsePool, guarded, on_parser_stack, read_capped, template_tag,
 };
-use crate::taint::{self, ExtSink, Linking, MountFact, RawFinding, Summaries};
-use jss_core::Auth;
+use crate::taint::{self, ExtSink, Linking, RawFinding, Summaries};
+use jss_core::ir;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What happened to one scanned file.
@@ -38,31 +38,9 @@ pub struct ScanReport {
     pub findings: Vec<Finding>,
     /// This file's functions whose parameters reach a sink, located for other files.
     summaries: Summaries,
-    /// What this file contributes to the entry-point inventory.
-    pub entries: FileEntries,
-}
-
-/// A file's entry points, mounts, exports and resolved imports.
-#[derive(Debug, Clone, Default)]
-pub struct FileEntries {
-    pub routes: Vec<RouteEntry>,
-    pub mounts: Vec<MountFact>,
-    pub exports: BTreeMap<String, String>,
-    pub imports: BTreeMap<String, (String, Option<String>)>,
-}
-
-/// One entry point as registered (before mount prefixes are applied).
-#[derive(Debug, Clone)]
-pub struct RouteEntry {
-    pub receiver: Option<String>,
-    pub method: String,
-    pub path: String,
-    pub handler: String,
-    pub line: u32,
-    pub auth: Auth,
-    pub kind: String,
-    /// Request inputs the handler reads: (location, name).
-    pub inputs: Vec<(String, String)>,
+    /// The file lowered to the owned IR: imports, exports, functions (calls and flows), entry
+    /// points and mounts.
+    pub module: ir::Module,
 }
 
 impl ParsePool {
@@ -130,7 +108,7 @@ fn report(file: &SourceFile, status: ScanStatus) -> ScanReport {
         truncated: false,
         findings: Vec::new(),
         summaries: Summaries::new(),
-        entries: FileEntries::default(),
+        module: ir::Module::default(),
     }
 }
 
@@ -166,13 +144,13 @@ fn scan_file(
         scan_text(allocator, file, text, external, all)
     });
     Some(match outcome {
-        Ok(Ok((findings, truncated, summaries, entries))) => ScanReport {
+        Ok(Ok((findings, truncated, summaries, module))) => ScanReport {
             rel_path: file.rel_path.clone(),
             status: ScanStatus::Scanned,
             truncated,
             findings,
             summaries,
-            entries,
+            module,
         },
         Ok(Err(reason)) => report(file, ScanStatus::Skipped(reason)),
         Err(ParseFailure::Panicked(panic)) => report(file, ScanStatus::Panicked(panic)),
@@ -191,7 +169,7 @@ fn scan_text(
     text: &str,
     external: &Summaries,
     all: &BTreeSet<String>,
-) -> Result<(Vec<Finding>, bool, Summaries, FileEntries), String> {
+) -> Result<(Vec<Finding>, bool, Summaries, ir::Module), String> {
     let primary = source_type(file.kind, file.package_type);
     let mut candidates = vec![primary];
     if let Some(fallbacks) = typed_fallbacks(file.kind, file.package_type) {
@@ -256,7 +234,7 @@ fn analyze(
     text: &str,
     external: &Summaries,
     all: &BTreeSet<String>,
-) -> (Vec<Finding>, bool, Summaries, FileEntries) {
+) -> (Vec<Finding>, bool, Summaries, ir::Module) {
     let linking = Linking {
         file: &file.rel_path,
         files: all,
@@ -289,16 +267,83 @@ fn analyze(
         }
     }
     let facts = result.facts;
-    let entries = FileEntries {
-        routes: facts
+    let line = |offset: u32| index.line_col(offset).line;
+    let mut functions: BTreeMap<String, ir::Function> = facts
+        .functions
+        .iter()
+        .map(|(name, (offset, params))| {
+            (
+                name.clone(),
+                ir::Function {
+                    name: name.clone(),
+                    line: line(*offset),
+                    params: params.clone(),
+                    calls: Vec::new(),
+                    flows: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    for (name, calls) in &facts.calls {
+        let function = functions
+            .entry(name.clone())
+            .or_insert_with(|| ir::Function {
+                name: name.clone(),
+                ..ir::Function::default()
+            });
+        function.calls = calls
+            .iter()
+            .map(|(callee, offset, args)| ir::Call {
+                callee: callee.clone(),
+                line: line(*offset),
+                args: args.clone(),
+            })
+            .collect();
+    }
+    for (name, list) in &summaries {
+        let function = functions
+            .entry(name.clone())
+            .or_insert_with(|| ir::Function {
+                name: name.clone(),
+                ..ir::Function::default()
+            });
+        for summary in list {
+            let to = if summary.api == taint::RETURNS {
+                ir::FlowTarget::Return
+            } else {
+                let ext = summary.ext.as_ref();
+                ir::FlowTarget::Sink {
+                    class: summary.class,
+                    severity: summary.severity,
+                    api: summary.api.clone(),
+                    file: ext.map_or_else(|| file.rel_path.clone(), |e| e.file.clone()),
+                    line: ext.map_or(0, |e| e.line),
+                }
+            };
+            let flow = ir::Flow {
+                param: summary.param,
+                field: summary.field.clone(),
+                to,
+            };
+            if !function.flows.contains(&flow) {
+                function.flows.push(flow);
+            }
+        }
+    }
+    let module = ir::Module {
+        file: file.rel_path.clone(),
+        imports: facts.imports,
+        exports: facts.exports,
+        functions: functions.into_values().collect(),
+        entries: facts
             .routes
             .iter()
-            .map(|r| RouteEntry {
+            .map(|r| ir::Entry {
                 receiver: r.receiver.clone(),
                 method: r.method.clone(),
                 path: r.path.clone(),
                 handler: r.handler.clone(),
-                line: index.line_col(r.span.start).line,
+                line: line(r.span.start),
                 auth: r.auth,
                 kind: r.kind.to_owned(),
                 inputs: facts
@@ -308,11 +353,18 @@ fn analyze(
                     .unwrap_or_default(),
             })
             .collect(),
-        mounts: facts.mounts,
-        exports: facts.exports,
-        imports: facts.imports,
+        mounts: facts
+            .mounts
+            .into_iter()
+            .map(|mount| ir::Mount {
+                receiver: mount.receiver,
+                prefix: mount.prefix,
+                target: mount.target,
+                target_file: mount.target_file,
+            })
+            .collect(),
     };
-    (findings, result.truncated, summaries, entries)
+    (findings, result.truncated, summaries, module)
 }
 
 fn snippet(text: &str, span: Span) -> String {

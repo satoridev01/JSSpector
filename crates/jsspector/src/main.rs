@@ -50,6 +50,18 @@ enum Command {
     /// List every entry point: HTTP routes with full paths (mount prefixes followed across files),
     /// socket events, IPC channels, GraphQL fields, tRPC procedures and queue processors.
     Routes(RoutesArgs),
+    /// Print the owned IR of a file or directory (modules and their cross-module call graph) as
+    /// JSON (development aid).
+    #[command(hide = true)]
+    Ir(IrArgs),
+}
+
+#[derive(Args)]
+struct IrArgs {
+    /// File or directory to lower.
+    path: PathBuf,
+    #[arg(long, value_name = "N")]
+    threads: Option<NonZeroUsize>,
 }
 
 #[derive(Args)]
@@ -175,6 +187,7 @@ fn main() -> ExitCode {
         Command::Parse(args) => parse(&args),
         Command::Scan(args) => scan(&args),
         Command::Routes(args) => routes(&args),
+        Command::Ir(args) => ir(&args),
     }
 }
 
@@ -411,6 +424,33 @@ fn write_text(
         output.skipped.len(),
         elapsed.as_secs_f64()
     )
+}
+
+fn ir(args: &IrArgs) -> ExitCode {
+    let pool = match ParsePool::new(args.threads) {
+        Ok(pool) => pool,
+        Err(err) => return fail(EXIT_ENGINE, err),
+    };
+    let discovered = pool.install(|| jss_core::discover(&args.path, &DiscoverOptions::default()));
+    let discovery = match discovered {
+        Ok(discovery) => discovery,
+        Err(err @ DiscoverError::Io { .. }) => return fail(EXIT_ENGINE, err),
+        Err(err) => return fail(EXIT_USAGE, err),
+    };
+    let selection = discovery.selection(ClassSet::default());
+    let reports = pool.scan(&discovery.files, selection);
+    let modules: Vec<jss_core::ir::Module> = reports.into_iter().map(|r| r.module).collect();
+    let graph = jss_core::ir::link(&modules);
+    let document = serde_json::json!({ "modules": modules, "call_graph": graph });
+    let mut out = BufWriter::new(io::stdout().lock());
+    let written = serde_json::to_writer_pretty(&mut out, &document)
+        .map_err(io::Error::from)
+        .and_then(|()| writeln!(out))
+        .and_then(|()| out.flush());
+    if let Err(err) = written {
+        return fail(EXIT_ENGINE, format!("cannot write the IR: {err}"));
+    }
+    ExitCode::SUCCESS
 }
 
 fn routes(args: &RoutesArgs) -> ExitCode {

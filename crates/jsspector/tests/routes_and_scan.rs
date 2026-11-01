@@ -221,3 +221,44 @@ fn route_tables_helpers_fastify_graphql_and_trpc_are_inventoried() {
         );
     }
 }
+
+#[test]
+fn ir_lowers_modules_and_links_calls_across_files() {
+    let dir = tempfile::tempdir().unwrap();
+    app(dir.path());
+    let ir = run(&["ir", dir.path().to_str().unwrap()]);
+    let modules = ir["modules"].as_array().unwrap();
+    let service = modules
+        .iter()
+        .find(|m| m["file"] == "src/services/users.js")
+        .unwrap();
+    let find = service["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "find")
+        .unwrap();
+    assert_eq!(find["params"][0], "name");
+    assert_eq!(find["flows"][0]["to"]["kind"], "sink");
+    assert_eq!(find["flows"][0]["to"]["class"], "sql-injection");
+    let routes = modules
+        .iter()
+        .find(|m| m["file"] == "src/routes/users.js")
+        .unwrap();
+    let svc = routes["imports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["local"] == "svc")
+        .unwrap();
+    assert_eq!(svc["resolved"], "src/services/users.js");
+    let edges = &ir["call_graph"]["edges"];
+    let callees = edges["src/routes/users.js#GET /users/:id"]
+        .as_array()
+        .unwrap();
+    assert!(
+        callees.iter().any(|c| c == "src/services/users.js#find"),
+        "{callees:?}"
+    );
+    assert!(ir["call_graph"]["cross_module"].as_u64().unwrap() >= 1);
+}

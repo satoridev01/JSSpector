@@ -43,7 +43,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
     // Mount edges: child router -> (parent router, prefix).
     let mut parents: BTreeMap<RouterId, Vec<(RouterId, String)>> = BTreeMap::new();
     for (file, report) in &by_file {
-        for mount in &report.entries.mounts {
+        for mount in &report.module.mounts {
             let Some(parent) = &mount.receiver else {
                 continue;
             };
@@ -63,7 +63,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
 
     let mut routes = BTreeSet::new();
     for (file, report) in &by_file {
-        for entry in &report.entries.routes {
+        for entry in &report.module.entries {
             let prefixes = match &entry.receiver {
                 Some(receiver) => prefixes(&parents, &(file.to_string(), receiver.clone()), 0),
                 None => vec![String::new()],
@@ -112,11 +112,12 @@ fn resolve_local(
     local: &str,
 ) -> Option<RouterId> {
     let report = by_file.get(file)?;
-    match report.entries.imports.get(local) {
-        Some((target_file, export)) => {
+    match report.module.imports.iter().find(|i| i.local == local) {
+        Some(import) => {
+            let target_file = import.resolved.as_ref()?;
             let target = by_file.get(target_file.as_str())?;
-            let name = export.as_deref().unwrap_or("default");
-            let exported = target.entries.exports.get(name)?;
+            let name = import.export.as_deref().unwrap_or("default");
+            let exported = target.module.exports.get(name)?;
             Some((target_file.clone(), exported.clone()))
         }
         None => Some((file.to_owned(), local.to_owned())),
@@ -124,7 +125,7 @@ fn resolve_local(
 }
 
 fn default_export(by_file: &BTreeMap<&str, &ScanReport>, file: &str) -> Option<RouterId> {
-    let exported = by_file.get(file)?.entries.exports.get("default")?;
+    let exported = by_file.get(file)?.module.exports.get("default")?;
     Some((file.to_owned(), exported.clone()))
 }
 

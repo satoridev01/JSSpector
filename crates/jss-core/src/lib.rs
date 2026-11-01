@@ -18,6 +18,7 @@ pub mod content;
 pub mod diag;
 pub mod discover;
 pub mod finding;
+pub mod ir;
 pub mod line_index;
 pub mod package_type;
 pub mod resolve;

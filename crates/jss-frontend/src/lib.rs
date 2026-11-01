@@ -25,4 +25,4 @@ pub use process::{
     STACK_PER_BYTE, WORKER_STACK_BYTES, parser_stack_bound,
 };
 pub use routes::{Route, inventory};
-pub use scan::{FileEntries, RouteEntry, ScanReport, ScanStatus, finalize};
+pub use scan::{ScanReport, ScanStatus, finalize};

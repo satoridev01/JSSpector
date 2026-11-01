@@ -1575,3 +1575,78 @@ fn stdio_only_mcp_servers_are_capped() {
         assert_eq!(severities, vec![expected], "http: {http}");
     }
 }
+
+/// Findings inside client callbacks (socket.io events, Electron IPC channels, queue workers,
+/// MCP handlers) are linked to the entry that registers them, whatever the event's name is: a
+/// literal, a constant, an expression, or none (`queue.process(fn)`).
+#[test]
+fn client_callbacks_are_linked_to_their_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/server.js",
+        "const { exec } = require('child_process');\nconst fs = require('fs');\n\
+         const io = require('socket.io')(3000);\n\
+         io.on('connection', (socket) => { socket.on('run', (data) => { exec('ls ' + data.dir); }); });\n\
+         const { ipcMain } = require('electron');\n\
+         ipcMain.handle('open-file', async (event, p) => { fs.readFileSync(p); });\n\
+         const { Worker, Queue } = require('bullmq');\n\
+         new Worker('jobs', async (job) => { exec('run ' + job.data.cmd); });\n\
+         class Base { constructor(q) { this.queue = q; } start() { new Worker(this.queue.name, async (job) => { exec('go ' + job.data.cmd); }); } }\n\
+         const q = new Queue('emails');\nq.process(async (job) => { exec('mail ' + job.data.to); });\n\
+         async function handleToolCall(request) { return fs.readFileSync(request.params.arguments.path); }\n\
+         server.setRequestHandler(CallToolRequestSchema, async (request) => ctx.run({}, () => observe(async () => handleToolCall(request))));\n\
+         app.get('/batch', (req, res) => { req.query.items.split(',').forEach((item) => { exec('process ' + item); }); });\n\
+         require('http').createServer((req, res) => { const u = new URL(req.url, 'http://x'); exec('show ' + u.searchParams.get('id')); });\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let entries: Vec<String> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["entry"].as_str().unwrap_or("").to_owned())
+        .collect();
+    for entry in [
+        "SOCKET run",
+        "IPC open-file",
+        "QUEUE jobs",
+        "QUEUE {this.queue.name}",
+        "QUEUE {q}",
+        // Nested callbacks belong to the named function they are written in.
+        "MCP CallToolRequestSchema",
+        "GET /batch",
+        // A raw `node:http` server: every request.
+        "ANY /{wildcard}",
+    ] {
+        assert!(
+            entries.iter().any(|e| e == entry),
+            "{entry} missing from {entries:?}"
+        );
+    }
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let listed: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for entry in ["SOCKET run", "IPC open-file", "QUEUE jobs", "QUEUE {q}"] {
+        assert!(
+            listed.iter().any(|e| e == entry),
+            "{entry} missing from {listed:?}"
+        );
+    }
+}

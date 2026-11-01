@@ -707,6 +707,10 @@ struct Env {
     /// Inside a branch or loop: assignments only add taint.
     branch: u32,
     function: String,
+    /// The nearest named function: this one, or for an anonymous callback the function it
+    /// is written in (`app.get('/x', (req, res) => list.forEach((i) => exec(i)))`: `GET /x`).
+    /// Its calls and findings belong to that function, for the call graph and entry points.
+    owner: String,
 }
 
 /// What a statement can change about the facts and taint of an [`Env`], saved before a branch
@@ -893,6 +897,7 @@ impl Env {
             found_by: BTreeMap::new(),
             locals: BTreeSet::new(),
             branch: 0,
+            owner: function.clone(),
             function,
         }
     }
@@ -926,6 +931,11 @@ impl Env {
             found_by: self.found_by.clone(),
             locals: BTreeSet::new(),
             branch: 0,
+            owner: if function == "<anonymous>" {
+                self.owner.clone()
+            } else {
+                function.clone()
+            },
             function,
         }
     }
@@ -4716,7 +4726,7 @@ impl Walker<'_> {
                                 api: format!("{target} ="),
                                 arg: assign.right.span(),
                                 call: assign.span,
-                                function: env.function.clone(),
+                                function: env.owner.clone(),
                                 origin: origin.clone(),
                                 ext: None,
                                 auth: Auth::NoneDetected,
@@ -4875,16 +4885,47 @@ impl Walker<'_> {
                 {
                     self.facts.constructed.insert(name);
                 }
-                // `new Worker('jobs', async (job) => ...)`: client callbacks as with calls.
+                // `new Worker('jobs', async (job) => ...)`: client callbacks as with calls, an
+                // entry named by the queue, and the callback by its entry.
                 let (role, shape) = self.client_role(&callee, &new.callee, &new.arguments, env);
                 let last = new.arguments.len().saturating_sub(1);
+                let client_name = match role {
+                    Role::Client(kind, _) => self.client_event(&new.arguments, None).map(|event| {
+                        let name = format!("{} {event}", kind.to_ascii_uppercase());
+                        if !self.summarize && !self.record_only {
+                            self.facts.routes.push(RouteFact {
+                                receiver: None,
+                                receiver_file: None,
+                                method: kind.to_ascii_uppercase(),
+                                path: event,
+                                handler: name.clone(),
+                                span: new.span,
+                                auth: Auth::NoneDetected,
+                                kind,
+                            });
+                        }
+                        name
+                    }),
+                    _ => None,
+                };
                 let mut taints = Vec::new();
                 for (index, argument) in new.arguments.iter().enumerate() {
                     let role = match shape {
                         Shape::LastCallback if index != last => Role::Plain,
                         _ => role,
                     };
-                    taints.push(self.argument(argument, env, role));
+                    let named = match argument.as_expression() {
+                        Some(expr) if index == last && client_name.is_some() => {
+                            self.maybe_function(expr, env, client_name.clone(), role)
+                        }
+                        _ => false,
+                    };
+                    if named {
+                        self.apply_closure_writes(env);
+                        taints.push(None);
+                    } else {
+                        taints.push(self.argument(argument, env, role));
+                    }
                 }
                 let sink = match &callee {
                     Callee::Module { family, export } => {
@@ -4977,7 +5018,7 @@ impl Walker<'_> {
                             api: "import".to_owned(),
                             arg: import.source.span(),
                             call: import.span,
-                            function: env.function.clone(),
+                            function: env.owner.clone(),
                             origin,
                             ext: None,
                             auth: Auth::NoneDetected,
@@ -5053,7 +5094,7 @@ impl Walker<'_> {
                                             api: name.to_owned(),
                                             arg: value.span(),
                                             call: attribute.span,
-                                            function: env.function.clone(),
+                                            function: env.owner.clone(),
                                             origin,
                                             ext: None,
                                             auth: Auth::NoneDetected,
@@ -5223,7 +5264,7 @@ impl Walker<'_> {
                 api,
                 arg,
                 call,
-                function: env.function.clone(),
+                function: env.owner.clone(),
                 origin,
                 ext: None,
                 auth: Auth::NoneDetected,
@@ -5461,7 +5502,7 @@ impl Walker<'_> {
                                     api: "obj[key][key] =".to_owned(),
                                     arg: outer.span,
                                     call: outer.span,
-                                    function: env.function.clone(),
+                                    function: env.owner.clone(),
                                     origin,
                                     ext: None,
                                     auth: Auth::NoneDetected,
@@ -5488,7 +5529,7 @@ impl Walker<'_> {
                                 api: format!(".{property} ="),
                                 arg: member.span(),
                                 call: member.span(),
-                                function: env.function.clone(),
+                                function: env.owner.clone(),
                                 origin: origin.clone(),
                                 ext: None,
                                 auth: Auth::NoneDetected,
@@ -6082,6 +6123,51 @@ impl Walker<'_> {
             }
             _ => None,
         };
+        // `http.createServer(async (req, res) => ...)`: every request, an entry of its own.
+        let route_name = route_name.or_else(|| {
+            let factory = match &callee {
+                Callee::Module {
+                    export: Some(e), ..
+                }
+                | Callee::Method { method: e, .. } => has(&m().server_factories, e),
+                Callee::Global(name) => has(&m().server_factories, name),
+                Callee::Module { export: None, .. } => false,
+            };
+            let handler = call
+                .arguments
+                .last()
+                .and_then(Argument::as_expression)
+                .filter(|e| {
+                    matches!(
+                        e.get_inner_expression(),
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    )
+                });
+            (role == Role::Route && factory && handler.is_some()).then(|| {
+                let name = self.inline_route_name("ANY", "*", None, call.span.start);
+                if !self.summarize && !self.record_only {
+                    self.facts.routes.push(RouteFact {
+                        receiver: None,
+                        receiver_file: None,
+                        method: "ANY".to_owned(),
+                        path: "*".to_owned(),
+                        handler: name.clone(),
+                        span: call.span,
+                        auth: Auth::NoneDetected,
+                        kind: "http",
+                    });
+                }
+                name
+            })
+        });
+        // `socket.on('join', (data) => ...)`: the callback goes by its entry's name, so the
+        // findings in it are linked to that entry.
+        let client_name = match (&role, &callee) {
+            (Role::Client(kind, _), Callee::Method { object, .. }) => self
+                .client_event(&call.arguments, object.as_deref())
+                .map(|event| format!("{} {event}", kind.to_ascii_uppercase())),
+            _ => None,
+        };
         let last = call.arguments.len().saturating_sub(1);
         // Authentication middleware: `app.get(path, requireLogin, handler)`, an earlier
         // `router.use(auth)`, or `router.use(auth)` itself.
@@ -6273,6 +6359,18 @@ impl Walker<'_> {
                 _ if callbacks_object => None,
                 (Some(expr), Some(name)) if arg_role == Role::Route => {
                     if self.maybe_function(expr, env, Some(name.clone()), arg_role) {
+                        None
+                    } else {
+                        self.expr(expr, env)
+                    }
+                }
+                (Some(expr), _)
+                    if matches!(arg_role, Role::Client(..))
+                        && index == last
+                        && client_name.is_some() =>
+                {
+                    if self.maybe_function(expr, env, client_name.clone(), arg_role) {
+                        self.apply_closure_writes(env);
                         None
                     } else {
                         self.expr(expr, env)
@@ -6547,7 +6645,7 @@ impl Walker<'_> {
                 .collect();
             self.facts
                 .calls
-                .entry(env.function.clone())
+                .entry(env.owner.clone())
                 .or_default()
                 .push((callee_text, call.span.start, args));
         }
@@ -8567,6 +8665,30 @@ impl Walker<'_> {
     }
 
     /// Records the entry point or mount a registration call makes.
+    /// The event, channel, schema or queue name a client callback is registered for:
+    /// `socket.on('join', ..)`, `ipcMain.handle(CHANNEL, ..)`, `new Worker(this.queue.name, ..)`
+    /// (`{this.queue.name}`), or `queue.process(..)` with the callback alone (`{queue}`).
+    fn client_event(&self, arguments: &[Argument<'_>], object: Option<&str>) -> Option<String> {
+        let event = match arguments.first() {
+            _ if arguments.len() < 2 => object.map(|o| format!("{{{o}}}")),
+            Some(Argument::StringLiteral(name)) => name.value.as_str().map(str::to_owned),
+            Some(Argument::Identifier(id)) => Some(
+                self.constant(id.name.as_str())
+                    .unwrap_or_else(|| id.name.as_str().to_owned()),
+            ),
+            Some(other) => other
+                .as_expression()
+                .and_then(|e| guards::path_key(e).or_else(|| callee_name(e)))
+                .map(|key| match key.strip_prefix('.') {
+                    // `this.queue.name`
+                    Some(rest) => format!("{{this.{rest}}}"),
+                    None => format!("{{{key}}}"),
+                }),
+            None => None,
+        };
+        event.filter(|n| !n.is_empty() && !n.contains(char::is_whitespace) && n.len() < 120)
+    }
+
     fn record_entry(
         &mut self,
         callee: &Callee,
@@ -8657,18 +8779,7 @@ impl Walker<'_> {
         // A client source: an event, channel or schema name (`socket.on('join', ...)`,
         // `server.setRequestHandler(CallToolRequestSchema, ...)`), never the callback itself.
         if let Role::Client(kind, _) = role {
-            let event = match call.arguments.first() {
-                _ if call.arguments.len() < 2 => None,
-                Some(Argument::StringLiteral(name)) => name.value.as_str().map(str::to_owned),
-                Some(Argument::Identifier(id)) => Some(
-                    self.constant(id.name.as_str())
-                        .unwrap_or_else(|| id.name.as_str().to_owned()),
-                ),
-                _ => None,
-            };
-            if let Some(event) =
-                event.filter(|n| !n.is_empty() && !n.contains(char::is_whitespace) && n.len() < 120)
-            {
+            if let Some(event) = self.client_event(&call.arguments, object.as_deref()) {
                 let handler = call
                     .arguments
                     .last()
@@ -9484,7 +9595,7 @@ impl Walker<'_> {
                     } else {
                         summary.call
                     },
-                    function: env.function.clone(),
+                    function: env.owner.clone(),
                     origin,
                     ext: summary.ext.clone(),
                     auth: Auth::NoneDetected,
@@ -9781,7 +9892,7 @@ impl Walker<'_> {
                     api: api.to_owned(),
                     arg: arg.span(),
                     call: span,
-                    function: env.function.clone(),
+                    function: env.owner.clone(),
                     origin,
                     ext: None,
                     auth: Auth::NoneDetected,

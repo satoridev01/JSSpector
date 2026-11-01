@@ -1237,8 +1237,16 @@ impl Walker<'_> {
                 param: None,
             });
         }
-        // multer: the server chooses where an upload is stored.
-        if let Some(inner) = object.as_member_expression()
+        // multer: the server chooses where an upload is stored (`req.file.path`,
+        // `req.files[0].path`, `req.files.avatar[0].path`).
+        let upload = {
+            let mut cursor = object;
+            while let Expression::ComputedMemberExpression(c) = cursor {
+                cursor = c.object.get_inner_expression();
+            }
+            cursor
+        };
+        if let Some(inner) = upload.as_member_expression()
             && inner
                 .static_property_name()
                 .is_some_and(|p| p == "file" || p == "files")

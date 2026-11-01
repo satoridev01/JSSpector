@@ -207,7 +207,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
             .map_err(io::Error::from)
             .and_then(|()| writeln!(out))
     } else {
-        write_text(&mut out, &output)
+        write_text(&mut out, &output, &discovery.root)
     }
     .and_then(|()| out.flush());
     if let Err(err) = written {
@@ -216,34 +216,137 @@ fn scan(args: &ScanArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The readable list: one block per finding, then a one-line summary.
-fn write_text(out: &mut impl Write, output: &ScanOutput) -> io::Result<()> {
+/// ANSI styles, empty when stdout is not a terminal.
+struct Style {
+    bold: &'static str,
+    dim: &'static str,
+    red: &'static str,
+    yellow: &'static str,
+    reset: &'static str,
+}
+
+impl Style {
+    fn new(color: bool) -> Self {
+        if color {
+            Style {
+                bold: "\x1b[1m",
+                dim: "\x1b[2m",
+                red: "\x1b[31m",
+                yellow: "\x1b[33m",
+                reset: "\x1b[0m",
+            }
+        } else {
+            Style {
+                bold: "",
+                dim: "",
+                red: "",
+                yellow: "",
+                reset: "",
+            }
+        }
+    }
+}
+
+/// One line of a file under `root` (1-based), trimmed; empty when unreadable.
+fn source_line(root: &std::path::Path, file: &str, line: u32) -> String {
+    std::fs::read_to_string(root.join(file))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .nth(usize::try_from(line).unwrap_or(1).saturating_sub(1))
+                .map(|l| {
+                    let l = l.trim();
+                    if l.chars().count() > 140 {
+                        let mut cut: String = l.chars().take(137).collect();
+                        cut.push_str("...");
+                        cut
+                    } else {
+                        l.to_owned()
+                    }
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// A plain-language description of a vulnerability class.
+fn describe(class: jss_core::VulnClass) -> &'static str {
+    use jss_core::VulnClass as C;
+    match class {
+        C::CommandInjection => "reaches a shell command or program execution",
+        C::CodeInjection => "is evaluated as code",
+        C::SqlInjection => "is concatenated into an SQL query",
+        C::PathTraversal => "is used as a file path without confinement",
+        C::Ssrf => "controls the URL of a server-side request",
+        C::Xss => "is written into the page as HTML",
+        C::PrototypePollution => "chooses both keys of a nested object write",
+    }
+}
+
+/// Semgrep-style output: findings grouped by the file of their sink, with the code lines.
+fn write_text(out: &mut impl Write, output: &ScanOutput, root: &std::path::Path) -> io::Result<()> {
+    use std::io::IsTerminal;
+    let st = Style::new(io::stdout().is_terminal());
+    let mut by_file: std::collections::BTreeMap<&str, Vec<&Finding>> = Default::default();
     for f in &output.findings {
-        let severity = serde_json::to_value(f.severity)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_uppercase))
-            .unwrap_or_default();
-        writeln!(
-            out,
-            "{severity} {}  {}:{}",
-            f.class.name(),
-            f.file,
-            f.source.line
-        )?;
-        writeln!(out, "  source  {} ({})", f.source.expr, f.source.kind)?;
-        let sink_file = f.sink.file.as_deref().unwrap_or(&f.file);
-        writeln!(
-            out,
-            "  sink    {}:{}  {}({})",
-            sink_file, f.sink.line, f.sink.api, f.sink.arg
-        )?;
-        writeln!(out, "  in      {}", f.function)?;
-        writeln!(out)?;
+        by_file
+            .entry(f.sink.file.as_deref().unwrap_or(&f.file))
+            .or_default()
+            .push(f);
+    }
+    for (file, findings) in &by_file {
+        writeln!(out, "\n  {}{file}{}", st.bold, st.reset)?;
+        for f in findings {
+            let severity = serde_json::to_value(f.severity)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_uppercase))
+                .unwrap_or_default();
+            let color = if severity == "CRITICAL" {
+                st.red
+            } else {
+                st.yellow
+            };
+            writeln!(
+                out,
+                "  {color}{}❯❯❱ jsspector.{}{} {}[{severity}]{}",
+                st.bold,
+                f.class.name(),
+                st.reset,
+                color,
+                st.reset
+            )?;
+            writeln!(
+                out,
+                "          Data from `{}` ({}) {}.",
+                f.source.expr,
+                f.source.kind,
+                describe(f.class)
+            )?;
+            writeln!(
+                out,
+                "          {}in {}, auth: {}{}",
+                st.dim, f.function, f.auth, st.reset
+            )?;
+            writeln!(out)?;
+            let sink_code = source_line(root, file, f.sink.line);
+            writeln!(out, "  {:>8}┆ {}", f.sink.line, sink_code)?;
+            if f.sink.file.is_some() || f.source.line != f.sink.line {
+                let source_code = source_line(root, &f.file, f.source.line);
+                writeln!(
+                    out,
+                    "          {}↳ source: {}:{}{}",
+                    st.dim, f.file, f.source.line, st.reset
+                )?;
+                writeln!(out, "  {:>8}┆ {}", f.source.line, source_code)?;
+            }
+            writeln!(out, "          ⋮┆----------------------------------------")?;
+        }
     }
     writeln!(
         out,
-        "{} finding(s), {} file(s) scanned, {} skipped",
+        "\n{}{} finding(s){} in {} file(s) scanned ({} skipped)",
+        st.bold,
         output.findings.len(),
+        st.reset,
         output.files_scanned,
         output.skipped.len()
     )

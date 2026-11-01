@@ -128,6 +128,7 @@ fn scan_program(program: &Program<'_>, _text: &str) -> ScanResult {
 pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanResult {
     let mut walker = Walker {
         external,
+        field_of: BTreeMap::new(),
         modules: BTreeMap::new(),
         relative: BTreeMap::new(),
         result: ScanResult::default(),
@@ -170,6 +171,9 @@ pub struct Summary {
     pub at_sink: Origin,
     /// Set once the summary leaves its file (spans are then meaningless).
     pub ext: Option<ExtSink>,
+    /// The field of the parameter that reaches the sink, when the helper destructures it:
+    /// `function f({ table, ids })` reaches a sink with `ids` only.
+    pub field: Option<String>,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -190,6 +194,8 @@ struct Env {
     sockets: BTreeSet<String>,
     /// Names whose `.input` field is client data (tRPC procedure options).
     inputs: BTreeMap<String, &'static str>,
+    /// Variables bound to an object literal: the taint of each field.
+    fields: BTreeMap<String, BTreeMap<String, Origin>>,
     /// Access paths a guard validated: no longer tainted.
     clean: BTreeSet<String>,
     /// Access paths a guard proved scalar: never an object.
@@ -224,6 +230,7 @@ impl Env {
             requests: BTreeMap::new(),
             sockets: BTreeSet::new(),
             inputs: BTreeMap::new(),
+            fields: BTreeMap::new(),
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
             branch: 0,
@@ -237,6 +244,7 @@ impl Env {
             requests: self.requests.clone(),
             sockets: self.sockets.clone(),
             inputs: self.inputs.clone(),
+            fields: self.fields.clone(),
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
             branch: 0,
@@ -314,6 +322,8 @@ enum Shape {
 
 struct Walker<'e> {
     external: &'e Summaries,
+    /// Summary pass: the field each destructured parameter source stands for, by span start.
+    field_of: BTreeMap<u32, String>,
     modules: BTreeMap<String, Imported>,
     /// Local names bound to relative modules: name -> (specifier, export or None).
     relative: BTreeMap<String, (String, Option<String>)>,
@@ -671,7 +681,34 @@ impl Walker<'_> {
                 BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
                 _ => None,
             };
-            let taint = self.expr_named(init, env, name_hint);
+            let taint = self.expr_named(init, env, name_hint.clone());
+            // `const opts = { table: 'x', ids: req.body.ids }`: remember each field's taint.
+            if let (Some(name), Expression::ObjectExpression(object)) =
+                (&name_hint, init.get_inner_expression())
+            {
+                let mut fields = BTreeMap::new();
+                let mut spread = false;
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(p) => {
+                            if let Some(key) = prop_name(&p.key) {
+                                let mut probe = env.clone();
+                                if let Some(origin) = self.expr(&p.value, &mut probe) {
+                                    fields.insert(key, origin);
+                                }
+                            }
+                        }
+                        ObjectPropertyKind::SpreadProperty(_) => spread = true,
+                    }
+                }
+                if spread {
+                    env.fields.remove(name);
+                } else {
+                    env.fields.insert(name.clone(), fields);
+                }
+            } else if let Some(name) = &name_hint {
+                env.fields.remove(name);
+            }
             // `const { body, query } = req`
             let request = match init.get_inner_expression() {
                 Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
@@ -887,6 +924,24 @@ impl Walker<'_> {
         }
         if self.summarize && role == Role::Plain && env.function != "<anonymous>" {
             for (index, param) in params.items.iter().enumerate() {
+                if let BindingPattern::ObjectPattern(object) = &param.pattern {
+                    // `function f({ table, ids })`: one summary source per field.
+                    for property in &object.properties {
+                        let Some(key) = prop_name(&property.key) else {
+                            continue;
+                        };
+                        self.field_of.insert(property.span.start, key);
+                        let mut origin = Origin::source("param", property.span);
+                        origin.param = Some(index);
+                        self.bind_pattern(&property.value, Some(origin), None, &mut env);
+                    }
+                    if let Some(rest) = &object.rest {
+                        let mut origin = Origin::source("param", param.span);
+                        origin.param = Some(index);
+                        self.bind_pattern(&rest.argument, Some(origin), None, &mut env);
+                    }
+                    continue;
+                }
                 let origin = Origin {
                     kind: "param",
                     span: param.span,
@@ -1309,6 +1364,7 @@ impl Walker<'_> {
             AssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let taint =
                     taint.map(|o| o.step(id.span.start, format!("assigned to `{}`", id.name)));
+                env.fields.remove(id.name.as_str());
                 env.bind(id.name.as_str(), taint);
             }
             other => {
@@ -1366,7 +1422,27 @@ impl Walker<'_> {
                             env,
                         );
                     }
-                    // `obj.x = tainted` taints `obj` (coarse: fields are not tracked).
+                    // `opts.ids = tainted` on a tracked object: that field only.
+                    if let (Expression::Identifier(root), Some(property)) = (
+                        member.object().get_inner_expression(),
+                        member
+                            .static_property_name()
+                            .and_then(|p| p.as_str().map(str::to_owned)),
+                    ) && env.fields.contains_key(root.name.as_str())
+                    {
+                        if let Some(fields) = env.fields.get_mut(root.name.as_str()) {
+                            match taint {
+                                Some(origin) => {
+                                    fields.insert(property, origin);
+                                }
+                                None => {
+                                    fields.remove(&property);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    // `obj.x = tainted` taints `obj` (coarse: other objects' fields are not tracked).
                     if let (Some(origin), Expression::Identifier(root)) =
                         (taint, member.object().get_inner_expression())
                     {
@@ -1484,6 +1560,12 @@ impl Walker<'_> {
                 .is_some()
         {
             return None;
+        }
+        // A field of an object literal we tracked: only that field's taint.
+        if let (Expression::Identifier(id), Some(property)) = (object, property.as_deref())
+            && let Some(fields) = env.fields.get(id.name.as_str())
+        {
+            return fields.get(property).cloned();
         }
         // Any property of a tainted object is tainted.
         self.expr(member.object(), env)
@@ -1792,7 +1874,14 @@ impl Walker<'_> {
             }
         });
         if let Some((name, summaries)) = helper {
-            self.apply_summaries(&name, &summaries, &taints, call.span, env);
+            self.apply_summaries(
+                &name,
+                &summaries,
+                &taints,
+                Some(&call.arguments),
+                call.span,
+                env,
+            );
         }
         // Handlers passed by reference: `socket.on('ev', onEvent)`, `ipcMain.handle(ch, fn)`.
         if let Role::Client(kind, selected) = role {
@@ -1834,7 +1923,7 @@ impl Walker<'_> {
                         })
                     })
                     .collect();
-                self.apply_summaries(&name, &summaries, &synthetic, call.span, env);
+                self.apply_summaries(&name, &summaries, &synthetic, None, call.span, env);
             }
         }
 
@@ -1990,17 +2079,64 @@ impl Walker<'_> {
         (Role::Plain, Shape::Callback)
     }
 
+    /// The taint of `argument.field`: from an object literal's property, a variable's tracked
+    /// fields, or (when neither is known) the whole argument.
+    fn field_taint(
+        &mut self,
+        argument: Option<&Argument<'_>>,
+        field: &str,
+        env: &Env,
+        whole: Option<Origin>,
+    ) -> Option<Origin> {
+        let expr = argument?.as_expression()?.get_inner_expression();
+        match expr {
+            Expression::ObjectExpression(object) => {
+                let mut taint = None;
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(p)
+                            if prop_name(&p.key).as_deref() == Some(field) =>
+                        {
+                            let mut probe = env.clone();
+                            taint = union(taint, self.expr(&p.value, &mut probe));
+                        }
+                        // `{ ...opts }` may carry the field.
+                        ObjectPropertyKind::SpreadProperty(spread) => {
+                            let mut probe = env.clone();
+                            taint = union(taint, self.expr(&spread.argument, &mut probe));
+                        }
+                        ObjectPropertyKind::ObjectProperty(_) => {}
+                    }
+                }
+                taint
+            }
+            Expression::Identifier(id) => match env.fields.get(id.name.as_str()) {
+                Some(fields) => fields.get(field).cloned(),
+                None => whole,
+            },
+            _ => whole,
+        }
+    }
+
     /// Reports each summary whose parameter receives a tainted value at a call.
     fn apply_summaries(
         &mut self,
         name: &str,
         summaries: &[Summary],
         taints: &[Option<Origin>],
+        arguments: Option<&[Argument<'_>]>,
         call_span: Span,
         env: &Env,
     ) {
         for summary in summaries {
-            let Some(origin) = taints.get(summary.param).cloned().flatten() else {
+            let whole = taints.get(summary.param).cloned().flatten();
+            let origin = match (&summary.field, arguments) {
+                (Some(field), Some(arguments)) => {
+                    self.field_taint(arguments.get(summary.param), field, env, whole)
+                }
+                _ => whole,
+            };
+            let Some(origin) = origin else {
                 continue;
             };
             let at_sink = &summary.at_sink;
@@ -2071,6 +2207,7 @@ impl Walker<'_> {
                         arg: finding.arg,
                         call: finding.call,
                         steps: finding.origin.steps.clone(),
+                        field: self.field_of.get(&finding.origin.span.start).cloned(),
                         at_sink: finding.origin,
                         ext: finding.ext,
                     });
@@ -2583,6 +2720,19 @@ mod tests {
         assert!(one("app.post('/l', async (req, res) => { const e = req.body.email; if (typeof e !== 'string') return; await User.findOne({ email: e }); });").is_empty());
         // a string check does not make SQL text safe
         assert_eq!(one("app.post('/l', async (req, res) => { const e = req.body.email; if (typeof e !== 'string') return; await db.query('SELECT * FROM u WHERE e = ' + e); });").len(), 1);
+    }
+
+    #[test]
+    fn object_fields_and_destructured_parameters_are_tracked_one_by_one() {
+        // yuvomi: constant table name, tainted ids in another field
+        let helper = "function replaceLinks(db, { table, ids }) { db.prepare(`DELETE FROM ${table} WHERE x = 1`).run(); }\n";
+        assert!(one(&format!("{helper}app.post('/i', (req, res) => {{ replaceLinks(db, {{ table: 'docs', ids: req.body.ids }}); }});")).is_empty());
+        assert_eq!(one(&format!("{helper}app.post('/i', (req, res) => {{ replaceLinks(db, {{ table: req.body.t, ids: 1 }}); }});")).len(), 1);
+        // a variable holding an object literal
+        assert!(one("app.get('/x', (req, res) => { const meta = { name: req.query.name, dir: '/srv' }; fs.readFileSync(path.join(meta.dir, 'a')); });").is_empty());
+        assert_eq!(one("app.get('/x', (req, res) => { const meta = { name: req.query.name, dir: '/srv' }; fs.readFileSync(path.join(meta.dir, meta.name)); });").len(), 1);
+        // a field written later
+        assert_eq!(one("app.get('/x', (req, res) => { const o = { dir: '/srv' }; o.dir = req.query.d; fs.readFileSync(o.dir); });").len(), 1);
     }
 
     #[test]

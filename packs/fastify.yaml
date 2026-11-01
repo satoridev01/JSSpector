@@ -1,6 +1,8 @@
 # Fastify: `fastify.route({ method, url, handler })` and `(request, reply)` handlers.
 name: fastify
 routes:
+  factories: [fastify, Fastify]
+  names: [fastify, instance]
   object_methods: [route]
   handler_keys: [handler, preHandler]
   method_keys: [method]

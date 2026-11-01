@@ -5,6 +5,7 @@ sockets:
   names: [client, ws]
   methods: [on, once]
   connection_events: [connection, connect]
-  builtin_events: [connect, connection, disconnect, disconnecting, error, connect_error, reconnect]
+  builtin_events: [connect, connection, disconnect, disconnecting, error, connect_error, reconnect, close, end,
+    open, ping, pong, upgrade, listening, timeout, drain, finish, ready]
   ack_names: [cb, callback, ack, fn, done, next]
   any_methods: [onAny]

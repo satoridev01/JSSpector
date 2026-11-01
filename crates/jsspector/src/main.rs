@@ -1,5 +1,6 @@
 //! `jsspector` command-line interface.
 
+mod openapi;
 mod report;
 
 use std::fmt::Display;
@@ -46,6 +47,24 @@ enum Command {
     /// Single-file, intra-procedural, heuristic: every finding is a candidate for hand triage.
     /// Prints deterministic JSON (byte-identical for any number of threads).
     Scan(ScanArgs),
+    /// List every entry point: HTTP routes with full paths (mount prefixes followed across files),
+    /// socket events, IPC channels, GraphQL fields, tRPC procedures and queue processors.
+    Routes(RoutesArgs),
+}
+
+#[derive(Args)]
+struct RoutesArgs {
+    /// File or directory to inventory.
+    path: PathBuf,
+    /// Number of threads [default: all available cores].
+    #[arg(long, value_name = "N")]
+    threads: Option<NonZeroUsize>,
+    /// Print JSON instead of a table.
+    #[arg(long, conflicts_with = "openapi")]
+    json: bool,
+    /// Print an OpenAPI 3.1 document of the HTTP routes.
+    #[arg(long)]
+    openapi: bool,
 }
 
 #[derive(Args)]
@@ -155,6 +174,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Parse(args) => parse(&args),
         Command::Scan(args) => scan(&args),
+        Command::Routes(args) => routes(&args),
     }
 }
 
@@ -391,6 +411,72 @@ fn write_text(
         output.skipped.len(),
         elapsed.as_secs_f64()
     )
+}
+
+fn routes(args: &RoutesArgs) -> ExitCode {
+    let pool = match ParsePool::new(args.threads) {
+        Ok(pool) => pool,
+        Err(err) => return fail(EXIT_ENGINE, err),
+    };
+    let discovered = pool.install(|| jss_core::discover(&args.path, &DiscoverOptions::default()));
+    let discovery = match discovered {
+        Ok(discovery) => discovery,
+        Err(err @ DiscoverError::Io { .. }) => return fail(EXIT_ENGINE, err),
+        Err(err) => return fail(EXIT_USAGE, err),
+    };
+    let selection = discovery.selection(ClassSet::default());
+    let reports = pool.scan(&discovery.files, selection);
+    let routes = jss_frontend::inventory(&reports);
+    let mut out = BufWriter::new(io::stdout().lock());
+    let written = if args.openapi {
+        let title = args
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        serde_json::to_writer_pretty(&mut out, &openapi::document(&title, &routes))
+            .map_err(io::Error::from)
+            .and_then(|()| writeln!(out))
+    } else if args.json {
+        serde_json::to_writer_pretty(&mut out, &routes)
+            .map_err(io::Error::from)
+            .and_then(|()| writeln!(out))
+    } else {
+        write_routes(&mut out, &routes)
+    }
+    .and_then(|()| out.flush());
+    if let Err(err) = written {
+        return fail(EXIT_ENGINE, format!("cannot write the inventory: {err}"));
+    }
+    ExitCode::SUCCESS
+}
+
+/// One line per entry point: method, path, auth, handler and where it is registered.
+fn write_routes(out: &mut impl Write, routes: &[jss_frontend::Route]) -> io::Result<()> {
+    let width = routes
+        .iter()
+        .map(|r| r.path.len())
+        .max()
+        .unwrap_or(0)
+        .min(70);
+    for r in routes {
+        writeln!(
+            out,
+            "{:<8} {:<width$}  {:<13} {}  {}:{}{}",
+            r.method,
+            r.path,
+            r.auth.name(),
+            r.handler,
+            r.file,
+            r.line,
+            if r.inputs.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", r.inputs.join(", "))
+            }
+        )?;
+    }
+    writeln!(out, "\n{} entry point(s)", routes.len())
 }
 
 fn parse(args: &ParseArgs) -> ExitCode {

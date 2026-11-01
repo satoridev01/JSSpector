@@ -191,6 +191,15 @@ pub struct RouteSpec {
     pub handler_keys: Vec<String>,
     #[serde(default)]
     pub method_keys: Vec<String>,
+    /// Methods that mount a child router: `router.use('/prefix', child)`.
+    #[serde(default)]
+    pub mount_methods: Vec<String>,
+    /// Calls that create a router or app: `express()`, `express.Router()`, `new Koa()`.
+    #[serde(default)]
+    pub factories: Vec<String>,
+    /// Conventional names of routers and apps (lower case; also matched as a suffix).
+    #[serde(default)]
+    pub names: Vec<String>,
     #[serde(default)]
     pub path_keys: Vec<String>,
 }
@@ -234,6 +243,9 @@ pub struct ClientSource {
     /// property named like a method whose value is an object of resolver functions).
     #[serde(default)]
     pub shape: Option<String>,
+    /// The registration takes exactly this many arguments: tRPC's `.query(resolver)`.
+    #[serde(default)]
+    pub arity: Option<usize>,
     /// `all`, `first`, `second`, `after-first` or `input` (the `input` field of the first param).
     pub params: String,
     pub kind: String,
@@ -420,6 +432,9 @@ pub struct Model {
     pub auth_request_fields: Vec<String>,
     pub auth_decorators: Vec<String>,
     pub route_method_keys: Vec<String>,
+    pub mount_methods: Vec<String>,
+    pub router_factories: Vec<String>,
+    pub router_names: Vec<String>,
     pub route_path_keys: Vec<String>,
     /// Packs that failed to load, with the reason.
     pub errors: Vec<String>,
@@ -528,6 +543,9 @@ impl Model {
         self.auth_decorators.extend(pack.auth.decorators);
         self.input_fields.extend(pack.input_fields);
         self.route_method_keys.extend(pack.routes.method_keys);
+        self.mount_methods.extend(pack.routes.mount_methods);
+        self.router_factories.extend(pack.routes.factories);
+        self.router_names.extend(pack.routes.names);
         self.route_path_keys.extend(pack.routes.path_keys);
     }
 

@@ -11,6 +11,9 @@ request:
   object_props: [body, query, payload]
 routes:
   methods: [get, post, put, patch, delete, del, all, use, options, head, route]
+  mount_methods: [use]
+  factories: [express, Router, express.Router, createServer, polka, connect]
+  names: [app, router, server, api, routes, route, apirouter, application, express]
 sinks:
   # A `root` option confines these (engine rule).
   - {methods: [sendFile, download], class: path-traversal, severity: high, args: ["any:0"], confined_by: [root]}

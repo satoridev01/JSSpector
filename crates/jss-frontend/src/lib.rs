@@ -14,6 +14,7 @@
 mod flow;
 mod parse;
 mod process;
+pub mod routes;
 mod scan;
 pub mod taint;
 
@@ -23,4 +24,5 @@ pub use process::{
     FileReport, FileStatus, ParsePool, PoolError, STACK_BASE, STACK_PER_BRACKET_BYTE,
     STACK_PER_BYTE, WORKER_STACK_BYTES, parser_stack_bound,
 };
-pub use scan::{ScanReport, ScanStatus, finalize};
+pub use routes::{Route, inventory};
+pub use scan::{FileEntries, RouteEntry, ScanReport, ScanStatus, finalize};

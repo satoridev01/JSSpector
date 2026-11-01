@@ -1,5 +1,5 @@
 # tRPC: `.query(({ input }) => ...)` / `.mutation(...)`; `input` is client data.
 name: trpc
 client_sources:
-  - {methods: [query, mutation, subscription], shape: callback, params: input, kind: trpc}
+  - {methods: [query, mutation, subscription], shape: callback, arity: 1, params: input, kind: trpc}
 input_fields: [input]

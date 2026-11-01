@@ -2,3 +2,5 @@
 name: koa
 request:
   context_names: [ctx]
+routes:
+  factories: [Koa, koa, KoaRouter, Router]

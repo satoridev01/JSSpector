@@ -14,7 +14,9 @@ use crate::parse::{parse_options, source_type, typed_fallbacks};
 use crate::process::{
     ParseFailure, ParsePool, guarded, on_parser_stack, read_capped, template_tag,
 };
-use crate::taint::{self, ExtSink, RawFinding, Summaries};
+use crate::taint::{self, ExtSink, Linking, MountFact, RawFinding, Summaries};
+use jss_core::Auth;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What happened to one scanned file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +38,31 @@ pub struct ScanReport {
     pub findings: Vec<Finding>,
     /// This file's functions whose parameters reach a sink, located for other files.
     summaries: Summaries,
+    /// What this file contributes to the entry-point inventory.
+    pub entries: FileEntries,
+}
+
+/// A file's entry points, mounts, exports and resolved imports.
+#[derive(Debug, Clone, Default)]
+pub struct FileEntries {
+    pub routes: Vec<RouteEntry>,
+    pub mounts: Vec<MountFact>,
+    pub exports: BTreeMap<String, String>,
+    pub imports: BTreeMap<String, (String, Option<String>)>,
+}
+
+/// One entry point as registered (before mount prefixes are applied).
+#[derive(Debug, Clone)]
+pub struct RouteEntry {
+    pub receiver: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub handler: String,
+    pub line: u32,
+    pub auth: Auth,
+    pub kind: String,
+    /// Request inputs the handler reads: (location, name).
+    pub inputs: Vec<(String, String)>,
 }
 
 impl ParsePool {
@@ -46,16 +73,17 @@ impl ParsePool {
     /// them, so a call into another file's function reaches its sinks. Functions are linked by
     /// name, and only names that are unique in the scan root are used.
     pub fn scan(&self, files: &[SourceFile], selection: ClassSet) -> Vec<ScanReport> {
+        let all: BTreeSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
         let run = |external: &Summaries| -> Vec<ScanReport> {
             self.install(|| {
                 files
                     .par_iter()
-                    .filter_map(
-                        |file| match guarded(|| scan_file(file, selection, external)) {
+                    .filter_map(|file| {
+                        match guarded(|| scan_file(file, selection, external, &all)) {
                             Ok(report) => report,
                             Err(panic) => Some(report(file, ScanStatus::Panicked(panic))),
-                        },
-                    )
+                        }
+                    })
                     .collect()
             })
         };
@@ -64,26 +92,14 @@ impl ParsePool {
     }
 }
 
-/// Merges per-file summaries, dropping any name defined in more than one file.
+/// Merges per-file summaries. A name defined in several files keeps every definition: callers
+/// link to the one their import resolves to.
 fn merge(reports: Vec<ScanReport>) -> Summaries {
     let mut merged = Summaries::new();
-    let mut owner: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    let mut ambiguous = std::collections::BTreeSet::new();
     for report in reports {
         for (name, list) in report.summaries {
-            match owner.get(&name) {
-                Some(file) if *file != report.rel_path => {
-                    ambiguous.insert(name);
-                }
-                _ => {
-                    owner.insert(name.clone(), report.rel_path.clone());
-                    merged.entry(name).or_default().extend(list);
-                }
-            }
+            merged.entry(name).or_default().extend(list);
         }
-    }
-    for name in ambiguous {
-        merged.remove(&name);
     }
     merged
 }
@@ -95,10 +111,16 @@ fn report(file: &SourceFile, status: ScanStatus) -> ScanReport {
         truncated: false,
         findings: Vec::new(),
         summaries: Summaries::new(),
+        entries: FileEntries::default(),
     }
 }
 
-fn scan_file(file: &SourceFile, selection: ClassSet, external: &Summaries) -> Option<ScanReport> {
+fn scan_file(
+    file: &SourceFile,
+    selection: ClassSet,
+    external: &Summaries,
+    all: &BTreeSet<String>,
+) -> Option<ScanReport> {
     if !matches!(file.work(selection), Work::Parse) {
         return None;
     }
@@ -121,14 +143,17 @@ fn scan_file(file: &SourceFile, selection: ClassSet, external: &Summaries) -> Op
         Ok(text) => text,
         Err(skip) => return Some(report(file, ScanStatus::Skipped(skip.message))),
     };
-    let outcome = on_parser_stack(text, |allocator| scan_text(allocator, file, text, external));
+    let outcome = on_parser_stack(text, |allocator| {
+        scan_text(allocator, file, text, external, all)
+    });
     Some(match outcome {
-        Ok(Ok((findings, truncated, summaries))) => ScanReport {
+        Ok(Ok((findings, truncated, summaries, entries))) => ScanReport {
             rel_path: file.rel_path.clone(),
             status: ScanStatus::Scanned,
             truncated,
             findings,
             summaries,
+            entries,
         },
         Ok(Err(reason)) => report(file, ScanStatus::Skipped(reason)),
         Err(ParseFailure::Panicked(panic)) => report(file, ScanStatus::Panicked(panic)),
@@ -146,7 +171,8 @@ fn scan_text(
     file: &SourceFile,
     text: &str,
     external: &Summaries,
-) -> Result<(Vec<Finding>, bool, Summaries), String> {
+    all: &BTreeSet<String>,
+) -> Result<(Vec<Finding>, bool, Summaries, FileEntries), String> {
     let primary = source_type(file.kind, file.package_type);
     let mut candidates = vec![primary];
     if let Some(fallbacks) = typed_fallbacks(file.kind, file.package_type) {
@@ -181,7 +207,11 @@ fn scan_text(
             }
             continue;
         }
-        let result = taint::scan_program_with(&ret.program, external);
+        let linking = Linking {
+            file: &file.rel_path,
+            files: all,
+        };
+        let result = taint::scan_file_program(&ret.program, &linking, external);
         let index = LineIndex::new(text);
         let findings = result
             .findings
@@ -208,7 +238,31 @@ fn scan_text(
                 });
             }
         }
-        return Ok((findings, result.truncated, summaries));
+        let facts = result.facts;
+        let entries = FileEntries {
+            routes: facts
+                .routes
+                .iter()
+                .map(|r| RouteEntry {
+                    receiver: r.receiver.clone(),
+                    method: r.method.clone(),
+                    path: r.path.clone(),
+                    handler: r.handler.clone(),
+                    line: index.line_col(r.span.start).line,
+                    auth: r.auth,
+                    kind: r.kind.to_owned(),
+                    inputs: facts
+                        .inputs
+                        .get(&r.handler)
+                        .map(|set| set.iter().cloned().collect())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            mounts: facts.mounts,
+            exports: facts.exports,
+            imports: facts.imports,
+        };
+        return Ok((findings, result.truncated, summaries, entries));
     }
     Err(format!(
         "fatal syntax error: {}",

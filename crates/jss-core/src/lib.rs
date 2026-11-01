@@ -20,6 +20,7 @@ pub mod discover;
 pub mod finding;
 pub mod line_index;
 pub mod package_type;
+pub mod resolve;
 
 pub use classify::{ClassSet, FileClass};
 pub use diag::{DiagCode, Diagnostic, SkipReason};

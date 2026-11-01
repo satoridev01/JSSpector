@@ -626,3 +626,133 @@ fn path_scoped_middleware_guards_its_prefix() {
     assert_eq!(auth("/apiary"), "none-detected");
     assert_eq!(auth("/"), "none-detected");
 }
+
+/// Calls into other files are linked through the export tables: two hops, default and aliased
+/// exports, CommonJS shapes, barrels and instances of imported classes; never to a same-named
+/// function that is not the one exported.
+#[test]
+fn calls_link_through_export_tables() {
+    let shell = "import { exec } from 'child_process';\n";
+    let route = |import: &str, call: &str| {
+        format!(
+            "import express from 'express';\n{import}\nconst app = express();\n\
+             app.get('/run', (req, res) => {{ {call}; res.end(); }});\n"
+        )
+    };
+    // (label, files, expected findings)
+    type Case<'a> = (&'a str, Vec<(&'a str, String)>, usize);
+    let cases: Vec<Case<'_>> = vec![
+        (
+            "two hops",
+            vec![
+                ("routes.ts", route("import { runIt } from './services';", "runIt(req.query.cmd as string)")),
+                ("services.ts", "import { execute } from './shell';\nexport function runIt(cmd: string) { return execute(cmd); }\n".to_owned()),
+                ("shell.ts", format!("{shell}export function execute(c: string) {{ exec('ls ' + c); }}\n")),
+            ],
+            1,
+        ),
+        (
+            "default export",
+            vec![
+                ("app.ts", route("import run from './shell';", "run(req.query.cmd as string)")),
+                ("shell.ts", format!("{shell}export default function runCommand(c: string) {{ exec('ls ' + c); }}\n")),
+            ],
+            1,
+        ),
+        (
+            "commonjs function",
+            vec![
+                ("app.js", "const express = require('express');\nconst runCommand = require('./shell');\nconst app = express();\napp.get('/run', (req, res) => { runCommand(req.query.cmd); res.end(); });\n".to_owned()),
+                ("shell.js", "const { exec } = require('child_process');\nmodule.exports = function runCommand(c) { exec('ls ' + c); };\n".to_owned()),
+            ],
+            1,
+        ),
+        (
+            "barrel alias",
+            vec![
+                ("app.ts", route("import { run } from './lib';", "run(req.query.cmd as string)")),
+                ("lib/index.ts", "export { runCommand as run } from './shell';\n".to_owned()),
+                ("lib/shell.ts", format!("{shell}export function runCommand(c: string) {{ exec('ls ' + c); }}\n")),
+            ],
+            1,
+        ),
+        (
+            "instance of an imported class",
+            vec![
+                ("app.ts", route("import { ShellService } from './shell';\nconst shell = new ShellService();", "shell.run(req.query.cmd as string)")),
+                ("shell.ts", format!("{shell}export class ShellService {{ run(c: string) {{ exec('ls ' + c); }} }}\n")),
+            ],
+            1,
+        ),
+        (
+            "barrel name collision",
+            vec![
+                ("app.ts", route("import { normalize } from './utils';", "res.json(normalize(req.query.n as string))")),
+                ("utils/index.ts", "export * from './files';\nexport * from './strings';\n".to_owned()),
+                ("utils/files.ts", "import * as fs from 'fs';\nfunction normalize(p: string) { return fs.readFileSync('/d/' + p, 'utf8'); }\nexport function loadAll(l: string[]) { return l.map((p) => normalize(p)); }\n".to_owned()),
+                ("utils/strings.ts", "export function normalize(s: string) { return s.trim(); }\n".to_owned()),
+            ],
+            0,
+        ),
+        (
+            "local function shadowing an imported method",
+            vec![
+                ("app.js", "const express = require('express');\nconst { exec } = require('child_process');\nconst users = require('./users');\nconst app = express();\nfunction find(p) { exec('find /var -name ' + p); }\napp.get('/u', (req, res) => { res.json(users.find(req.query.name)); });\napp.post('/m', (req, res) => { find('*.log'); res.end(); });\n".to_owned()),
+                ("users.js", "const all = [];\nexports.find = function find(name) { return all.filter((u) => u.name === name); };\n".to_owned()),
+            ],
+            0,
+        ),
+    ];
+    for (label, files, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, text) in &files {
+            write(dir.path(), path, text);
+        }
+        let report = run(&[
+            "scan",
+            "--json",
+            "--min-severity",
+            "low",
+            dir.path().to_str().unwrap(),
+        ]);
+        let findings = report["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), expected, "{label}: {findings:?}");
+        for finding in findings {
+            assert_eq!(finding["class"], "command-injection", "{label}");
+        }
+    }
+}
+
+/// Express 5 parses query strings with the simple parser (no objects): no NoSQL operator
+/// injection through `req.query` there; a JSON body still can carry one.
+#[test]
+fn express_major_version_decides_whether_query_values_can_be_objects() {
+    let app = "const express = require('express');\nconst app = express();\n\
+               app.get('/q', async (req, res) => { res.json(await User.findOne({ email: req.query.email })); });\n\
+               app.post('/b', async (req, res) => { res.json(await User.findOne({ email: req.body.email })); });\n";
+    let count = |express: &str| -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            &format!("{{\"name\": \"x\", \"dependencies\": {{\"express\": \"{express}\"}}}}"),
+        );
+        write(dir.path(), "src/app.js", app);
+        let report = run(&[
+            "scan",
+            "--json",
+            "--min-severity",
+            "low",
+            dir.path().to_str().unwrap(),
+        ]);
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["class"] == "nosql-injection")
+            .count()
+    };
+    assert_eq!(count("^4.21.2"), 2);
+    assert_eq!(count("^5.3.0"), 1);
+    assert_eq!(count("latest"), 2);
+}

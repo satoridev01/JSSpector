@@ -70,6 +70,11 @@ const RETURNS_SOURCE: usize = usize::MAX;
 /// The `api` of a summary that says "the function returns this parameter" (not a sink).
 pub const RETURNS: &str = "<return>";
 
+/// The `api` of a summary that says "the function throws unless this parameter is valid": a
+/// void helper whose exit-on-failure guards clean it (`function assertSafe(p) { if (!ok(p))
+/// throw ... }`). After a call returns, the argument is clean.
+pub const VALIDATES: &str = "<validates>";
+
 /// The request-kind marker for a context object whose request data is under `.req`.
 const CONTEXT: &str = "context";
 
@@ -155,6 +160,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
     let reexports = BTreeMap::new();
     let templates = Templates::new();
     let constants = BTreeMap::new();
+    let exports = BTreeMap::new();
     let linking = Linking {
         file: "",
         files: &files,
@@ -162,6 +168,8 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
         reexports: &reexports,
         templates: &templates,
         constants: &constants,
+        exports: &exports,
+        scalar_props: &[],
     };
     scan_file_program(program, &linking, external)
 }
@@ -180,6 +188,11 @@ pub struct Linking<'a> {
     pub templates: &'a Templates,
     /// Constants of every file (enum members, `const` strings): file -> name -> value.
     pub constants: &'a BTreeMap<String, BTreeMap<String, String>>,
+    /// Exports of every file (from the previous round): file -> export name -> local name.
+    pub exports: &'a BTreeMap<String, BTreeMap<String, String>>,
+    /// Request props that hold only strings and arrays in this file's package (`query` with
+    /// Express 5).
+    pub scalar_props: &'a [String],
 }
 
 impl Linking<'_> {
@@ -365,6 +378,9 @@ pub struct Summary {
     /// Return summaries only: the field of the returned object literal that carries the
     /// parameter (`return { command: bin, args }`).
     pub out_field: Option<String>,
+    /// The file that defines the function (set once the summary leaves its file). Imports
+    /// are matched against it; `ext` says where the sink is, which can be files further away.
+    pub defined_in: Option<String>,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -404,6 +420,9 @@ struct Env {
     plain: BTreeSet<String>,
     /// Client-source parameters whose listed fields the server chose (`file.path` of an upload).
     server_fields: BTreeMap<String, &'static [String]>,
+    /// Variables holding an instance of an imported class (`const shell = new ShellService()`):
+    /// the imported binding of the class.
+    instances: BTreeMap<String, String>,
     /// Variables holding what an auth call returned (`const user = verifyToken(token)`): a
     /// falsy one means the caller is not logged in (or not an admin).
     auth_vars: BTreeMap<String, Auth>,
@@ -451,6 +470,7 @@ impl Env {
             server_fields: BTreeMap::new(),
             declared: BTreeMap::new(),
             auth_vars: BTreeMap::new(),
+            instances: BTreeMap::new(),
             branch: 0,
             function,
         }
@@ -473,6 +493,7 @@ impl Env {
             server_fields: self.server_fields.clone(),
             declared: self.declared.clone(),
             auth_vars: self.auth_vars.clone(),
+            instances: self.instances.clone(),
             branch: 0,
             function,
         }
@@ -623,6 +644,37 @@ fn auth_call_level(init: &Expression<'_>) -> Option<Auth> {
             callee_name(&call.callee).and_then(|name| m().auth_of(&name))
         }
         _ => None,
+    }
+}
+
+/// Whether a function body returns a value somewhere (not counting nested functions).
+fn returns_value(statements: &[Statement<'_>]) -> bool {
+    statements.iter().any(statement_returns_value)
+}
+
+fn statement_returns_value(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::ReturnStatement(r) => r.argument.is_some(),
+        Statement::BlockStatement(b) => returns_value(&b.body),
+        Statement::IfStatement(i) => {
+            statement_returns_value(&i.consequent)
+                || i.alternate.as_ref().is_some_and(statement_returns_value)
+        }
+        Statement::TryStatement(t) => {
+            returns_value(&t.block.body)
+                || t.handler
+                    .as_ref()
+                    .is_some_and(|h| returns_value(&h.body.body))
+                || t.finalizer.as_ref().is_some_and(|f| returns_value(&f.body))
+        }
+        Statement::SwitchStatement(sw) => sw.cases.iter().any(|c| returns_value(&c.consequent)),
+        Statement::ForStatement(f) => statement_returns_value(&f.body),
+        Statement::ForInStatement(f) => statement_returns_value(&f.body),
+        Statement::ForOfStatement(f) => statement_returns_value(&f.body),
+        Statement::WhileStatement(w) => statement_returns_value(&w.body),
+        Statement::DoWhileStatement(d) => statement_returns_value(&d.body),
+        Statement::LabeledStatement(l) => statement_returns_value(&l.body),
+        _ => false,
     }
 }
 
@@ -1120,6 +1172,14 @@ impl Walker<'_> {
                 {
                     self.facts.reexports.push(target);
                 }
+                // `export { runCommand as run } from './shell'`: `run` is the other file's
+                // `runCommand`.
+                for specifier in &export.specifiers {
+                    self.facts.exports.insert(
+                        specifier.exported.name().as_str().to_owned(),
+                        specifier.local.name().as_str().to_owned(),
+                    );
+                }
             }
             ModuleDeclaration::ExportNamedDeclaration(export) => {
                 for specifier in &export.specifiers {
@@ -1175,7 +1235,14 @@ impl Walker<'_> {
                     }
                     self.var_decl(d, env);
                 }
-                Declaration::ClassDeclaration(c) => self.class(c, env),
+                Declaration::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        self.facts
+                            .exports
+                            .insert(id.name.as_str().to_owned(), id.name.as_str().to_owned());
+                    }
+                    self.class(c, env);
+                }
                 Declaration::TSEnumDeclaration(e) => self.record_enum(e),
                 _ => {}
             },
@@ -1200,7 +1267,14 @@ impl Walker<'_> {
                     }
                     self.function(f, env, name, Role::Plain);
                 }
-                ExportDefaultDeclarationKind::ClassDeclaration(c) => self.class(c, env),
+                ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        self.facts
+                            .exports
+                            .insert("default".to_owned(), id.name.as_str().to_owned());
+                    }
+                    self.class(c, env);
+                }
                 other => {
                     if let Some(expr) = other.as_expression() {
                         if let Expression::Identifier(id) = expr.get_inner_expression() {
@@ -1327,6 +1401,38 @@ impl Walker<'_> {
                     }
                     None => {
                         env.auth_vars.remove(&name);
+                    }
+                }
+            }
+            // `const upload = req.files.upload`: an upload object, whose `path` and stored
+            // `filename` are the server's.
+            if let Some(name) = &name_hint {
+                if self.is_upload_object(init, env) {
+                    env.server_fields
+                        .insert(name.clone(), m().upload_server_fields.as_slice());
+                } else {
+                    env.server_fields.remove(name);
+                }
+            }
+            // `const shell = new ShellService()`, with `ShellService` imported from our files.
+            if let Some(name) = &name_hint {
+                let class = match init.get_inner_expression() {
+                    Expression::NewExpression(n) => match n.callee.get_inner_expression() {
+                        Expression::Identifier(id)
+                            if self.relative.contains_key(id.name.as_str()) =>
+                        {
+                            Some(id.name.as_str().to_owned())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match class {
+                    Some(class) => {
+                        env.instances.insert(name.clone(), class);
+                    }
+                    None => {
+                        env.instances.remove(name);
                     }
                 }
             }
@@ -1522,12 +1628,24 @@ impl Walker<'_> {
                                 sqlish: false,
                                 escaped: 0,
                                 param: None,
-                                object: true,
+                                // As for `req.body`: only a parsed body or query can hold objects.
+                                object: has(&m().object_props, key)
+                                    && !has(self.linking.scalar_props, key),
                             })
                         }
                         (Some(_), _) => None,
                         (None, _) => taint.clone(),
                     };
+                    // `const { files } = request`: an upload object, whose `path` is the server's.
+                    if request.is_some()
+                        && key.as_deref().is_some_and(|k| has(&m().upload_objects, k))
+                        && let BindingPattern::BindingIdentifier(id) = &property.value
+                    {
+                        env.server_fields.insert(
+                            id.name.as_str().to_owned(),
+                            m().upload_server_fields.as_slice(),
+                        );
+                    }
                     self.bind_pattern(&property.value, field, None, env);
                 }
                 if let Some(rest) = &object.rest {
@@ -1751,6 +1869,7 @@ impl Walker<'_> {
         let mut env = self.enter_function(&f.params, parent, name, role);
         if self.enter() {
             self.statements(&body.statements, &mut env);
+            self.record_validated(&body.statements, f.params.span, &env);
             self.leave();
         }
     }
@@ -1965,7 +2084,10 @@ impl Walker<'_> {
             return;
         }
         match body {
-            ArrowFunctionBody::FunctionBody(body) => self.statements(&body.statements, &mut env),
+            ArrowFunctionBody::FunctionBody(body) => {
+                self.statements(&body.statements, &mut env);
+                self.record_validated(&body.statements, params.span, &env);
+            }
             other => {
                 if let Some(expr) = other.as_expression() {
                     let taint = self.expr(expr, &mut env);
@@ -1974,6 +2096,41 @@ impl Walker<'_> {
             }
         }
         self.leave();
+    }
+
+    /// Summary pass: a void function that throws unless its parameters are valid
+    /// (`isValidRequest(req, fileName)` throwing on a bad name) validates them for its callers.
+    fn record_validated(&mut self, body: &[Statement<'_>], span: Span, env: &Env) {
+        if !self.summarize
+            || env.function == "<anonymous>"
+            || env.function == "<module>"
+            || returns_value(body)
+        {
+            return;
+        }
+        for (index, param) in env.params.iter().enumerate() {
+            if param.is_empty() || !env.clean.contains(param) {
+                continue;
+            }
+            let list = self.summaries.entry(env.function.clone()).or_default();
+            if list.iter().any(|s| s.api == VALIDATES && s.param == index) {
+                continue;
+            }
+            list.push(Summary {
+                param: index,
+                class: VulnClass::CodeInjection,
+                severity: Severity::Low,
+                api: VALIDATES.to_owned(),
+                arg: span,
+                call: span,
+                steps: Vec::new(),
+                at_sink: Origin::source("param", span),
+                ext: None,
+                field: None,
+                out_field: None,
+                defined_in: None,
+            });
+        }
     }
 
     /// Summary pass: a function that returns (a value derived from) its parameter.
@@ -2009,6 +2166,7 @@ impl Walker<'_> {
             ext: None,
             field,
             out_field,
+            defined_in: None,
         });
     }
 
@@ -2166,8 +2324,25 @@ impl Walker<'_> {
             }
             Expression::ConditionalExpression(c) => {
                 self.expr(&c.test, env);
-                let a = self.expr(&c.consequent, env);
-                let b = self.expr(&c.alternate, env);
+                // `ALLOWED.includes(x) ? x : 'id'`: what the test establishes holds in its branch.
+                let mut held = Vec::new();
+                guards::facts(&c.test, true, &mut held);
+                let mut failed = Vec::new();
+                guards::facts(&c.test, false, &mut failed);
+                let a = if held.is_empty() {
+                    self.expr(&c.consequent, env)
+                } else {
+                    let mut probe = env.clone();
+                    probe.learn(held);
+                    self.expr(&c.consequent, &mut probe)
+                };
+                let b = if failed.is_empty() {
+                    self.expr(&c.alternate, env)
+                } else {
+                    let mut probe = env.clone();
+                    probe.learn(failed);
+                    self.expr(&c.alternate, &mut probe)
+                };
                 union(a, b)
             }
             Expression::AwaitExpression(a) => self.expr(&a.argument, env),
@@ -2191,11 +2366,15 @@ impl Walker<'_> {
             }
             Expression::UpdateExpression(_) => None,
             Expression::AssignmentExpression(assign) => {
-                let name = match &assign.left {
-                    AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                let name = match (&assign.left, assign.right.get_inner_expression()) {
+                    // `module.exports = function runCommand() {}`: its own name, as exported.
+                    (_, Expression::FunctionExpression(f)) if f.id.is_some() => {
+                        f.id.as_ref().map(|id| id.name.as_str().to_owned())
+                    }
+                    (AssignmentTarget::AssignmentTargetIdentifier(id), _) => {
                         Some(id.name.as_str().to_owned())
                     }
-                    target => target
+                    (target, _) => target
                         .as_simple_assignment_target()
                         .and_then(|t| t.as_member_expression())
                         .and_then(|m| m.static_property_name())
@@ -2769,9 +2948,9 @@ impl Walker<'_> {
                 sqlish: false,
                 escaped: 0,
                 param: None,
-                object: property
-                    .as_deref()
-                    .is_some_and(|p| has(&m().object_props, p)),
+                object: property.as_deref().is_some_and(|p| {
+                    has(&m().object_props, p) && !has(self.linking.scalar_props, p)
+                }),
             });
         }
         // `this.url` in a class method: what another method stored there.
@@ -3368,9 +3547,19 @@ impl Walker<'_> {
             );
         }
 
-        // Same-file helpers whose parameters reach a sink.
+        // Same-file helpers whose parameters reach a sink (never for a method of an imported
+        // module: `users.find()` is the other file's `find`, not this file's).
         let helper = match &callee {
             Callee::Global(name) => self.summaries.get(name).map(|s| (name.clone(), s.clone())),
+            Callee::Method {
+                object: Some(object),
+                ..
+            } if self.relative.contains_key(object)
+                || self.modules.contains_key(object)
+                || env.instances.contains_key(object) =>
+            {
+                None
+            }
             Callee::Method { method, .. } if !method.is_empty() => {
                 let suffix = format!(".{method}");
                 let mut matching = self
@@ -3386,47 +3575,118 @@ impl Walker<'_> {
         };
         // Then other files of the repository, by unique name.
         // Only through a relative import, and only to the file that import names.
-        let linked = match &callee {
-            Callee::Global(name) => self
-                .relative
-                .get(name)
-                .and_then(|(spec, export)| export.clone().map(|e| (spec.clone(), e))),
+        // The function an import names, through the exporting file's export table:
+        // `import run from './shell'` is its default export (`export default function runCommand`,
+        // `module.exports = runCommand`), `import { run }` may be an alias, `shell.run()` on a
+        // whole module is its `run` export (`module.exports = { run: runCommand }`).
+        // The function a call names in another of our files, through the exporting file's
+        // export table: `import run from './shell'` is its default export (`export default
+        // function runCommand`, `module.exports = runCommand`), `import { run }` may be an
+        // alias, `shell.run()` on a whole module is its `run` export (`module.exports = { run:
+        // runCommand }`), `svc.find()` on `new UsersService()` is `UsersService.find`.
+        struct Target {
+            spec: String,
+            /// The defining file and local name, when the export table knows them.
+            exact: Option<(String, String)>,
+            /// Names to try otherwise (or for a class's methods), best first.
+            names: Vec<String>,
+        }
+        let class_target =
+            |this: &Self, spec: &String, export: Option<&str>, local: &str, method: &str| {
+                let class = match export {
+                    Some(e) if e != "default" => this
+                        .exported_function(spec, e)
+                        .map_or_else(|| e.to_owned(), |(_, name)| name),
+                    _ => this
+                        .exported_function(spec, "default")
+                        .map_or_else(|| local.to_owned(), |(_, name)| name),
+                };
+                Target {
+                    spec: spec.clone(),
+                    exact: None,
+                    names: vec![format!("{class}.{method}"), method.to_owned()],
+                }
+            };
+        let linked: Option<Target> = match &callee {
+            Callee::Global(name) => self.relative.get(name).map(|(spec, export)| {
+                let export = export.as_deref().unwrap_or("default");
+                Target {
+                    spec: spec.clone(),
+                    exact: self.exported_function(spec, export),
+                    names: vec![export.to_owned()],
+                }
+            }),
+            Callee::Method {
+                object: Some(object),
+                method,
+            } if !method.is_empty() && env.instances.contains_key(object) => env
+                .instances
+                .get(object)
+                .and_then(|class| self.relative.get(class).map(|r| (class, r)))
+                .map(|(class, (spec, export))| {
+                    class_target(self, spec, export.as_deref(), class, method)
+                }),
             Callee::Method {
                 object: Some(object),
                 method,
             } if !method.is_empty() => {
                 self.relative
                     .get(object)
-                    .map(|(spec, export)| match export {
+                    .map(|(spec, export)| match export.as_deref() {
                         // `import { UsersService } ...; users.find()`: the class's method.
                         Some(class) if class != "default" => {
-                            (spec.clone(), format!("{class}.{method}"))
+                            class_target(self, spec, Some(class), object, method)
                         }
-                        _ => (spec.clone(), method.clone()),
+                        _ => Target {
+                            spec: spec.clone(),
+                            exact: self.exported_function(spec, method),
+                            names: vec![method.clone()],
+                        },
                     })
             }
             _ => None,
         };
         let helper = helper.or_else(|| {
-            let (spec, name) = linked?;
+            let target = linked?;
+            // Known exactly: that function of that file, or nothing (no flow to a sink).
+            if let Some((file, name)) = &target.exact {
+                let list: Vec<Summary> = self
+                    .external
+                    .get(name)?
+                    .iter()
+                    .filter(|s| s.defined_in.as_deref() == Some(file.as_str()))
+                    .cloned()
+                    .collect();
+                return (!list.is_empty()).then(|| (name.clone(), list));
+            }
+            let spec = target.spec;
+            let defined_there = |s: &Summary| {
+                s.defined_in
+                    .as_deref()
+                    .or(s.ext.as_ref().map(|e| e.file.as_str()))
+                    .is_some_and(|file| self.names_file(&spec, file))
+            };
+            // An exact name first; else one unique method of that name in that file.
+            for name in &target.names {
+                if let Some(list) = self.external.get(name) {
+                    let list: Vec<Summary> =
+                        list.iter().filter(|s| defined_there(s)).cloned().collect();
+                    if !list.is_empty() {
+                        return Some((name.clone(), list));
+                    }
+                }
+            }
+            let name = target.names.first()?.clone();
             let suffix = format!(".{name}");
-            let mut matching = self.external.iter().filter(|(k, list)| {
-                (**k == name || k.ends_with(&suffix))
-                    && list.iter().any(|s| {
-                        s.ext
-                            .as_ref()
-                            .is_some_and(|e| self.names_file(&spec, &e.file))
-                    })
-            });
+            let mut matching = self
+                .external
+                .iter()
+                .filter(|(k, list)| k.ends_with(&suffix) && list.iter().any(&defined_there));
             match (matching.next(), matching.next()) {
                 (Some((k, list)), None) => Some((
                     k.clone(),
                     list.iter()
-                        .filter(|s| {
-                            s.ext
-                                .as_ref()
-                                .is_some_and(|e| self.names_file(&spec, &e.file))
-                        })
+                        .filter(|s| defined_there(s))
                         .cloned()
                         .collect::<Vec<_>>(),
                 )),
@@ -3477,6 +3737,21 @@ impl Walker<'_> {
             whole
         });
         self.last_returned_fields = (!returned_fields.is_empty()).then_some(returned_fields);
+        // `isValidRequest(req, fileName)`: past the call, what it validates is clean.
+        if let Some((_, summaries)) = &helper {
+            let validated: Vec<(String, guards::Fact)> = summaries
+                .iter()
+                .filter(|s| s.api == VALIDATES)
+                .filter_map(|s| {
+                    call.arguments
+                        .get(s.param)
+                        .and_then(Argument::as_expression)
+                        .and_then(guards::path_key)
+                })
+                .map(|key| (key, guards::Fact::Clean))
+                .collect();
+            env.learn(validated);
+        }
         if let Some((name, summaries)) = helper {
             self.apply_summaries(
                 &name,
@@ -4064,9 +4339,14 @@ impl Walker<'_> {
             return Some((key, list.clone()));
         }
         let (spec, export) = self.relative.get(class)?;
+        // `import Job from './runner'` with `export default class Runner`: `Runner`.
         let exported = match export.as_deref() {
-            Some(e) if e != "default" => e.to_owned(),
-            _ => class.to_owned(),
+            Some(e) if e != "default" => self
+                .exported_function(spec, e)
+                .map_or_else(|| e.to_owned(), |(_, name)| name),
+            _ => self
+                .exported_function(spec, "default")
+                .map_or_else(|| class.to_owned(), |(_, name)| name),
         };
         let key = format!("{exported}.constructor");
         let list: Vec<Summary> = self
@@ -4074,9 +4354,10 @@ impl Walker<'_> {
             .get(&key)?
             .iter()
             .filter(|s| {
-                s.ext
-                    .as_ref()
-                    .is_some_and(|e| self.names_file(spec, &e.file))
+                s.defined_in
+                    .as_deref()
+                    .or(s.ext.as_ref().map(|e| e.file.as_str()))
+                    .is_some_and(|file| self.names_file(spec, file))
             })
             .cloned()
             .collect();
@@ -4089,21 +4370,37 @@ impl Walker<'_> {
         let Some((spec, _)) = self.relative.get(object) else {
             return false;
         };
+        // A function the module exports (`exports.find = function find`): our code, not a
+        // library call named like a sink.
+        if self.exported_function(spec, method).is_some() {
+            return true;
+        }
         let suffix = format!(".{method}");
         self.external.iter().any(|(name, list)| {
             (name == method || name.ends_with(&suffix))
                 && list.iter().any(|s| {
-                    s.ext
-                        .as_ref()
-                        .is_some_and(|e| self.names_file(spec, &e.file))
+                    s.defined_in
+                        .as_deref()
+                        .or(s.ext.as_ref().map(|e| e.file.as_str()))
+                        .is_some_and(|file| self.names_file(spec, file))
                 })
         })
     }
 
-    /// A router or app variable: from a factory, or named like one.
     /// Whether `expr` is an upload object of the request: `req.file`, `req.files[0]`,
     /// `req.files.avatar[0]`.
     fn is_upload_object(&self, expr: &Expression<'_>, env: &Env) -> bool {
+        // `req.files || {}`, `req.files && req.files.avatar[0]`, `x ? req.file : null`.
+        match expr.get_inner_expression() {
+            Expression::LogicalExpression(l) => {
+                return self.is_upload_object(&l.left, env) || self.is_upload_object(&l.right, env);
+            }
+            Expression::ConditionalExpression(c) => {
+                return self.is_upload_object(&c.consequent, env)
+                    || self.is_upload_object(&c.alternate, env);
+            }
+            _ => {}
+        }
         let mut cursor = expr.get_inner_expression();
         while let Expression::ComputedMemberExpression(c) = cursor {
             cursor = c.object.get_inner_expression();
@@ -4174,6 +4471,7 @@ impl Walker<'_> {
         }
     }
 
+    /// A router or app variable: from a factory, or named like one.
     fn is_router(&self, name: &str) -> bool {
         self.routers.contains(name) || {
             let lower = name.to_ascii_lowercase();
@@ -4434,6 +4732,40 @@ impl Walker<'_> {
 
     /// Whether the relative import `spec` names `file`: resolved exactly when the scan root's
     /// files are known, by name otherwise (a single file scanned alone).
+    /// The function a module exports as `export` (`default` for `export default` /
+    /// `module.exports =`): the file that defines it (the module itself, or a file a barrel
+    /// re-exports) and its local name there. `None` when unknown (first round, or no such
+    /// recorded export).
+    fn exported_function(&self, spec: &str, export: &str) -> Option<(String, String)> {
+        let file = self.linking.resolve(spec)?;
+        let table = |f: &str| self.linking.exports.get(f);
+        let reexported: Vec<&String> = self
+            .linking
+            .reexports
+            .get(&file)
+            .map(|set| set.iter().collect())
+            .unwrap_or_default();
+        match table(&file).and_then(|t| t.get(export)) {
+            // A barrel's `export { default as runDefault } from './shell'`: the name it maps to
+            // is an export of the file it re-exports.
+            Some(local) => Some(
+                reexported
+                    .iter()
+                    .find_map(|f| {
+                        table(f)
+                            .and_then(|t| t.get(local))
+                            .map(|name| ((*f).clone(), name.clone()))
+                    })
+                    .unwrap_or_else(|| (file.clone(), local.clone())),
+            ),
+            None => reexported.iter().find_map(|f| {
+                table(f)
+                    .and_then(|t| t.get(export))
+                    .map(|name| ((*f).clone(), name.clone()))
+            }),
+        }
+    }
+
     fn names_file(&self, spec: &str, file: &str) -> bool {
         if self.linking.files.is_empty() {
             return spec_names_file(spec, file);
@@ -4461,7 +4793,10 @@ impl Walker<'_> {
         call_span: Span,
         env: &Env,
     ) {
-        for summary in summaries.iter().filter(|s| s.api != RETURNS) {
+        for summary in summaries
+            .iter()
+            .filter(|s| s.api != RETURNS && s.api != VALIDATES)
+        {
             let whole = taints.get(summary.param).cloned().flatten();
             let origin = match (&summary.field, arguments) {
                 (Some(field), Some(arguments)) => {
@@ -4571,6 +4906,7 @@ impl Walker<'_> {
                         at_sink: finding.origin,
                         ext: finding.ext,
                         out_field: None,
+                        defined_in: None,
                     });
                 }
             }
@@ -5575,6 +5911,35 @@ mod tests {
                  exec('ping ' + req.body.h); });"
             ),
             vec![(Auth::NoneDetected, Severity::Critical)]
+        );
+    }
+
+    #[test]
+    fn void_helpers_that_throw_validate_their_arguments() {
+        let helper = "function assertSafeName(name) {\n\
+                        if (!/^[\\w.-]+$/.test(name)) { throw new Error('bad name'); }\n\
+                      }\n";
+        assert!(
+            one(&format!(
+                "{helper}app.get('/f', (req, res) => {{ const name = req.query.name;\n\
+                 assertSafeName(name);\n\
+                 fs.readFile(path.join(dir, name), () => {{}}); }});"
+            ))
+            .is_empty()
+        );
+        // A predicate that returns its verdict validates nothing when the result is ignored.
+        let predicate = "function looksFine(name) {\n\
+                           if (!/^[\\w.-]+$/.test(name)) { return false; }\n\
+                           return true;\n\
+                         }\n";
+        assert_eq!(
+            one(&format!(
+                "{predicate}app.get('/f', (req, res) => {{ const name = req.query.name;\n\
+                 looksFine(name);\n\
+                 fs.readFile(path.join(dir, name), () => {{}}); }});"
+            ))
+            .len(),
+            1
         );
     }
 

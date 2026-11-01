@@ -68,6 +68,9 @@ struct Context<'a> {
     reexports: BTreeMap<String, BTreeSet<String>>,
     templates: taint::Templates,
     constants: BTreeMap<String, BTreeMap<String, String>>,
+    exports: BTreeMap<String, BTreeMap<String, String>>,
+    /// Request props that hold no objects, per directory of a scanned file.
+    scalar: &'a BTreeMap<String, Vec<String>>,
 }
 
 impl ParsePool {
@@ -85,12 +88,15 @@ impl ParsePool {
             abs.strip_suffix(&f.rel_path).map(std::path::PathBuf::from)
         });
         let workspace = root
-            .map(|r| jss_core::resolve::Workspace::load(&r))
+            .as_ref()
+            .map(|r| jss_core::resolve::Workspace::load(r))
             .unwrap_or_default();
+        let scalar = scalar_props_by_dir(files, root.as_deref());
         let run = |external: &Summaries,
                    reexports: BTreeMap<String, BTreeSet<String>>,
                    templates: taint::Templates,
-                   constants: BTreeMap<String, BTreeMap<String, String>>|
+                   constants: BTreeMap<String, BTreeMap<String, String>>,
+                   exports: BTreeMap<String, BTreeMap<String, String>>|
          -> Vec<ScanReport> {
             let context = Context {
                 all: &all,
@@ -98,6 +104,8 @@ impl ParsePool {
                 reexports,
                 templates,
                 constants,
+                exports,
+                scalar: &scalar,
             };
             self.install(|| {
                 files
@@ -121,6 +129,7 @@ impl ParsePool {
             BTreeMap::new(),
             taint::Templates::new(),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         for _ in 1..CROSS_FILE_HOPS {
             let reexports = reexport_closure(&reports);
@@ -140,6 +149,11 @@ impl ParsePool {
                 .map(|r| (r.rel_path.clone(), r.constants.clone()))
                 .collect();
             let constant_count: usize = constants.values().map(BTreeMap::len).sum();
+            let exports: BTreeMap<String, BTreeMap<String, String>> = reports
+                .iter()
+                .filter(|r| !r.module.exports.is_empty())
+                .map(|r| (r.rel_path.clone(), r.module.exports.clone()))
+                .collect();
             let merged = merge(reports);
             let grew = count(&merged) > count(&external)
                 || template_count > known_templates
@@ -147,13 +161,84 @@ impl ParsePool {
             known_templates = template_count;
             known_constants = constant_count;
             external = merged;
-            reports = run(&external, reexports, templates, constants);
+            reports = run(&external, reexports, templates, constants, exports);
             if !grew {
                 break;
             }
         }
         reports
     }
+}
+
+/// The directory part of a root-relative path (`""` at the root).
+fn parent_dir(rel_path: &str) -> &str {
+    rel_path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Request props that hold no objects, per directory of a scanned file: from the nearest
+/// `package.json` that depends on a package a pack gates (`express` 5 parses query strings
+/// with the simple parser). Unknown versions (`*`, `latest`, a git URL) gate nothing.
+fn scalar_props_by_dir(
+    files: &[SourceFile],
+    root: Option<&std::path::Path>,
+) -> BTreeMap<String, Vec<String>> {
+    let gates = &taint::models::model().scalar_props_from;
+    let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Some(root) = root else { return by_dir };
+    if gates.is_empty() {
+        return by_dir;
+    }
+    let mut manifests: BTreeMap<std::path::PathBuf, Option<serde_json::Value>> = BTreeMap::new();
+    for file in files {
+        let dir = parent_dir(&file.rel_path);
+        if by_dir.contains_key(dir) {
+            continue;
+        }
+        let mut props = Vec::new();
+        for gate in gates {
+            let mut cursor = root.join(dir);
+            let major = loop {
+                let manifest = manifests
+                    .entry(cursor.join("package.json"))
+                    .or_insert_with_key(|path| {
+                        std::fs::read(path)
+                            .ok()
+                            .filter(|bytes| bytes.len() < 1 << 20)
+                            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    });
+                let spec = manifest.as_ref().and_then(|m| {
+                    ["dependencies", "devDependencies", "peerDependencies"]
+                        .iter()
+                        .find_map(|section| m.get(section)?.get(&gate.package)?.as_str())
+                });
+                if let Some(spec) = spec {
+                    break major_version(spec);
+                }
+                if cursor.as_path() == root {
+                    break None;
+                }
+                match cursor.parent() {
+                    Some(parent) if parent.starts_with(root) => cursor = parent.to_path_buf(),
+                    _ => break None,
+                }
+            };
+            if major.is_some_and(|m| m >= gate.major) {
+                props.extend(gate.props.iter().cloned());
+            }
+        }
+        by_dir.insert(dir.to_owned(), props);
+    }
+    by_dir
+}
+
+/// The major version a dependency spec starts from: `^5.3.0` -> 5, `~4.18` -> 4, `5.x` -> 5.
+fn major_version(spec: &str) -> Option<u64> {
+    let digits: String = spec
+        .trim_start_matches(|c: char| !c.is_ascii_digit() && "^~=<> v".contains(c))
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Most files a value is followed across: route -> controller -> service -> helper.
@@ -346,6 +431,11 @@ fn analyze(
         reexports: &context.reexports,
         templates: &context.templates,
         constants: &context.constants,
+        exports: &context.exports,
+        scalar_props: context
+            .scalar
+            .get(parent_dir(&file.rel_path))
+            .map_or(&[], Vec::as_slice),
     };
     let result = taint::scan_file_program(program, &linking, external);
     let index = LineIndex::new(text);
@@ -356,6 +446,24 @@ fn analyze(
         .collect();
     let mut summaries = result.summaries;
     for summary in summaries.values_mut().flatten() {
+        summary.defined_in = Some(file.rel_path.clone());
+        // Derived from another file's summary: this file's own steps come first in the trace.
+        if let Some(ext) = &mut summary.ext {
+            let ours: Vec<TraceStep> = summary
+                .steps
+                .iter()
+                .map(|(offset, note)| {
+                    let step = index.line_col(*offset);
+                    TraceStep {
+                        file: Some(file.rel_path.clone()),
+                        line: step.line,
+                        col: step.column,
+                        note: note.clone(),
+                    }
+                })
+                .collect();
+            ext.steps.splice(0..0, ours);
+        }
         if summary.ext.is_none() {
             let at = index.line_col(summary.call.start);
             summary.ext = Some(ExtSink {
@@ -421,7 +529,7 @@ fn analyze(
                 name: name.clone(),
                 ..ir::Function::default()
             });
-        for summary in list {
+        for summary in list.iter().filter(|s| s.api != taint::VALIDATES) {
             let to = if summary.api == taint::RETURNS {
                 ir::FlowTarget::Return
             } else {

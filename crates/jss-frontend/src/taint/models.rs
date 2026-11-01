@@ -241,6 +241,10 @@ pub struct RequestSpec {
     /// Properties holding uploads, whose `upload_server_fields` the server chooses.
     #[serde(default)]
     pub upload_objects: Vec<String>,
+    /// From these package versions on, these request props hold only strings and arrays:
+    /// Express 5 parses the query string with the simple parser.
+    #[serde(default)]
+    pub scalar_props_from: Vec<ScalarFrom>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -343,6 +347,15 @@ pub struct ClientSource {
     /// upload's temporary `path`.
     #[serde(default)]
     pub server_fields: Vec<String>,
+}
+
+/// Request props that hold no objects from a major version of a package on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScalarFrom {
+    pub package: String,
+    pub major: u64,
+    pub props: Vec<String>,
 }
 
 /// A call whose result is client data.
@@ -555,6 +568,7 @@ pub struct Model {
     pub sub_objects: Vec<String>,
     pub upload_objects: Vec<String>,
     pub object_props: Vec<String>,
+    pub scalar_props_from: Vec<ScalarFrom>,
     pub member_sources: Vec<MemberSource>,
     pub severity_caps: BTreeMap<String, Severity>,
     pub implicit_modules: Vec<String>,
@@ -702,6 +716,7 @@ impl Model {
         self.sub_objects.extend(r.sub_objects);
         self.upload_objects.extend(r.upload_objects);
         self.object_props.extend(r.object_props);
+        self.scalar_props_from.extend(r.scalar_props_from);
         self.member_sources.extend(pack.member_sources);
         for (kind, cap) in pack.severity_caps {
             self.severity_caps.insert(kind, cap.severity());

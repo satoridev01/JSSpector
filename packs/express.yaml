@@ -9,6 +9,8 @@ request:
   upload_objects: [file, files]
   sub_objects: [request, req]
   object_props: [body, query, payload]
+  # Express 5 parses the query string with the simple parser: strings and arrays, no objects.
+  scalar_props_from: [{package: express, major: 5, props: [query]}]
 routes:
   methods: [get, post, put, patch, delete, del, all, use, options, head, route]
   mount_methods: [use]

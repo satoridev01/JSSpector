@@ -39,15 +39,29 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
     let by_file: BTreeMap<&str, &jss_core::ir::Module> =
         modules.iter().map(|m| (m.file.as_str(), m)).collect();
     let graph = jss_core::ir::link(&modules);
-    let mut roots = Vec::new();
-    let mut labels = Vec::new();
-    for route in &routes {
-        if let Some(target) = jss_core::ir::resolve_reference(&by_file, &route.file, &route.handler)
-        {
-            roots.push(target);
-            labels.push((format!("{} {}", route.method, route.path), route.auth));
-        }
-    }
+    // Weakest authentication first: a function reached from a public route and from an admin
+    // route is reachable without logging in.
+    let mut entries: Vec<(Auth, String, jss_core::ir::FunctionId)> = routes
+        .iter()
+        .filter_map(|route| {
+            jss_core::ir::resolve_reference(&by_file, &route.file, &route.handler).map(|target| {
+                (
+                    route.auth,
+                    format!("{} {}", route.method, route.path),
+                    target,
+                )
+            })
+        })
+        .collect();
+    entries.sort();
+    let roots: Vec<jss_core::ir::FunctionId> = entries
+        .iter()
+        .map(|(_, _, target)| target.clone())
+        .collect();
+    let labels: Vec<(String, Auth)> = entries
+        .into_iter()
+        .map(|(auth, label, _)| (label, auth))
+        .collect();
     let reached = jss_core::ir::reachable(&graph, &roots);
     for report in reports.iter_mut() {
         for finding in &mut report.findings {

@@ -447,3 +447,182 @@ fn findings_get_their_entry_point_and_the_route_auth_from_mounts_in_other_files(
     let routes = run(&["routes", "--json", root.to_str().unwrap()]);
     assert_eq!(routes[0]["auth"], "admin");
 }
+
+/// Middleware applies to the routes registered after it, on that router only.
+#[test]
+fn middleware_auth_follows_registration_order_and_router() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "app.js",
+        "const express = require('express');\nconst { exec } = require('child_process');\n\
+         const app = express();\n\
+         app.get('/run', (req, res) => { exec('ls ' + req.query.dir); });\n\
+         app.use(requireAdmin);\n\
+         app.get('/admin/stats', (req, res) => res.send('ok'));\n",
+    );
+    write(
+        root,
+        "routes.js",
+        "const express = require('express');\nconst { exec } = require('child_process');\n\
+         function adminRoutes() { const router = express.Router(); router.use(requireAdmin); \
+         router.get('/stats', (req, res) => res.send('ok')); return router; }\n\
+         function publicRoutes() { const router = express.Router(); \
+         router.get('/open', (req, res) => { exec('ls ' + req.query.dir); }); return router; }\n\
+         module.exports = { adminRoutes, publicRoutes };\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let auth = |path: &str| -> String {
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"] == path)
+            .map(|r| r["auth"].as_str().unwrap().to_owned())
+            .unwrap_or_default()
+    };
+    assert_eq!(auth("/run"), "none-detected");
+    assert_eq!(auth("/admin/stats"), "admin");
+    assert_eq!(auth("/open"), "none-detected");
+    assert_eq!(auth("/stats"), "admin");
+    let report = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    for finding in report["findings"].as_array().unwrap() {
+        assert_eq!(finding["auth"], "none-detected", "{finding}");
+        assert_eq!(finding["severity"], "critical", "{finding}");
+    }
+}
+
+/// A helper reached from a public and an admin route is public; same-path inline handlers on two
+/// routers of one file stay apart.
+#[test]
+fn findings_take_the_weakest_auth_among_reaching_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "app.js",
+        "const express = require('express');\nconst { exec } = require('child_process');\n\
+         const app = express();\n\
+         function runReport(req) { exec('report ' + req.query.name); }\n\
+         app.post('/admin/report', requireAdmin, (req, res) => { runReport(req); });\n\
+         app.get('/public/report', (req, res) => { runReport(req); });\n\
+         const publicRouter = express.Router();\nconst settingsRouter = express.Router();\n\
+         publicRouter.get('/', (req, res) => { exec('ls ' + req.query.d); });\n\
+         settingsRouter.get('/', requireAdmin, (req, res) => res.send('ok'));\n\
+         app.use('/public', publicRouter);\napp.use('/settings', settingsRouter);\n",
+    );
+    let report = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    for finding in findings {
+        assert_eq!(finding["severity"], "critical", "{finding}");
+        assert_eq!(finding["auth"], "none-detected", "{finding}");
+    }
+    let entries: Vec<&str> = findings
+        .iter()
+        .map(|f| f["entry"].as_str().unwrap())
+        .collect();
+    assert!(entries.contains(&"GET /public/report"), "{entries:?}");
+    assert!(entries.contains(&"GET /public"), "{entries:?}");
+}
+
+/// Path-less mounts keep prefixes; mounted routers, setup middleware and non-auth guards are no
+/// authentication.
+#[test]
+fn mounts_without_paths_and_what_is_not_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "users.js",
+        "const router = require('express').Router();\n\
+         router.get('/users', (req, res) => res.end());\nmodule.exports = router;\n",
+    );
+    write(
+        root,
+        "api.js",
+        "const router = require('express').Router();\nconst users = require('./users');\n\
+         router.use(users);\nrouter.get('/health', (req, res) => res.end());\nmodule.exports = router;\n",
+    );
+    write(
+        root,
+        "adminRouter.js",
+        "const router = require('express').Router();\n\
+         router.get('/admin/stats', (req, res) => res.end());\nmodule.exports = router;\n",
+    );
+    write(
+        root,
+        "app.js",
+        "const express = require('express');\nconst session = require('express-session');\n\
+         const passport = require('passport');\nconst adminRouter = require('./adminRouter');\n\
+         const app = express();\napp.use(session({ secret: 'k' }));\napp.use(passport.initialize());\n\
+         app.use(adminRouter);\napp.use('/api/v1', requireAuth, require('./api'));\n\
+         app.get('/search', (req, res) => res.end());\n",
+    );
+    write(
+        root,
+        "auth.controller.ts",
+        "@Controller('auth')\nexport class AuthController {\n\
+         @UseGuards(ThrottlerGuard)\n@Post('login')\nlogin(@Body() body) {}\n\
+         @UseGuards(AdminGuard)\n@Get('purge')\npurge() {}\n}\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let auth = |path: &str| -> String {
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"] == path)
+            .map(|r| r["auth"].as_str().unwrap().to_owned())
+            .unwrap_or_else(|| format!("missing {path}"))
+    };
+    assert_eq!(auth("/api/v1/users"), "user");
+    assert_eq!(auth("/api/v1/health"), "user");
+    assert_eq!(auth("/search"), "none-detected");
+    assert_eq!(auth("/admin/stats"), "none-detected");
+    assert_eq!(auth("/auth/login"), "none-detected");
+    assert_eq!(auth("/auth/purge"), "admin");
+}
+
+/// `app.use('/api', jwt())` guards the routes registered after it under `/api` only.
+#[test]
+fn path_scoped_middleware_guards_its_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "app.js",
+        "const express = require('express');\nconst app = express();\n\
+         app.get('/api/early', (req, res) => res.end());\n\
+         app.use(urljoin(settings.route, 'api'), expressJwt({ secret: 'x' }));\n\
+         app.get(urljoin(settings.route, 'api/state'), (req, res) => res.end());\n\
+         app.get('/apiary', (req, res) => res.end());\napp.get('/', (req, res) => res.end());\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let auth = |path: &str| -> String {
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["path"] == path)
+            .map(|r| r["auth"].as_str().unwrap().to_owned())
+            .unwrap_or_else(|| format!("missing {path}"))
+    };
+    assert_eq!(auth("/api/state"), "user");
+    assert_eq!(auth("/api/early"), "none-detected");
+    assert_eq!(auth("/apiary"), "none-detected");
+    assert_eq!(auth("/"), "none-detected");
+}

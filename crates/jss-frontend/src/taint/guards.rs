@@ -174,7 +174,7 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
 }
 
 /// `isX`, `hasX`, `canX`, `checkX`...: a name that reads as a yes/no question.
-fn is_predicate(lower: &str) -> bool {
+pub fn is_predicate(lower: &str) -> bool {
     [
         "is", "has", "can", "check", "validate", "verify", "ensure", "assert",
     ]

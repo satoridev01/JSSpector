@@ -191,22 +191,23 @@ pub fn resolve_reference(
     resolve_call(reference, &local, &imports, modules, file)
 }
 
-/// Every function reachable from `roots` through the call graph (roots included).
+/// Functions reachable from `roots` through the call graph, each with the index of the first
+/// root, in the order given, that reaches it: pass the roots in order of preference (the
+/// weakest authentication first, so a helper reached from any public route counts as public).
 pub fn reachable(graph: &CallGraph, roots: &[FunctionId]) -> BTreeMap<FunctionId, usize> {
     let mut seen: BTreeMap<FunctionId, usize> = BTreeMap::new();
-    let mut stack: Vec<(FunctionId, usize)> = Vec::new();
     for (index, root) in roots.iter().enumerate() {
-        stack.push((root.clone(), index));
-    }
-    while let Some((id, root)) = stack.pop() {
-        if seen.contains_key(&id) || seen.len() > 200_000 {
-            continue;
-        }
-        seen.insert(id.clone(), root);
-        if let Some(callees) = graph.edges.get(&format!("{}#{}", id.0, id.1)) {
-            for callee in callees {
-                if let Some((file, name)) = callee.split_once('#') {
-                    stack.push(((file.to_owned(), name.to_owned()), root));
+        let mut stack: Vec<FunctionId> = vec![root.clone()];
+        while let Some(id) = stack.pop() {
+            if seen.contains_key(&id) || seen.len() > 200_000 {
+                continue;
+            }
+            seen.insert(id.clone(), index);
+            if let Some(callees) = graph.edges.get(&format!("{}#{}", id.0, id.1)) {
+                for callee in callees {
+                    if let Some((file, name)) = callee.split_once('#') {
+                        stack.push((file.to_owned(), name.to_owned()));
+                    }
                 }
             }
         }

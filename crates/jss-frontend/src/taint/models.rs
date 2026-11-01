@@ -138,6 +138,10 @@ pub struct AuthSpec {
     pub request_fields: Vec<String>,
     #[serde(default)]
     pub decorators: Vec<String>,
+    /// Middleware whose names contain an auth word but that check nothing (exact names,
+    /// case-insensitive): `session(...)`, `passport.initialize()`.
+    #[serde(default)]
+    pub setup: Vec<String>,
 }
 
 /// An authentication level in a pack.
@@ -562,6 +566,7 @@ pub struct Model {
     pub auth_admin: Vec<String>,
     pub auth_request_fields: Vec<String>,
     pub auth_decorators: Vec<String>,
+    pub auth_setup: Vec<String>,
     pub route_method_keys: Vec<String>,
     pub mount_methods: Vec<String>,
     pub router_factories: Vec<String>,
@@ -708,6 +713,8 @@ impl Model {
         self.auth_middleware.extend(pack.auth.middleware);
         self.auth_admin.extend(pack.auth.admin);
         self.auth_request_fields.extend(pack.auth.request_fields);
+        self.auth_setup
+            .extend(pack.auth.setup.iter().map(|n| n.to_ascii_lowercase()));
         self.auth_decorators.extend(pack.auth.decorators);
         self.input_fields.extend(pack.input_fields);
         self.route_method_keys.extend(pack.routes.method_keys);
@@ -773,6 +780,11 @@ impl Model {
     /// The authentication a middleware or guard name implies, if any.
     pub fn auth_of(&self, name: &str) -> Option<jss_core::Auth> {
         let lower = name.to_ascii_lowercase();
+        // `session ` from `session({...})`: the callee, without its string arguments.
+        let head = lower.split_whitespace().next().unwrap_or("");
+        if self.auth_setup.iter().any(|s| s == head) {
+            return None;
+        }
         if self.auth_admin.iter().any(|a| lower.contains(a.as_str())) {
             Some(jss_core::Auth::Admin)
         } else if self
@@ -840,9 +852,10 @@ impl Model {
 
     /// Whether `call` (a callee name, `obj.method` or `method`) escapes data for `class`.
     pub fn escapes(&self, class: VulnClass, call: &str) -> bool {
+        // `escapeHTML` and `escapeHtml` are the same escaper.
         self.escapers
             .get(class.name())
-            .is_some_and(|calls| calls.iter().any(|c| c == call))
+            .is_some_and(|calls| calls.iter().any(|c| c.eq_ignore_ascii_case(call)))
     }
 }
 

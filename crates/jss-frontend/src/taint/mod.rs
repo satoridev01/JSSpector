@@ -216,6 +216,7 @@ pub fn scan_file_program(
         pending_request_kind: std::cell::Cell::new(None),
         pending_server_fields: std::cell::Cell::new(None),
         router_auth: BTreeMap::new(),
+        inline_names: BTreeMap::new(),
         routers: BTreeSet::new(),
         injected: BTreeMap::new(),
         export_aliases: BTreeSet::new(),
@@ -236,11 +237,15 @@ pub fn scan_file_program(
     // Two summary passes: the second sees the first's summaries (helpers calling helpers).
     for _ in 0..2 {
         walker.modules.clear();
+        // Middleware applies to the routes registered after it, in program order: never carry
+        // a later `use(auth)` into an earlier route through a previous pass.
+        walker.router_auth.clear();
         let mut env = Env::new("<module>".to_owned());
         walker.statements(&program.body, &mut env);
     }
     walker.summarize = false;
     walker.modules.clear();
+    walker.router_auth.clear();
     walker.result = ScanResult {
         findings: Vec::new(),
         truncated: walker.result.truncated,
@@ -399,6 +404,12 @@ struct Env {
     plain: BTreeSet<String>,
     /// Client-source parameters whose listed fields the server chose (`file.path` of an upload).
     server_fields: BTreeMap<String, &'static [String]>,
+    /// Variables holding what an auth call returned (`const user = verifyToken(token)`): a
+    /// falsy one means the caller is not logged in (or not an admin).
+    auth_vars: BTreeMap<String, Auth>,
+    /// Variables initialized by a call (routers, apps), by name: where they were declared, so
+    /// same-named variables of different functions are told apart.
+    declared: BTreeMap<String, u32>,
     /// Inside a branch or loop: assignments only add taint.
     branch: u32,
     function: String,
@@ -438,6 +449,8 @@ impl Env {
             scalars: BTreeSet::new(),
             plain: BTreeSet::new(),
             server_fields: BTreeMap::new(),
+            declared: BTreeMap::new(),
+            auth_vars: BTreeMap::new(),
             branch: 0,
             function,
         }
@@ -458,6 +471,8 @@ impl Env {
             scalars: self.scalars.clone(),
             plain: self.plain.clone(),
             server_fields: self.server_fields.clone(),
+            declared: self.declared.clone(),
+            auth_vars: self.auth_vars.clone(),
             branch: 0,
             function,
         }
@@ -545,7 +560,12 @@ struct Walker<'e> {
     /// The `server_fields` of the client source the next callback is registered for.
     pending_server_fields: std::cell::Cell<Option<&'static [String]>>,
     /// Routers with authentication middleware applied to every later route: `router.use(auth)`.
-    router_auth: BTreeMap<String, Auth>,
+    /// Middleware added with `use(...)` on each router (by [`router_key`]): the path prefix it
+    /// guards (`""` for all) and the authentication it requires, in registration order.
+    router_auth: BTreeMap<String, Vec<(String, Auth)>>,
+    /// Names given to inline route handlers (`GET /items`), with the registration that took
+    /// each: kept across passes so every pass names a handler the same way.
+    inline_names: BTreeMap<String, u32>,
     /// Variables bound to a router or app from a factory: `const router = express.Router()`.
     routers: BTreeSet<String>,
     /// Constructor-injected fields of the class being walked: `this.users` -> `UsersService`.
@@ -587,6 +607,47 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
             ..a
         }),
         (a, b) => a.or(b),
+    }
+}
+
+/// The authentication an initializer's auth call implies: `verifyToken(t)`, `await auth()`,
+/// `token ? verifyToken(token) : null`.
+fn auth_call_level(init: &Expression<'_>) -> Option<Auth> {
+    match init.get_inner_expression() {
+        Expression::AwaitExpression(a) => auth_call_level(&a.argument),
+        Expression::ConditionalExpression(c) => {
+            auth_call_level(&c.consequent).max(auth_call_level(&c.alternate))
+        }
+        Expression::LogicalExpression(l) => auth_call_level(&l.left).max(auth_call_level(&l.right)),
+        Expression::CallExpression(call) => {
+            callee_name(&call.callee).and_then(|name| m().auth_of(&name))
+        }
+        _ => None,
+    }
+}
+
+/// Whether middleware `use`d under `prefix` runs for a route at `path` (`None`: unknown path,
+/// covered only by router-wide middleware).
+fn covers(prefix: &str, path: Option<&str>) -> bool {
+    let prefix = prefix.trim_end_matches('*').trim_end_matches('/');
+    if prefix.is_empty() {
+        return true;
+    }
+    path.is_some_and(|path| {
+        let path = path.trim_end_matches('/');
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// The key of a router's middleware state: its name and where it was declared (or, for a
+/// parameter or a global, the function using it).
+fn router_key(name: &str, env: &Env) -> String {
+    match env.declared.get(name) {
+        Some(at) => format!("{name}@{at}"),
+        None => format!("{name}@{}", env.function),
     }
 }
 
@@ -859,8 +920,8 @@ impl Walker<'_> {
                 self.branch(&s.consequent, env);
                 let consequent_exits = guards::exits(&s.consequent);
                 // `if (!req.user) return res.status(401)...`: past here, the caller is logged in.
-                if consequent_exits && self.requires_login(&s.test, env) {
-                    env.auth = env.auth.max(Auth::User);
+                if consequent_exits && let Some(level) = self.requires_login(&s.test, env) {
+                    env.auth = env.auth.max(level);
                 }
                 if consequent_exits {
                     // Taint added in an exiting branch never reaches what follows.
@@ -1244,8 +1305,41 @@ impl Walker<'_> {
                     env.tables.insert(name.clone(), rows);
                 }
             }
+            // `const user = verifyToken(token)`, `const session = await getServerSession()`,
+            // `const { user } = await auth()`: what an auth call returned.
+            let auth_call = auth_call_level(init);
+            let mut bound = Vec::new();
+            match &declarator.id {
+                BindingPattern::BindingIdentifier(id) => bound.push(id.name.as_str().to_owned()),
+                BindingPattern::ObjectPattern(object) => {
+                    for property in &object.properties {
+                        if let BindingPattern::BindingIdentifier(id) = &property.value {
+                            bound.push(id.name.as_str().to_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for name in bound {
+                match auth_call {
+                    Some(level) => {
+                        env.auth_vars.insert(name, level);
+                    }
+                    None => {
+                        env.auth_vars.remove(&name);
+                    }
+                }
+            }
             // `const router = express.Router()`, `const app = fastify()`
             if let Some(name) = &name_hint {
+                if matches!(
+                    init.get_inner_expression(),
+                    Expression::CallExpression(_) | Expression::NewExpression(_)
+                ) {
+                    env.declared.insert(name.clone(), declarator.span.start);
+                } else {
+                    env.declared.remove(name);
+                }
                 let factory = match init.get_inner_expression() {
                     Expression::CallExpression(c) => callee_name(&c.callee),
                     Expression::NewExpression(n) => callee_name(&n.callee),
@@ -1459,14 +1553,36 @@ impl Walker<'_> {
     fn class(&mut self, class: &Class<'_>, env: &mut Env) {
         let class_name = class.id.as_ref().map(|id| id.name.as_str().to_owned());
         // `@UseGuards(AuthGuard)` on the class or a method: every request passes the guard.
+        // Rated by the guards it names (`@UseGuards(ThrottlerGuard)` is no login check,
+        // `@UseGuards(AdminGuard)` an admin one); a bare auth decorator (`@Authorized()`) is a
+        // login check.
         let guarded = |decorators: &[oxc_ast::ast::Decorator<'_>]| {
             decorators
                 .iter()
                 .filter_map(|d| {
                     let name = callee_name(&d.expression)?;
                     let head = name.split([' ', '(', '.']).next().unwrap_or("").to_owned();
-                    has(&m().auth_decorators, &head)
-                        .then(|| m().auth_of(&name).unwrap_or(Auth::User))
+                    if !has(&m().auth_decorators, &head) {
+                        return None;
+                    }
+                    let Expression::CallExpression(call) = d.expression.get_inner_expression()
+                    else {
+                        return Some(Auth::User);
+                    };
+                    if call.arguments.is_empty() {
+                        return Some(Auth::User);
+                    }
+                    let named: Vec<Auth> = call
+                        .arguments
+                        .iter()
+                        .filter_map(Argument::as_expression)
+                        .filter_map(|a| match a.get_inner_expression() {
+                            Expression::StringLiteral(l) => l.value.as_str().map(str::to_owned),
+                            other => callee_name(other),
+                        })
+                        .filter_map(|guard| m().auth_of(&guard))
+                        .collect();
+                    named.into_iter().max()
                 })
                 .max()
         };
@@ -2736,32 +2852,70 @@ impl Walker<'_> {
         {
             return None;
         }
-        // Any property of a tainted object is tainted.
-        self.expr(member.object(), env)
+        // Any property of a tainted object is tainted. In the summary pass, `opts.cmd` of a
+        // parameter is recorded as that field: a call then passes only that field of its
+        // argument (`run({ cmd: 'ls', user })`, `discard(req.file)` reading `file.path`).
+        let whole = self.expr(member.object(), env);
+        if self.summarize
+            && let (Expression::Identifier(_), Some(property)) = (object, property.as_deref())
+            && let Some(origin) = &whole
+            && origin.param.is_some()
+            && !self.field_of.contains_key(&origin.span.start)
+        {
+            let mut field = origin.clone();
+            field.span = member.span();
+            self.field_of
+                .insert(member.span().start, property.to_owned());
+            if let Some(class) = self.ctor_params.get(&origin.span.start).cloned() {
+                self.ctor_params.insert(member.span().start, class);
+            }
+            return Some(field);
+        }
+        whole
     }
 
-    /// `!req.user`, `!req.session.userId`, `!req.isAuthenticated()`: a test that is true when no
-    /// one is logged in.
-    fn requires_login(&self, test: &Expression<'_>, env: &Env) -> bool {
+    /// `!req.user`, `!req.session.userId`, `!req.isAuthenticated()`, `!isAdmin(req)`, or `!user`
+    /// after `const user = verifyToken(token)`: a test that is true when the caller is not
+    /// logged in (or not an admin). The level it establishes once it failed.
+    fn requires_login(&self, test: &Expression<'_>, env: &Env) -> Option<Auth> {
         let Expression::UnaryExpression(u) = test.get_inner_expression() else {
             if let Expression::LogicalExpression(l) = test.get_inner_expression() {
-                return self.requires_login(&l.left, env) || self.requires_login(&l.right, env);
+                return self
+                    .requires_login(&l.left, env)
+                    .max(self.requires_login(&l.right, env));
             }
-            return false;
+            return None;
         };
         if u.operator != UnaryOperator::LogicalNot {
-            return false;
+            return None;
         }
-        let target = match u.argument.get_inner_expression() {
-            Expression::CallExpression(call) => &call.callee,
+        let argument = u.argument.get_inner_expression();
+        // `!user`, where `user` came from an auth call: someone is logged in (whatever an
+        // admin-sounding name says: `const owner = findOwner(id)` is a lookup).
+        if let Expression::Identifier(id) = argument
+            && env.auth_vars.contains_key(id.name.as_str())
+        {
+            return Some(Auth::User);
+        }
+        let target = match argument {
+            // `!isAdmin(req)`, `!verifyToken(token)`: a yes/no check named like auth.
+            Expression::CallExpression(call) => {
+                let name = callee_name(&call.callee).unwrap_or_default();
+                let last = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                if guards::is_predicate(&last)
+                    && let Some(level) = m().auth_of(&name)
+                {
+                    return Some(level);
+                }
+                &call.callee
+            }
             other => other,
         };
-        let Some(key) = guards::path_key(target) else {
-            return false;
-        };
+        let key = guards::path_key(target)?;
         let mut parts = key.split('.');
         let root = parts.next().unwrap_or("");
-        env.requests.contains_key(root) && parts.any(|p| has(&m().auth_request_fields, p))
+        (env.requests.contains_key(root) && parts.any(|p| has(&m().auth_request_fields, p)))
+            .then_some(Auth::User)
     }
 
     /// The source kind when `expr` is a request object: a request parameter, or `ctx.request`.
@@ -2895,15 +3049,14 @@ impl Walker<'_> {
 
         // How function arguments are entered.
         let (role, shape) = self.client_role(&callee, &call.callee, &call.arguments, env);
-        let route_name = match (&callee, call.arguments.first()) {
-            (Callee::Method { method, .. }, Some(Argument::StringLiteral(path)))
-                if role == Role::Route =>
-            {
-                Some(format!(
-                    "{} {}",
-                    method.to_ascii_uppercase(),
-                    path.value.as_str().unwrap_or("?")
-                ))
+        let route_name = match (
+            &callee,
+            call.arguments.first().and_then(Argument::as_expression),
+        ) {
+            (Callee::Method { method, object }, Some(first)) if role == Role::Route => {
+                self.resolve_text(first, env).map(|path| {
+                    self.inline_route_name(method, &path, object.as_deref(), call.span.start)
+                })
             }
             _ => None,
         };
@@ -2924,28 +3077,55 @@ impl Walker<'_> {
             .filter_map(|name| m().auth_of(&name))
             .max()
             .unwrap_or_default();
+        // What earlier `use(...)` calls on this router require under this route's path.
+        let route_path = call
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .and_then(|e| self.mount_path(e, env));
         let route_auth = receiver_name
             .as_deref()
-            .and_then(|r| self.router_auth.get(r).copied())
+            .and_then(|r| self.router_auth.get(&router_key(r, env)))
+            .map(|guards| {
+                guards
+                    .iter()
+                    .filter(|(prefix, _)| covers(prefix, route_path.as_deref()))
+                    .map(|(_, auth)| *auth)
+                    .max()
+                    .unwrap_or_default()
+            })
             .unwrap_or_default()
             .max(middleware_auth);
+        // `router.use(auth)`, `app.use('/api', jwt())`: middleware for the routes registered after
+        // it on this router (under that path). A use() that mounts routers (`use(adminRouter)`,
+        // `use('/admin', requireAdmin, child)`) guards only what it mounts.
         if let Callee::Method {
             object: Some(object),
             method,
         } = &callee
-            && has(&m().route_methods, method)
-            && role != Role::Route
+            && has(&m().mount_methods, method)
         {
-            // `router.use(auth)`: a router-wide middleware.
-            let used = call
+            let arguments: Vec<&Expression<'_>> = call
                 .arguments
                 .iter()
-                .filter_map(|a| a.as_expression().and_then(callee_name))
-                .filter_map(|name| m().auth_of(&name))
-                .max();
-            if let Some(level) = used {
-                let entry = self.router_auth.entry(object.clone()).or_default();
-                *entry = (*entry).max(level);
+                .filter_map(Argument::as_expression)
+                .collect();
+            let prefix = arguments.first().and_then(|e| self.mount_path(e, env));
+            let middleware = arguments
+                .get(usize::from(prefix.is_some())..)
+                .unwrap_or(&[]);
+            if !middleware.iter().any(|e| self.mountable(e)) {
+                let used = middleware
+                    .iter()
+                    .filter_map(|e| callee_name(e))
+                    .filter_map(|name| m().auth_of(&name))
+                    .max();
+                if let Some(level) = used {
+                    self.router_auth
+                        .entry(router_key(object, env))
+                        .or_default()
+                        .push((prefix.unwrap_or_default(), level));
+                }
             }
         }
         // Routes are kept from the final pass only (facts reset before it); templates from any.
@@ -3584,6 +3764,19 @@ impl Walker<'_> {
         whole: Option<Origin>,
     ) -> Option<Origin> {
         let expr = argument?.as_expression()?.get_inner_expression();
+        // The server chose this field: an upload's `path` (`move(req.file)`), or a field a
+        // client source lists as the server's.
+        if has(&m().upload_server_fields, field) && self.is_upload_object(expr, env) {
+            return None;
+        }
+        if let Expression::Identifier(id) = expr
+            && env
+                .server_fields
+                .get(id.name.as_str())
+                .is_some_and(|fields| has(fields, field))
+        {
+            return None;
+        }
         match expr {
             Expression::ObjectExpression(object) => {
                 let mut taint = None;
@@ -3614,6 +3807,29 @@ impl Walker<'_> {
     }
 
     /// Records the entry point or mount a registration call makes.
+    /// The name of an inline route handler: `GET /items`, or, when another registration in
+    /// this file already took that name, with its receiver (`GET / [settings]`).
+    fn inline_route_name(
+        &mut self,
+        method: &str,
+        path: &str,
+        receiver: Option<&str>,
+        at: u32,
+    ) -> String {
+        let base = format!("{} {path}", method.to_ascii_uppercase());
+        match self.inline_names.get(&base) {
+            None => {
+                self.inline_names.insert(base.clone(), at);
+                base
+            }
+            Some(first) if *first == at => base,
+            Some(_) => match receiver {
+                Some(receiver) => format!("{base} [{receiver}]"),
+                None => base,
+            },
+        }
+    }
+
     fn record_entry(
         &mut self,
         callee: &Callee,
@@ -3752,6 +3968,26 @@ impl Walker<'_> {
         if method_param.is_some() {
             return;
         }
+        // `router.use(child)`, `app.use(requireAuth, api)`: path-less mounts.
+        if has(&m().mount_methods, &method)
+            && object.as_deref().is_some_and(|o| self.is_router(o))
+            && first.is_some_and(|e| self.mount_path(e, env).is_none())
+        {
+            for argument in call.arguments.iter().filter_map(Argument::as_expression) {
+                if !self.mountable(argument) {
+                    continue;
+                }
+                let (target, target_file) = self.mount_target(argument);
+                self.facts.mounts.push(MountFact {
+                    receiver: object.clone(),
+                    prefix: String::new(),
+                    target,
+                    target_file,
+                    auth,
+                });
+            }
+            return;
+        }
         let Some(path) = first.and_then(|e| self.resolve_text(e, env)) else {
             return;
         };
@@ -3782,7 +4018,9 @@ impl Walker<'_> {
                 Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => None,
                 other => callee_name(other),
             })
-            .unwrap_or_else(|| format!("{} {path}", method.to_ascii_uppercase()));
+            .unwrap_or_else(|| {
+                self.inline_route_name(method, &path, object.as_deref(), call.span.start)
+            });
         let is_function = last.is_some_and(|e| {
             matches!(
                 e.get_inner_expression(),
@@ -3793,20 +4031,8 @@ impl Walker<'_> {
             {
                 // `router.use('/api', child)`: a mount, unless the last argument is a handler.
                 if has(&m().mount_methods, method) && !is_function {
-                    let (target, target_file) = match last.map(Expression::get_inner_expression) {
-                        Some(Expression::Identifier(id)) => {
-                            (Some(id.name.as_str().to_owned()), None)
-                        }
-                        Some(e) => {
-                            // `require('./users')` or a factory `require('./users')()`.
-                            let required = match e {
-                                Expression::CallExpression(c) if require_spec(e).is_none() => {
-                                    require_spec(&c.callee)
-                                }
-                                _ => require_spec(e),
-                            };
-                            (None, required.and_then(|spec| self.linking.resolve(&spec)))
-                        }
+                    let (target, target_file) = match last {
+                        Some(e) => self.mount_target(e),
                         None => (None, None),
                     };
                     self.facts.mounts.push(MountFact {
@@ -3875,6 +4101,79 @@ impl Walker<'_> {
     }
 
     /// A router or app variable: from a factory, or named like one.
+    /// Whether `expr` is an upload object of the request: `req.file`, `req.files[0]`,
+    /// `req.files.avatar[0]`.
+    fn is_upload_object(&self, expr: &Expression<'_>, env: &Env) -> bool {
+        let mut cursor = expr.get_inner_expression();
+        while let Expression::ComputedMemberExpression(c) = cursor {
+            cursor = c.object.get_inner_expression();
+        }
+        let model = m();
+        let upload = |member: &oxc_ast::ast::MemberExpression<'_>| {
+            member
+                .static_property_name()
+                .is_some_and(|p| has(&model.upload_objects, p.as_str().unwrap_or("")))
+        };
+        // `req.files.avatar`: the field under the upload object.
+        let member = match cursor.as_member_expression() {
+            Some(outer) if upload(outer) => Some(outer),
+            Some(outer) => outer
+                .object()
+                .get_inner_expression()
+                .as_member_expression()
+                .filter(|inner| upload(inner)),
+            None => None,
+        };
+        member.is_some_and(|member| {
+            self.request_kind(member.object().get_inner_expression(), env)
+                .is_some()
+        })
+    }
+
+    /// The path a `use(path, ...)` or a route starts with: text, or a call that joins text
+    /// (`urljoin(root, 'api')`), never auth middleware (`passport.authenticate('jwt')`).
+    fn mount_path(&self, expr: &Expression<'_>, env: &Env) -> Option<String> {
+        if matches!(expr.get_inner_expression(), Expression::CallExpression(_))
+            && callee_name(expr).is_some_and(|name| m().auth_of(&name).is_some())
+        {
+            return None;
+        }
+        self.resolve_text(expr, env)
+    }
+
+    /// Whether a `use(...)` argument mounts routes rather than adding middleware: a router, a
+    /// router imported from our own files, or `require('./routes')` (or a factory call of it).
+    fn mountable(&self, expr: &Expression<'_>) -> bool {
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) => {
+                let name = id.name.as_str();
+                self.is_router(name)
+                    || (self.relative.contains_key(name) && m().auth_of(name).is_none())
+            }
+            e @ Expression::CallExpression(c) => {
+                require_spec(e).is_some() || require_spec(&c.callee).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// What a mount argument names: a local router, or the file of `require('./users')` (or of
+    /// a factory `require('./users')()`).
+    fn mount_target(&self, expr: &Expression<'_>) -> (Option<String>, Option<String>) {
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) => (Some(id.name.as_str().to_owned()), None),
+            e => {
+                let required = match e {
+                    Expression::CallExpression(c) if require_spec(e).is_none() => {
+                        require_spec(&c.callee)
+                    }
+                    _ => require_spec(e),
+                };
+                (None, required.and_then(|spec| self.linking.resolve(&spec)))
+            }
+        }
+    }
+
     fn is_router(&self, name: &str) -> bool {
         self.routers.contains(name) || {
             let lower = name.to_ascii_lowercase();
@@ -5203,6 +5502,79 @@ mod tests {
                    form.on('file', (name, file) => { fs.remove(file.path); });\n\
                  });")
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn parameter_summaries_follow_the_field_that_reaches_the_sink() {
+        let helper = "function run(opts) { exec('cmd ' + opts.cmd); }\n";
+        assert!(
+            one(&format!(
+                "{helper}app.get('/p', (req, res) => {{ run({{ cmd: 'ls', user: req.query.u }}); }});"
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            one(&format!(
+                "{helper}app.get('/p', (req, res) => {{ run({{ cmd: req.query.c, user: 'x' }}); }});"
+            ))
+            .len(),
+            1
+        );
+        // An upload's temporary path is the server's; its original name is the client's.
+        let helpers = "function discard(file) { fs.unlink(file.path, () => {}); }\n\
+                       function keep(file) { fs.writeFileSync(path.join(dir, file.originalname), x); }\n";
+        assert!(
+            one(&format!(
+                "{helpers}app.post('/u', upload.single('f'), (req, res) => {{ discard(req.file); }});"
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            one(&format!(
+                "{helpers}app.post('/u', upload.single('f'), (req, res) => {{ keep(req.file); }});"
+            ))
+            .iter()
+            .map(|f| f.0)
+            .collect::<Vec<_>>(),
+            vec![VulnClass::PathTraversal]
+        );
+    }
+
+    #[test]
+    fn auth_checks_on_what_an_auth_call_returned() {
+        assert_eq!(
+            auth_of(
+                "app.post('/p', (req, res) => { const token = req.headers.authorization;\n\
+                 const user = token ? verifyToken(token) : null;\n\
+                 if (!user) return res.status(401).end();\n\
+                 exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "app.post('/p', async (req, res) => { const session = await getServerSession(opts);\n\
+                 if (!session) { return res.status(401).end(); }\n\
+                 exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "app.post('/p', (req, res) => { if (!isAdmin(req)) return res.sendStatus(403);\n\
+                 exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::Admin, Severity::High)]
+        );
+        // A value from any other call proves nothing.
+        assert_eq!(
+            auth_of(
+                "app.post('/p', (req, res) => { const item = lookup(req.body.id);\n\
+                 if (!item) return res.status(404).end();\n\
+                 exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::NoneDetected, Severity::Critical)]
         );
     }
 

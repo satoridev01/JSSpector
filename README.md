@@ -61,9 +61,26 @@ Routes are followed through router mounts across files (`app.use('/api', require
 
 Every framework or library fact is data in [`packs/*.yaml`](packs/) (sources, sinks with argument rules, propagators, sanitizers, guards, route conventions, auth patterns). `cargo xtask ci` fails if the engine repeats a name a pack lists.
 
+### Linking and the IR
+
+Each file is lowered to an owned IR (`jss_core::ir`: imports resolved to files, exports, functions with their calls and flows, entry points, mounts). Imports resolve relative paths, monorepo workspace packages (`package.json` names, `dist/` mapped back to `src/`), tsconfig/jsconfig `baseUrl` and `paths`, barrels (`export * from`) and namespace re-exports. Summaries, route templates and constants (enum members, `const` strings) cross files through those links, iterated until nothing new is learned. Findings are linked to the entry point that reaches them through the call graph, and take that route's authentication (including middleware on mounts in other files). `jsspector ir` prints the IR and call graph.
+
 ### Measuring
 
-`cargo xtask replay` scores `scan` against the verified CVE-replay pairs in [`corpus/research/`](corpus/research/): the advisory's sink must be found at the vulnerable commit and gone at the fix. Repositories are fetched blobless and sparse; nothing in them is run.
+`cargo xtask replay` scores `scan` against the verified CVE-replay pairs in [`corpus/research/`](corpus/research/): a finding of the advisory's class must have its sink in the advisory's file (nearest to its line) at the vulnerable commit, and that finding's line-independent key must be gone at the fix. Repositories are fetched blobless and sparse; nothing in them is run.
+
+Latest measurements (2026-11-01, static reading only):
+
+| What | Result |
+|---|---|
+| Route recall vs the project's own OpenAPI spec: immich (NestJS) | 245/245 operations (100%); 99.2% of our operations are in the spec |
+| Route recall vs spec: NodeBB (Express + route helpers) | 106/153 (69.3%); plugin-remountable mounts (`admin`, `tags`, `groups`) are named at runtime |
+| socket.io events, uptime-kuma server | 71/71 |
+| Electron `ipcMain` channels, OpenWhispr | 558/575 (97%) |
+| CVE replay, covered classes | 4/69 detected (all path traversal), 2/4 cleared at the fix |
+| 100-repo corpus, HIGH/CRITICAL candidates | 118, including both hand-confirmed true positives |
+
+The n8n public API is defined by its OpenAPI document (`express-openapi-validator` wires operations to handlers), so it has no route registrations to extract; its internal `@RestController` API (263 routes) is inventoried with each route's authentication.
 
 ## What it will do (the plan)
 

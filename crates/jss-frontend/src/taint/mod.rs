@@ -10,6 +10,7 @@
 //!   assignment clears it.
 //! - Recursion is capped at [`MAX_DEPTH`]; a capped file says so (`truncated`).
 
+mod guards;
 pub mod models;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -189,18 +190,42 @@ struct Env {
     sockets: BTreeSet<String>,
     /// Names whose `.input` field is client data (tRPC procedure options).
     inputs: BTreeMap<String, &'static str>,
+    /// Access paths a guard validated: no longer tainted.
+    clean: BTreeSet<String>,
+    /// Access paths a guard proved scalar: never an object.
+    scalars: BTreeSet<String>,
     /// Inside a branch or loop: assignments only add taint.
     branch: u32,
     function: String,
 }
 
 impl Env {
+    /// Records what a guard established.
+    fn learn(&mut self, facts: Vec<(String, guards::Fact)>) {
+        for (key, fact) in facts {
+            match fact {
+                guards::Fact::Clean => {
+                    self.vars.remove(&key);
+                    self.clean.insert(key);
+                }
+                guards::Fact::Scalar => {
+                    if let Some(origin) = self.vars.get_mut(&key) {
+                        origin.object = false;
+                    }
+                    self.scalars.insert(key);
+                }
+            }
+        }
+    }
+
     fn new(function: String) -> Self {
         Self {
             vars: BTreeMap::new(),
             requests: BTreeMap::new(),
             sockets: BTreeSet::new(),
             inputs: BTreeMap::new(),
+            clean: BTreeSet::new(),
+            scalars: BTreeSet::new(),
             branch: 0,
             function,
         }
@@ -212,6 +237,8 @@ impl Env {
             requests: self.requests.clone(),
             sockets: self.sockets.clone(),
             inputs: self.inputs.clone(),
+            clean: self.clean.clone(),
+            scalars: self.scalars.clone(),
             branch: 0,
             function,
         }
@@ -401,6 +428,10 @@ impl Walker<'_> {
         match statement {
             Statement::ExpressionStatement(s) => {
                 self.expr(&s.expression, env);
+                // `check(x, String)`, `assertSafe(x)`: past this line, the assertion held.
+                let mut asserted = Vec::new();
+                guards::assertion(statement, &mut asserted);
+                env.learn(asserted);
             }
             Statement::VariableDeclaration(d) => self.var_decl(d, env),
             Statement::FunctionDeclaration(f) => {
@@ -411,9 +442,38 @@ impl Walker<'_> {
             Statement::BlockStatement(b) => self.statements(&b.body, env),
             Statement::IfStatement(s) => {
                 self.expr(&s.test, env);
+                // Inside the consequent, the test held; inside the alternate, it failed.
+                let mut held = Vec::new();
+                guards::facts(&s.test, true, &mut held);
+                let mut failed = Vec::new();
+                guards::facts(&s.test, false, &mut failed);
+                let saved = (env.vars.clone(), env.clean.clone(), env.scalars.clone());
+                env.learn(held);
                 self.branch(&s.consequent, env);
+                let consequent_exits = guards::exits(&s.consequent);
+                if consequent_exits {
+                    // Taint added in an exiting branch never reaches what follows.
+                    (env.vars, env.clean, env.scalars) = saved;
+                } else {
+                    // The guard only held inside: what it cleaned is tainted again after.
+                    for (name, origin) in saved.0 {
+                        env.vars.entry(name).or_insert(origin);
+                    }
+                    env.clean = saved.1;
+                    env.scalars = saved.2;
+                }
                 if let Some(alternate) = &s.alternate {
+                    let saved = (env.vars.clone(), env.clean.clone(), env.scalars.clone());
+                    env.learn(failed.clone());
                     self.branch(alternate, env);
+                    for (name, origin) in saved.0 {
+                        env.vars.entry(name).or_insert(origin);
+                    }
+                    (env.clean, env.scalars) = (saved.1, saved.2);
+                }
+                // `if (!valid(x)) return;`: what follows only runs when the test failed.
+                if consequent_exits {
+                    env.learn(failed);
                 }
             }
             Statement::ReturnStatement(s) => {
@@ -997,7 +1057,12 @@ impl Walker<'_> {
 
     fn expr_inner(&mut self, expr: &Expression<'_>, env: &mut Env) -> Option<Origin> {
         match expr {
-            Expression::Identifier(id) => env.vars.get(id.name.as_str()).cloned(),
+            Expression::Identifier(id) => env.vars.get(id.name.as_str()).cloned().map(|mut o| {
+                if env.scalars.contains(id.name.as_str()) {
+                    o.object = false;
+                }
+                o
+            }),
             Expression::StaticMemberExpression(_)
             | Expression::ComputedMemberExpression(_)
             | Expression::PrivateFieldExpression(_) => self.member(expr, env),
@@ -1326,10 +1391,40 @@ impl Walker<'_> {
         member: &oxc_ast::ast::MemberExpression<'_>,
         env: &mut Env,
     ) -> Option<Origin> {
+        // A guard validated this access path or one of its prefixes.
+        let key = guards::member_key(member);
+        let prefixes = || {
+            key.iter().flat_map(|k| {
+                k.match_indices('.')
+                    .map(|(at, _)| k.get(..at).unwrap_or(""))
+                    .chain(std::iter::once(k.as_str()))
+            })
+        };
+        if prefixes().any(|p| env.clean.contains(p)) {
+            if let oxc_ast::ast::MemberExpression::ComputedMemberExpression(c) = member {
+                self.expr(&c.expression, env);
+            }
+            return None;
+        }
+        let scalar = prefixes().any(|p| env.scalars.contains(p));
+        self.member_of_inner(member, env).map(|mut o| {
+            if scalar {
+                o.object = false;
+            }
+            o
+        })
+    }
+
+    fn member_of_inner(
+        &mut self,
+        member: &oxc_ast::ast::MemberExpression<'_>,
+        env: &mut Env,
+    ) -> Option<Origin> {
         use oxc_ast::ast::MemberExpression as M;
         if let M::ComputedMemberExpression(computed) = member {
             self.expr(&computed.expression, env);
         }
+
         let property = member
             .static_property_name()
             .and_then(|name| name.as_str().map(str::to_owned));
@@ -2461,6 +2556,33 @@ mod tests {
         let any =
             one("io.on('connection', (socket) => { socket.onAny((event, data) => exec(data)); });");
         assert_eq!(any.len(), 1, "{any:?}");
+    }
+
+    #[test]
+    fn guards_from_real_false_positives_clean_the_value() {
+        // uptime-kuma: regex allowlist before path.join
+        assert!(one("io.on('connection', (socket) => { socket.on('ex', async (language, cb) => { if (!/^[a-z-]+$/.test(language)) { throw new Error('bad'); } fs.readdir(path.join('./x', language), cb); }); });").is_empty());
+        // Haven: hex id regex, then a temp path
+        assert!(one("app.post('/i', (req, res) => { const { importId } = req.body; if (!/^[a-f0-9]{32}$/.test(importId)) { return res.status(400).end(); } fs.readFile(path.join(tmp, importId), cb); });").is_empty());
+        // mirotalksfu / OpenWhispr: resolved path must stay under the base
+        assert!(one("app.post('/r', (req, res) => { const p = path.resolve(base, req.query.f); if (!p.startsWith(base)) { return res.status(400).end(); } fs.createWriteStream(p); });").is_empty());
+        // positive form: use inside the validated block only
+        assert!(one("app.get('/a', (req, res) => { const n = req.query.n; if (ALLOWED.includes(n)) { exec('run ' + n); } });").is_empty());
+        assert_eq!(one("app.get('/a', (req, res) => { const n = req.query.n; if (ALLOWED.includes(n)) { log(n); } exec('run ' + n); });").len(), 1);
+        // a guard that does not exit cleans nothing after it
+        assert_eq!(one("app.get('/a', (req, res) => { const n = req.query.n; if (!/^\\w+$/.test(n)) { log('bad'); } exec('run ' + n); });").len(), 1);
+        // a guard on a request field
+        assert!(one("app.get('/a', (req, res) => { if (!isValidId(req.query.id)) return res.end(); exec('run ' + req.query.id); });").is_empty());
+        // comparison with a constant
+        assert!(one("app.get('/a', (req, res) => { const m = req.query.m; if (m !== 'fast' && m !== 'slow') return; exec('run ' + m); });").is_empty());
+    }
+
+    #[test]
+    fn type_assertions_rule_out_nosql_objects_only() {
+        assert!(one("Meteor.methods({ load(boardId) { check(boardId, String); return Boards.find({ _id: boardId }); } });").is_empty());
+        assert!(one("app.post('/l', async (req, res) => { const e = req.body.email; if (typeof e !== 'string') return; await User.findOne({ email: e }); });").is_empty());
+        // a string check does not make SQL text safe
+        assert_eq!(one("app.post('/l', async (req, res) => { const e = req.body.email; if (typeof e !== 'string') return; await db.query('SELECT * FROM u WHERE e = ' + e); });").len(), 1);
     }
 
     #[test]

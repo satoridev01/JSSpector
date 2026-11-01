@@ -56,7 +56,9 @@ sanitizers:
   calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN]
   # Used as a guard (`if (!isValid(x)) return;`), these clear their argument on the passing path.
   validators: [isUUID, isUuid, uuidValidate, validate, isValid, isValidId, isSafe, isSafeName, isAlphanumeric,
-    isInt, isNumeric, isEmail, isURL, isMongoId, isValidObjectId, isSafeMapKey, isFinite, isInteger, includes, has]
+    isInt, isNumeric, isEmail, isURL, isMongoId, isValidObjectId, isSafeMapKey, isFinite, isInteger, includes, has,
+    test, isPathInside, isWithin, isSubPath]
+  receiver_validators: [startsWith, match]
   escapers:
     sql-injection: [escape, escapeId, format, mysql.escape, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
     xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss]

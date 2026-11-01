@@ -250,6 +250,12 @@ pub struct Sanitizers {
     /// Calls that, used as a guard (`if (!isValid(x)) return`), clear their argument.
     #[serde(default)]
     pub validators: Vec<String>,
+    /// Methods that, true, validate their receiver: `p.startsWith(base)`.
+    #[serde(default)]
+    pub receiver_validators: Vec<String>,
+    /// Statements that throw unless their first argument has a type: `check(x, String)`.
+    #[serde(default)]
+    pub type_assertions: Vec<String>,
     /// Calls that escape for one class only: `class: [calls]`.
     #[serde(default)]
     pub escapers: BTreeMap<String, Vec<String>>,
@@ -377,6 +383,8 @@ pub struct Model {
     pub pass_globals: Vec<String>,
     pub clearing: Vec<String>,
     pub validators: Vec<String>,
+    pub receiver_validators: Vec<String>,
+    pub type_assertions: Vec<String>,
     pub escapers: BTreeMap<String, Vec<String>>,
     pub html_props: Vec<String>,
     pub sql_keywords: Vec<String>,
@@ -474,6 +482,9 @@ impl Model {
         self.pass_globals.extend(pack.propagation.pass_globals);
         self.clearing.extend(pack.sanitizers.calls);
         self.validators.extend(pack.sanitizers.validators);
+        self.receiver_validators
+            .extend(pack.sanitizers.receiver_validators);
+        self.type_assertions.extend(pack.sanitizers.type_assertions);
         for (class, calls) in pack.sanitizers.escapers {
             self.escapers.entry(class).or_default().extend(calls);
         }

@@ -21,3 +21,8 @@ hosting = "github"
 install-updater = false
 # Changes go straight to main: no release plan on pull requests.
 pr-run-mode = "skip"
+
+# macOS 14 runner images are retired on 2026-11-02 (the v0.1.0 build on them was cancelled by
+# a brownout): Apple Silicon builds run on macOS 15.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"

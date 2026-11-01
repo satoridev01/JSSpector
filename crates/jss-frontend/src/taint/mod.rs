@@ -61,6 +61,9 @@ pub struct Origin {
     /// their origin, for its field, whether that parameter's data can be at the start of the
     /// value), at most [`MAX_ALSO`]: `exec(b + a)` carries both, `a` after `b`.
     pub also: Vec<(usize, u32, bool)>,
+    /// Upload objects (`req.files`, wherever they went): the fields the server chose (`path`,
+    /// `filename`, `destination`) are not the attacker's.
+    pub upload: bool,
 }
 
 /// The key under which a tracked object keeps what its fields of unknown name may hold
@@ -179,6 +182,7 @@ impl Origin {
             param: None,
             object: true,
             also: Vec::new(),
+            upload: false,
         }
     }
 
@@ -362,6 +366,7 @@ pub fn scan_file_program(
         pending_element: None,
         fn_returns: None,
         callback_returns: None,
+        closure_writes: Vec::new(),
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -585,6 +590,9 @@ struct Env {
     local_instances: BTreeMap<String, String>,
     /// Variables bound to a DOM node created here (`document.createElement('iframe')`).
     nodes: BTreeSet<String>,
+    /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
+    /// bindings, inner functions): writes to any other name are writes to its parent's.
+    locals: BTreeSet<String>,
     /// Collections of tuples: the taint at each position of their elements
     /// (`extras.push(['topic', topic])`, `Object.entries(o)` gives `[key, value]`).
     tuples: BTreeMap<String, Vec<Option<Origin>>>,
@@ -614,6 +622,7 @@ struct PathState {
 /// state (attacker-controlled start, possibly an object, built) and escaped only if both are.
 fn join(a: &mut Origin, b: &Origin) {
     a.absorb(b);
+    a.upload &= b.upload;
     a.object |= b.object;
     a.prefix |= b.prefix;
     a.built |= b.built;
@@ -769,6 +778,7 @@ impl Env {
             local_instances: BTreeMap::new(),
             tuples: BTreeMap::new(),
             nodes: BTreeSet::new(),
+            locals: BTreeSet::new(),
             branch: 0,
             function,
         }
@@ -796,6 +806,7 @@ impl Env {
             local_instances: self.local_instances.clone(),
             tuples: self.tuples.clone(),
             nodes: self.nodes.clone(),
+            locals: BTreeSet::new(),
             branch: 0,
             function,
         }
@@ -932,6 +943,8 @@ struct Walker<'e> {
     fn_returns: Option<Origin>,
     /// What the function walked last returned (read by the call that passed it as a callback).
     callback_returns: Option<Origin>,
+    /// What the function walked last wrote to its parent's names: (name, field, taint).
+    closure_writes: Vec<(String, Option<String>, Origin)>,
     /// The file is a service worker (`self.addEventListener('fetch', ...)`): a `request` there is
     /// the page's own request, not a server's (kept across passes).
     service_worker: bool,
@@ -957,6 +970,7 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
                 sqlish: a.sqlish || b.sqlish,
                 // Escaped only if every part is.
                 escaped: a.escaped & b.escaped,
+                upload: a.upload && b.upload,
                 ..a
             })
         }
@@ -1171,6 +1185,61 @@ fn is_regex(expr: &Expression<'_>) -> bool {
         Expression::CallExpression(c) => c.callee.is_specific_id("RegExp"),
         _ => false,
     }
+}
+
+/// The names a binding pattern declares.
+fn pattern_names(pattern: &BindingPattern<'_>, out: &mut BTreeSet<String>) {
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => {
+            out.insert(id.name.as_str().to_owned());
+        }
+        BindingPattern::ObjectPattern(object) => {
+            for property in &object.properties {
+                pattern_names(&property.value, out);
+            }
+            if let Some(rest) = &object.rest {
+                pattern_names(&rest.argument, out);
+            }
+        }
+        BindingPattern::ArrayPattern(array) => {
+            for element in array.elements.iter().flatten() {
+                pattern_names(element, out);
+            }
+            if let Some(rest) = &array.rest {
+                pattern_names(&rest.argument, out);
+            }
+        }
+        BindingPattern::AssignmentPattern(assignment) => pattern_names(&assignment.left, out),
+    }
+}
+
+/// What a function's walk wrote to names it did not declare: its parent's variables, and
+/// fields of its parent's tracked objects (at most 32).
+fn closure_writes(inner: &Env, parent: &Env) -> Vec<(String, Option<String>, Origin)> {
+    let changed = |before: Option<&Origin>, after: &Origin| {
+        before.is_none_or(|b| b.span != after.span || b.steps.len() != after.steps.len())
+    };
+    let mut writes = Vec::new();
+    for (name, origin) in &inner.vars {
+        if !inner.locals.contains(name) && changed(parent.vars.get(name), origin) {
+            writes.push((name.clone(), None, origin.clone()));
+        }
+    }
+    for (name, fields) in &inner.fields {
+        let Some(before) = parent.fields.get(name) else {
+            continue;
+        };
+        if inner.locals.contains(name) {
+            continue;
+        }
+        for (field, origin) in fields {
+            if changed(before.get(field), origin) {
+                writes.push((name.clone(), Some(field.clone()), origin.clone()));
+            }
+        }
+    }
+    writes.truncate(32);
+    writes
 }
 
 /// Merges a tuple's position taints into the positions seen so far.
@@ -1506,6 +1575,9 @@ impl Walker<'_> {
             Statement::VariableDeclaration(d) => self.var_decl(d, env),
             Statement::FunctionDeclaration(f) => {
                 let name = f.id.as_ref().map(|id| id.name.as_str().to_owned());
+                if let Some(name) = &name {
+                    env.locals.insert(name.clone());
+                }
                 self.function(f, env, name, Role::Plain);
             }
             Statement::ClassDeclaration(c) => self.class(c, env),
@@ -1563,6 +1635,9 @@ impl Walker<'_> {
                 env.branch += 1;
                 self.statements(&s.block.body, env);
                 if let Some(handler) = &s.handler {
+                    if let Some(param) = &handler.param {
+                        pattern_names(&param.pattern, &mut env.locals);
+                    }
                     let after_try = env.save();
                     // The handler runs when the block threw: what the block established (a
                     // throwing check) does not hold there.
@@ -1962,6 +2037,7 @@ impl Walker<'_> {
         match left {
             ForStatementLeft::VariableDeclaration(d) => {
                 for declarator in &d.declarations {
+                    pattern_names(&declarator.id, &mut env.locals);
                     self.bind_pattern(&declarator.id, taint.clone(), None, env);
                 }
             }
@@ -1975,6 +2051,7 @@ impl Walker<'_> {
 
     fn var_decl(&mut self, declaration: &VariableDeclaration<'_>, env: &mut Env) {
         for declarator in &declaration.declarations {
+            pattern_names(&declarator.id, &mut env.locals);
             let Some(init) = &declarator.init else {
                 continue;
             };
@@ -2374,6 +2451,7 @@ impl Walker<'_> {
                                 object: has(&m().object_props, key)
                                     && !has(self.linking.scalar_props, key),
                                 also: Vec::new(),
+                                upload: false,
                             })
                         }
                         (Some(_), _) => None,
@@ -2631,6 +2709,7 @@ impl Walker<'_> {
             self.leave();
         }
         self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
+        self.closure_writes = closure_writes(&env, parent);
     }
 
     fn enter_function(
@@ -2659,6 +2738,12 @@ impl Walker<'_> {
         }
         let first = names.first().copied().flatten();
         env.params = names.iter().map(|n| n.unwrap_or("").to_owned()).collect();
+        for param in &params.items {
+            pattern_names(&param.pattern, &mut env.locals);
+        }
+        if let Some(rest) = &params.rest {
+            pattern_names(&rest.rest.argument, &mut env.locals);
+        }
         if !self.summarize && env.function != "<anonymous>" {
             self.facts
                 .functions
@@ -2721,6 +2806,7 @@ impl Walker<'_> {
                     // `@Param('id')`, `@Headers()`: strings.
                     object: !has(&m().scalar_decorators, name),
                     also: Vec::new(),
+                    upload: false,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -2762,6 +2848,7 @@ impl Walker<'_> {
                     param: Some(index),
                     object: true,
                     also: Vec::new(),
+                    upload: false,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -2850,6 +2937,7 @@ impl Walker<'_> {
                         // GraphQL arguments are typed by the schema.
                         object: !has(&m().scalar_kinds, kind),
                         also: Vec::new(),
+                        upload: false,
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -2934,6 +3022,34 @@ impl Walker<'_> {
             self.leave();
         }
         self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
+        self.closure_writes = closure_writes(&env, parent);
+    }
+
+    /// Adds what the inline function walked last wrote to this function's names (`let s = '';
+    /// list.forEach((x) => { s += x; })`), as weak updates: registered callbacks run later, so
+    /// later reads see the write.
+    fn apply_closure_writes(&mut self, env: &mut Env) {
+        for (name, field, origin) in std::mem::take(&mut self.closure_writes) {
+            match field {
+                None => {
+                    let merged = match env.vars.get(&name) {
+                        Some(existing) => {
+                            let mut merged = existing.clone();
+                            join(&mut merged, &origin);
+                            merged
+                        }
+                        None => origin,
+                    };
+                    env.vars.insert(name, merged);
+                }
+                Some(field) => {
+                    if let Some(fields) = env.fields.get_mut(&name) {
+                        let merged = union(fields.remove(&field), Some(origin.clone()));
+                        fields.insert(field, merged.unwrap_or(origin));
+                    }
+                }
+            }
+        }
     }
 
     /// Summary pass: a void function that throws unless its parameters are valid
@@ -3545,6 +3661,7 @@ impl Walker<'_> {
             }
             Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {
                 self.maybe_function(expr, env, None, Role::Plain);
+                self.apply_closure_writes(env);
                 None
             }
             Expression::ClassExpression(class) => {
@@ -3616,7 +3733,9 @@ impl Walker<'_> {
                                         env,
                                     );
                                 }
-                            } else if !self.maybe_function(expr, env, None, Role::Plain) {
+                            } else if self.maybe_function(expr, env, None, Role::Plain) {
+                                self.apply_closure_writes(env);
+                            } else {
                                 self.expr(expr, env);
                             }
                         }
@@ -4053,6 +4172,9 @@ impl Walker<'_> {
                     has(&m().object_props, p) && !has(self.linking.scalar_props, p)
                 }),
                 also: Vec::new(),
+                upload: property
+                    .as_deref()
+                    .is_some_and(|p| has(&m().upload_objects, p)),
             });
         }
         // `this.url` in a class method: what another method stored there.
@@ -4148,6 +4270,14 @@ impl Walker<'_> {
             Some(rest) => Some(rest),
             None => self.expr(member.object(), env),
         };
+        // `file.path` of an upload that went through a helper, an array or a callback.
+        if whole.as_ref().is_some_and(|o| o.upload)
+            && property
+                .as_deref()
+                .is_some_and(|p| has(&m().upload_server_fields, p))
+        {
+            return None;
+        }
         if self.summarize
             && let (Expression::Identifier(_), Some(property)) = (object, property.as_deref())
             && let Some(origin) = &whole
@@ -4245,6 +4375,8 @@ impl Walker<'_> {
             other => {
                 let expr = other.as_expression()?;
                 if self.maybe_function(expr, env, None, role) {
+                    // `list.forEach((x) => { total += x; })`: the callback's writes.
+                    self.apply_closure_writes(env);
                     None
                 } else {
                     self.expr(expr, env)
@@ -5043,6 +5175,7 @@ impl Walker<'_> {
                 let origin = if s.param == RETURNS_SOURCE {
                     let mut origin = Origin::source(s.at_sink.kind, call.span);
                     origin.object = s.at_sink.object;
+                    origin.upload = s.at_sink.upload;
                     Some(origin)
                 } else {
                     let arg = argument_taint(&taints, s.param, s.rest);
@@ -5169,6 +5302,7 @@ impl Walker<'_> {
                             param: None,
                             object: true,
                             also: Vec::new(),
+                            upload: false,
                         })
                     })
                     .collect();
@@ -5248,6 +5382,7 @@ impl Walker<'_> {
                         param: None,
                         object: true,
                         also: Vec::new(),
+                        upload: false,
                     });
                 }
                 // Pack result sources: `zip.getEntries()`.
@@ -5850,7 +5985,10 @@ impl Walker<'_> {
         let mut returned = None;
         for s in summaries.iter().filter(|s| s.api == RETURNS) {
             let origin = if s.param == RETURNS_SOURCE {
-                Some(Origin::source(s.at_sink.kind, span))
+                let mut origin = Origin::source(s.at_sink.kind, span);
+                origin.object = s.at_sink.object;
+                origin.upload = s.at_sink.upload;
+                Some(origin)
             } else {
                 argument_taint(&arguments, s.param, s.rest)
             };
@@ -7889,6 +8027,55 @@ mod tests {
         let sw = "async function precache(request) { const base = new URL(request.url).origin; await fetch(base + '/avatars'); }\n\
                   self.addEventListener('fetch', (event) => event.respondWith(precache(event.request)));\n";
         assert!(scan(sw).is_empty(), "{:?}", scan(sw));
+    }
+
+    #[test]
+    fn callbacks_write_back_to_captured_variables() {
+        use Severity::*;
+        use VulnClass::*;
+        let critical = vec![(CommandInjection, Critical)];
+        assert_eq!(
+            route("let s = ''; req.body.list.forEach((x) => { s += x; }); exec('ls ' + s);"),
+            critical
+        );
+        assert_eq!(
+            route(
+                "const ref = { current: '' }; [1].forEach(() => { ref.current = req.query.a; }); exec(ref.current);"
+            ),
+            critical
+        );
+        // A shadowing local, a constant write: nothing comes back.
+        assert!(
+            route("let s = ''; req.body.list.forEach((x) => { let s = x; }); exec('ls ' + s);")
+                .is_empty()
+        );
+        assert!(route("const ref = { current: '' }; [1].forEach(() => { ref.current = 'x'; }); exec(ref.current);").is_empty());
+    }
+
+    #[test]
+    fn uploads_keep_their_server_chosen_fields_through_collections() {
+        assert!(one(
+            "function collect(files) { return Object.values(files).flat(); }\n\
+             app.post('/u', (req, res) => { const uploads = collect(req.files); uploads.map((f) => fs.remove(f.path)); });"
+        )
+        .is_empty());
+        // The client's name is still the attacker's.
+        let found = one(
+            "app.post('/u', (req, res) => { req.files.forEach((f) => fs.writeFileSync(path.join(DIR, f.originalname), f.buffer)); });",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::PathTraversal),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn uploads_returned_by_a_request_helper_stay_uploads() {
+        assert!(one(
+            "function collectFiles(req) { const out = []; for (const key of Object.keys(req.files)) out.push(...req.files[key]); return out; }\n\
+             app.post('/u', (req, res) => { const uploads = collectFiles(req); uploads.map((f) => fs.remove(f.path)); });"
+        )
+        .is_empty());
     }
 
     #[test]

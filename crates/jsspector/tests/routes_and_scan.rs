@@ -892,3 +892,100 @@ fn import_equals_and_inline_requires_link() {
         );
     }
 }
+
+#[test]
+fn router_factories_and_next_export_forms_are_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "server/app.ts",
+        "import express from 'express';\nimport users from './users';\nimport * as routes from './routes';\n\
+         const app = express();\n\
+         function makeAdmin() {\n  const r = express.Router();\n  r.get('/stats', (req, res) => res.end());\n  return r;\n}\n\
+         app.use('/users', users());\napp.use('/v2', routes.items());\napp.use('/admin', makeAdmin());\n",
+    );
+    write(
+        root,
+        "server/users.ts",
+        "import { Router } from 'express';\nexport default function users() {\n  const router = Router();\n  \
+         router.get('/:id', (req, res) => res.json(req.params.id));\n  return router;\n}\n",
+    );
+    write(
+        root,
+        "server/routes.ts",
+        "import { Router } from 'express';\nexport function items() {\n  const router = Router();\n  \
+         router.post('/items', (req, res) => res.end());\n  return router;\n}\n",
+    );
+    // NextAuth-style re-exported handlers.
+    write(
+        root,
+        "web/app/api/auth/[...nextauth]/route.ts",
+        "import NextAuth from 'next-auth';\nconst handler = NextAuth({});\nexport { handler as GET, handler as POST };\n",
+    );
+    // pages/api: an anonymous default export, and a wrapped one.
+    write(
+        root,
+        "web/pages/api/items.ts",
+        "import db from '../../lib/db';\nexport default async (req, res) => {\n  \
+         await db.query(\"SELECT * FROM items WHERE id = '\" + req.query.id + \"'\");\n  res.end();\n};\n",
+    );
+    write(
+        root,
+        "web/pages/api/me.ts",
+        "async function handler(req, res) {\n  res.json({});\n}\nexport default withAuth(handler);\n",
+    );
+    // Not routes: a default export in an app route file, a named GET in pages/api.
+    write(
+        root,
+        "web/app/api/legacy/route.ts",
+        "export default function handler(req, res) {}\n",
+    );
+    write(
+        root,
+        "web/pages/api/named.ts",
+        "export function GET(request) { return null; }\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap(),
+                r["auth"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for expected in [
+        "GET /users/{id} none-detected",
+        "POST /v2/items none-detected",
+        "GET /admin/stats none-detected",
+        "GET /api/auth/{nextauth} none-detected",
+        "POST /api/auth/{nextauth} none-detected",
+        "ANY /api/items none-detected",
+        "ANY /api/me user",
+    ] {
+        assert!(
+            list.iter().any(|r| r == expected),
+            "{expected} missing from {list:?}"
+        );
+    }
+    for absent in ["/api/legacy", "/api/named"] {
+        assert!(
+            !list.iter().any(|r| r.contains(absent)),
+            "{absent} should not be a route: {list:?}"
+        );
+    }
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = scan["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["class"] == "sql-injection" && f["entry"] == "ANY /api/items"),
+        "{findings:?}"
+    );
+}

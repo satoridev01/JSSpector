@@ -135,7 +135,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                 None => vec![(String::new(), Auth::NoneDetected)],
             };
             let path = match entry.kind.as_str() {
-                "file-route" | "default-export" => match file_route_path(file) {
+                kind @ ("file-route" | "default-export") => match file_route_path(file, kind) {
                     Some(path) => path,
                     None => continue,
                 },
@@ -192,7 +192,8 @@ fn resolve_local(
             };
             locate_export(by_file, target_file, name, 0)
         }
-        None => Some((file.to_owned(), local.to_owned())),
+        // A local router, or what a local factory returns (`app.use('/x', makeRouter())`).
+        None => Some((file.to_owned(), product(report, local))),
     }
 }
 
@@ -314,23 +315,78 @@ fn join(prefix: &str, path: &str) -> String {
 
 /// Express parameters as OpenAPI templates: `/users/:id` becomes `/users/{id}`.
 pub fn openapi_path(path: &str) -> String {
-    // Express 5 optional groups: `/exchange{/:id}` is `/exchange/:id` or `/exchange`.
-    let path = if path.contains(':') {
-        path.replace(['{', '}'], "")
-    } else {
-        path.to_owned()
+    let mut out = String::new();
+    let mut chars = path.chars().peekable();
+    let identifier = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        let mut name = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                name.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        name
     };
-    path.split('/')
-        .map(|segment| match segment.strip_prefix(':') {
-            Some(name) => format!("{{{}}}", name.trim_end_matches('?')),
-            None => segment.to_owned(),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    while let Some(c) = chars.next() {
+        match c {
+            // `:id`, `:id(\\d+)` (Express 4), `:date{[0-9]+}` (Hono), `:id?`, `:path*`.
+            ':' => {
+                let name = identifier(&mut chars);
+                if let Some(&open @ ('(' | '{')) = chars.peek() {
+                    let close = if open == '(' { ')' } else { '}' };
+                    let mut depth = 0usize;
+                    for inner in chars.by_ref() {
+                        if inner == open {
+                            depth += 1;
+                        } else if inner == close {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                while chars.peek().is_some_and(|m| matches!(m, '?' | '*' | '+')) {
+                    chars.next();
+                }
+                if name.is_empty() {
+                    out.push(':');
+                } else {
+                    out.push_str(&format!("{{{name}}}"));
+                }
+            }
+            // Express 5 named wildcard `*filepath`, or a bare `*`.
+            '*' => {
+                let name = identifier(&mut chars);
+                let name = if name.is_empty() {
+                    "wildcard".to_owned()
+                } else {
+                    name
+                };
+                out.push_str(&format!("{{{name}}}"));
+            }
+            // `{id}` already a parameter; `{/:id}` or `{.:format}` an Express 5 optional group.
+            '{' => {
+                let mut look = chars.clone();
+                let name = identifier(&mut look);
+                if !name.is_empty() && look.peek() == Some(&'}') {
+                    look.next();
+                    chars = look;
+                    out.push_str(&format!("{{{name}}}"));
+                }
+            }
+            '}' => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
-/// The URL path of a file route: Next.js `app/**/route.ts` or `pages/api/**`.
-fn file_route_path(file: &str) -> Option<String> {
+/// The URL path of a file route: a named `GET`/`POST`/... export of a Next.js `app/**/route.ts`
+/// (`kind` "file-route"), or the default export of a `pages/api/**` module ("default-export").
+fn file_route_path(file: &str, kind: &str) -> Option<String> {
     let segments: Vec<&str> = file.split('/').collect();
     let stem = |s: &str| s.split('.').next().unwrap_or("").to_owned();
     let convert = |parts: &[&str]| -> String {
@@ -356,9 +412,22 @@ fn file_route_path(file: &str) -> Option<String> {
         }
         format!("/{}", out.join("/"))
     };
-    if let Some(at) = segments.iter().position(|s| *s == "app")
-        && segments.last().is_some_and(|last| stem(last) == "route")
-    {
+    if kind == "file-route" {
+        if !segments.last().is_some_and(|last| stem(last) == "route") {
+            return None;
+        }
+        // The app directory: `src/app`, else the first `app` that is not a package named `app`
+        // (`packages/app/app/api/route.ts`).
+        let at = segments
+            .windows(2)
+            .position(|w| w == ["src", "app"])
+            .map(|i| i + 1)
+            .or_else(|| {
+                (0..segments.len()).find(|&i| {
+                    segments.get(i) == Some(&"app")
+                        && !matches!(segments.get(i + 1), Some(&"app" | &"src"))
+                })
+            })?;
         let parts = segments.get(at + 1..segments.len() - 1)?;
         return Some(convert(parts));
     }
@@ -393,21 +462,40 @@ mod tests {
     #[test]
     fn nextjs_file_routes() {
         assert_eq!(
-            file_route_path("app/api/users/[id]/route.ts").as_deref(),
+            file_route_path("app/api/users/[id]/route.ts", "file-route").as_deref(),
             Some("/api/users/{id}")
         );
         assert_eq!(
-            file_route_path("src/app/(admin)/x/route.js").as_deref(),
+            file_route_path("src/app/(admin)/x/route.js", "file-route").as_deref(),
             Some("/x")
         );
         assert_eq!(
-            file_route_path("pages/api/hello.ts").as_deref(),
+            file_route_path("pages/api/hello.ts", "default-export").as_deref(),
             Some("/api/hello")
         );
         assert_eq!(
-            file_route_path("pages/api/users/index.ts").as_deref(),
+            file_route_path("pages/api/users/index.ts", "default-export").as_deref(),
             Some("/api/users")
         );
-        assert_eq!(file_route_path("src/lib/util.ts"), None);
+        assert_eq!(file_route_path("src/lib/util.ts", "file-route"), None);
+        assert_eq!(file_route_path("src/lib/util.ts", "default-export"), None);
+        // Each export form counts only where Next.js reads it.
+        assert_eq!(
+            file_route_path("app/api/x/route.ts", "default-export"),
+            None
+        );
+        assert_eq!(file_route_path("pages/api/x.ts", "file-route"), None);
+        assert_eq!(
+            file_route_path("packages/app/app/api/x/route.ts", "file-route").as_deref(),
+            Some("/api/x")
+        );
+        assert_eq!(
+            file_route_path("packages/app/src/app/api/x/route.ts", "file-route").as_deref(),
+            Some("/api/x")
+        );
+        assert_eq!(
+            file_route_path("app/(dashboard)/app/route.ts", "file-route").as_deref(),
+            Some("/app")
+        );
     }
 }

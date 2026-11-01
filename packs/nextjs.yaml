@@ -1,4 +1,4 @@
 # Next.js / web-standard route handlers: exported HTTP-method functions.
 name: nextjs
 routes:
-  exports: [GET, POST, PUT, PATCH, DELETE]
+  exports: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]

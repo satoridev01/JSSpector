@@ -1064,6 +1064,17 @@ fn callee_name_within(expr: &Expression<'_>, budget: usize) -> Option<String> {
 }
 
 /// `require('x')` → `x`.
+/// The authentication a wrapper call gives the handler it wraps: `withAuth(handler)`,
+/// `requireAdmin(async (req) => ...)`. Not a wrapper: none detected.
+fn wrapper_auth(expr: &Expression<'_>) -> Auth {
+    match expr.get_inner_expression() {
+        Expression::CallExpression(call) => callee_name(&call.callee)
+            .and_then(|name| m().auth_of(&name))
+            .unwrap_or(Auth::NoneDetected),
+        _ => Auth::NoneDetected,
+    }
+}
+
 fn require_spec(expr: &Expression<'_>) -> Option<String> {
     let Expression::CallExpression(call) = expr.get_inner_expression() else {
         return None;
@@ -1419,10 +1430,22 @@ impl Walker<'_> {
             }
             ModuleDeclaration::ExportNamedDeclaration(export) => {
                 for specifier in &export.specifiers {
-                    self.facts.exports.insert(
-                        specifier.exported.name().as_str().to_owned(),
-                        specifier.local.name().as_str().to_owned(),
-                    );
+                    let exported = specifier.exported.name().as_str().to_owned();
+                    let local = specifier.local.name().as_str().to_owned();
+                    // `export { handler as GET, handler as POST }` (NextAuth, tRPC adapters).
+                    if has(&m().route_exports, &exported) {
+                        self.facts.routes.push(RouteFact {
+                            receiver: None,
+                            receiver_file: None,
+                            method: exported.clone(),
+                            path: String::new(),
+                            handler: local.clone(),
+                            span: specifier.span,
+                            auth: Auth::NoneDetected,
+                            kind: "file-route",
+                        });
+                    }
+                    self.facts.exports.insert(exported, local);
                 }
             }
             ModuleDeclaration::ExportDeclaration(export) => match &export.declaration {
@@ -1464,7 +1487,11 @@ impl Walker<'_> {
                                     path: String::new(),
                                     handler: name.clone(),
                                     span: declarator.span,
-                                    auth: Auth::NoneDetected,
+                                    // `export const GET = withAuth(async (req) => ...)`
+                                    auth: declarator
+                                        .init
+                                        .as_ref()
+                                        .map_or(Auth::NoneDetected, wrapper_auth),
                                     kind: "file-route",
                                 });
                             }
@@ -1520,6 +1547,41 @@ impl Walker<'_> {
                             self.facts
                                 .exports
                                 .insert("default".to_owned(), id.name.as_str().to_owned());
+                        }
+                        // `export default async (req, res) => {}`, `export default handler`,
+                        // `export default withAuth(handler)`: a pages/api route's handler.
+                        let handler = match expr.get_inner_expression() {
+                            Expression::ArrowFunctionExpression(f) if f.params.items.len() >= 2 => {
+                                Some("<default>".to_owned())
+                            }
+                            Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                            Expression::CallExpression(call) => {
+                                call.arguments.iter().find_map(|a| {
+                                    match a.as_expression().map(Expression::get_inner_expression) {
+                                        Some(Expression::Identifier(id)) => {
+                                            Some(id.name.as_str().to_owned())
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(handler) = handler {
+                            self.facts.routes.push(RouteFact {
+                                receiver: None,
+                                receiver_file: None,
+                                method: "ANY".to_owned(),
+                                path: String::new(),
+                                handler: handler.clone(),
+                                span: expr.span(),
+                                auth: wrapper_auth(expr),
+                                kind: "default-export",
+                            });
+                            if handler == "<default>" {
+                                self.maybe_function(expr, env, Some(handler), Role::Route);
+                                return;
+                            }
                         }
                         self.expr(expr, env);
                     }
@@ -4892,7 +4954,23 @@ impl Walker<'_> {
                     || (self.relative.contains_key(name) && m().auth_of(name).is_none())
             }
             e @ Expression::CallExpression(c) => {
-                require_spec(e).is_some() || require_spec(&c.callee).is_some()
+                require_spec(e).is_some()
+                    || require_spec(&c.callee).is_some()
+                    // `users()` or `routes.users()` from our files: a router factory.
+                    || match c.callee.get_inner_expression() {
+                        Expression::Identifier(id) => {
+                            self.relative.contains_key(id.name.as_str())
+                                && m().auth_of(id.name.as_str()).is_none()
+                        }
+                        Expression::StaticMemberExpression(member) => {
+                            matches!(member.object.get_inner_expression(),
+                                Expression::Identifier(id)
+                                    if self.relative.contains_key(id.name.as_str()))
+                                && callee_name(&c.callee)
+                                    .is_some_and(|name| m().auth_of(&name).is_none())
+                        }
+                        _ => false,
+                    }
             }
             // `api.router` of an import, `require('./api').router`.
             Expression::StaticMemberExpression(member) => {
@@ -4929,6 +5007,12 @@ impl Walker<'_> {
                         Some(property),
                     ),
                 }
+            }
+            // `users()` or `routes.users()`: a factory, whose product is the router.
+            Expression::CallExpression(c)
+                if require_spec(expr).is_none() && require_spec(&c.callee).is_none() =>
+            {
+                (callee_name(&c.callee), None, None)
             }
             e => {
                 let required = match e {

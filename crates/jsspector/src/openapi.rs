@@ -1,6 +1,6 @@
 //! OpenAPI 3.1 export of the HTTP entry points.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jss_frontend::Route;
 use serde_json::{Map, Value, json};
@@ -10,26 +10,34 @@ const METHODS: &[&str] = &[
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
 
-/// An OpenAPI 3.1 document of `routes` (HTTP only). Routes registered for any method (`ALL`,
-/// `ANY`, `USE`) are listed under every method they may answer, marked `x-jsspector-any-method`.
+/// An OpenAPI 3.1 document of `routes` (HTTP only). A route registered for any method (`ALL`,
+/// `ANY`) is listed under every method that no specific route of the same path takes, marked
+/// `x-jsspector-any-method`; middleware (`USE`) is no operation. Every operationId is unique.
 pub fn document(title: &str, routes: &[Route]) -> Value {
     let mut paths: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
-    for route in routes.iter().filter(|r| r.kind == "http") {
-        let method = route.method.to_ascii_lowercase();
-        let methods: Vec<&str> = if METHODS.contains(&method.as_str()) {
-            vec![
-                METHOD_NAMES
-                    .iter()
-                    .copied()
-                    .find(|m| *m == method)
-                    .unwrap_or("get"),
-            ]
-        } else {
-            vec!["get", "post"]
+    let http: Vec<&Route> = routes
+        .iter()
+        .filter(|r| r.kind == "http" && !r.method.eq_ignore_ascii_case("use"))
+        .collect();
+    // Specific methods first, so they win their slot over any-method routes.
+    let (specific, any): (Vec<&Route>, Vec<&Route>) = http
+        .into_iter()
+        .partition(|r| METHODS.contains(&r.method.to_ascii_lowercase().as_str()));
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    for route in specific.into_iter().chain(any) {
+        let lower = route.method.to_ascii_lowercase();
+        let methods: Vec<&str> = match METHODS.iter().find(|m| **m == lower) {
+            Some(method) => vec![method],
+            None => METHODS.to_vec(),
         };
+        let (path, renamed) = unique_parameters(&route.path);
         for method in methods {
-            let operations = paths.entry(route.path.clone()).or_default();
-            operations.insert(method.to_owned(), operation(route, method));
+            let operations = paths.entry(path.clone()).or_default();
+            if operations.contains_key(method) {
+                continue;
+            }
+            let id = unique_id(&mut ids, method, &path);
+            operations.insert(method.to_owned(), operation(route, &renamed, &id));
         }
     }
     json!({
@@ -39,20 +47,65 @@ pub fn document(title: &str, routes: &[Route]) -> Value {
     })
 }
 
-const METHOD_NAMES: &[&str] = METHODS;
+/// `get_api_users_id`, with a numeric suffix if that is taken.
+fn unique_id(ids: &mut BTreeSet<String>, method: &str, path: &str) -> String {
+    let mut base: String = format!("{method}_{path}")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    while base.contains("__") {
+        base = base.replace("__", "_");
+    }
+    let base = base.trim_end_matches('_').to_owned();
+    let mut id = base.clone();
+    let mut n = 2;
+    while !ids.insert(id.clone()) {
+        id = format!("{base}_{n}");
+        n += 1;
+    }
+    id
+}
 
-fn operation(route: &Route, method: &str) -> Value {
-    let mut parameters: Vec<Value> = route
-        .path
-        .split('/')
-        .filter_map(|s| s.strip_prefix('{').and_then(|s| s.strip_suffix('}')))
+/// The path with every repeated parameter name made unique (`/orgs/{id}/members/{id}` ->
+/// `/orgs/{id}/members/{id_2}`), and its parameter names in order.
+fn unique_parameters(path: &str) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else {
+            break;
+        };
+        let name = &rest[open + 1..open + close];
+        out.push_str(&rest[..open]);
+        let mut unique = name.to_owned();
+        let mut n = 2;
+        while names.contains(&unique) {
+            unique = format!("{name}_{n}");
+            n += 1;
+        }
+        out.push_str(&format!("{{{unique}}}"));
+        names.push(unique);
+        rest = &rest[open + close + 1..];
+    }
+    out.push_str(rest);
+    (out, names)
+}
+
+fn operation(route: &Route, parameters: &[String], id: &str) -> Value {
+    let mut parameters: Vec<Value> = parameters
+        .iter()
         .map(|name| json!({ "name": name, "in": "path", "required": true, "schema": { "type": "string" } }))
         .collect();
     let mut body = Map::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     for input in &route.inputs {
         let Some((location, name)) = input.split_once('.') else {
             continue;
         };
+        if !seen.insert((location.to_owned(), name.to_owned())) {
+            continue;
+        }
         match location {
             "query" => parameters
                 .push(json!({ "name": name, "in": "query", "schema": { "type": "string" } })),
@@ -67,7 +120,7 @@ fn operation(route: &Route, method: &str) -> Value {
         }
     }
     let mut op = json!({
-        "operationId": format!("{method}_{}", route.handler.replace([' ', '/', ':', '{', '}', '.'], "_")),
+        "operationId": id,
         "parameters": parameters,
         "responses": { "default": { "description": "Not modeled" } },
         "x-jsspector-handler": route.handler,
@@ -88,4 +141,29 @@ fn operation(route: &Route, method: &str) -> Value {
         );
     }
     op
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_parameters_and_ids_are_unique() {
+        assert_eq!(
+            unique_parameters("/orgs/{id}/members/{id}"),
+            (
+                "/orgs/{id}/members/{id_2}".to_owned(),
+                vec!["id".to_owned(), "id_2".to_owned()]
+            )
+        );
+        let mut ids = BTreeSet::new();
+        assert_eq!(
+            unique_id(&mut ids, "get", "/api/users/{id}"),
+            "get_api_users_id"
+        );
+        assert_eq!(
+            unique_id(&mut ids, "get", "/api/users/{id}"),
+            "get_api_users_id_2"
+        );
+    }
 }

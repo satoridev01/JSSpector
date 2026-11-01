@@ -57,7 +57,8 @@ sinks:
   - {global: [eval, Function], class: code-injection, severity: critical, args: ["any:0", "any:1", "any:2"]}
 propagation:
   pass_methods: [trim, trimStart, trimEnd, toLowerCase, toUpperCase, toLocaleLowerCase, toLocaleUpperCase, replace,
-    replaceAll, slice, substring, substr, split, join, concat, toString, padStart, padEnd, normalize, at, valueOf, repeat]
+    replaceAll, slice, substring, substr, split, join, concat, toString, padStart, padEnd, normalize, at, valueOf, repeat,
+    match, matchAll]
   build_methods: [concat, join, format]
   strip_methods: [replace, replaceAll]
   pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, JSON.stringify, util.format,
@@ -76,6 +77,28 @@ propagation:
   store_globals: [Object.assign]
   # Globals whose result holds the keys of their argument (attacker-chosen for a parsed body).
   key_globals: [Object.keys, Object.entries, Object.getOwnPropertyNames]
+  # Callbacks of array, promise and string methods: which argument is the callback, which of its
+  # parameters get an element of the receiver, and whether the call returns what it returns.
+  callbacks:
+    map: {element: [0], returns: true}
+    flatMap: {element: [0], returns: true}
+    forEach: {element: [0]}
+    filter: {element: [0]}
+    find: {element: [0]}
+    findLast: {element: [0]}
+    findIndex: {element: [0]}
+    findLastIndex: {element: [0]}
+    some: {element: [0]}
+    every: {element: [0]}
+    sort: {element: [0, 1]}
+    toSorted: {element: [0, 1]}
+    reduce: {element: [1], accumulator: 0, returns: true}
+    reduceRight: {element: [1], accumulator: 0, returns: true}
+    then: {element: [0], returns: true}
+    finally: {keeps_receiver: true}
+    catch: {returns: true, keeps_receiver: true}
+    replace: {callback: 1, element_all: true}
+    replaceAll: {callback: 1, element_all: true}
   # Module functions returning (part of) their first argument, objects included.
   object_module_pass: [lodash.clone, lodash.cloneDeep, lodash.omit, lodash.pick, lodash.get, lodash.castArray,
     lodash.toArray, lodash.flatten, lodash.head, lodash.last, deepcopy, klona, clone]

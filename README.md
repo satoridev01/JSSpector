@@ -89,16 +89,17 @@ jsspector routes --json path/to/repo
 jsspector routes --openapi path/to/repo  # OpenAPI 3.1 of the HTTP routes
 ```
 
-Routes are followed through router mounts across files (`app.use('/api', require('./routes/users'))`), route tables and registration helpers. Covered: Express/Koa/Hono/Fastify routers, `fastify.route`, NestJS controllers, Next.js `app/**/route.ts` and `pages/api`, raw `http.createServer`, socket.io events, Electron IPC, GraphQL resolver maps, tRPC procedures and queue processors.
+Routes are followed through router mounts across files (`app.use('/api', require('./routes/users'))`, factories such as `app.use('/users', users())`), route tables and registration helpers. Covered: Express/Koa/Hono/Fastify routers (array paths, `app.route('/book').get(...)` chains, verb-first `router.route('POST', path, h)`, Hono `app.route()` mounts and `basePath`, Koa router prefixes, `fastify.register(plugin, { prefix })`), `fastify.route`, NestJS controllers, Next.js `app/**/route.ts` and `pages/api` (including `export { handler as GET }` and wrapped default exports), raw `http.createServer`, socket.io events, Electron IPC, GraphQL resolver maps, tRPC procedures and queue processors. `--openapi` writes OpenAPI 3.1 paths with unique operation ids.
 
 ### What `scan` covers
 
 - **Sources:** Express/Fastify/Koa/Hono/Next.js/NestJS request data (and helpers that take the request), socket.io events (including `onAny` and connection sockets), Meteor methods, Electron `ipcMain`, `postMessage` and extension messages, GraphQL `args`, tRPC `input`, job payloads, archive entry names, browser URL sources (`location`, `document.referrer`, `window.name`), React props (medium), `process.argv` (low).
 - **Sinks:** command and code injection (`child_process` incl. `shell: true` and argument injection, `eval`, `Function`, `vm`, `executeJavaScript`, `shell.openExternal`), SQL built from text, NoSQL operator injection (object-capable values in queries), path traversal, SSRF (attacker-chosen URL start), XSS (`innerHTML`, jQuery, `document.write`, `dangerouslySetInnerHTML`, navigation to `javascript:`), prototype pollution (`o[k1][k2] = v`, deep-set helpers).
-- **Flow:** assignments, destructuring, templates, string methods, array callbacks, object fields (field by field), instance fields across methods, return values and parameter-to-sink summaries, followed across files (up to 4 hops) through relative imports, workspace packages, barrels and constructor injection.
-- **Guards:** validation that exits (`if (!/^\w+$/.test(x)) return`), allowlists, `startsWith` containment, comparisons with constants, `typeof`/`check()` type checks (NoSQL), validators and escapers listed in packs.
+- **Flow:** assignments, destructuring, templates, string methods, collections (`push`, `Object.assign`, `Object.entries`, `Array.from`, `Promise.all`, clones), callbacks (`map`, `forEach`, `reduce`, `then`, `replace`, by reference too), regex captures, rest parameters, object fields (field by field, spreads included, keys apart from values, tuple positions), instance fields across methods, return values and parameter-to-sink summaries (every contributing parameter, sinks inside callbacks belonging to their function), followed across files (up to 8 hops) through relative imports, workspace packages, barrels and constructor injection.
+- **Guards:** validation that exits (`if (!/^\w+$/.test(x)) return`), allowlists (also in regex captures), containment (`p === base || p.startsWith(base + sep)`, never against a base the request chose), comparisons with constants, `typeof`/`check()` type checks (NoSQL), validators and escapers listed in packs.
 - **Auth:** each finding carries `auth` (`none-detected`, `user`, `admin`) from route middleware, `router.use`, guard decorators and in-handler checks; admin-only paths are one level lower.
-- **Output:** grouped by sink file with every step from source to sink; JSON and SARIF carry line-independent fingerprints for baselines.
+- **Precision:** NoSQL query sinks apply where the project has a MongoDB driver (or is a Meteor app); browser-side sources never reach server sinks; a service worker's `request` is the page's; appending a created DOM node is no HTML injection; `location.href` starts with the page's own origin.
+- **Output:** grouped by sink file with every step from source to sink; JSON and SARIF carry line-independent fingerprints for baselines. JSON findings start with a readable `title` and carry `resource` (sink file:line), `description` and `remediation`, the fields issue trackers such as Satori read.
 
 ### Packs
 
@@ -120,8 +121,8 @@ Latest measurements (2026-11-01, static reading only):
 | Route recall vs spec: NodeBB (Express + route helpers) | 106/153 (69.3%); plugin-remountable mounts (`admin`, `tags`, `groups`) are named at runtime |
 | socket.io events, uptime-kuma server | 71/71 |
 | Electron `ipcMain` channels, OpenWhispr | 558/575 (97%) |
-| CVE replay, covered classes | 4/69 detected (all path traversal), 2/4 cleared at the fix |
-| 100-repo corpus | 35,765 files in 45 s, 0 panics; 116 HIGH/CRITICAL candidates (benchmark fixtures aside), including both hand-confirmed true positives |
+| CVE replay, covered classes | 7/69 detected (path traversal 5/15, XSS 1/15, prototype pollution 1/8), 5/7 cleared at the fix |
+| 100-repo corpus | 35,765 files in about 80 s, 0 panics, identical output at 1 and 10 threads; 162 HIGH/CRITICAL candidates, including both hand-confirmed true positives |
 
 `cargo xtask corpus --list FILE` fetches a list of repositories (`owner/name@commit`, shallow and sparse; nothing in them is run), scans each one and writes per-repository reports, a `summary.json` and a table; it fails if the scanner crashes or panics on any file. [`.satori.yml`](.satori.yml) runs the same job on Satori with the list given as input (`-d CORPUS="..."`), so the corpus list never has to be committed. Keep those runs private: HEAD findings may be undisclosed vulnerabilities.
 

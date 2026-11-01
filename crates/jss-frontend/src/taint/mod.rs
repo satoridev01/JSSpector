@@ -67,6 +67,26 @@ pub struct Origin {
 /// (spreads of unknown shape, computed keys).
 const REST_FIELD: &str = "<rest>";
 
+/// A tracked object's values written under computed keys the attacker does not choose
+/// (`fields[key] = value` with `key` from a fixed list): read like [`REST_FIELD`], keys clean.
+const VALUES_FIELD: &str = "<values>";
+
+/// A tracked object's keys written by an attacker-chosen computed key (`o[req.query.k] = 1`).
+const KEYED_FIELD: &str = "<keyed>";
+
+/// The pseudo-field of a summary that names the keys of a parameter (`Object.keys(fields)`):
+/// a call site takes the keys of its argument, not its values.
+const KEYS_FIELD: &str = "<keys>";
+
+/// What the fields a tracked object does not name may hold: its unknown spreads' values and the
+/// values written under computed keys.
+fn unnamed_fields(fields: &BTreeMap<String, Origin>) -> Option<Origin> {
+    union(
+        fields.get(REST_FIELD).cloned(),
+        fields.get(VALUES_FIELD).cloned(),
+    )
+}
+
 /// Most extra parameters an [`Origin`] remembers.
 const MAX_ALSO: usize = 4;
 
@@ -337,6 +357,13 @@ pub fn scan_file_program(
         current_class: None,
         class_fields: BTreeMap::new(),
         ctor_params: BTreeMap::new(),
+        param_owner: BTreeMap::new(),
+        rest_params: BTreeSet::new(),
+        pending_element: None,
+        fn_returns: None,
+        callback_returns: None,
+        regexes: BTreeMap::new(),
+        service_worker: false,
         modules: BTreeMap::new(),
         relative: BTreeMap::new(),
         result: ScanResult::default(),
@@ -506,6 +533,8 @@ pub struct Summary {
     /// The sink's rule needs the attacker to choose the start of the value (see
     /// [`RawFinding::start`]).
     pub start: bool,
+    /// The parameter is a rest parameter (`...paths`): every argument from `param` on.
+    pub rest: bool,
 }
 
 /// What a local name was bound to by `require` or `import`.
@@ -554,6 +583,11 @@ struct Env {
     instances: BTreeMap<String, String>,
     /// Variables holding an instance of a class of this file: the class.
     local_instances: BTreeMap<String, String>,
+    /// Variables bound to a DOM node created here (`document.createElement('iframe')`).
+    nodes: BTreeSet<String>,
+    /// Collections of tuples: the taint at each position of their elements
+    /// (`extras.push(['topic', topic])`, `Object.entries(o)` gives `[key, value]`).
+    tuples: BTreeMap<String, Vec<Option<Origin>>>,
     /// Variables holding what an auth call returned (`const user = verifyToken(token)`): a
     /// falsy one means the caller is not logged in (or not an admin).
     auth_vars: BTreeMap<String, Auth>,
@@ -733,6 +767,8 @@ impl Env {
             auth_vars: BTreeMap::new(),
             instances: BTreeMap::new(),
             local_instances: BTreeMap::new(),
+            tuples: BTreeMap::new(),
+            nodes: BTreeSet::new(),
             branch: 0,
             function,
         }
@@ -758,6 +794,8 @@ impl Env {
             auth_vars: self.auth_vars.clone(),
             instances: self.instances.clone(),
             local_instances: self.local_instances.clone(),
+            tuples: self.tuples.clone(),
+            nodes: self.nodes.clone(),
             branch: 0,
             function,
         }
@@ -881,6 +919,25 @@ struct Walker<'e> {
     /// Summary pass: constructor parameter spans, so what reaches a sink through a field is
     /// summarized under `Class.constructor`.
     ctor_params: BTreeMap<u32, String>,
+    /// Summary pass: the function each parameter origin (by span start) belongs to, so a sink
+    /// reached inside a callback or a nested function is summarized for the function whose
+    /// parameter it is.
+    param_owner: BTreeMap<u32, String>,
+    /// Summary pass: span starts of rest parameters' origins (`...paths`): their summaries take
+    /// every argument from their index on.
+    rest_params: BTreeSet<u32>,
+    /// The elements the next function entered is called back with (`list.map((x) => ...)`).
+    pending_element: Option<PendingElement>,
+    /// What the function being walked returns, so far.
+    fn_returns: Option<Origin>,
+    /// What the function walked last returned (read by the call that passed it as a callback).
+    callback_returns: Option<Origin>,
+    /// The file is a service worker (`self.addEventListener('fetch', ...)`): a `request` there is
+    /// the page's own request, not a server's (kept across passes).
+    service_worker: bool,
+    /// Variables bound to a regular expression (`const re = /a(.*)/`): `re.exec(s)` returns
+    /// parts of `s`; with the classes its captures are safe for (an anchored allowlist).
+    regexes: BTreeMap<String, u8>,
     modules: BTreeMap<String, Imported>,
     /// Local names bound to relative modules: name -> (specifier, export or None).
     relative: BTreeMap<String, (String, Option<String>)>,
@@ -1093,6 +1150,52 @@ fn table_rows(array: &oxc_ast::ast::ArrayExpression<'_>) -> Vec<BTreeMap<String,
 }
 
 /// The pack sink a finding's `api` names: `fetch`, `http-client.get`, `.query`, `db.query`.
+/// The classes the captures of a regular expression literal are safe for: an anchored allowlist
+/// (`/^(\d{15,25})\.(png|gif)$/`) admits only its characters; anything else, none.
+fn capture_mask(expr: &Expression<'_>) -> u8 {
+    match expr.get_inner_expression() {
+        Expression::RegExpLiteral(regex) => guards::anchored_allowlist(
+            regex.regex.pattern.text.as_str(),
+            &regex.regex.flags.to_string(),
+        )
+        .map_or(0, |set| guards::mask(&set)),
+        _ => 0,
+    }
+}
+
+/// A regular expression: `/a(.*)/` or `new RegExp(...)`.
+fn is_regex(expr: &Expression<'_>) -> bool {
+    match expr.get_inner_expression() {
+        Expression::RegExpLiteral(_) => true,
+        Expression::NewExpression(n) => n.callee.is_specific_id("RegExp"),
+        Expression::CallExpression(c) => c.callee.is_specific_id("RegExp"),
+        _ => false,
+    }
+}
+
+/// Merges a tuple's position taints into the positions seen so far.
+fn merge_positions(merged: &mut Vec<Option<Origin>>, tuple: Vec<Option<Origin>>) {
+    for (index, taint) in tuple.into_iter().enumerate() {
+        if index >= merged.len() {
+            merged.push(taint);
+        } else if let Some(slot) = merged.get_mut(index) {
+            *slot = union(slot.take(), taint);
+        }
+    }
+}
+
+/// The taint of argument `param`, or for a rest parameter, of every argument from it on.
+fn argument_taint(taints: &[Option<Origin>], param: usize, rest: bool) -> Option<Origin> {
+    if rest {
+        taints
+            .iter()
+            .skip(param)
+            .fold(None, |acc, t| union(acc, t.clone()))
+    } else {
+        taints.get(param).cloned().flatten()
+    }
+}
+
 /// Whether `origin` is safe for a sink of `class`: escaped or checked for that class, or for a
 /// class the sink lists in `cleared_by`.
 fn cleared(origin: &Origin, class: VulnClass, sink: &models::Sink) -> bool {
@@ -1337,6 +1440,16 @@ fn chain_prefixes<'e, 'a>(expr: &'e Expression<'a>) -> Vec<&'e Expression<'a>> {
     found
 }
 
+/// The values a callback is about to be called with: an element of the receiver, the initial
+/// value of an accumulator (see [`models::CallbackSpec`]).
+struct PendingElement {
+    element: Option<Origin>,
+    initial: Option<Origin>,
+    spec: models::CallbackSpec,
+    /// The element is a tuple with these taints by position (`([key, value]) => ...`).
+    positions: Option<Vec<Option<Origin>>>,
+}
+
 /// A route registration in one of the shapes beyond `router.get(path, handler)`.
 struct Registration {
     receiver: Option<String>,
@@ -1431,6 +1544,7 @@ impl Walker<'_> {
             Statement::ReturnStatement(s) => {
                 if let Some(argument) = &s.argument {
                     let taint = self.expr(argument, env);
+                    self.fn_returns = union(self.fn_returns.take(), taint.clone());
                     self.record_returned(argument, taint, env);
                     // `return router`: a factory's product (for mounts of `require('./x')()`).
                     if let Expression::Identifier(id) = argument.get_inner_expression() {
@@ -1498,10 +1612,24 @@ impl Walker<'_> {
                 env.branch -= 1;
             }
             Statement::ForOfStatement(s) => {
+                let positions = self.tuple_positions(&s.right, env);
                 let taint = self.expr(&s.right, env);
                 env.branch += 1;
                 let before = env.save();
-                self.for_left(&s.left, taint, env);
+                // `for (const [key, value] of Object.entries(o))`: each position its own taint.
+                let tuple_pattern = match &s.left {
+                    ForStatementLeft::VariableDeclaration(d) if d.declarations.len() == 1 => {
+                        match d.declarations.first().map(|declarator| &declarator.id) {
+                            Some(BindingPattern::ArrayPattern(array)) => Some(array),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match (tuple_pattern, positions) {
+                    (Some(array), Some(positions)) => self.bind_positions(array, &positions, env),
+                    _ => self.for_left(&s.left, taint, env),
+                }
                 self.statement(&s.body, env);
                 env.join_with(&before);
                 env.branch -= 1;
@@ -1878,6 +2006,21 @@ impl Walker<'_> {
                 env.vars.remove(name);
                 continue;
             }
+            if let Some(name) = &name_hint {
+                match self.tuple_positions(init, env) {
+                    Some(positions) => {
+                        env.tuples.insert(name.clone(), positions);
+                    }
+                    None => {
+                        env.tuples.remove(name);
+                    }
+                }
+                if is_regex(init) {
+                    self.regexes.insert(name.clone(), capture_mask(init));
+                } else {
+                    self.regexes.remove(name);
+                }
+            }
             // `const PREFIX = '/api'`, `const ROUTES = { users: '/users' }`: constants.
             if let (Some(name), VariableDeclarationKind::Const) = (&name_hint, declaration.kind) {
                 if let Some(text) = literal_path(init).filter(|_| {
@@ -2064,6 +2207,17 @@ impl Walker<'_> {
                     env.plain.insert(name.clone());
                 } else {
                     env.plain.remove(name);
+                }
+                // `const iframe = document.createElement('iframe')`: a node, not markup.
+                let node = match init.get_inner_expression() {
+                    Expression::CallExpression(c) => guards::path_key(&c.callee)
+                        .is_some_and(|callee| has(&m().node_factories, &callee)),
+                    _ => false,
+                };
+                if node {
+                    env.nodes.insert(name.clone());
+                } else {
+                    env.nodes.remove(name);
                 }
             }
             self.last_returned_fields = None;
@@ -2469,12 +2623,14 @@ impl Walker<'_> {
         let Some(body) = &f.body else {
             return;
         };
+        let outer = self.fn_returns.take();
         let mut env = self.enter_function(&f.params, parent, name, role);
         if self.enter() {
             self.statements(&body.statements, &mut env);
             self.record_validated(&body.statements, f.params.span, &env);
             self.leave();
         }
+        self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
     }
 
     fn enter_function(
@@ -2578,17 +2734,23 @@ impl Walker<'_> {
                             continue;
                         };
                         self.field_of.insert(property.span.start, key);
+                        self.param_owner
+                            .insert(property.span.start, env.function.clone());
                         let mut origin = Origin::source("param", property.span);
                         origin.param = Some(index);
                         self.bind_pattern(&property.value, Some(origin), None, &mut env);
                     }
                     if let Some(rest) = &object.rest {
+                        self.param_owner
+                            .insert(param.span.start, env.function.clone());
                         let mut origin = Origin::source("param", param.span);
                         origin.param = Some(index);
                         self.bind_pattern(&rest.argument, Some(origin), None, &mut env);
                     }
                     continue;
                 }
+                self.param_owner
+                    .insert(param.span.start, env.function.clone());
                 let origin = Origin {
                     kind: "param",
                     span: param.span,
@@ -2602,6 +2764,40 @@ impl Walker<'_> {
                     also: Vec::new(),
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
+            }
+            // `function run(cmd, ...args)`: every argument from the rest's index on.
+            if let Some(rest) = &params.rest {
+                let span = rest.span;
+                self.param_owner.insert(span.start, env.function.clone());
+                self.rest_params.insert(span.start);
+                let mut origin = Origin::source("param", span);
+                origin.param = Some(params.items.len());
+                self.bind_pattern(&rest.rest.argument, Some(origin), None, &mut env);
+            }
+        }
+        // A callback of an array, promise or string method: its parameters are the receiver's
+        // elements (and a reduce's accumulator its initial value).
+        if let Some(pending) = self.pending_element.take() {
+            for (index, param) in params.items.iter().enumerate() {
+                let value = if pending.spec.accumulator == Some(index) {
+                    pending.initial.clone()
+                } else if pending.spec.element_all || pending.spec.element.contains(&index) {
+                    pending.element.clone()
+                } else {
+                    None
+                };
+                if value.is_none() {
+                    continue;
+                }
+                match (&param.pattern, &pending.positions) {
+                    // `([key, value]) => ...` over tuples: each position its own taint.
+                    (BindingPattern::ArrayPattern(array), Some(positions))
+                        if pending.spec.accumulator != Some(index) =>
+                    {
+                        self.bind_positions(array, positions, &mut env);
+                    }
+                    _ => self.bind_pattern(&param.pattern, value, None, &mut env),
+                }
             }
         }
         match role {
@@ -2657,6 +2853,15 @@ impl Walker<'_> {
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
+                // `socket.onAny((event, ...args) => ...)`: the rest holds client data too.
+                if let Some(rest) = &params.rest
+                    && selected.wants(params.items.len())
+                    && selected != Params::Input
+                {
+                    let mut origin = Origin::source(kind, rest.span);
+                    origin.object = !has(&m().scalar_kinds, kind);
+                    self.bind_pattern(&rest.rest.argument, Some(origin), None, &mut env);
+                }
             }
             Role::SocketConnection => {
                 if let Some(first) = first {
@@ -2683,6 +2888,12 @@ impl Walker<'_> {
                         } else {
                             "http"
                         };
+                        // In a service worker, a `request` is the page's (browser-side data).
+                        let kind = if self.service_worker && kind == "http" {
+                            "dom"
+                        } else {
+                            kind
+                        };
                         env.requests.insert(first.to_owned(), kind);
                     }
                 } else if role == Role::Route
@@ -2704,23 +2915,25 @@ impl Walker<'_> {
         name: Option<String>,
         role: Role,
     ) {
+        let outer = self.fn_returns.take();
         let mut env = self.enter_function(params, parent, name, role);
-        if !self.enter() {
-            return;
-        }
-        match body {
-            ArrowFunctionBody::FunctionBody(body) => {
-                self.statements(&body.statements, &mut env);
-                self.record_validated(&body.statements, params.span, &env);
-            }
-            other => {
-                if let Some(expr) = other.as_expression() {
-                    let taint = self.expr(expr, &mut env);
-                    self.record_returned(expr, taint, &env);
+        if self.enter() {
+            match body {
+                ArrowFunctionBody::FunctionBody(body) => {
+                    self.statements(&body.statements, &mut env);
+                    self.record_validated(&body.statements, params.span, &env);
+                }
+                other => {
+                    if let Some(expr) = other.as_expression() {
+                        let taint = self.expr(expr, &mut env);
+                        self.fn_returns = union(self.fn_returns.take(), taint.clone());
+                        self.record_returned(expr, taint, &env);
+                    }
                 }
             }
+            self.leave();
         }
-        self.leave();
+        self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
     }
 
     /// Summary pass: a void function that throws unless its parameters are valid
@@ -2763,6 +2976,7 @@ impl Walker<'_> {
                 out_field: None,
                 defined_in: None,
                 start: false,
+                rest: false,
             });
         }
     }
@@ -2817,6 +3031,7 @@ impl Walker<'_> {
                 out_field: out_field.clone(),
                 defined_in: None,
                 start: false,
+                rest: false,
             });
         }
     }
@@ -3503,13 +3718,23 @@ impl Walker<'_> {
     /// object can be an attacker's (a parsed body or query, a parameter), never for an object
     /// or array literal or a tracked local, whose keys are written in the code.
     fn keys_taint(
-        &self,
+        &mut self,
         expr: &Expression<'_>,
         taint: Option<&Origin>,
         env: &Env,
     ) -> Option<Origin> {
+        // A tracked local: the keys its unknown spreads bring and those an attacker-chosen
+        // computed write added; its written keys are the code's.
+        if let Expression::Identifier(id) = expr.get_inner_expression()
+            && let Some(fields) = env.fields.get(id.name.as_str())
+        {
+            return union(
+                fields.get(REST_FIELD).filter(|o| o.object).cloned(),
+                fields.get(KEYED_FIELD).cloned(),
+            );
+        }
         let taint = taint.filter(|o| o.object)?;
-        match expr.get_inner_expression() {
+        let keys = match expr.get_inner_expression() {
             // `{ ...req.body }` brings the body's keys; `{ a: req.query.x }` has only `a`.
             Expression::ObjectExpression(object) => object
                 .properties
@@ -3517,14 +3742,24 @@ impl Walker<'_> {
                 .any(|p| matches!(p, ObjectPropertyKind::SpreadProperty(_)))
                 .then(|| taint.clone()),
             Expression::ArrayExpression(_) => None,
-            Expression::Identifier(id) if env.fields.contains_key(id.name.as_str()) => env
-                .fields
-                .get(id.name.as_str())
-                .and_then(|fields| fields.get(REST_FIELD))
-                .filter(|o| o.object)
-                .cloned(),
             _ => Some(taint.clone()),
+        }?;
+        // Summary pass: a parameter's keys are a pseudo-field of it, which each call site
+        // resolves to its argument's keys (not its values).
+        if self.summarize && keys.param.is_some() && !self.field_of.contains_key(&keys.span.start) {
+            let at = expr.span().start;
+            if let Some(owner) = self.param_owner.get(&keys.span.start).cloned() {
+                self.param_owner.insert(at, owner);
+            }
+            if let Some(class) = self.ctor_params.get(&keys.span.start).cloned() {
+                self.ctor_params.insert(at, class);
+            }
+            self.field_of.insert(at, KEYS_FIELD.to_owned());
+            let mut keyed = keys;
+            keyed.span = expr.span();
+            return Some(keyed);
         }
+        Some(keys)
     }
 
     /// Stores `value` in what `target` names, as a weak update (`args.push(x)`,
@@ -3697,6 +3932,32 @@ impl Walker<'_> {
                         }
                         return;
                     }
+                    // `fields[key] = value` on a tracked object: an unnamed field; the key, if the
+                    // attacker chose it, a key of the object.
+                    if let oxc_ast::ast::MemberExpression::ComputedMemberExpression(c) = member
+                        && let Expression::Identifier(root) = c.object.get_inner_expression()
+                        && env.fields.contains_key(root.name.as_str())
+                        && guards::member_key(member).is_none()
+                    {
+                        let mut probe = env.clone();
+                        let key = self.expr(&c.expression, &mut probe);
+                        let root = root.name.as_str().to_owned();
+                        if let Some(fields) = env.fields.get_mut(&root) {
+                            if let Some(key) = key {
+                                let merged = union(fields.remove(KEYED_FIELD), Some(key));
+                                if let Some(merged) = merged {
+                                    fields.insert(KEYED_FIELD.to_owned(), merged);
+                                }
+                            }
+                            if let Some(value) = taint {
+                                let merged = union(fields.remove(VALUES_FIELD), Some(value));
+                                if let Some(merged) = merged {
+                                    fields.insert(VALUES_FIELD.to_owned(), merged);
+                                }
+                            }
+                        }
+                        return;
+                    }
                     // `obj.x = tainted` taints `obj` (coarse: other objects' fields are not tracked).
                     // A weak update: an `obj` that already carried data keeps its own origin
                     // (`properties.x = fromConfig` leaves `properties` the caller's argument).
@@ -3865,10 +4126,10 @@ impl Walker<'_> {
         if let (Expression::Identifier(id), Some(property)) = (object, property.as_deref())
             && let Some(fields) = env.fields.get(id.name.as_str())
         {
-            match (fields.get(property), fields.get(REST_FIELD)) {
+            match (fields.get(property), unnamed_fields(fields)) {
                 (Some(origin), _) => return Some(origin.clone()),
                 (None, None) => return None,
-                (None, Some(origin)) => rest = Some(origin.clone()),
+                (None, Some(origin)) => rest = Some(origin),
             }
         }
         // `file.path` of an upload event: chosen by the server.
@@ -3899,6 +4160,12 @@ impl Walker<'_> {
                 .insert(member.span().start, property.to_owned());
             if let Some(class) = self.ctor_params.get(&origin.span.start).cloned() {
                 self.ctor_params.insert(member.span().start, class);
+            }
+            if let Some(owner) = self.param_owner.get(&origin.span.start).cloned() {
+                self.param_owner.insert(member.span().start, owner);
+            }
+            if self.rest_params.contains(&origin.span.start) {
+                self.rest_params.insert(member.span().start);
             }
             return Some(field);
         }
@@ -4073,6 +4340,17 @@ impl Walker<'_> {
     }
 
     fn call(&mut self, call: &CallExpression<'_>, env: &mut Env) -> Option<Origin> {
+        // `self.addEventListener('fetch', ...)`, `self.skipWaiting()`: a service worker.
+        if !self.service_worker
+            && let Some(name) = guards::path_key(&call.callee)
+            && (matches!(name.as_str(), "self.skipWaiting" | "self.clients.claim")
+                || (matches!(name.as_str(), "self.addEventListener" | "addEventListener")
+                    && matches!(call.arguments.first(),
+                        Some(Argument::StringLiteral(event))
+                            if matches!(event.value.as_str(), Some("fetch" | "install" | "activate")))))
+        {
+            self.service_worker = true;
+        }
         let callee = self.callee(&call.callee);
         // Receiver taint (for pass-through methods), walking the callee once.
         let receiver = match call.callee.get_inner_expression().as_member_expression() {
@@ -4233,6 +4511,34 @@ impl Walker<'_> {
                 }
             }
         }
+        // `list.map((x) => ...)`, `p.then((v) => ...)`, `s.replace(re, (m) => ...)`: what the
+        // callback is called with, and what it returns.
+        let (callback_spec, method_name) = match &callee {
+            Callee::Method { method, .. } if !method.is_empty() => {
+                (m().callbacks.get(method).cloned(), method.clone())
+            }
+            _ => (None, String::new()),
+        };
+        // `reduce((acc, x) => ..., initial)`: the accumulator starts as the initial value
+        // (walked ahead for its taint only: no findings from this walk).
+        let initial = match &callback_spec {
+            Some(spec) if spec.accumulator.is_some() => call
+                .arguments
+                .get(spec.callback + 1)
+                .and_then(Argument::as_expression)
+                .and_then(|e| {
+                    let saved = std::mem::replace(&mut self.record_only, true);
+                    let mut probe = env.clone();
+                    let taint = self.expr(e, &mut probe);
+                    self.record_only = saved;
+                    taint
+                }),
+            _ => None,
+        };
+        let element = receiver
+            .clone()
+            .map(|o| o.step(call.span.start, format!("element of .{method_name}()")));
+        let mut callback_result: Option<Origin> = None;
         let mut taints = Vec::with_capacity(call.arguments.len());
         for (index, argument) in call.arguments.iter().enumerate() {
             let arg_role = match shape {
@@ -4240,15 +4546,25 @@ impl Walker<'_> {
                 Shape::ObjectOfFunctions => Role::Plain,
                 _ => role,
             };
-            // `items.map((item) => ...)` on tainted items: the callback's element is tainted.
-            let arg_role = match (&callee, &receiver) {
-                (Callee::Method { method, .. }, Some(origin))
-                    if arg_role == Role::Plain && has(&m().iteration_methods, method) =>
-                {
-                    Role::Client(origin.kind, Params::First)
-                }
-                _ => arg_role,
-            };
+            let callback = callback_spec
+                .as_ref()
+                .filter(|spec| spec.callback == index && arg_role == Role::Plain);
+            if let Some(spec) = callback
+                && (element.is_some() || initial.is_some())
+            {
+                let positions = call
+                    .callee
+                    .get_inner_expression()
+                    .as_member_expression()
+                    .and_then(|member| self.tuple_positions(member.object(), env));
+                self.pending_element = Some(PendingElement {
+                    element: element.clone(),
+                    initial: initial.clone(),
+                    spec: spec.clone(),
+                    positions,
+                });
+            }
+            self.callback_returns = None;
             let callbacks_object = matches!(shape, Shape::ObjectOfFunctions | Shape::RouteObject)
                 && matches!(
                     argument
@@ -4271,6 +4587,31 @@ impl Walker<'_> {
                 }
                 _ => self.argument(argument, env, arg_role),
             };
+            if let Some(spec) = callback {
+                self.pending_element = None;
+                let is_function = argument.as_expression().is_some_and(|e| {
+                    matches!(
+                        e.get_inner_expression(),
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    )
+                });
+                callback_result = if is_function {
+                    self.callback_returns.take()
+                } else {
+                    // `ids.map(Number)`, `items.forEach(save)`: the function by what it does.
+                    let spec = spec.clone();
+                    argument.as_expression().and_then(|e| {
+                        self.callback_by_reference(
+                            e,
+                            &spec,
+                            element.clone(),
+                            initial.clone(),
+                            call.span,
+                            env,
+                        )
+                    })
+                };
+            }
             taints.push(taint);
         }
         // `Meteor.methods({ name(args) { ... } })`, `fastify.route({ method, url, handler })`:
@@ -4372,6 +4713,37 @@ impl Walker<'_> {
             _ => None,
         };
         if let Some((target, from)) = stored {
+            // `extras.push(['topic', topic])`: tuples, position by position.
+            if let Expression::Identifier(id) = target.get_inner_expression() {
+                let name = id.name.as_str().to_owned();
+                let stored: Vec<&Expression<'_>> = call
+                    .arguments
+                    .iter()
+                    .skip(from)
+                    .filter_map(Argument::as_expression)
+                    .collect();
+                let tuples: Option<Vec<Vec<Option<Origin>>>> = stored
+                    .iter()
+                    .map(|e| match e.get_inner_expression() {
+                        Expression::ArrayExpression(array) => {
+                            Some(self.array_positions(array, env))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                match tuples {
+                    Some(tuples) if !tuples.is_empty() => {
+                        let mut merged = env.tuples.remove(&name).unwrap_or_default();
+                        for tuple in tuples {
+                            merge_positions(&mut merged, tuple);
+                        }
+                        env.tuples.insert(name, merged);
+                    }
+                    _ => {
+                        env.tuples.remove(&name);
+                    }
+                }
+            }
             let value = taints
                 .iter()
                 .skip(from)
@@ -4673,7 +5045,7 @@ impl Walker<'_> {
                     origin.object = s.at_sink.object;
                     Some(origin)
                 } else {
-                    let arg = taints.get(s.param).cloned().flatten();
+                    let arg = argument_taint(&taints, s.param, s.rest);
                     match &s.field {
                         Some(field) => {
                             let value =
@@ -4692,6 +5064,11 @@ impl Walker<'_> {
                                         self.ctor_params.get(&origin.span.start).cloned()
                                     {
                                         self.ctor_params.insert(call.span.start, class);
+                                    }
+                                    if let Some(owner) =
+                                        self.param_owner.get(&origin.span.start).cloned()
+                                    {
+                                        self.param_owner.insert(call.span.start, owner);
                                     }
                                     origin.span = call.span;
                                     self.field_of.insert(call.span.start, field.clone());
@@ -4834,6 +5211,25 @@ impl Walker<'_> {
         }
         let any_arg = || taints.iter().flatten().next().cloned();
         match &callee {
+            Callee::Method { method, .. }
+                if callback_spec
+                    .as_ref()
+                    .is_some_and(|s| s.returns || s.keeps_receiver) =>
+            {
+                let spec = callback_spec.as_ref()?;
+                let mut result = if spec.keeps_receiver {
+                    receiver.clone()
+                } else {
+                    None
+                };
+                if spec.returns {
+                    result = union(result, callback_result);
+                    if spec.accumulator.is_some() {
+                        result = union(result, initial);
+                    }
+                }
+                result.map(|o| o.step(call.span.start, format!("returned through .{method}()")))
+            }
             Callee::Method { method, .. } => {
                 // `req.get('x')`, `await request.json()`
                 if let Some(member) = call.callee.get_inner_expression().as_member_expression()
@@ -4857,6 +5253,43 @@ impl Walker<'_> {
                 // Pack result sources: `zip.getEntries()`.
                 if let Some(source) = m().result_sources.iter().find(|s| has(&s.methods, method)) {
                     return Some(Origin::source(source.kind.as_str(), call.span));
+                }
+                // `/a(.*)/.exec(s)`: the match and its groups are parts of `s` (only characters
+                // an anchored allowlist admits: `/^(\d+)\.png$/` leaves nothing to attack).
+                if method == "exec"
+                    && let Some(member) = call.callee.get_inner_expression().as_member_expression()
+                    && let Some(classes) = match member.object().get_inner_expression() {
+                        Expression::Identifier(id) => self.regexes.get(id.name.as_str()).copied(),
+                        other if is_regex(other) => Some(capture_mask(other)),
+                        _ => None,
+                    }
+                {
+                    if classes == guards::ALL {
+                        return None;
+                    }
+                    return taints.first().cloned().flatten().map(|mut o| {
+                        o.object = false;
+                        o.escaped |= classes;
+                        o.step(
+                            call.span.start,
+                            "matched by a regular expression".to_owned(),
+                        )
+                    });
+                }
+                // `s.match(/^(\d+)$/)`: likewise.
+                if (method == "match" || method == "matchAll")
+                    && let Some(regex) = call.arguments.first().and_then(Argument::as_expression)
+                    && is_regex(regex)
+                {
+                    let classes = capture_mask(regex);
+                    if classes == guards::ALL {
+                        return None;
+                    }
+                    return receiver.map(|mut o| {
+                        o.object = false;
+                        o.escaped |= classes;
+                        o.step(call.span.start, format!("matched by .{method}()"))
+                    });
                 }
                 // `items.find(..)`, `list.filter(..)`, `args.pop()`: elements of the receiver,
                 // never the arguments (`User.find({ name })` is a query, not its result).
@@ -5161,6 +5594,10 @@ impl Walker<'_> {
         env: &Env,
         whole: Option<Origin>,
     ) -> Option<Origin> {
+        // A helper that uses its parameter's keys: this argument's keys.
+        if field == KEYS_FIELD {
+            return self.keys_taint(expr, whole.as_ref(), env);
+        }
         match expr.get_inner_expression() {
             Expression::ObjectExpression(object) => {
                 let mut taint = None;
@@ -5209,8 +5646,8 @@ impl Walker<'_> {
             Expression::Identifier(id) => match env.fields.get(id.name.as_str()) {
                 Some(fields) => fields
                     .get(field)
-                    .or_else(|| fields.get(REST_FIELD))
-                    .cloned(),
+                    .cloned()
+                    .or_else(|| unnamed_fields(fields)),
                 None => whole,
             },
             _ => whole,
@@ -5265,6 +5702,203 @@ impl Walker<'_> {
     /// Walks an expression for what it records, discarding its taint.
     fn walk_only(&mut self, expr: &Expression<'_>, env: &mut Env) {
         self.expr(expr, env);
+    }
+
+    /// The taint at each position of the tuples a collection holds: a tracked collection of
+    /// tuples, `Object.entries(o)` (`[key, value]`), or an array of array literals.
+    fn tuple_positions(&mut self, expr: &Expression<'_>, env: &Env) -> Option<Vec<Option<Origin>>> {
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) => env.tuples.get(id.name.as_str()).cloned(),
+            Expression::CallExpression(call)
+                if guards::path_key(&call.callee).as_deref() == Some("Object.entries") =>
+            {
+                let object = call.arguments.first().and_then(Argument::as_expression)?;
+                let saved = std::mem::replace(&mut self.record_only, true);
+                let mut probe = env.clone();
+                let whole = self.expr(object, &mut probe);
+                let keys = self.keys_taint(object, whole.as_ref(), env);
+                self.record_only = saved;
+                Some(vec![keys, whole])
+            }
+            Expression::ArrayExpression(array)
+                if !array.elements.is_empty()
+                    && array.elements.iter().all(|e| {
+                        matches!(
+                            e.as_expression().map(Expression::get_inner_expression),
+                            Some(Expression::ArrayExpression(_))
+                        )
+                    }) =>
+            {
+                let mut merged = Vec::new();
+                for element in &array.elements {
+                    if let Some(Expression::ArrayExpression(inner)) = element
+                        .as_expression()
+                        .map(Expression::get_inner_expression)
+                    {
+                        let positions = self.array_positions(inner, env);
+                        merge_positions(&mut merged, positions);
+                    }
+                }
+                Some(merged)
+            }
+            _ => None,
+        }
+    }
+
+    /// The taint of each element of an array literal (walked for its taint only).
+    fn array_positions(
+        &mut self,
+        array: &oxc_ast::ast::ArrayExpression<'_>,
+        env: &Env,
+    ) -> Vec<Option<Origin>> {
+        let saved = std::mem::replace(&mut self.record_only, true);
+        let mut probe = env.clone();
+        let positions = array
+            .elements
+            .iter()
+            .take(16)
+            .map(|element| match element {
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    self.expr(&spread.argument, &mut probe)
+                }
+                other => other.as_expression().and_then(|e| self.expr(e, &mut probe)),
+            })
+            .collect();
+        self.record_only = saved;
+        positions
+    }
+
+    /// Binds `[a, b]` to a tuple's positions.
+    fn bind_positions(
+        &mut self,
+        array: &oxc_ast::ast::ArrayPattern<'_>,
+        positions: &[Option<Origin>],
+        env: &mut Env,
+    ) {
+        for (index, element) in array.elements.iter().enumerate() {
+            if let Some(pattern) = element {
+                let value = positions.get(index).cloned().flatten();
+                self.bind_pattern(pattern, value, None, env);
+            }
+        }
+        if let Some(rest) = &array.rest {
+            let value = positions
+                .iter()
+                .skip(array.elements.len())
+                .fold(None, |acc, t| union(acc, t.clone()));
+            self.bind_pattern(&rest.argument, value, None, env);
+        }
+    }
+
+    /// What a function passed by reference as a callback does with the elements it is called
+    /// with: a global by its rule (`Number` clears, `String` passes), a function of ours by its
+    /// summaries (sinks reached, values returned). Returns what the callback returns.
+    fn callback_by_reference(
+        &mut self,
+        expr: &Expression<'_>,
+        spec: &models::CallbackSpec,
+        element: Option<Origin>,
+        initial: Option<Origin>,
+        span: Span,
+        env: &Env,
+    ) -> Option<Origin> {
+        if let Expression::Identifier(id) = expr.get_inner_expression()
+            && !self.relative.contains_key(id.name.as_str())
+            && !self.summaries.contains_key(id.name.as_str())
+        {
+            let name = id.name.as_str();
+            if has(&m().clearing, name) {
+                let classes = guards::named_mask(name, None);
+                return (classes != guards::ALL)
+                    .then(|| {
+                        element.map(|mut o| {
+                            o.escaped |= classes;
+                            o.object = false;
+                            o
+                        })
+                    })
+                    .flatten();
+            }
+            if has(&m().pass_globals, name) {
+                return element.map(|mut o| {
+                    o.object = has(&m().object_globals, name);
+                    o.step(span.start, format!("through {name}()"))
+                });
+            }
+            return None;
+        }
+        let (name, summaries) = self.referenced_summaries(expr)?;
+        let most = summaries
+            .iter()
+            .map(|s| s.param.saturating_add(1))
+            .filter(|n| *n < 64)
+            .max()
+            .unwrap_or(0)
+            .max(spec.element.iter().map(|i| i + 1).max().unwrap_or(1));
+        let arguments: Vec<Option<Origin>> = (0..most)
+            .map(|index| {
+                if spec.accumulator == Some(index) {
+                    initial.clone()
+                } else if spec.element_all || spec.element.contains(&index) {
+                    element.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.apply_summaries(&name, &summaries, &arguments, None, span, env);
+        let mut returned = None;
+        for s in summaries.iter().filter(|s| s.api == RETURNS) {
+            let origin = if s.param == RETURNS_SOURCE {
+                Some(Origin::source(s.at_sink.kind, span))
+            } else {
+                argument_taint(&arguments, s.param, s.rest)
+            };
+            let at = &s.at_sink;
+            returned = union(
+                returned,
+                origin.map(|mut o| {
+                    o.built |= at.built;
+                    o.sqlish |= at.sqlish;
+                    o.prefix &= at.prefix;
+                    o.object &= at.object;
+                    o.escaped |= at.escaped;
+                    o.step(span.start, format!("returned by `{name}()`"))
+                }),
+            );
+        }
+        returned
+    }
+
+    /// The summaries of a function referenced by name (`save`, `this.save`, `helpers.save`):
+    /// this file's, or an imported function's.
+    fn referenced_summaries(&self, expr: &Expression<'_>) -> Option<(String, Vec<Summary>)> {
+        let referenced = match expr.get_inner_expression() {
+            Expression::Identifier(id) => id.name.as_str().to_owned(),
+            other => other
+                .as_member_expression()
+                .and_then(|m| m.static_property_name())
+                .and_then(|n| n.as_str().map(str::to_owned))?,
+        };
+        if let Expression::Identifier(id) = expr.get_inner_expression()
+            && let Some((spec, export)) = self.relative.get(id.name.as_str())
+        {
+            let export = export.as_deref().unwrap_or("default");
+            let (file, name) = self.exported_function(spec, export)?;
+            let list: Vec<Summary> = self
+                .external
+                .get(&name)?
+                .iter()
+                .filter(|s| s.defined_in.as_deref() == Some(file.as_str()))
+                .cloned()
+                .collect();
+            return (!list.is_empty()).then_some((name, list));
+        }
+        let suffix = format!(".{referenced}");
+        self.summaries
+            .iter()
+            .find(|(k, _)| **k == referenced || k.ends_with(&suffix))
+            .map(|(k, list)| (k.clone(), list.clone()))
     }
 
     /// A router's own path prefix (`""` without one).
@@ -6380,7 +7014,7 @@ impl Walker<'_> {
             .iter()
             .filter(|s| s.api != RETURNS && s.api != VALIDATES)
         {
-            let whole = taints.get(summary.param).cloned().flatten();
+            let whole = argument_taint(taints, summary.param, summary.rest);
             let origin = match (&summary.field, arguments) {
                 (Some(field), Some(arguments)) => {
                     self.field_taint(arguments.get(summary.param), field, env, whole)
@@ -6477,10 +7111,15 @@ impl Walker<'_> {
                 if url_sink && !prefix {
                     continue;
                 }
-                // Reached through an instance field set from a constructor parameter.
+                // Reached through an instance field set from a constructor parameter; else the
+                // function whose parameter it is (a sink inside a callback or a nested function).
                 let owner = match self.ctor_params.get(&at) {
                     Some(class) => format!("{class}.constructor"),
-                    None => env.function.clone(),
+                    None => self
+                        .param_owner
+                        .get(&at)
+                        .cloned()
+                        .unwrap_or_else(|| env.function.clone()),
                 };
                 let field = self.field_of.get(&at).cloned();
                 let list = self.summaries.entry(owner).or_default();
@@ -6508,6 +7147,7 @@ impl Walker<'_> {
                         out_field: None,
                         defined_in: None,
                         start: finding.start || url_sink,
+                        rest: self.rest_params.contains(&at),
                     });
                 }
             }
@@ -6687,6 +7327,15 @@ impl Walker<'_> {
                 }
             };
             let Some(origin) = origin else { continue };
+            // `shadowRoot.append(iframe)`: a node created here is inserted as a node.
+            if sink.class == VulnClass::Xss
+                && matches!(
+                    arguments.get(index).and_then(Argument::as_expression).map(Expression::get_inner_expression),
+                    Some(Expression::Identifier(id)) if env.nodes.contains(id.name.as_str())
+                )
+            {
+                continue;
+            }
             if has(&sink.ignore_kinds, origin.kind) || cleared(&origin, sink.class, sink) {
                 // Another rule of the group may still match an unescaped argument.
                 continue;
@@ -7070,6 +7719,176 @@ mod tests {
             route("fs.readFileSync(path.join(LIBRARY, req.params.file));"),
             vec![(PathTraversal, High)]
         );
+    }
+
+    #[test]
+    fn sinks_in_callbacks_and_nested_functions_belong_to_the_parameters_function() {
+        use VulnClass::*;
+        let found = one(
+            "function run(cmd) { return new Promise((resolve) => exec(cmd, resolve)); }\n\
+             app.get('/x', (req, res) => run(req.query.c));",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        let found = one(
+            "async function q(v) { await db.transaction(async (trx) => trx.raw('SELECT * FROM t WHERE a = ' + v)); }\n\
+             app.get('/x', (req, res) => q(req.query.a));",
+        );
+        assert!(found.iter().any(|f| f.0 == SqlInjection), "{found:?}");
+        let found = one(
+            "function outer(a) { function inner(b) { exec('ls ' + a); } inner('x'); }\n\
+             app.get('/x', (req, res) => outer(req.query.a));",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        assert!(
+            one("function run(cmd) { return new Promise((r) => exec('ls', r)); }\napp.get('/x', (req, res) => run(req.query.c));")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rest_parameters_take_every_later_argument() {
+        use VulnClass::*;
+        let found = one(
+            "function run(a, ...rest) { exec('ls ' + rest[0]); }\napp.get('/x', (req, res) => run('x', req.query.a));",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        let found = one(
+            "function save(buf, ...p) { fs.writeFileSync(path.join(...p), buf); }\n\
+             app.post('/x', (req, res) => save(B, ROOT, req.params.a));",
+        );
+        assert!(found.iter().any(|f| f.0 == PathTraversal), "{found:?}");
+        let found = scan(
+            "const { exec } = require('child_process');\n\
+             io.on('connection', (socket) => { socket.onAny((event, ...args) => exec(args[0])); });",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        // The value lands in `a`; the rest is empty or clean.
+        assert!(one("function f(a, ...rest) { exec('ls ' + rest[0]); }\napp.get('/x', (req, res) => f(req.query.a));").is_empty());
+        assert!(one("function f(a, ...rest) { exec(a); }\napp.get('/x', (req, res) => f('ls', req.query.x));").is_empty());
+    }
+
+    #[test]
+    fn callbacks_get_elements_and_give_results() {
+        use Severity::*;
+        use VulnClass::*;
+        let critical = vec![(CommandInjection, Critical)];
+        assert_eq!(
+            route("exec(req.body.list.map((p) => 'x' + p).join(' '));"),
+            critical
+        );
+        assert_eq!(
+            route("Promise.resolve(req.query.c).then((c) => exec(c));"),
+            critical
+        );
+        assert_eq!(
+            route(
+                "const s = req.body.f.reduce((acc, f) => acc + ',' + f, ''); db.query('SELECT ' + s + ' FROM t');"
+            ),
+            vec![(SqlInjection, High)]
+        );
+        // A helper iterating its parameter: summarized, reported at the route.
+        let found = one(
+            "function runAll(list) { list.forEach((x) => exec(x)); }\napp.get('/a', (req, res) => runAll(req.body.list));",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        // A callback by reference: its summary, with the element as argument.
+        let found = one(
+            "function run(x) { exec(x); }\napp.get('/a', (req, res) => req.body.list.forEach(run));",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+        // Nothing of the element returned; numbers; plain arrays.
+        assert!(route("exec(req.body.list.map(() => 'x').join(' '));").is_empty());
+        assert!(route("exec(req.body.ids.map(Number).join(' '));").is_empty());
+        assert!(route("exec([1, 2].map((x) => x * 2).join(' '));").is_empty());
+    }
+
+    #[test]
+    fn replace_callbacks_and_regex_captures() {
+        use Severity::*;
+        use VulnClass::*;
+        let critical = vec![(CommandInjection, Critical)];
+        assert_eq!(
+            route("req.query.s.replace(/x(.*)/g, (m, g) => exec(g));"),
+            critical
+        );
+        assert_eq!(
+            route("const m = /a(.*)/.exec(req.query.s); exec(m[1]);"),
+            critical
+        );
+        assert_eq!(
+            route("const re = /a(.*)/; const m = re.exec(req.query.s); exec(m[1]);"),
+            critical
+        );
+        assert_eq!(route("exec(req.query.s.match(/a(.*)/)[1]);"), critical);
+        assert!(route("'abc'.replace(/b/, (m) => exec(m));").is_empty());
+        assert!(route("const m = /x/.exec(CONFIG.s); exec(m[0]);").is_empty());
+    }
+
+    #[test]
+    fn allowlist_captures_are_safe() {
+        assert!(route(
+            "const m = /^(\\d{15,25})\\.(png|gif)$/.exec(String(req.params.file || '')); res.sendFile(path.join(DIR, m[1] + '.' + m[2]));"
+        )
+        .is_empty());
+        assert!(!route("const m = /^(.+)\\.png$/.exec(req.params.file); res.sendFile(path.join(DIR, m[1]));").is_empty());
+    }
+
+    #[test]
+    fn keys_and_values_are_told_apart() {
+        use VulnClass::*;
+        // A helper that builds SQL from its argument's keys: values from the body, keys fixed.
+        let helper = "function update(table, fields) { const keys = Object.keys(fields);\n  \
+                      db.prepare(`UPDATE t SET ${keys.map((k) => `${k} = ?`).join(', ')}`).run(...keys.map((k) => fields[k])); }\n";
+        assert!(one(&format!(
+            "{helper}app.post('/x', (req, res) => {{ const fields = {{}};\n  \
+             for (const key of ['a', 'b']) fields[key] = req.body[key];\n  update('t', fields); }});"
+        ))
+        .is_empty());
+        // ...the body itself: its keys are the attacker's.
+        let found = one(&format!(
+            "{helper}app.post('/x', (req, res) => update('t', req.body));"
+        ));
+        assert!(found.iter().any(|f| f.0 == SqlInjection), "{found:?}");
+        // An attacker-chosen computed key.
+        let found = route(
+            "const o = {}; o[req.query.k] = 1; for (const k of Object.keys(o)) exec('ls ' + k);",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+    }
+
+    #[test]
+    fn tuples_keep_their_positions() {
+        use VulnClass::*;
+        // Literal keys, attacker values: `SET topic = ?` is not an injection.
+        assert!(route(
+            "const extras = []; extras.push(['topic', req.body.topic]); extras.push(['mode', 1]);\n\
+             db.prepare(`UPDATE c SET ${extras.map(([k]) => `${k} = ?`).join(', ')}`).run(...extras.map(([, v]) => v));"
+        )
+        .is_empty());
+        let found = route(
+            "const extras = []; extras.push([req.body.col, 1]); db.prepare(`UPDATE c SET ${extras.map(([k]) => `${k} = ?`).join(', ')}`);",
+        );
+        assert!(found.iter().any(|f| f.0 == SqlInjection), "{found:?}");
+        // `Object.entries` of a literal: keys are the code's.
+        assert!(route("const o = { name: req.body.name }; for (const [k, v] of Object.entries(o)) db.query(`UPDATE t SET ${k} = ?`, [v]);").is_empty());
+        let found = route(
+            "for (const [k, v] of Object.entries(req.body)) db.query(`UPDATE t SET ${k} = ?`, [v]);",
+        );
+        assert!(found.iter().any(|f| f.0 == SqlInjection), "{found:?}");
+    }
+
+    #[test]
+    fn appending_a_created_node_is_no_html_injection() {
+        assert!(scan("const iframe = document.createElement('iframe'); iframe.src = location.hash; shadowRoot.append(iframe);").is_empty());
+        let found = scan("const html = '<b>' + location.hash + '</b>'; $(el).append(html);");
+        assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn a_service_workers_requests_are_the_pages() {
+        let sw = "async function precache(request) { const base = new URL(request.url).origin; await fetch(base + '/avatars'); }\n\
+                  self.addEventListener('fetch', (event) => event.respondWith(precache(event.request)));\n";
+        assert!(scan(sw).is_empty(), "{:?}", scan(sw));
     }
 
     #[test]

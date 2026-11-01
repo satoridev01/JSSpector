@@ -85,6 +85,10 @@ pub struct Pack {
     /// do not apply to `new C()` of them.
     #[serde(default)]
     pub plain_constructors: Vec<String>,
+    /// Calls that create a DOM node (`document.createElement('iframe')`): appending one is no
+    /// HTML injection, whatever its attributes hold.
+    #[serde(default)]
+    pub node_factories: Vec<String>,
     /// Query operators whose operand is compared as a value (`{ email: { $eq: x } }`), and
     /// ORM option keys that wrap the filter (`{ where: { email } }`): not NoSQL injection points.
     #[serde(default)]
@@ -448,6 +452,36 @@ pub struct Propagation {
     /// `_.cloneDeep(o)`, `_.get(o, path)`, `deepcopy(o)`.
     #[serde(default)]
     pub object_module_pass: Vec<String>,
+    /// Methods that call back with the receiver's elements: `list.map((x) => ...)`,
+    /// `p.then((v) => ...)`, `s.replace(re, (m, g1) => ...)`.
+    #[serde(default)]
+    pub callbacks: BTreeMap<String, CallbackSpec>,
+}
+
+/// How a method calls its callback (see [`Propagation::callbacks`]).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallbackSpec {
+    /// The argument that is the callback (0 unless given: `replace`'s is 1).
+    #[serde(default)]
+    pub callback: usize,
+    /// The callback's parameters that receive an element of the receiver.
+    #[serde(default)]
+    pub element: Vec<usize>,
+    /// Every parameter receives (a part of) the receiver: `replace`'s match and groups.
+    #[serde(default)]
+    pub element_all: bool,
+    /// The accumulator parameter, seeded with the initial value (the argument after the
+    /// callback): `reduce`.
+    #[serde(default)]
+    pub accumulator: Option<usize>,
+    /// The call returns what the callback returns (`map`, `then`; with the initial value for
+    /// `reduce`).
+    #[serde(default)]
+    pub returns: bool,
+    /// The call's result is still the receiver's value (`catch`, `finally`: the promise's).
+    #[serde(default)]
+    pub keeps_receiver: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -638,6 +672,7 @@ pub struct Model {
     pub store_globals: Vec<String>,
     pub key_globals: Vec<String>,
     pub object_module_pass: Vec<String>,
+    pub callbacks: BTreeMap<String, CallbackSpec>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -658,6 +693,7 @@ pub struct Model {
     pub escapers: BTreeMap<String, Vec<String>>,
     pub html_props: Vec<String>,
     pub plain_constructors: Vec<String>,
+    pub node_factories: Vec<String>,
     pub sql_keywords: Vec<String>,
     pub sql_pairs: Vec<(String, String)>,
     pub literal_operators: Vec<String>,
@@ -803,6 +839,7 @@ impl Model {
         self.key_globals.extend(pack.propagation.key_globals);
         self.object_module_pass
             .extend(pack.propagation.object_module_pass);
+        self.callbacks.extend(pack.propagation.callbacks);
         self.jsx_html_props.extend(pack.jsx.html_props);
         self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
         if pack.jsx.props_kind.is_some() {
@@ -836,6 +873,7 @@ impl Model {
         }
         self.html_props.extend(pack.html_props);
         self.plain_constructors.extend(pack.plain_constructors);
+        self.node_factories.extend(pack.node_factories);
         self.sql_keywords.extend(pack.sql_keywords);
         self.sql_pairs.extend(pack.sql_pairs);
         self.literal_operators.extend(pack.literal_operators);

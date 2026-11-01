@@ -185,6 +185,10 @@ const fn class_bit(class: VulnClass) -> u8 {
     1 << (class as u8)
 }
 
+/// Prefix of the constants that hold a regular expression's capture mask (see
+/// [`Walker::regex_mask`]): no path or name lookup ever builds such a key.
+const REGEX_CONSTANT: &str = "\u{1}regex:";
+
 /// The `param` of a return summary whose value is client data, whatever the arguments.
 const RETURNS_SOURCE: usize = usize::MAX;
 
@@ -201,6 +205,11 @@ pub const RETURNS: &str = "<return>";
 /// void helper whose exit-on-failure guards clean it (`function assertSafe(p) { if (!ok(p))
 /// throw ... }`). After a call returns, the argument is clean.
 pub const VALIDATES: &str = "<validates>";
+
+/// The `api` of a summary that says "the function throws unless this parameter is a string,
+/// number or boolean" (`if (channel && typeof channel !== 'string') throw ...`): after a call
+/// returns, the argument is never an object (no query operators).
+pub const SCALARS: &str = "<scalar>";
 
 /// The `api` of a summary that says "the function returns true only when this parameter is
 /// safe for the classes in `at_sink.escaped`": a predicate by what it does
@@ -959,16 +968,18 @@ impl Env {
         }
     }
 
+    /// A strong update, in a branch too: every branch saves the state before it and joins it
+    /// after (`if (!p) { p = '/usr/bin/chromium'; install(p); }` installs the constant, and past
+    /// the `if` `p` is the caller's again).
     fn bind(&mut self, name: &str, taint: Option<Origin>) {
         self.forget(name);
         match taint {
             Some(origin) => {
                 self.vars.insert(name.to_owned(), origin);
             }
-            None if self.branch == 0 => {
+            None => {
                 self.vars.remove(name);
             }
-            None => {}
         }
     }
 }
@@ -1219,33 +1230,36 @@ fn literal_comparison(value: &Expression<'_>) -> bool {
         })
 }
 
-/// Whether a function body returns a value somewhere (not counting nested functions).
-fn returns_value(statements: &[Statement<'_>]) -> bool {
-    statements.iter().any(statement_returns_value)
+/// Whether a function body has a `return` somewhere, with a value or not (not counting nested
+/// functions): a void check that `return`s on bad input lets its caller go on with it.
+fn returns_at_all(statements: &[Statement<'_>]) -> bool {
+    statements.iter().any(|s| statement_returns(s, true))
 }
 
-fn statement_returns_value(statement: &Statement<'_>) -> bool {
+/// A `return` in `statement` (with a value, unless `bare` counts a plain `return;` too).
+fn statement_returns(statement: &Statement<'_>, bare: bool) -> bool {
+    let any = |list: &[Statement<'_>]| list.iter().any(|s| statement_returns(s, bare));
     match statement {
-        Statement::ReturnStatement(r) => r.argument.is_some(),
-        Statement::BlockStatement(b) => returns_value(&b.body),
+        Statement::ReturnStatement(r) => bare || r.argument.is_some(),
+        Statement::BlockStatement(b) => any(&b.body),
         Statement::IfStatement(i) => {
-            statement_returns_value(&i.consequent)
-                || i.alternate.as_ref().is_some_and(statement_returns_value)
+            statement_returns(&i.consequent, bare)
+                || i.alternate
+                    .as_ref()
+                    .is_some_and(|a| statement_returns(a, bare))
         }
         Statement::TryStatement(t) => {
-            returns_value(&t.block.body)
-                || t.handler
-                    .as_ref()
-                    .is_some_and(|h| returns_value(&h.body.body))
-                || t.finalizer.as_ref().is_some_and(|f| returns_value(&f.body))
+            any(&t.block.body)
+                || t.handler.as_ref().is_some_and(|h| any(&h.body.body))
+                || t.finalizer.as_ref().is_some_and(|f| any(&f.body))
         }
-        Statement::SwitchStatement(sw) => sw.cases.iter().any(|c| returns_value(&c.consequent)),
-        Statement::ForStatement(f) => statement_returns_value(&f.body),
-        Statement::ForInStatement(f) => statement_returns_value(&f.body),
-        Statement::ForOfStatement(f) => statement_returns_value(&f.body),
-        Statement::WhileStatement(w) => statement_returns_value(&w.body),
-        Statement::DoWhileStatement(d) => statement_returns_value(&d.body),
-        Statement::LabeledStatement(l) => statement_returns_value(&l.body),
+        Statement::SwitchStatement(sw) => sw.cases.iter().any(|c| any(&c.consequent)),
+        Statement::ForStatement(f) => statement_returns(&f.body, bare),
+        Statement::ForInStatement(f) => statement_returns(&f.body, bare),
+        Statement::ForOfStatement(f) => statement_returns(&f.body, bare),
+        Statement::WhileStatement(w) => statement_returns(&w.body, bare),
+        Statement::DoWhileStatement(d) => statement_returns(&d.body, bare),
+        Statement::LabeledStatement(l) => statement_returns(&l.body, bare),
         _ => false,
     }
 }
@@ -1583,6 +1597,20 @@ fn receiver_chain(callee: &Expression<'_>) -> Vec<String> {
         }
     }
     names
+}
+
+/// A call that creates a DOM node (`document.createElement('iframe')`,
+/// `host.ownerDocument.createElement('video')`, `template.content.cloneNode(true)`): appending it
+/// inserts that node, not markup. Pack names starting with `.` are methods on any receiver.
+fn creates_node(expr: &Expression<'_>) -> bool {
+    let Expression::CallExpression(c) = expr.get_inner_expression() else {
+        return false;
+    };
+    guards::path_key(&c.callee).is_some_and(|callee| {
+        m().node_factories
+            .iter()
+            .any(|f| *f == callee || (f.starts_with('.') && callee.ends_with(f.as_str())))
+    })
 }
 
 /// The name of a path part known only at run time: `mount` for `mounts[mount]`, `base` for
@@ -2750,15 +2778,31 @@ impl Walker<'_> {
                     )
                 }) {
                     self.constants.insert(name.clone(), text);
+                } else if is_regex(init) {
+                    self.constants.insert(
+                        format!("{REGEX_CONSTANT}{name}"),
+                        capture_mask(init).to_string(),
+                    );
                 } else if let Expression::ObjectExpression(object) = init.get_inner_expression() {
                     for property in &object.properties {
-                        if let ObjectPropertyKind::ObjectProperty(p) = property
-                            && let Some(key) = prop_name(&p.key)
-                            && let Expression::StringLiteral(value) = p.value.get_inner_expression()
+                        let ObjectPropertyKind::ObjectProperty(p) = property else {
+                            continue;
+                        };
+                        let Some(key) = prop_name(&p.key) else {
+                            continue;
+                        };
+                        if let Expression::StringLiteral(value) = p.value.get_inner_expression()
                             && let Some(text) = value.value.as_str()
                         {
                             self.constants
                                 .insert(format!("{name}.{key}"), text.to_owned());
+                        }
+                        // `const regexes = { profile: /^\/user\/([\w\-]+)/i }`
+                        if is_regex(&p.value) {
+                            let mask = capture_mask(&p.value);
+                            self.regexes.insert(format!("{name}.{key}"), mask);
+                            self.constants
+                                .insert(format!("{REGEX_CONSTANT}{name}.{key}"), mask.to_string());
                         }
                     }
                 }
@@ -2946,12 +2990,7 @@ impl Walker<'_> {
                     env.encoded.remove(name);
                 }
                 // `const iframe = document.createElement('iframe')`: a node, not markup.
-                let node = match init.get_inner_expression() {
-                    Expression::CallExpression(c) => guards::path_key(&c.callee)
-                        .is_some_and(|callee| has(&m().node_factories, &callee)),
-                    _ => false,
-                };
-                if node {
+                if creates_node(init) {
                     env.nodes.insert(name.clone());
                 } else {
                     env.nodes.remove(name);
@@ -2987,7 +3026,7 @@ impl Walker<'_> {
                 }
                 // `document.createElement('a')`: an anchor, whose `href` is a URL sink.
                 let tag = match init.get_inner_expression() {
-                    Expression::CallExpression(c) if node => c
+                    Expression::CallExpression(c) if creates_node(init) => c
                         .arguments
                         .first()
                         .and_then(Argument::as_expression)
@@ -4030,14 +4069,45 @@ impl Walker<'_> {
     /// Summary pass: a void function that throws unless its parameters are valid
     /// (`isValidRequest(req, fileName)` throwing on a bad name) validates them for its callers.
     fn record_validated(&mut self, body: &[Statement<'_>], span: Span, env: &Env) {
+        // Only a check whose every failure throws: one that `return`s lets the caller go on.
         if !self.summarize
             || env.function == "<anonymous>"
             || env.function == "<module>"
-            || returns_value(body)
+            || returns_at_all(body)
         {
             return;
         }
         for (index, param) in env.params.iter().enumerate() {
+            // `if (typeof channel !== 'string') throw ...`: never an object past the call.
+            if !param.is_empty()
+                && env.scalars.contains(param)
+                && !env.clean.contains(param)
+                && !self
+                    .summaries
+                    .get(&env.function)
+                    .is_some_and(|list| list.iter().any(|s| s.api == SCALARS && s.param == index))
+            {
+                self.summaries
+                    .entry(env.function.clone())
+                    .or_default()
+                    .push(Summary {
+                        param: index,
+                        class: VulnClass::NosqlInjection,
+                        severity: Severity::Low,
+                        api: SCALARS.to_owned(),
+                        arg: span,
+                        call: span,
+                        steps: Vec::new(),
+                        at_sink: Origin::source("param", span),
+                        ext: None,
+                        field: None,
+                        out_field: None,
+                        defined_in: None,
+                        start: false,
+                        rest: false,
+                        instance_of: None,
+                    });
+            }
             // The classes it validates the parameter for (`at_sink.escaped`).
             let classes = if env.clean.contains(param) {
                 guards::ALL
@@ -4897,6 +4967,17 @@ impl Walker<'_> {
                 // new Registry()`: what the target now holds an instance of.
                 if assign.operator.is_assign() {
                     self.type_assignment(&assign.left, &assign.right, env);
+                }
+                // `video = doc.createElement('video')` on a `let video` declared earlier: a node.
+                if assign.operator.is_assign()
+                    && let Some(SimpleAssignmentTarget::AssignmentTargetIdentifier(id)) =
+                        assign.left.as_simple_assignment_target()
+                {
+                    if creates_node(&assign.right) {
+                        env.nodes.insert(id.name.as_str().to_owned());
+                    } else {
+                        env.nodes.remove(id.name.as_str());
+                    }
                 }
                 // `_mounts.main = (app) => { ... }`: one more function of the table.
                 if assign.operator.is_assign()
@@ -5826,6 +5907,27 @@ impl Walker<'_> {
                             BTreeMap::from([(REST_FIELD.to_owned(), whole)]),
                         );
                         newly_tracked = true;
+                    }
+                    // `settings.map = fromUrl` on a clean object we do not track: track it from
+                    // here, its other fields as clean as it was (`settings.wpnMode` is not
+                    // `fromUrl`); the object as a whole carries what is written to it.
+                    if let (Some(origin), Expression::Identifier(root), Some(_)) = (
+                        &taint,
+                        member.object().get_inner_expression(),
+                        member.static_property_name(),
+                    ) && !env.fields.contains_key(root.name.as_str())
+                        && !env.requests.contains_key(root.name.as_str())
+                        && !env.vars.contains_key(root.name.as_str())
+                    {
+                        let name = root.name.as_str().to_owned();
+                        env.fields.insert(name.clone(), BTreeMap::new());
+                        env.vars.insert(
+                            name,
+                            origin.clone().step(
+                                member.span().start,
+                                format!("stored in a field of `{}`", root.name),
+                            ),
+                        );
                     }
                     // `opts.ids = tainted` on a tracked object: that field only.
                     if let (Expression::Identifier(root), Some(property)) = (
@@ -7416,13 +7518,20 @@ impl Walker<'_> {
         if let Some((_, summaries)) = &helper {
             let validated: Vec<(String, guards::Fact)> = summaries
                 .iter()
-                .filter(|s| s.api == VALIDATES)
+                .filter(|s| s.api == VALIDATES || s.api == SCALARS)
                 .filter_map(|s| {
                     call.arguments
                         .get(s.param)
                         .and_then(Argument::as_expression)
                         .and_then(guards::path_key)
-                        .map(|key| (key, guards::Fact::Clean(s.at_sink.escaped)))
+                        .map(|key| {
+                            let fact = if s.api == SCALARS {
+                                guards::Fact::Scalar
+                            } else {
+                                guards::Fact::Clean(s.at_sink.escaped)
+                            };
+                            (key, fact)
+                        })
                 })
                 .collect();
             env.learn(validated);
@@ -7628,11 +7737,7 @@ impl Walker<'_> {
                 // an anchored allowlist admits: `/^(\d+)\.png$/` leaves nothing to attack).
                 if has(&m().regex_methods, method)
                     && let Some(member) = call.callee.get_inner_expression().as_member_expression()
-                    && let Some(classes) = match member.object().get_inner_expression() {
-                        Expression::Identifier(id) => self.regexes.get(id.name.as_str()).copied(),
-                        other if is_regex(other) => Some(capture_mask(other)),
-                        _ => None,
-                    }
+                    && let Some(classes) = self.regex_mask(member.object())
                 {
                     if classes == guards::ALL {
                         return None;
@@ -7648,10 +7753,12 @@ impl Walker<'_> {
                 }
                 // `s.match(/^(\d+)$/)`: likewise.
                 if has(&m().match_methods, method)
-                    && let Some(regex) = call.arguments.first().and_then(Argument::as_expression)
-                    && is_regex(regex)
+                    && let Some(classes) = call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|regex| self.regex_mask(regex))
                 {
-                    let classes = capture_mask(regex);
                     if classes == guards::ALL {
                         return None;
                     }
@@ -9878,7 +9985,12 @@ impl Walker<'_> {
 
     /// A constant by access path: this file's, or an imported module's (`RouteKey.Asset`).
     fn constant(&self, key: &str) -> Option<String> {
-        if let Some(value) = self.constants.get(key) {
+        self.linked_constant(key, "")
+    }
+
+    /// [`Self::constant`] under a prefix of the constants map ([`REGEX_CONSTANT`]).
+    fn linked_constant(&self, key: &str, prefix: &str) -> Option<String> {
+        if let Some(value) = self.constants.get(&format!("{prefix}{key}")) {
             return Some(value.clone());
         }
         let (head, rest) = match key.split_once('.') {
@@ -9897,6 +10009,7 @@ impl Walker<'_> {
         if let Some(more) = self.linking.reexports.get(&file) {
             files.extend(more.iter().cloned());
         }
+        let name = format!("{prefix}{name}");
         files.iter().find_map(|f| {
             self.linking
                 .constants
@@ -9904,6 +10017,21 @@ impl Walker<'_> {
                 .and_then(|c| c.get(&name))
                 .cloned()
         })
+    }
+
+    /// The classes a regular expression's captures are safe for: a literal, a local
+    /// `const re = /.../`, or a property of a local or imported object of them
+    /// (`regexes.profile` from `lib/utils/location.js`).
+    fn regex_mask(&self, expr: &Expression<'_>) -> Option<u8> {
+        if is_regex(expr) {
+            return Some(capture_mask(expr));
+        }
+        let key = guards::path_key(expr)?;
+        if let Some(mask) = self.regexes.get(&key) {
+            return Some(*mask);
+        }
+        self.linked_constant(&key, REGEX_CONSTANT)
+            .and_then(|mask| mask.parse().ok())
     }
 
     /// Records a TypeScript enum's members with literal values.
@@ -10014,7 +10142,11 @@ impl Walker<'_> {
         env: &Env,
     ) {
         for summary in summaries.iter().filter(|s| {
-            s.api != RETURNS && s.api != VALIDATES && s.api != INSTANCE && s.api != PREDICATE
+            s.api != RETURNS
+                && s.api != VALIDATES
+                && s.api != SCALARS
+                && s.api != INSTANCE
+                && s.api != PREDICATE
         }) {
             let whole = argument_taint(taints, summary.param, summary.rest);
             let origin = match (&summary.field, arguments) {
@@ -10998,6 +11130,98 @@ mod tests {
         assert!(scan("const iframe = document.createElement('iframe'); iframe.title = location.hash; shadowRoot.append(iframe);").is_empty());
         let found = scan("const html = '<b>' + location.hash + '</b>'; $(el).append(html);");
         assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+        // corosolto: created by another document, assigned after its declaration.
+        assert!(scan("const doc = host.ownerDocument; let video = null; video = doc.createElement('video'); video.src = `/v/${location.hash}.webm`; media.append(video);").is_empty());
+        assert!(scan("const row = template.content.cloneNode(true); row.title = location.hash; list.append(row);").is_empty());
+        // A string is still markup for jQuery.
+        let found = scan(
+            "let video = null; video = '<video src=' + location.hash + '>'; $(media).append(video);",
+        );
+        assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn long_or_chains_of_guards_stay_small() {
+        // Each `typeof x === 'string' && x === 'vN'` side gives two facts about `x`; combining a
+        // 40-way `||` pair by pair once multiplied them at every level (gigabytes, then a kill).
+        let chain: Vec<String> = (0..40)
+            .map(|i| format!("(typeof x === 'string' && x === 'v{i}')"))
+            .collect();
+        let code = format!(
+            "app.get('/a', (req, res) => {{ const x = req.query.x; if (!({})) {{ return res.end(); }} exec('run ' + x); }});",
+            chain.join(" || ")
+        );
+        assert!(route(&code).is_empty());
+    }
+
+    #[test]
+    fn a_check_that_returns_on_bad_input_validates_nothing() {
+        // The caller goes on after `return`: only a check that throws protects it.
+        assert_eq!(
+            route("function checkSafe(v) { if (!/^[a-z]+$/.test(v)) { return; } }\napp.post('/a', (req, res) => { const { n } = req.body; checkSafe(n); exec('run ' + n); });").len(),
+            1
+        );
+        assert!(route("function checkSafe(v) { if (!/^[a-z]+$/.test(v)) { throw new Error('bad'); } }\napp.post('/a', (req, res) => { const { n } = req.body; checkSafe(n); exec('run ' + n); });").is_empty());
+        assert_eq!(
+            route("function checkStr(v) { if (typeof v !== 'string') { return; } }\napp.post('/b', async (req, res) => { const { uid } = req.body; checkStr(uid); await db.collection('c').deleteOne({ uid }); });").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn string_checks_keep_query_operators_out() {
+        // indiekit: `if (channel && typeof channel !== 'string') throw`, inline and in a void
+        // validator; a falsy value is no operator either.
+        assert!(route("app.post('/c', async (req, res) => { const { uid } = req.body; if (uid && typeof uid !== 'string') { throw new Error('x'); } await db.collection('c').deleteOne({ uid }); });").is_empty());
+        assert!(route("function check(v) { if (typeof v !== 'string') { throw new Error('x'); } }\napp.post('/b', async (req, res) => { const { uid } = req.body; check(uid); await db.collection('c').deleteOne({ uid }); });").is_empty());
+        let found = route(
+            "app.post('/d', async (req, res) => { const { uid } = req.body; await db.collection('c').deleteOne({ uid }); });",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::NosqlInjection),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_constant_assigned_in_a_branch_holds_there_not_after() {
+        // uptime-kuma: `executablePath = "/usr/bin/chromium"` right before the install.
+        let install = "async function install(p) { childProcess.execSync(p + ' --version'); }\n\
+            async function prepare(p) { if (p === '#x') { p = undefined; } else if (!p) { if (process.env.X) { p = '/usr/bin/chromium'; await install(p); } } return p; }\n";
+        assert!(one(&format!("{install}io.on('connection', (socket) => {{ socket.on('t', (exe) => {{ prepare(exe); }}); }});")).is_empty());
+        // Past the branch the other path's value is back.
+        assert_eq!(
+            one("io.on('connection', (socket) => { socket.on('u', (cmd) => { if (process.env.Y) { cmd = 'ls'; } exec(cmd); }); });").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn captures_of_named_regexes_keep_their_charset() {
+        // A local `const`, and a property of an object of regexes (RES's `regexes.profile`).
+        assert!(scan("const re = /^\\/u\\/([\\w-]+)$/; const [, name] = location.hash.match(re) || []; el.innerHTML = name;").is_empty());
+        assert!(scan("const regexes = { profile: /^\\/u\\/([\\w-]+)$/ }; const [, name] = location.hash.match(regexes.profile) || []; el.innerHTML = name;").is_empty());
+        assert!(scan("const regexes = { profile: /^\\/u\\/([\\w-]+)$/ }; const m = regexes.profile.exec(location.hash); el.innerHTML = m[1];").is_empty());
+        // A capture that admits markup does not clean it.
+        let found = scan(
+            "const regexes = { any: /^\\/u\\/(.+)$/ }; const [, name] = location.hash.match(regexes.any) || []; el.innerHTML = name;",
+        );
+        assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn a_field_written_on_a_clean_object_taints_that_field() {
+        // corosolto: `settings.map` from the URL is not `settings.wpnMode`.
+        assert!(scan("const settings = load(); if (!x) { settings.map = location.hash; } el.innerHTML = settings.wpnMode;").is_empty());
+        let field = scan(
+            "const settings = load(); settings.map = location.hash; el.innerHTML = settings.map;",
+        );
+        assert!(field.iter().any(|f| f.0 == VulnClass::Xss), "{field:?}");
+        // The object as a whole still carries it.
+        let whole = scan(
+            "const settings = load(); settings.map = location.hash; el.innerHTML = JSON.stringify(settings);",
+        );
+        assert!(whole.iter().any(|f| f.0 == VulnClass::Xss), "{whole:?}");
     }
 
     #[test]

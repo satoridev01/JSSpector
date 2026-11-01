@@ -119,10 +119,30 @@ pub fn facts(test: &Expression<'_>, truth: bool, out: &mut Vec<(String, Fact)>) 
                 for key in equal_operands(&l.right, truth) {
                     right.extend(left.iter().filter(|(k, _)| *k == key).cloned());
                 }
-                out.extend(left.into_iter().filter(|fact| right.contains(fact)));
+                // What both sides establish about a path, the weaker of the two: falsy (clean)
+                // or a string is never an object (`!x || typeof x === 'string'`). Each fact once:
+                // a chain of `||` would otherwise multiply them at every level.
+                dedup(&mut left);
+                dedup(&mut right);
+                for (key, fact) in &left {
+                    let other = right.iter().filter(|(k, _)| k == key).map(|(_, f)| f);
+                    for theirs in other {
+                        if let Some(met) = meet(fact, theirs)
+                            && !out.iter().any(|(k, f)| k == key && *f == met)
+                        {
+                            out.push((key.clone(), met));
+                        }
+                    }
+                }
             }
             _ => {}
         },
+        // `if (!x) ...`: a falsy value (`undefined`, `''`, `0`, `null`) carries nothing.
+        Expression::Identifier(_) | Expression::StaticMemberExpression(_) if !truth => {
+            if let Some(key) = path_key(test) {
+                out.push((key, Fact::Clean(ALL)));
+            }
+        }
         Expression::CallExpression(call) if truth => validator_call(call, out),
         // `if (isPathTraversal(x)) throw ...`: a check that is true for bad input, false here.
         Expression::CallExpression(call) => rejecter_call(call, out),
@@ -162,6 +182,30 @@ pub fn facts(test: &Expression<'_>, truth: bool, out: &mut Vec<(String, Fact)>) 
             }
         }
         _ => {}
+    }
+}
+
+/// `facts` without repeats, first occurrence kept.
+fn dedup(facts: &mut Vec<(String, Fact)>) {
+    let mut seen: Vec<(String, Fact)> = Vec::with_capacity(facts.len());
+    facts.retain(|fact| {
+        if seen.contains(fact) {
+            false
+        } else {
+            seen.push(fact.clone());
+            true
+        }
+    });
+}
+
+/// The fact that holds when either of two facts about a path holds: the same fact, the classes
+/// both clean, or never an object when either one is a scalar and the other clean.
+fn meet(a: &Fact, b: &Fact) -> Option<Fact> {
+    match (a, b) {
+        _ if a == b => Some(a.clone()),
+        (Fact::Clean(x), Fact::Clean(y)) => (x & y != 0).then_some(Fact::Clean(x & y)),
+        (Fact::Clean(_), Fact::Scalar) | (Fact::Scalar, Fact::Clean(_)) => Some(Fact::Scalar),
+        _ => None,
     }
 }
 

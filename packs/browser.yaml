@@ -14,9 +14,10 @@ service_worker:
   events: [fetch, install, activate]
   calls: [self.skipWaiting, self.clients.claim]
   kind: dom
-# Calls that create a DOM node: appending it inserts that node, not markup.
-node_factories: [document.createElement, document.createElementNS, document.createTextNode,
-  document.createDocumentFragment, document.importNode]
+# Calls that create a DOM node: appending it inserts that node, not markup. On any document
+# (`host.ownerDocument.createElement('video')`) or node (`template.content.cloneNode(true)`).
+node_factories: [.createElement, .createElementNS, .createTextNode, .createDocumentFragment, .importNode,
+  .cloneNode]
 sinks:
   - {methods: [insertAdjacentHTML], class: xss, severity: high, args: ["any:1"]}
   - {methods: [html, append, prepend, after, before, replaceWith, writeln], class: xss, severity: high, args: ["html:0"]}

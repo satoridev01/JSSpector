@@ -1961,3 +1961,79 @@ fn queue_mcp_and_trpc_registrations_need_their_receiver() {
         ]
     );
 }
+
+/// A regular expression exported in an object from another module, through a barrel
+/// (Reddit Enhancement Suite's `regexes.profile`): its captures keep their character set.
+#[test]
+fn imported_regexes_keep_their_charset() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "lib/utils/location.js",
+        "export const regexes = { profile: /^\\/user\\/([\\w\\-]+)\\/?$/i, any: /^\\/user\\/(.+)$/ };\n",
+    );
+    write(
+        root,
+        "lib/utils/index.js",
+        "export { regexes } from './location';\n",
+    );
+    write(
+        root,
+        "lib/modules/search.js",
+        "import $ from 'jquery';\nimport { regexes } from '../utils';\n\
+         export function safe() { const [, user] = location.hash.match(regexes.profile) || []; $('.main').prepend(`<b>${user}</b>`); }\n\
+         export function unsafe() { const [, user] = location.hash.match(regexes.any) || []; $('.main').prepend(`<b>${user}</b>`); }\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let functions: Vec<&str> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["function"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(functions, vec!["unsafe"]);
+}
+
+/// A validator in another module that throws unless a value is a string (indiekit's
+/// `validateChannel`) keeps query operators out of the query its caller builds.
+#[test]
+fn imported_string_validators_keep_query_operators_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "lib/validation.js",
+        "export function validateChannel(__, channel, isRequired = true) {\n  \
+         if (isRequired && !channel) { throw new Error('missing'); }\n  \
+         if (channel && typeof channel !== 'string') { throw new Error('invalid'); }\n}\n",
+    );
+    write(
+        root,
+        "lib/app.js",
+        "import express from 'express';\nimport { validateChannel } from './validation.js';\n\
+         const app = express();\n\
+         app.post('/checked', async (req, res) => { const { uid } = req.body; validateChannel(null, uid); await db.collection('c').deleteOne({ uid }); });\n\
+         app.post('/unchecked', async (req, res) => { const { uid } = req.body; await db.collection('c').deleteOne({ uid }); });\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let entries: Vec<&str> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["entry"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(entries, vec!["POST /unchecked"]);
+}

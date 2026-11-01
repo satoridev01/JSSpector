@@ -415,6 +415,8 @@ struct Env {
     clean: BTreeSet<String>,
     /// Access paths a guard proved scalar: never an object.
     scalars: BTreeSet<String>,
+    /// Access paths a guard validated for some classes only (bits of [`class_bit`]).
+    partial: BTreeMap<String, u8>,
     /// Names bound to `new C()` of a class whose objects hold no HTML (`URLSearchParams`):
     /// method sinks such as `.append()` do not apply to them.
     plain: BTreeSet<String>,
@@ -441,6 +443,7 @@ struct PathState {
     vars: BTreeMap<String, Origin>,
     clean: BTreeSet<String>,
     scalars: BTreeSet<String>,
+    partial: BTreeMap<String, u8>,
     fields: BTreeMap<String, BTreeMap<String, Origin>>,
 }
 
@@ -460,6 +463,7 @@ impl Env {
             vars: self.vars.clone(),
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
+            partial: self.partial.clone(),
             fields: self.fields.clone(),
         }
     }
@@ -468,6 +472,7 @@ impl Env {
         self.vars = state.vars;
         self.clean = state.clean;
         self.scalars = state.scalars;
+        self.partial = state.partial;
         self.fields = state.fields;
     }
 
@@ -483,6 +488,14 @@ impl Env {
         }
         self.clean.retain(|k| other.clean.contains(k));
         self.scalars.retain(|k| other.scalars.contains(k));
+        self.partial
+            .retain(|k, classes| match other.partial.get(k) {
+                Some(theirs) => {
+                    *classes &= *theirs;
+                    *classes != 0
+                }
+                None => false,
+            });
         for (name, fields) in &other.fields {
             let entry = self.fields.entry(name.clone()).or_default();
             for (field, origin) in fields {
@@ -503,6 +516,8 @@ impl Env {
             .retain(|k| k != key && !k.starts_with(prefix.as_str()));
         self.scalars
             .retain(|k| k != key && !k.starts_with(prefix.as_str()));
+        self.partial
+            .retain(|k, _| k != key && !k.starts_with(prefix.as_str()));
     }
 
     /// A request object or one of its object-valued parts (`req`, `req.body`, `ctx.request`):
@@ -524,10 +539,17 @@ impl Env {
     fn learn(&mut self, facts: Vec<(String, guards::Fact)>) {
         for (key, fact) in facts {
             match fact {
-                guards::Fact::Clean if self.is_request_object(&key) => {}
-                guards::Fact::Clean => {
+                guards::Fact::Clean(_) if self.is_request_object(&key) => {}
+                guards::Fact::Clean(guards::ALL) => {
                     self.vars.remove(&key);
                     self.clean.insert(key);
+                }
+                // Safe for some classes only: still tainted, escaped for those.
+                guards::Fact::Clean(classes) => {
+                    if let Some(origin) = self.vars.get_mut(&key) {
+                        origin.escaped |= classes;
+                    }
+                    *self.partial.entry(key).or_insert(0) |= classes;
                 }
                 guards::Fact::Scalar => {
                     if let Some(origin) = self.vars.get_mut(&key) {
@@ -552,6 +574,7 @@ impl Env {
             rows: BTreeMap::new(),
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
+            partial: BTreeMap::new(),
             plain: BTreeSet::new(),
             server_fields: BTreeMap::new(),
             declared: BTreeMap::new(),
@@ -575,6 +598,7 @@ impl Env {
             rows: self.rows.clone(),
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
+            partial: self.partial.clone(),
             plain: self.plain.clone(),
             server_fields: self.server_fields.clone(),
             declared: self.declared.clone(),
@@ -885,23 +909,24 @@ fn sink_for_api(api: &str) -> Option<&'static models::Sink> {
         .or_else(|| model.method_sink(last))
 }
 
-/// `(/[^a-z0-9]/g, '')`: a global negated character class replaced by nothing.
-fn allowlist_strip(arguments: &[Argument<'_>]) -> bool {
+/// `s.replace(/[^a-z0-9_-]/g, '')`: the classes a value is safe for once only the characters of
+/// the negated class remain (`None` if the arguments are no such strip).
+fn allowlist_strip(arguments: &[Argument<'_>]) -> Option<u8> {
     let (Some(Argument::RegExpLiteral(regex)), Some(Argument::StringLiteral(replacement))) =
         (arguments.first(), arguments.get(1))
     else {
-        return false;
+        return None;
     };
-    let pattern = regex.regex.pattern.text.as_str();
-    let class = pattern
-        .strip_suffix('+')
-        .or_else(|| pattern.strip_suffix('*'))
-        .unwrap_or(pattern);
-    replacement.value.as_str() == Some("")
-        && regex.regex.flags.contains(oxc_ast::ast::RegExpFlags::G)
-        && class.starts_with("[^")
-        && class.ends_with(']')
-        && !class.get(2..class.len() - 1).unwrap_or("").contains(']')
+    if replacement.value.as_str() != Some("")
+        || !regex.regex.flags.contains(oxc_ast::ast::RegExpFlags::G)
+    {
+        return None;
+    }
+    let mut kept = guards::negated_class(regex.regex.pattern.text.as_str())?;
+    if regex.regex.flags.contains(oxc_ast::ast::RegExpFlags::I) {
+        kept = guards::with_both_cases(kept);
+    }
+    Some(guards::mask(&kept))
 }
 
 /// A route path written as a literal, or built from literals: `urljoin(base, 'api/x')`,
@@ -1104,6 +1129,7 @@ impl Walker<'_> {
                     // throwing check) does not hold there.
                     env.clean.retain(|k| before.clean.contains(k));
                     env.scalars.retain(|k| before.scalars.contains(k));
+                    env.partial.retain(|k, _| before.partial.contains_key(k));
                     for (name, origin) in &before.vars {
                         env.vars
                             .entry(name.clone())
@@ -2231,13 +2257,21 @@ impl Walker<'_> {
             return;
         }
         for (index, param) in env.params.iter().enumerate() {
-            if param.is_empty() || !env.clean.contains(param) {
+            // The classes it validates the parameter for (`at_sink.escaped`).
+            let classes = if env.clean.contains(param) {
+                guards::ALL
+            } else {
+                env.partial.get(param).copied().unwrap_or(0)
+            };
+            if param.is_empty() || classes == 0 {
                 continue;
             }
             let list = self.summaries.entry(env.function.clone()).or_default();
             if list.iter().any(|s| s.api == VALIDATES && s.param == index) {
                 continue;
             }
+            let mut at_sink = Origin::source("param", span);
+            at_sink.escaped = classes;
             list.push(Summary {
                 param: index,
                 class: VulnClass::CodeInjection,
@@ -2246,7 +2280,7 @@ impl Walker<'_> {
                 arg: span,
                 call: span,
                 steps: Vec::new(),
-                at_sink: Origin::source("param", span),
+                at_sink,
                 ext: None,
                 field: None,
                 out_field: None,
@@ -3041,10 +3075,14 @@ impl Walker<'_> {
             return None;
         }
         let scalar = prefixes().any(|p| env.scalars.contains(p));
+        let escaped = prefixes()
+            .filter_map(|p| env.partial.get(p))
+            .fold(0, |classes, c| classes | c);
         self.member_of_inner(member, env).map(|mut o| {
             if scalar {
                 o.object = false;
             }
+            o.escaped |= escaped;
             o
         })
     }
@@ -3898,8 +3936,8 @@ impl Walker<'_> {
                         .get(s.param)
                         .and_then(Argument::as_expression)
                         .and_then(guards::path_key)
+                        .map(|key| (key, guards::Fact::Clean(s.at_sink.escaped)))
                 })
-                .map(|key| (key, guards::Fact::Clean))
                 .collect();
             env.learn(validated);
         }
@@ -3966,10 +4004,11 @@ impl Walker<'_> {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        if m()
-            .result_cleaning_prefixes
-            .iter()
-            .any(|p| last_segment.starts_with(p.as_str()))
+        if returned.is_none()
+            && m()
+                .result_cleaning_prefixes
+                .iter()
+                .any(|p| last_segment.starts_with(p.as_str()))
         {
             return None;
         }
@@ -4011,9 +4050,18 @@ impl Walker<'_> {
                 if let Some(source) = m().result_sources.iter().find(|s| has(&s.methods, method)) {
                     return Some(Origin::source(source.kind.as_str(), call.span));
                 }
-                // `s.replace(/[^a-z0-9_-]/gi, '')`: an allowlist strip leaves only safe characters.
-                if has(&m().strip_methods, method) && allowlist_strip(&call.arguments) {
-                    return None;
+                // `s.replace(/[^a-z0-9_-]/gi, '')`: an allowlist strip leaves only the characters
+                // it keeps, safe for the classes they cannot attack.
+                if has(&m().strip_methods, method)
+                    && let Some(classes) = allowlist_strip(&call.arguments)
+                {
+                    if classes == guards::ALL {
+                        return None;
+                    }
+                    return receiver.map(|mut o| {
+                        o.escaped |= classes;
+                        o.step(call.span.start, format!("stripped by .{method}()"))
+                    });
                 }
                 if has(&m().pass_methods, method) {
                     let built = has(&m().build_methods, method);
@@ -4030,7 +4078,16 @@ impl Walker<'_> {
                 let export = export.as_deref().unwrap_or("");
                 let qualified = format!("{family}.{export}");
                 if has(&m().clearing, &qualified) {
-                    return None;
+                    // `path.basename(p)`: safe as a file name, not in a shell or a query.
+                    let classes = guards::named_mask(export, Some(&qualified));
+                    if classes == guards::ALL {
+                        return None;
+                    }
+                    return any_arg().map(|mut o| {
+                        o.escaped |= classes;
+                        o.object = false;
+                        o.step(call.span.start, format!("through {qualified}()"))
+                    });
                 }
                 if has(&m().module_pass, &qualified) {
                     let built = has(&m().build_methods, export);
@@ -4045,7 +4102,16 @@ impl Walker<'_> {
             }
             Callee::Global(name) => {
                 if has(&m().clearing, name) {
-                    return None;
+                    // `encodeURIComponent(x)`: safe in a URL, not in a quoted SQL string.
+                    let classes = guards::named_mask(name, None);
+                    if classes == guards::ALL {
+                        return None;
+                    }
+                    return any_arg().map(|mut o| {
+                        o.escaped |= classes;
+                        o.object = false;
+                        o.step(call.span.start, format!("through {name}()"))
+                    });
                 }
                 if has(&m().pass_globals, name) {
                     let built = name
@@ -6144,7 +6210,7 @@ mod tests {
         assert_eq!(
             count(
                 "app.get('/p', (req, res) => { const name = req.query.name;\n\
-                   try { validate(name); } catch (e) { log(e); }\n\
+                   try { assertValidName(name); } catch (e) { log(e); }\n\
                    exec('x ' + name); });"
             ),
             1
@@ -6152,7 +6218,7 @@ mod tests {
         assert_eq!(
             count(
                 "app.get('/p', (req, res) => { const name = req.query.name;\n\
-                   try { validate(name); } catch (e) { return res.sendStatus(400); }\n\
+                   try { assertValidName(name); } catch (e) { return res.sendStatus(400); }\n\
                    exec('x ' + name); });"
             ),
             0
@@ -6174,6 +6240,88 @@ mod tests {
                    else { await axios.get(url); } });"
             ),
             1
+        );
+    }
+
+    #[test]
+    fn checks_make_values_safe_for_their_classes_only() {
+        let classes =
+            |body: &str| -> Vec<VulnClass> { one(body).into_iter().map(|f| f.0).collect() };
+        // A valid URL can point anywhere.
+        assert_eq!(
+            classes(
+                "app.get('/p', async (req, res) => { const url = req.query.u;\n\
+                     if (!validator.isURL(url)) return; await axios.get(url); });"
+            ),
+            vec![VulnClass::Ssrf]
+        );
+        // No `..` means no traversal, not no shell metacharacters.
+        let dots = "app.get('/p', (req, res) => { const p = req.query.p;\n\
+                    if (p.includes('..')) return;\n";
+        assert!(classes(&format!("{dots}fs.readFileSync(path.join(dir, p)); }});")).is_empty());
+        assert_eq!(
+            classes(&format!("{dots}exec('cat ' + p); }});")),
+            vec![VulnClass::CommandInjection]
+        );
+        // A base name is a safe file name, not a safe shell word.
+        assert!(
+            classes("app.get('/p', (req, res) => { fs.readFile(path.join(dir, path.basename(req.query.f)), () => {}); });")
+                .is_empty()
+        );
+        assert_eq!(
+            classes("app.get('/p', (req, res) => { exec('cat ' + path.basename(req.query.f)); });"),
+            vec![VulnClass::CommandInjection]
+        );
+        // encodeURIComponent leaves quotes alone.
+        assert_eq!(
+            classes(
+                "app.get('/p', (req, res) => { db.query(\"SELECT * FROM t WHERE n = '\" + encodeURIComponent(req.query.n) + \"'\"); });"
+            ),
+            vec![VulnClass::SqlInjection]
+        );
+        // `^[\w./-]+$` admits `../`: safe for a shell, not as a path.
+        let file = "app.get('/p', (req, res) => { const f = req.query.f;\n\
+                    if (!/^[\\w./-]+$/.test(f)) return;\n";
+        assert!(classes(&format!("{file}exec('cat ' + f); }});")).is_empty());
+        assert_eq!(
+            classes(&format!("{file}fs.readFileSync(f); }});")),
+            vec![VulnClass::PathTraversal]
+        );
+        // An unanchored regex is no allowlist; in its matching branch it is no check at all.
+        assert_eq!(
+            classes(
+                "app.get('/p', (req, res) => { const c = req.query.c;\n\
+                     if (!/^ls/.test(c)) return; exec(c); });"
+            ),
+            vec![VulnClass::CommandInjection]
+        );
+        assert_eq!(
+            classes(
+                "app.get('/p', (req, res) => { const p = req.query.p;\n\
+                     if (/\\.\\./.test(p)) { fs.readFileSync(p); } });"
+            ),
+            vec![VulnClass::PathTraversal]
+        );
+        // A scheme is not a host.
+        assert_eq!(
+            classes(
+                "app.get('/p', async (req, res) => { const url = req.query.u;\n\
+                     if (!url.startsWith('http')) return; await axios.get(url); });"
+            ),
+            vec![VulnClass::Ssrf]
+        );
+        assert!(
+            classes("app.get('/p', async (req, res) => { const url = req.query.u;\n\
+                     if (!url.startsWith('https://api.example.com/')) return; await axios.get(url); });")
+                .is_empty()
+        );
+        // A negated name is no validator.
+        assert_eq!(
+            classes(
+                "app.get('/p', (req, res) => { const c = req.query.c;\n\
+                     if (isNotAllowed(c)) { exec(c); } });"
+            ),
+            vec![VulnClass::CommandInjection]
         );
     }
 

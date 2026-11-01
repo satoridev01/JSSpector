@@ -407,6 +407,11 @@ pub struct Sanitizers {
     /// shape) leave scalars.
     #[serde(default)]
     pub object_patterns: Vec<String>,
+    /// Checks and clearing calls that make a value safe for some classes only, by class name
+    /// (`none` for format checks such as `isURL`, which only prove a string): exact names
+    /// (`isPathInside`, `path.basename`) and, for predicates matched by name, words.
+    #[serde(default)]
+    pub scoped: BTreeMap<String, Vec<String>>,
     /// Callee names (last segment, lower case) starting with these return trusted data:
     /// `jwt.verify(token)`, `verifySig(cookie)`.
     #[serde(default)]
@@ -562,6 +567,7 @@ pub struct Model {
     pub receiver_validators: Vec<String>,
     pub type_assertions: Vec<String>,
     pub object_patterns: Vec<String>,
+    pub scoped_sanitizers: BTreeMap<String, Vec<String>>,
     pub validator_words: Vec<String>,
     pub result_cleaning_prefixes: Vec<String>,
     pub rejecter_words: Vec<String>,
@@ -706,6 +712,12 @@ impl Model {
             .extend(pack.sanitizers.receiver_validators);
         self.type_assertions.extend(pack.sanitizers.type_assertions);
         self.object_patterns.extend(pack.sanitizers.object_patterns);
+        for (class, names) in pack.sanitizers.scoped {
+            self.scoped_sanitizers
+                .entry(class)
+                .or_default()
+                .extend(names);
+        }
         self.validator_words.extend(pack.sanitizers.validator_words);
         self.result_cleaning_prefixes
             .extend(pack.sanitizers.result_cleaning_prefixes);

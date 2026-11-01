@@ -74,6 +74,12 @@ sanitizers:
   rejecter_words: [traversal, malicious, unsafe, invalid, dangerous, forbidden, blocked, blacklisted, denylisted, private, internal, outside]
   receiver_rejecters: [includes, match, test]
   rejected_markers: ["..", "\\0", "%2e"]
+  # Checks and clearing calls that are safe for some classes only (names, and words of names
+  # matched as predicates). `none`: format checks that only prove a string.
+  scoped:
+    path-traversal: [isPathInside, isWithin, isSubPath, inside, within, outside, traversal, path.basename, basename]
+    ssrf: [encodeURIComponent, private, internal, blocked, blacklisted, denylisted, forbidden]
+    none: [isURL, isEmail, url, email]
   escapers:
     sql-injection: [escape, escapeId, mysql.escape, mysql.format, SqlString.format, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
     xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss]

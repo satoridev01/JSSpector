@@ -234,13 +234,46 @@ pub fn assertion(statement: &Statement<'_>, out: &mut Vec<(String, Fact)>) {
     let Expression::Identifier(callee) = call.callee.get_inner_expression() else {
         return;
     };
-    if has(&model().type_assertions, callee.name.as_str())
-        && let Some(Argument::Identifier(id)) = call.arguments.first()
-    {
-        out.push((id.name.as_str().to_owned(), Fact::Scalar));
+    if has(&model().type_assertions, callee.name.as_str()) {
+        // `check(x, String)` or `check(x, [Number])`; `check(x, Object)` or `Match.Any` still
+        // admit an operator object.
+        let scalar = call
+            .arguments
+            .get(1)
+            .and_then(Argument::as_expression)
+            .is_some_and(scalar_pattern);
+        if scalar && let Some(Argument::Identifier(id)) = call.arguments.first() {
+            out.push((id.name.as_str().to_owned(), Fact::Scalar));
+        }
     } else if has(&model().validators, callee.name.as_str()) {
         // `assertSafe(x)` used as a statement throws on bad input.
         validator_call(call, out);
+    }
+}
+
+/// Whether a type pattern rules out operator objects: anything but a pattern that admits an
+/// object (`Object`, `Match.Any`, `Match.ObjectIncluding(...)`), a wrapper of one
+/// (`Match.Optional(Object)`), or a shape or array with one inside.
+fn scalar_pattern(pattern: &Expression<'_>) -> bool {
+    let admits_object = |name: &str| has(&model().object_patterns, name);
+    match pattern.get_inner_expression() {
+        Expression::ArrayExpression(array) => array
+            .elements
+            .iter()
+            .all(|e| e.as_expression().is_none_or(scalar_pattern)),
+        Expression::ObjectExpression(object) => object.properties.iter().all(|p| match p {
+            oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) => scalar_pattern(&p.value),
+            oxc_ast::ast::ObjectPropertyKind::SpreadProperty(_) => false,
+        }),
+        Expression::CallExpression(call) => {
+            !path_key(&call.callee).is_some_and(|name| admits_object(&name))
+                && call
+                    .arguments
+                    .iter()
+                    .filter_map(Argument::as_expression)
+                    .all(scalar_pattern)
+        }
+        other => !path_key(other).is_some_and(|name| admits_object(&name)),
     }
 }
 

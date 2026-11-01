@@ -434,11 +434,97 @@ struct Env {
     function: String,
 }
 
+/// What a statement can change about the facts and taint of an [`Env`], saved before a branch
+/// to join both paths after it.
+#[derive(Debug, Clone)]
+struct PathState {
+    vars: BTreeMap<String, Origin>,
+    clean: BTreeSet<String>,
+    scalars: BTreeSet<String>,
+    fields: BTreeMap<String, BTreeMap<String, Origin>>,
+}
+
+/// The value after two paths meet: tainted if either path left it tainted, with the weaker
+/// state (attacker-controlled start, possibly an object, built) and escaped only if both are.
+fn join(a: &mut Origin, b: &Origin) {
+    a.object |= b.object;
+    a.prefix |= b.prefix;
+    a.built |= b.built;
+    a.sqlish |= b.sqlish;
+    a.escaped &= b.escaped;
+}
+
 impl Env {
+    fn save(&self) -> PathState {
+        PathState {
+            vars: self.vars.clone(),
+            clean: self.clean.clone(),
+            scalars: self.scalars.clone(),
+            fields: self.fields.clone(),
+        }
+    }
+
+    fn restore(&mut self, state: PathState) {
+        self.vars = state.vars;
+        self.clean = state.clean;
+        self.scalars = state.scalars;
+        self.fields = state.fields;
+    }
+
+    /// Joins another path's state into this one: taint from either, facts from both.
+    fn join_with(&mut self, other: &PathState) {
+        for (name, origin) in &other.vars {
+            match self.vars.get_mut(name) {
+                Some(current) => join(current, origin),
+                None => {
+                    self.vars.insert(name.clone(), origin.clone());
+                }
+            }
+        }
+        self.clean.retain(|k| other.clean.contains(k));
+        self.scalars.retain(|k| other.scalars.contains(k));
+        for (name, fields) in &other.fields {
+            let entry = self.fields.entry(name.clone()).or_default();
+            for (field, origin) in fields {
+                match entry.get_mut(field) {
+                    Some(current) => join(current, origin),
+                    None => {
+                        entry.insert(field.clone(), origin.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops every fact about `key` and the paths under it: it was written.
+    fn forget(&mut self, key: &str) {
+        let prefix = format!("{key}.");
+        self.clean
+            .retain(|k| k != key && !k.starts_with(prefix.as_str()));
+        self.scalars
+            .retain(|k| k != key && !k.starts_with(prefix.as_str()));
+    }
+
+    /// A request object or one of its object-valued parts (`req`, `req.body`, `ctx.request`):
+    /// a check that names it (`hasValidSession(req)`) says nothing about every value under it.
+    fn is_request_object(&self, key: &str) -> bool {
+        let mut parts = key.split('.');
+        let root = parts.next().unwrap_or("");
+        if !self.requests.contains_key(root) {
+            return false;
+        }
+        let rest: Vec<&str> = parts.collect();
+        rest.len() <= 2
+            && rest
+                .iter()
+                .all(|p| has(&m().request_props, p) || has(&m().sub_objects, p))
+    }
+
     /// Records what a guard established.
     fn learn(&mut self, facts: Vec<(String, guards::Fact)>) {
         for (key, fact) in facts {
             match fact {
+                guards::Fact::Clean if self.is_request_object(&key) => {}
                 guards::Fact::Clean => {
                     self.vars.remove(&key);
                     self.clean.insert(key);
@@ -500,6 +586,7 @@ impl Env {
     }
 
     fn bind(&mut self, name: &str, taint: Option<Origin>) {
+        self.forget(name);
         match taint {
             Some(origin) => {
                 self.vars.insert(name.to_owned(), origin);
@@ -967,7 +1054,7 @@ impl Walker<'_> {
                 guards::facts(&s.test, true, &mut held);
                 let mut failed = Vec::new();
                 guards::facts(&s.test, false, &mut failed);
-                let saved = (env.vars.clone(), env.clean.clone(), env.scalars.clone());
+                let before = env.save();
                 env.learn(held);
                 self.branch(&s.consequent, env);
                 let consequent_exits = guards::exits(&s.consequent);
@@ -975,29 +1062,20 @@ impl Walker<'_> {
                 if consequent_exits && let Some(level) = self.requires_login(&s.test, env) {
                     env.auth = env.auth.max(level);
                 }
-                if consequent_exits {
-                    // Taint added in an exiting branch never reaches what follows.
-                    (env.vars, env.clean, env.scalars) = saved;
-                } else {
-                    // The guard only held inside: what it cleaned is tainted again after.
-                    for (name, origin) in saved.0 {
-                        env.vars.entry(name).or_insert(origin);
-                    }
-                    env.clean = saved.1;
-                    env.scalars = saved.2;
-                }
+                let then_path = env.save();
+                // The other path starts where the test was evaluated, not where the
+                // consequent ended.
+                env.restore(before);
+                env.learn(failed);
                 if let Some(alternate) = &s.alternate {
-                    let saved = (env.vars.clone(), env.clean.clone(), env.scalars.clone());
-                    env.learn(failed.clone());
                     self.branch(alternate, env);
-                    for (name, origin) in saved.0 {
-                        env.vars.entry(name).or_insert(origin);
-                    }
-                    (env.clean, env.scalars) = (saved.1, saved.2);
                 }
-                // `if (!valid(x)) return;`: what follows only runs when the test failed.
-                if consequent_exits {
-                    env.learn(failed);
+                let alternate_exits = s.alternate.as_ref().is_some_and(guards::exits);
+                match (consequent_exits, alternate_exits) {
+                    // `if (!valid(x)) return;`: only the other path goes on.
+                    (true, _) => {}
+                    (false, true) => env.restore(then_path),
+                    (false, false) => env.join_with(&then_path),
                 }
             }
             Statement::ReturnStatement(s) => {
@@ -1017,10 +1095,29 @@ impl Walker<'_> {
                 self.expr(&s.argument, env);
             }
             Statement::TryStatement(s) => {
+                let before = env.save();
                 env.branch += 1;
                 self.statements(&s.block.body, env);
                 if let Some(handler) = &s.handler {
+                    let after_try = env.save();
+                    // The handler runs when the block threw: what the block established (a
+                    // throwing check) does not hold there.
+                    env.clean.retain(|k| before.clean.contains(k));
+                    env.scalars.retain(|k| before.scalars.contains(k));
+                    for (name, origin) in &before.vars {
+                        env.vars
+                            .entry(name.clone())
+                            .or_insert_with(|| origin.clone());
+                    }
                     self.statements(&handler.body.body, env);
+                    let handler_exits = handler.body.body.last().is_some_and(guards::exits);
+                    if handler_exits {
+                        // `try { assertSafe(x) } catch { return 400 }`: only the block's path
+                        // goes on.
+                        env.restore(after_try);
+                    } else {
+                        env.join_with(&after_try);
+                    }
                 }
                 env.branch -= 1;
                 if let Some(finalizer) = &s.finalizer {
@@ -1044,14 +1141,18 @@ impl Walker<'_> {
                 if let Some(update) = &s.update {
                     self.expr(update, env);
                 }
+                let before = env.save();
                 self.statement(&s.body, env);
+                env.join_with(&before);
                 env.branch -= 1;
             }
             Statement::ForOfStatement(s) => {
                 let taint = self.expr(&s.right, env);
                 env.branch += 1;
+                let before = env.save();
                 self.for_left(&s.left, taint, env);
                 self.statement(&s.body, env);
+                env.join_with(&before);
                 env.branch -= 1;
                 // `for (const r of routes) router[r.method](r.path, r.handler)`: one record-only
                 // walk per known row.
@@ -1075,30 +1176,50 @@ impl Walker<'_> {
                 // Keys of a tainted object are attacker-chosen too.
                 let taint = self.expr(&s.right, env);
                 env.branch += 1;
+                let before = env.save();
                 self.for_left(&s.left, taint, env);
                 self.statement(&s.body, env);
+                env.join_with(&before);
                 env.branch -= 1;
             }
             Statement::WhileStatement(s) => {
                 self.expr(&s.test, env);
+                let before = env.save();
                 self.branch(&s.body, env);
+                env.join_with(&before);
             }
             Statement::DoWhileStatement(s) => {
+                let before = env.save();
                 self.branch(&s.body, env);
+                env.join_with(&before);
                 self.expr(&s.test, env);
             }
             Statement::SwitchStatement(s) => {
                 self.expr(&s.discriminant, env);
                 env.branch += 1;
+                // Each case starts from the state after the discriminant; what one case
+                // established does not hold in another, nor after the switch.
+                let before = env.save();
+                let mut paths: Vec<PathState> = Vec::new();
                 for case in &s.cases {
+                    env.restore(before.clone());
                     if let Some(test) = &case.test {
                         self.expr(test, env);
                     }
                     self.statements(&case.consequent, env);
+                    paths.push(env.save());
+                }
+                env.restore(before.clone());
+                for path in &paths {
+                    env.join_with(path);
                 }
                 env.branch -= 1;
             }
-            Statement::LabeledStatement(s) => self.statement(&s.body, env),
+            Statement::LabeledStatement(s) => {
+                let before = env.save();
+                self.statement(&s.body, env);
+                env.join_with(&before);
+            }
             Statement::TSEnumDeclaration(e) => self.record_enum(e),
             Statement::WithStatement(s) => {
                 self.expr(&s.object, env);
@@ -1892,10 +2013,11 @@ impl Walker<'_> {
                 _ => None,
             })
             .collect();
-        // Parameters shadow outer taint of the same name.
+        // Parameters shadow outer taint and facts of the same name.
         for name in names.iter().flatten() {
             env.vars.remove(*name);
             env.requests.remove(*name);
+            env.forget(name);
         }
         let first = names.first().copied().flatten();
         env.params = names.iter().map(|n| n.unwrap_or("").to_owned()).collect();
@@ -2777,6 +2899,10 @@ impl Walker<'_> {
                     .as_simple_assignment_target()
                     .and_then(SimpleAssignmentTarget::as_member_expression)
                 {
+                    // `job.name = req.body.name`: what a guard said about `job.name` is gone.
+                    if let Some(key) = guards::member_key(member) {
+                        env.forget(&key);
+                    }
                     // `target[key][key2] = value` with attacker-chosen keys.
                     if let oxc_ast::ast::MemberExpression::ComputedMemberExpression(outer) = member
                         && let Expression::ComputedMemberExpression(inner) =
@@ -2859,14 +2985,17 @@ impl Walker<'_> {
                             .and_then(|p| p.as_str().map(str::to_owned)),
                     ) && env.fields.contains_key(root.name.as_str())
                     {
+                        let strong = env.branch == 0;
+                        env.forget(&format!("{}.{property}", root.name.as_str()));
                         if let Some(fields) = env.fields.get_mut(root.name.as_str()) {
                             match taint {
                                 Some(origin) => {
                                     fields.insert(property, origin);
                                 }
-                                None => {
+                                None if strong => {
                                     fields.remove(&property);
                                 }
+                                None => {}
                             }
                         }
                         return;
@@ -3707,7 +3836,29 @@ impl Walker<'_> {
                     let arg = taints.get(s.param).cloned().flatten();
                     match &s.field {
                         Some(field) => {
-                            self.field_taint(call.arguments.get(s.param), field, env, arg)
+                            let value =
+                                self.field_taint(call.arguments.get(s.param), field, env, arg);
+                            // Summarizing a function that passes its own parameter on: what it
+                            // returns is that parameter's `field` too (`resolveTarget(options)`
+                            // returning `options.path`).
+                            match value {
+                                Some(mut origin)
+                                    if self.summarize
+                                        && origin.param.is_some()
+                                        && !self.field_of.contains_key(&origin.span.start)
+                                        && !self.field_of.contains_key(&call.span.start) =>
+                                {
+                                    if let Some(class) =
+                                        self.ctor_params.get(&origin.span.start).cloned()
+                                    {
+                                        self.ctor_params.insert(call.span.start, class);
+                                    }
+                                    origin.span = call.span;
+                                    self.field_of.insert(call.span.start, field.clone());
+                                    Some(origin)
+                                }
+                                other => other,
+                            }
                         }
                         None => arg,
                     }
@@ -5941,6 +6092,110 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn guards_hold_only_where_they_were_checked() {
+        let count = |body: &str| one(body).len();
+        // A check on the whole request says nothing about its query.
+        assert_eq!(
+            count(
+                "app.get('/p', (req, res) => { if (!hasValidSession(req)) return; exec('ls ' + req.query.d); });"
+            ),
+            1
+        );
+        // A validated path written again with other input is tainted again.
+        assert_eq!(
+            count(
+                "app.post('/p', (req, res) => { const job = {}; job.name = req.query.a;\n\
+                   if (!isValidName(job.name)) return;\n\
+                   job.name = req.body.b; exec('x ' + job.name); });"
+            ),
+            1
+        );
+        // A callback parameter does not inherit the outer variable's facts.
+        assert_eq!(
+            count(
+                "app.post('/p', (req, res) => { const data = req.body;\n\
+                   if (!isValidCmd(data.cmd)) return;\n\
+                   req.body.list.forEach((data) => exec(data.cmd)); });"
+            ),
+            1
+        );
+        // A check inside a loop does not hold after it (the loop may have broken out).
+        assert_eq!(
+            count(
+                "app.get('/p', (req, res) => { const name = req.query.name;\n\
+                   while (more()) { if (!isValidName(name)) break; step(); }\n\
+                   exec('x ' + name); });"
+            ),
+            1
+        );
+        // Nor in another switch case.
+        assert_eq!(
+            count(
+                "app.get('/p', (req, res) => { const name = req.query.name;\n\
+                   switch (req.query.mode) { case 'a': if (!isValidName(name)) return; break;\n\
+                   case 'b': exec('x ' + name); break; } });"
+            ),
+            1
+        );
+        // A throwing check in a try holds after it only when the catch block leaves.
+        assert_eq!(
+            count(
+                "app.get('/p', (req, res) => { const name = req.query.name;\n\
+                   try { validate(name); } catch (e) { log(e); }\n\
+                   exec('x ' + name); });"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                "app.get('/p', (req, res) => { const name = req.query.name;\n\
+                   try { validate(name); } catch (e) { return res.sendStatus(400); }\n\
+                   exec('x ' + name); });"
+            ),
+            0
+        );
+        // A typeof fact learned in a branch that does not leave holds only inside it.
+        assert_eq!(
+            count(
+                "app.post('/p', async (req, res) => { const user = req.body.user;\n\
+                   if (typeof user === 'string') { log(user); }\n\
+                   await User.findOne({ name: user }); });"
+            ),
+            1
+        );
+        // The else branch starts from before the if, not from the then branch.
+        assert_eq!(
+            count(
+                "app.get('/p', async (req, res) => { let url = req.query.u;\n\
+                   if (req.query.a) { url = 'https://api.example.com/' + url; }\n\
+                   else { await axios.get(url); } });"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn meteor_check_patterns_decide_scalars() {
+        let method = |pattern: &str| {
+            one(&format!(
+                "Meteor.methods({{ find(q) {{ check(q, {pattern}); return Tasks.find(q); }} }});"
+            ))
+            .len()
+        };
+        assert_eq!(method("Object"), 1);
+        assert_eq!(method("Match.Any"), 1);
+        assert_eq!(method("Match.Optional(Object)"), 1);
+        assert_eq!(method("{ id: Object }"), 1);
+        assert_eq!(method("String"), 0);
+        assert_eq!(method("[String]"), 0);
+        assert_eq!(
+            method("{ boardId: String, drag: Match.Optional(Boolean) }"),
+            0
+        );
+        assert_eq!(method("targetShape"), 0);
     }
 
     #[test]

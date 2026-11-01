@@ -4,3 +4,6 @@ client_sources:
   - {object: Meteor, methods: [methods], shape: object-of-functions, params: all, kind: meteor}
 sanitizers:
   type_assertions: [check]
+  # check(x, Object), Match.Any or Match.ObjectIncluding: x may still be an operator object.
+  # Other patterns (String, [Number], { id: String }, a named shape) leave scalars.
+  object_patterns: [Object, Match.Any, Match.ObjectIncluding]

@@ -402,6 +402,11 @@ pub struct Sanitizers {
     /// Statements that throw unless their first argument has a type: `check(x, String)`.
     #[serde(default)]
     pub type_assertions: Vec<String>,
+    /// Type patterns of those assertions that still admit an object (`check(x, Object)`,
+    /// `Match.Any`): no fact. Other patterns (String, `[Number]`, `{ id: String }`, a named
+    /// shape) leave scalars.
+    #[serde(default)]
+    pub object_patterns: Vec<String>,
     /// Callee names (last segment, lower case) starting with these return trusted data:
     /// `jwt.verify(token)`, `verifySig(cookie)`.
     #[serde(default)]
@@ -556,6 +561,7 @@ pub struct Model {
     pub validators: Vec<String>,
     pub receiver_validators: Vec<String>,
     pub type_assertions: Vec<String>,
+    pub object_patterns: Vec<String>,
     pub validator_words: Vec<String>,
     pub result_cleaning_prefixes: Vec<String>,
     pub rejecter_words: Vec<String>,
@@ -699,6 +705,7 @@ impl Model {
         self.receiver_validators
             .extend(pack.sanitizers.receiver_validators);
         self.type_assertions.extend(pack.sanitizers.type_assertions);
+        self.object_patterns.extend(pack.sanitizers.object_patterns);
         self.validator_words.extend(pack.sanitizers.validator_words);
         self.result_cleaning_prefixes
             .extend(pack.sanitizers.result_cleaning_prefixes);

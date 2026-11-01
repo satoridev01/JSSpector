@@ -2,4 +2,4 @@
 name: queues
 client_sources:
   - {methods: [process], shape: last-callback, params: first, kind: queue}
-  - {object: Worker, methods: [Worker], shape: last-callback, params: first, kind: queue}
+  - {methods: [Worker], shape: last-callback, params: first, kind: queue}

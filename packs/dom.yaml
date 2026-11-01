@@ -1,0 +1,20 @@
+# Browser DOM: URL and window sources, script/HTML/navigation sinks.
+name: dom
+member_sources:
+  - {object: location, property: hash, kind: dom}
+  - {object: location, property: search, kind: dom}
+  - {object: location, property: href, kind: dom}
+  - {object: location, property: pathname, kind: dom}
+  - {object: window.location, property: hash, kind: dom}
+  - {object: window.location, property: search, kind: dom}
+  - {object: window.location, property: href, kind: dom}
+  - {object: document, property: URL, kind: dom}
+  - {object: document, property: documentURI, kind: dom}
+  - {object: document, property: referrer, kind: dom}
+  - {object: window, property: name, kind: dom}
+sinks:
+  - {methods: [document.write, document.writeln, window.document.write], class: xss, severity: high, args: ["any:0"]}
+  - {global: [setTimeout, setInterval], class: code-injection, severity: high, args: ["built:0"]}
+  # Navigating to an attacker URL runs `javascript:` in the page.
+  - {assign: [location, location.href, window.location, window.location.href, document.location, document.location.href], class: xss, severity: medium, args: ["url:0"]}
+  - {methods: [location.assign, location.replace, window.location.assign, window.location.replace, window.open], class: xss, severity: medium, args: ["url:0"]}

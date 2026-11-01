@@ -1699,6 +1699,38 @@ impl Walker<'_> {
                         o
                     })
                 };
+                // `location.href = value`
+                if let Some(origin) = &taint
+                    && let Some(target) =
+                        assign
+                            .left
+                            .as_simple_assignment_target()
+                            .and_then(|t| match t {
+                                SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                                    Some(id.name.as_str().to_owned())
+                                }
+                                other => other.as_member_expression().and_then(guards::member_key),
+                            })
+                    && let Some(sink) = m().assign_sink(&target)
+                {
+                    let url_rule = sink.args.iter().any(|r| matches!(r, ArgRule::UrlPrefix(_)));
+                    if !url_rule || origin.prefix {
+                        self.emit(
+                            RawFinding {
+                                class: sink.class,
+                                severity: m().cap(origin.kind, sink.severity),
+                                api: format!("{target} ="),
+                                arg: assign.right.span(),
+                                call: assign.span,
+                                function: env.function.clone(),
+                                origin: origin.clone(),
+                                ext: None,
+                                auth: Auth::NoneDetected,
+                            },
+                            env,
+                        );
+                    }
+                }
                 self.assign_target(&assign.left, taint.clone(), env);
                 taint
             }
@@ -1808,9 +1840,16 @@ impl Walker<'_> {
             Expression::CallExpression(call) => self.call(call, env),
             Expression::NewExpression(new) => {
                 let callee = self.callee(&new.callee);
+                // `new Worker('jobs', async (job) => ...)`: client callbacks as with calls.
+                let (role, shape) = self.client_role(&callee, &new.callee, &new.arguments, env);
+                let last = new.arguments.len().saturating_sub(1);
                 let mut taints = Vec::new();
-                for argument in &new.arguments {
-                    taints.push(self.argument(argument, env, Role::Plain));
+                for (index, argument) in new.arguments.iter().enumerate() {
+                    let role = match shape {
+                        Shape::LastCallback if index != last => Role::Plain,
+                        _ => role,
+                    };
+                    taints.push(self.argument(argument, env, role));
                 }
                 let sink = match &callee {
                     Callee::Module { family, export } => {
@@ -2127,12 +2166,13 @@ impl Walker<'_> {
         {
             return Some(Origin::source(kind, member.span()));
         }
-        // Pack member sources: `process.argv`.
-        if let (Expression::Identifier(id), Some(property)) = (object, property.as_deref())
+        // Pack member sources: `process.argv`, `window.location.hash`.
+        if let Some(property) = property.as_deref()
+            && let Some(path) = guards::path_key(object)
             && let Some(source) = m()
                 .member_sources
                 .iter()
-                .find(|s| s.object == id.name.as_str() && s.property == property)
+                .find(|s| s.object == path && s.property == property)
         {
             return Some(Origin::source(source.kind.as_str(), member.span()));
         }
@@ -2339,7 +2379,7 @@ impl Walker<'_> {
         };
 
         // How function arguments are entered.
-        let (role, shape) = self.client_role(&callee, call, env);
+        let (role, shape) = self.client_role(&callee, &call.callee, &call.arguments, env);
         let route_name = match (&callee, call.arguments.first()) {
             (Callee::Method { method, .. }, Some(Argument::StringLiteral(path)))
                 if role == Role::Route =>
@@ -2562,7 +2602,18 @@ impl Walker<'_> {
                 object: Some(object),
                 method,
             } if self.own_function_followed(object, method) => None,
-            Callee::Method { method, .. } => m().method_sink(method),
+            Callee::Method { method, .. } => {
+                // `document.write(...)` before any `write(...)`.
+                let qualified = call
+                    .callee
+                    .get_inner_expression()
+                    .as_member_expression()
+                    .and_then(|mem| guards::path_key(mem.object()))
+                    .map(|object| format!("{object}.{method}"));
+                qualified
+                    .and_then(|q| m().method_sink(&q))
+                    .or_else(|| m().method_sink(method))
+            }
         };
         if let Some(sink) = sink {
             self.check_sink(
@@ -2763,9 +2814,15 @@ impl Walker<'_> {
 
     /// How a call's function arguments are entered, from the packs' route, socket and
     /// client-source conventions.
-    fn client_role(&self, callee: &Callee, call: &CallExpression<'_>, env: &Env) -> (Role, Shape) {
+    fn client_role(
+        &self,
+        callee: &Callee,
+        callee_expr: &Expression<'_>,
+        arguments: &[Argument<'_>],
+        env: &Env,
+    ) -> (Role, Shape) {
         let model = m();
-        let event = match call.arguments.first() {
+        let event = match arguments.first() {
             Some(Argument::StringLiteral(lit)) => lit.value.as_str(),
             _ => None,
         };
@@ -2775,8 +2832,7 @@ impl Walker<'_> {
             Callee::Module { export, .. } => (None, export.as_deref().unwrap_or("")),
         };
         // The property the receiver was read from: `chrome.runtime.onMessage.addListener`.
-        let via = call
-            .callee
+        let via = callee_expr
             .get_inner_expression()
             .as_member_expression()
             .and_then(|mem| mem.object().as_member_expression())
@@ -2788,9 +2844,9 @@ impl Walker<'_> {
                 || source.event.as_deref().is_some_and(|e| event != Some(e))
                 || (!source.via.is_empty() && !via.as_deref().is_some_and(|v| has(&source.via, v)))
                 || source.shape.as_deref() == Some("resolver-map")
-                || source.arity.is_some_and(|n| n != call.arguments.len())
+                || source.arity.is_some_and(|n| n != arguments.len())
                 || (source.shape.as_deref().unwrap_or("callback") == "callback"
-                    && !call.arguments.iter().any(|a| {
+                    && !arguments.iter().any(|a| {
                         a.as_expression().is_some_and(|e| {
                             matches!(
                                 e.get_inner_expression(),
@@ -2840,7 +2896,7 @@ impl Walker<'_> {
         if let Callee::Method { .. } = callee {
             if has(&model.route_object_methods, method)
                 && matches!(
-                    call.arguments
+                    arguments
                         .first()
                         .and_then(Argument::as_expression)
                         .map(Expression::get_inner_expression),
@@ -2849,7 +2905,7 @@ impl Walker<'_> {
             {
                 return (Role::Plain, Shape::RouteObject);
             }
-            if has(&model.route_methods, method) && call.arguments.len() >= 2 {
+            if has(&model.route_methods, method) && arguments.len() >= 2 {
                 return (Role::Route, Shape::Callback);
             }
         }
@@ -3319,76 +3375,75 @@ impl Walker<'_> {
         env: &Env,
     ) -> bool {
         for &rule in rules {
-            let (index, origin) = match rule {
-                ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
-                ArgRule::Html(index) => (
-                    index,
-                    taints.get(index).cloned().flatten().filter(|o| o.built),
-                ),
-                ArgRule::Object(index) => {
-                    // `find(req.body.filter)` or `find({ email: req.body.email })`: a value that
-                    // JSON or qs can turn into `{ "$ne": null }`.
-                    let arg = arguments.get(index).and_then(Argument::as_expression);
-                    let from_fields = match arg.map(Expression::get_inner_expression) {
-                        Some(Expression::ObjectExpression(object)) => object
-                            .properties
-                            .iter()
-                            .find_map(|property| match property {
-                                ObjectPropertyKind::ObjectProperty(p) => {
-                                    let mut probe = env.clone();
-                                    self.expr(&p.value, &mut probe)
-                                        .filter(|o| !o.built && o.object)
-                                }
-                                ObjectPropertyKind::SpreadProperty(_) => None,
-                            }),
-                        _ => None,
-                    };
-                    let direct = taints.get(index).cloned().flatten().filter(|o| {
-                        !o.built
-                            && o.object
-                            && !matches!(
-                                arg.map(Expression::get_inner_expression),
-                                Some(Expression::ObjectExpression(_))
-                            )
-                    });
-                    (index, from_fields.or(direct))
-                }
-                ArgRule::Built(index) => (
-                    index,
-                    taints
-                        .get(index)
-                        .cloned()
-                        .flatten()
-                        .filter(|o| o.built && o.sqlish),
-                ),
-                ArgRule::UrlPrefix(index) => {
-                    let is_object = arguments
-                        .get(index)
-                        .and_then(Argument::as_expression)
-                        .is_some_and(|e| {
-                            matches!(e.get_inner_expression(), Expression::ObjectExpression(_))
+            let (index, origin) =
+                match rule {
+                    ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
+                    ArgRule::Html(index) => (
+                        index,
+                        taints.get(index).cloned().flatten().filter(|o| o.built),
+                    ),
+                    ArgRule::Object(index) => {
+                        // `find(req.body.filter)` or `find({ email: req.body.email })`: a value that
+                        // JSON or qs can turn into `{ "$ne": null }`.
+                        let arg = arguments.get(index).and_then(Argument::as_expression);
+                        let from_fields = match arg.map(Expression::get_inner_expression) {
+                            Some(Expression::ObjectExpression(object)) => object
+                                .properties
+                                .iter()
+                                .find_map(|property| match property {
+                                    ObjectPropertyKind::ObjectProperty(p) => {
+                                        let mut probe = env.clone();
+                                        self.expr(&p.value, &mut probe)
+                                            .filter(|o| !o.built && o.object)
+                                    }
+                                    ObjectPropertyKind::SpreadProperty(_) => None,
+                                }),
+                            _ => None,
+                        };
+                        let direct = taints.get(index).cloned().flatten().filter(|o| {
+                            !o.built
+                                && o.object
+                                && !matches!(
+                                    arg.map(Expression::get_inner_expression),
+                                    Some(Expression::ObjectExpression(_))
+                                )
                         });
-                    let direct = taints
-                        .get(index)
-                        .cloned()
-                        .flatten()
-                        .filter(|o| o.prefix && !is_object);
-                    let from_options = arguments
-                        .get(index)
-                        .and_then(Argument::as_expression)
-                        .and_then(|e| {
-                            let keys: Vec<&str> =
-                                m().url_option_keys.iter().map(String::as_str).collect();
-                            object_prop(e, &keys)
-                        })
-                        .and_then(|value| {
-                            let mut probe = env.clone();
-                            self.expr(value, &mut probe)
-                        })
-                        .filter(|o| o.prefix);
-                    (index, direct.or(from_options))
-                }
-            };
+                        (index, from_fields.or(direct))
+                    }
+                    ArgRule::Built(index) => (
+                        index,
+                        taints.get(index).cloned().flatten().filter(|o| {
+                            o.built && (o.sqlish || sink.class != VulnClass::SqlInjection)
+                        }),
+                    ),
+                    ArgRule::UrlPrefix(index) => {
+                        let is_object = arguments
+                            .get(index)
+                            .and_then(Argument::as_expression)
+                            .is_some_and(|e| {
+                                matches!(e.get_inner_expression(), Expression::ObjectExpression(_))
+                            });
+                        let direct = taints
+                            .get(index)
+                            .cloned()
+                            .flatten()
+                            .filter(|o| o.prefix && !is_object);
+                        let from_options = arguments
+                            .get(index)
+                            .and_then(Argument::as_expression)
+                            .and_then(|e| {
+                                let keys: Vec<&str> =
+                                    m().url_option_keys.iter().map(String::as_str).collect();
+                                object_prop(e, &keys)
+                            })
+                            .and_then(|value| {
+                                let mut probe = env.clone();
+                                self.expr(value, &mut probe)
+                            })
+                            .filter(|o| o.prefix);
+                        (index, direct.or(from_options))
+                    }
+                };
             let Some(origin) = origin else { continue };
             // The CLI is the user's own machine: never above low.
             let severity = m().cap(origin.kind, severity);
@@ -3886,6 +3941,45 @@ mod tests {
                 "socket"
             )]
         );
+    }
+
+    #[test]
+    fn dom_xss_sources_and_sinks() {
+        let found = scan(
+            "const q = new URLSearchParams(location.search); el.innerHTML = '<b>' + location.hash.slice(1) + '</b>';",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].3, "dom");
+        assert_eq!(
+            scan("document.write('<p>' + document.referrer + '</p>');").len(),
+            1
+        );
+        assert_eq!(
+            scan("window.location.href = location.hash.slice(1);").len(),
+            1
+        );
+        // a fixed origin before the tainted part cannot become `javascript:`
+        assert!(scan("location.href = '/search?q=' + location.hash.slice(1);").is_empty());
+        assert_eq!(
+            scan("setTimeout('render(' + location.hash + ')', 10);").len(),
+            1
+        );
+        // `stream.write` is not `document.write`
+        assert!(scan("stream.write(location.hash);").is_empty());
+    }
+
+    #[test]
+    fn electron_sinks_and_bullmq_workers() {
+        assert_eq!(scan("ipcMain.handle('run', (event, code) => { win.webContents.executeJavaScript(code); });")[0].1, Severity::Critical);
+        assert_eq!(
+            scan("ipcMain.on('open', (event, p) => shell.openPath(p));").len(),
+            1
+        );
+        let worker = one(
+            "const w = new Worker('convert', async (job) => { exec('convert ' + job.data.file); });",
+        );
+        assert_eq!(worker.len(), 1, "{worker:?}");
+        assert_eq!(worker[0].3, "queue");
     }
 
     #[test]

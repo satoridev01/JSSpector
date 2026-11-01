@@ -36,6 +36,7 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ("archive", include_str!("../../../../packs/archive.yaml")),
     ("auth", include_str!("../../../../packs/auth.yaml")),
     ("react", include_str!("../../../../packs/react.yaml")),
+    ("dom", include_str!("../../../../packs/dom.yaml")),
 ];
 
 /// One pack file, as written.
@@ -147,9 +148,12 @@ pub struct SinkSpec {
     /// Free functions, by name.
     #[serde(default)]
     pub global: Vec<String>,
-    /// Methods, on any receiver.
+    /// Methods, on any receiver (`write`) or a named one (`document.write`).
     #[serde(default)]
     pub methods: Vec<String>,
+    /// Assignment targets: `location.href = value`.
+    #[serde(default)]
+    pub assign: Vec<String>,
     pub class: VulnClassName,
     pub severity: SeverityName,
     /// `any:N`, `built:N`, `url:N`, `html:N` or `object:N`.
@@ -422,6 +426,7 @@ pub struct Model {
     module_sinks: BTreeMap<(String, String), Sink>,
     global_sinks: BTreeMap<String, Sink>,
     method_sinks: BTreeMap<String, Sink>,
+    assign_sinks: BTreeMap<String, Sink>,
     pub request_names: Vec<String>,
     pub request_props: Vec<String>,
     pub request_methods: Vec<String>,
@@ -541,6 +546,9 @@ impl Model {
             for name in &spec.methods {
                 self.method_sinks.insert(name.clone(), sink.clone());
             }
+            for target in &spec.assign {
+                self.assign_sinks.insert(target.clone(), sink.clone());
+            }
         }
         let r = pack.request;
         self.request_names.extend(r.names);
@@ -628,6 +636,11 @@ impl Model {
 
     pub fn method_sink(&self, method: &str) -> Option<&Sink> {
         self.method_sinks.get(method)
+    }
+
+    /// The sink an assignment to `target` (an access path) is.
+    pub fn assign_sink(&self, target: &str) -> Option<&Sink> {
+        self.assign_sinks.get(target)
     }
 
     /// Literal text that looks like part of an SQL statement (a keyword as a whole word).

@@ -32,6 +32,8 @@ pub enum Fact {
     Contained(u8, Vec<String>),
     /// Known to be a string (or number/boolean), never an object.
     Scalar,
+    /// Known not to start with `-` (`if (p.startsWith('-')) throw`): no argument injection.
+    NoLeadingDash,
 }
 
 /// Longest access path a key is built for: no guard or pack name has more segments, and a
@@ -498,6 +500,15 @@ fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String,
         {
             out.push((key, Fact::Clean(classes)));
         }
+        return;
+    }
+    // `p.startsWith('-')` was false: no option can be smuggled in as an argument.
+    if name == "startsWith"
+        && matches!(call.arguments.first(), Some(Argument::StringLiteral(dash)) if dash.value.as_str() == Some("-"))
+        && let Some(member) = callee.as_member_expression()
+        && let Some(key) = path_key(member.object())
+    {
+        out.push((key, Fact::NoLeadingDash));
         return;
     }
     // `p.includes('..')` (or another marker) was false: the receiver has no traversal.

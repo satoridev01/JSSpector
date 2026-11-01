@@ -102,6 +102,9 @@ propagation:
     catch: {returns: true, keeps_receiver: true}
     replace: {callback: 1, element_all: true}
     replaceAll: {callback: 1, element_all: true}
+  # Schema validation (zod, yup, joi): the result is the input, its leaves typed by the schema.
+  validating_methods: [parse, safeParse, parseAsync, safeParseAsync, cast, attempt]
+  validation_clean_fields: [success, error, issues]
   # Functions that call a function argument with the arguments after it.
   forwarders:
     - {functions: [setImmediate, queueMicrotask, process.nextTick], callback: 0, from: 1}

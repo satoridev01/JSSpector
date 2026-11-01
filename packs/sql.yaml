@@ -2,7 +2,8 @@
 name: sql
 sinks:
   - methods: [query, execute, raw, whereRaw, orderByRaw, havingRaw, joinRaw, $queryRawUnsafe, $executeRawUnsafe,
-      unsafe, exec, all, run, get, prepare, each]
+      unsafe, exec, all, run, get, prepare, each,
+      any, one, oneOrNone, many, manyOrNone, none, result, multi, multiResult]
     class: sql-injection
     severity: high
     args: ["built:0"]

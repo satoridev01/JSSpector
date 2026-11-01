@@ -64,6 +64,8 @@ pub struct Origin {
     /// Upload objects (`req.files`, wherever they went): the fields the server chose (`path`,
     /// `filename`, `destination`) are not the attacker's.
     pub upload: bool,
+    /// Checked not to start with `-` (`if (p.startsWith('-')) throw`): no argument injection.
+    pub dash_free: bool,
 }
 
 /// The key under which a tracked object keeps what its fields of unknown name may hold
@@ -187,6 +189,7 @@ impl Origin {
             object: true,
             also: Vec::new(),
             upload: false,
+            dash_free: false,
         }
     }
 
@@ -628,6 +631,7 @@ struct PathState {
 fn join(a: &mut Origin, b: &Origin) {
     a.absorb(b);
     a.upload &= b.upload;
+    a.dash_free &= b.dash_free;
     a.object |= b.object;
     a.prefix |= b.prefix;
     a.built |= b.built;
@@ -755,6 +759,11 @@ impl Env {
                         origin.object = false;
                     }
                     self.scalars.insert(key);
+                }
+                guards::Fact::NoLeadingDash => {
+                    if let Some(origin) = self.vars.get_mut(&key) {
+                        origin.dash_free = true;
+                    }
                 }
                 guards::Fact::Contained(..) => {}
             }
@@ -980,6 +989,7 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
                 // Escaped only if every part is.
                 escaped: a.escaped & b.escaped,
                 upload: a.upload && b.upload,
+                dash_free: a.dash_free && b.dash_free,
                 ..a
             })
         }
@@ -1223,6 +1233,20 @@ fn prototype_owner(
         return None;
     }
     Some((class.to_owned(), method))
+}
+
+/// `v.replace(/'/g, "''")` (or `replaceAll("'", "''")`): every single quote doubled.
+fn doubles_quotes(arguments: &[Argument<'_>]) -> bool {
+    let doubled = matches!(arguments.get(1), Some(Argument::StringLiteral(with)) if with.value.as_str() == Some("''"));
+    doubled
+        && match arguments.first() {
+            Some(Argument::RegExpLiteral(regex)) => {
+                regex.regex.pattern.text.as_str() == "'"
+                    && regex.regex.flags.contains(oxc_ast::ast::RegExpFlags::G)
+            }
+            Some(Argument::StringLiteral(quote)) => quote.value.as_str() == Some("'"),
+            _ => false,
+        }
 }
 
 /// A regular expression: `/a(.*)/` or `new RegExp(...)`.
@@ -2548,6 +2572,7 @@ impl Walker<'_> {
                                     && !has(self.linking.scalar_props, key),
                                 also: Vec::new(),
                                 upload: false,
+                                dash_free: false,
                             })
                         }
                         (Some(_), _) => None,
@@ -2931,6 +2956,7 @@ impl Walker<'_> {
                     object: !has(&m().scalar_decorators, name),
                     also: Vec::new(),
                     upload: false,
+                    dash_free: false,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -2973,6 +2999,7 @@ impl Walker<'_> {
                     object: true,
                     also: Vec::new(),
                     upload: false,
+                    dash_free: false,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -3071,6 +3098,7 @@ impl Walker<'_> {
                         object: !has(&m().scalar_kinds, kind),
                         also: Vec::new(),
                         upload: false,
+                        dash_free: false,
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -4369,6 +4397,7 @@ impl Walker<'_> {
                 upload: property
                     .as_deref()
                     .is_some_and(|p| has(&m().upload_objects, p)),
+                dash_free: false,
             });
         }
         // `this.url` in a class method: what another method stored there.
@@ -4464,6 +4493,18 @@ impl Walker<'_> {
             Some(rest) => Some(rest),
             None => self.expr(member.object(), env),
         };
+        // `r.success` of a validation result: a boolean, no input.
+        if property
+            .as_deref()
+            .is_some_and(|p| has(&m().validation_clean_fields, p))
+            && whole.as_ref().is_some_and(|o| {
+                o.steps
+                    .last()
+                    .is_some_and(|(_, note)| note.starts_with("validated by"))
+            })
+        {
+            return None;
+        }
         // `file.path` of an upload that went through a helper, an array or a callback.
         if whole.as_ref().is_some_and(|o| o.upload)
             && property
@@ -4940,6 +4981,38 @@ impl Walker<'_> {
             }
             taints.push(taint);
         }
+        self.call_tail(
+            call,
+            env,
+            callee,
+            receiver,
+            role,
+            shape,
+            taints,
+            callback_spec,
+            callback_result,
+            initial,
+        )
+    }
+
+    /// The part of [`Self::call`] after its arguments are walked: object callbacks, stores,
+    /// lowering, sinks, summaries and the result. Kept out of `call`'s stack frame, which
+    /// every level of nested calls holds while their arguments are walked.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn call_tail(
+        &mut self,
+        call: &CallExpression<'_>,
+        env: &mut Env,
+        callee: Callee,
+        receiver: Option<Origin>,
+        role: Role,
+        shape: Shape,
+        taints: Vec<Option<Origin>>,
+        callback_spec: Option<models::CallbackSpec>,
+        callback_result: Option<Origin>,
+        initial: Option<Origin>,
+    ) -> Option<Origin> {
         // `Meteor.methods({ name(args) { ... } })`, `fastify.route({ method, url, handler })`:
         // the function-valued properties of an object argument are the callbacks.
         if shape == Shape::ObjectOfFunctions || shape == Shape::RouteObject {
@@ -5506,6 +5579,7 @@ impl Walker<'_> {
                             object: true,
                             also: Vec::new(),
                             upload: false,
+                            dash_free: false,
                         })
                     })
                     .collect();
@@ -5590,11 +5664,28 @@ impl Walker<'_> {
                         object: true,
                         also: Vec::new(),
                         upload: false,
+                        dash_free: false,
                     });
                 }
                 // Pack result sources: `zip.getEntries()`.
                 if let Some(source) = m().result_sources.iter().find(|s| has(&s.methods, method)) {
                     return Some(Origin::source(source.kind.as_str(), call.span));
+                }
+                // `schema.safeParse(req.body)`: the input, typed by the schema (no operator objects).
+                if has(&m().validating_methods, method) {
+                    return any_arg().map(|mut o| {
+                        o.object = false;
+                        o.step(call.span.start, format!("validated by .{method}()"))
+                    });
+                }
+                // `v.replace(/'/g, "''")`: quotes doubled, safe inside a quoted SQL string.
+                if matches!(method.as_str(), "replace" | "replaceAll")
+                    && doubles_quotes(&call.arguments)
+                {
+                    return receiver.map(|mut o| {
+                        o.escaped |= class_bit(VulnClass::SqlInjection);
+                        o.step(call.span.start, "quotes doubled".to_owned())
+                    });
                 }
                 // `/a(.*)/.exec(s)`: the match and its groups are parts of `s` (only characters
                 // an anchored allowlist admits: `/^(\d+)\.png$/` leaves nothing to attack).
@@ -7657,11 +7748,32 @@ impl Walker<'_> {
             let (index, origin) = match rule {
                 ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
                 // `spawn('git', ['clone', x])`: `x` can start with `-` only if the attacker
-                // chooses its start.
-                ArgRule::Start(index) => (
-                    index,
-                    taints.get(index).cloned().flatten().filter(|o| o.prefix),
-                ),
+                // chooses its start, nothing checked it, and no `--` ends the options before it.
+                ArgRule::Start(index) => {
+                    let argument = arguments.get(index).and_then(Argument::as_expression);
+                    let origin = match argument.map(Expression::get_inner_expression) {
+                        Some(Expression::ArrayExpression(array)) => {
+                            let positions = self.array_positions(array, env);
+                            let end_of_options = array.elements.iter().position(|e| {
+                                matches!(e.as_expression().map(Expression::get_inner_expression),
+                                    Some(Expression::StringLiteral(l)) if l.value.as_str() == Some("--"))
+                            });
+                            positions
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(i, _)| end_of_options.is_none_or(|end| *i < end))
+                                .filter_map(|(_, t)| t)
+                                .filter(|o| o.prefix && !o.dash_free)
+                                .fold(None, |acc, o| union(acc, Some(o)))
+                        }
+                        _ => taints
+                            .get(index)
+                            .cloned()
+                            .flatten()
+                            .filter(|o| o.prefix && !o.dash_free),
+                    };
+                    (index, origin)
+                }
                 // A helper's parameter passed straight to the sink (`function query(sql) {
                 // return pool.query(sql) }`): a summary, whose callers must build the text.
                 ArgRule::Html(index) => (
@@ -8456,6 +8568,42 @@ mod tests {
                 "{call}"
             );
         }
+    }
+
+    #[test]
+    fn schema_results_argument_guards_and_quote_doubling() {
+        use Severity::*;
+        use VulnClass::*;
+        let critical = vec![(CommandInjection, Critical)];
+        // Validation results carry their input, typed.
+        assert_eq!(
+            route("const r = schema.safeParse(req.body); exec(r.data.cmd);"),
+            critical
+        );
+        assert_eq!(route("exec(schema.parse(req.body).cmd);"), critical);
+        assert!(route("exec('echo ' + schema.safeParse(req.body).success);").is_empty());
+        assert!(!route("User.find(schema.parse(req.body));").contains(&(NosqlInjection, High)));
+        // Argument injection: `--` ends the options; a leading-dash check rejects them.
+        assert!(route("spawn('rg', ['--json', '--', req.query.p]);").is_empty());
+        assert!(route("const p = req.query.p; if (p.startsWith('-')) throw new Error('x'); spawn('rg', ['--json', p]);").is_empty());
+        assert_eq!(
+            route("spawn('rg', [req.query.p, '--']);"),
+            vec![(CommandInjection, Medium)]
+        );
+        assert_eq!(
+            route(
+                "const p = req.query.p; if (p.startsWith('-')) throw new Error('x'); exec('rg ' + p);"
+            ),
+            critical
+        );
+        // pg-promise methods; doubled quotes.
+        assert_eq!(
+            route("db.any('SELECT * FROM t WHERE a = ' + req.query.a);"),
+            vec![(SqlInjection, High)]
+        );
+        assert!(route("db.any('SELECT * FROM t WHERE a = $1', [req.query.a]);").is_empty());
+        assert!(route("const v = req.query.a.replace(/'/g, \"''\"); db.query(\"SELECT * FROM t WHERE a = '\" + v + \"'\");").is_empty());
+        assert!(!route("const v = req.query.a.replace(/([^'])'/, \"$1''\"); db.query(\"SELECT * FROM t WHERE a = '\" + v + \"'\");").is_empty());
     }
 
     #[test]

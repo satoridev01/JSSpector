@@ -460,6 +460,12 @@ pub struct Propagation {
     /// `setImmediate(fn, a)`, `setTimeout(fn, ms, a)`.
     #[serde(default)]
     pub forwarders: Vec<ForwarderSpec>,
+    /// Schema methods whose result is their (validated) input: `schema.safeParse(req.body)`.
+    #[serde(default)]
+    pub validating_methods: Vec<String>,
+    /// Fields of a validation result that are no input (`r.success`, `r.error`).
+    #[serde(default)]
+    pub validation_clean_fields: Vec<String>,
 }
 
 /// A function that forwards arguments to a callback (see [`Propagation::forwarders`]).
@@ -690,6 +696,8 @@ pub struct Model {
     pub object_module_pass: Vec<String>,
     pub callbacks: BTreeMap<String, CallbackSpec>,
     pub forwarders: Vec<ForwarderSpec>,
+    pub validating_methods: Vec<String>,
+    pub validation_clean_fields: Vec<String>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -858,6 +866,10 @@ impl Model {
             .extend(pack.propagation.object_module_pass);
         self.callbacks.extend(pack.propagation.callbacks);
         self.forwarders.extend(pack.propagation.forwarders);
+        self.validating_methods
+            .extend(pack.propagation.validating_methods);
+        self.validation_clean_fields
+            .extend(pack.propagation.validation_clean_fields);
         self.jsx_html_props.extend(pack.jsx.html_props);
         self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
         if pack.jsx.props_kind.is_some() {

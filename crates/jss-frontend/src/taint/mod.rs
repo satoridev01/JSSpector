@@ -101,7 +101,7 @@ fn unnamed_fields(fields: &BTreeMap<String, Origin>) -> Option<Origin> {
 
 /// How an export table names a namespace export: `users` -> `<namespace>:src/api/users.js`
 /// (`exports.users = require('./users')`, `export * as users from './users'`).
-pub const NAMESPACE: &str = "<namespace>:";
+pub const NAMESPACE: &str = jss_core::ir::NAMESPACE;
 
 /// The classes percent-encoded text is safe for: no markup, quote, separator or shell character
 /// survives encoding.
@@ -221,7 +221,7 @@ pub type ClassRef = (String, String);
 
 /// An export that is a member of a class declared in another file (`module.exports = {
 /// getRegistry: Registry.getInstance }` with `Registry` imported): `<at>:file#Registry.getInstance`.
-pub const ELSEWHERE: &str = "<at>:";
+pub const ELSEWHERE: &str = jss_core::ir::ELSEWHERE;
 
 /// The request-kind marker for a context object whose request data is under `.req`.
 const CONTEXT: &str = "context";

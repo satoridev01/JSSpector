@@ -236,6 +236,25 @@ pub fn reachable(graph: &CallGraph, roots: &[FunctionId]) -> BTreeMap<FunctionId
     seen
 }
 
+/// How an export table names a namespace export: `users` -> `<namespace>:src/api/users.js`
+/// (`exports.users = require('./users')`, `export * as users from './users'`).
+pub const NAMESPACE: &str = "<namespace>:";
+
+/// How an export table names a class member declared in another file (`module.exports = {
+/// getRegistry: Registry.getInstance }`): `<at>:file#Registry.getInstance`.
+pub const ELSEWHERE: &str = "<at>:";
+
+/// The function an export-table value names when it points into another file.
+fn elsewhere(value: &str, by_file: &BTreeMap<&str, &Module>) -> Option<FunctionId> {
+    let (file, name) = value.strip_prefix(ELSEWHERE)?.split_once('#')?;
+    by_file
+        .get(file)?
+        .functions
+        .iter()
+        .any(|f| f.name == name)
+        .then(|| (file.to_owned(), name.to_owned()))
+}
+
 fn resolve_call(
     callee: &str,
     local: &BTreeSet<&str>,
@@ -314,6 +333,9 @@ fn resolve_in(
     {
         return Some((target_file.to_owned(), name.clone()));
     }
+    if let Some(found) = candidates.iter().find_map(|name| elsewhere(name, by_file)) {
+        return Some(found);
+    }
     // Not defined there: follow what the target itself imports or re-exports.
     let target_local: BTreeSet<&str> = target.functions.iter().map(|f| f.name.as_str()).collect();
     let target_imports: BTreeMap<&str, &Import> = target
@@ -329,6 +351,26 @@ fn resolve_in(
                 Some((segment, remaining)) => (segment, Some(remaining)),
                 None => (more, None),
             };
+            // `reports.cashReport.document` with `exports.cashReport = require('./cashReport')`:
+            // `document` of that file.
+            if let (Some(namespace), Some(remaining)) =
+                (exported(segment).strip_prefix(NAMESPACE), remaining)
+                && let Some(module) = by_file.get(namespace)
+            {
+                let names: BTreeSet<&str> =
+                    module.functions.iter().map(|f| f.name.as_str()).collect();
+                let imports: BTreeMap<&str, &Import> = module
+                    .imports
+                    .iter()
+                    .map(|i| (i.local.as_str(), i))
+                    .collect();
+                let local = module
+                    .exports
+                    .get(remaining)
+                    .cloned()
+                    .unwrap_or_else(|| remaining.to_owned());
+                return resolve_in(&local, &names, &imports, by_file, namespace, depth + 1);
+            }
             Some(match remaining {
                 Some(remaining) => format!("{}.{remaining}", exported(segment)),
                 None => exported(segment),
@@ -446,6 +488,62 @@ mod tests {
         assert_eq!(
             resolve_reference(&by_file, "app.js", "api.watch.readFile"),
             Some(("api/api.watch.js".to_owned(), "readFile".to_owned()))
+        );
+    }
+
+    #[test]
+    fn references_follow_commonjs_namespace_exports_and_members_elsewhere() {
+        // `const reports = require('./reports')` with `exports.cash = require('./cash')` in the
+        // index: `reports.cash.document` is `document` of `reports/cash/index.js`, dots in the
+        // path notwithstanding.
+        let routes = Module {
+            file: "config/routes.js".to_owned(),
+            imports: vec![Import {
+                local: "reports".to_owned(),
+                specifier: "../reports".to_owned(),
+                export: None,
+                resolved: Some("reports/index.js".to_owned()),
+            }],
+            ..Module::default()
+        };
+        let index = Module {
+            file: "reports/index.js".to_owned(),
+            exports: BTreeMap::from([
+                (
+                    "cash".to_owned(),
+                    format!("{NAMESPACE}reports/cash/index.js"),
+                ),
+                (
+                    "registry".to_owned(),
+                    format!("{ELSEWHERE}reports/registry.js#Registry.getInstance"),
+                ),
+            ]),
+            ..Module::default()
+        };
+        let cash = Module {
+            file: "reports/cash/index.js".to_owned(),
+            exports: BTreeMap::from([("document".to_owned(), "document".to_owned())]),
+            functions: vec![function("document", &[])],
+            ..Module::default()
+        };
+        let registry = Module {
+            file: "reports/registry.js".to_owned(),
+            functions: vec![function("Registry.getInstance", &[])],
+            ..Module::default()
+        };
+        let modules = [routes, index, cash, registry];
+        let by_file: BTreeMap<&str, &Module> =
+            modules.iter().map(|m| (m.file.as_str(), m)).collect();
+        assert_eq!(
+            resolve_reference(&by_file, "config/routes.js", "reports.cash.document"),
+            Some(("reports/cash/index.js".to_owned(), "document".to_owned()))
+        );
+        assert_eq!(
+            resolve_reference(&by_file, "config/routes.js", "reports.registry"),
+            Some((
+                "reports/registry.js".to_owned(),
+                "Registry.getInstance".to_owned()
+            ))
         );
     }
 }

@@ -113,7 +113,7 @@ Each file is lowered to an owned IR (`jss_core::ir`: imports resolved to files, 
 
 `cargo xtask replay` scores `scan` against the verified CVE-replay pairs in [`corpus/research/`](corpus/research/): a finding of the advisory's class must have its sink in the advisory's file (nearest to its line) at the vulnerable commit, and that finding's line-independent key must be gone at the fix. Repositories are fetched blobless and sparse; nothing in them is run.
 
-Latest measurements (2026-11-01, static reading only):
+Latest measurements (2026-11-02, static reading only):
 
 | What | Result |
 |---|---|
@@ -121,8 +121,8 @@ Latest measurements (2026-11-01, static reading only):
 | Route recall vs spec: NodeBB (Express + route helpers) | 106/153 (69.3%); plugin-remountable mounts (`admin`, `tags`, `groups`) are named at runtime |
 | socket.io events, uptime-kuma server | 71/71 |
 | Electron `ipcMain` channels, OpenWhispr | 558/575 (97%) |
-| CVE replay, covered classes | 7/69 detected (path traversal 5/15, XSS 1/15, prototype pollution 1/8), 5/7 cleared at the fix |
-| 100-repo corpus | 35,765 files in about 80 s, 0 panics, identical output at 1 and 10 threads; 162 HIGH/CRITICAL candidates, including both hand-confirmed true positives |
+| CVE replay, covered classes | 21/69 detected (path traversal 9/15, command injection 3/4, XSS 3/15, prototype pollution 3/8, NoSQL 2/3, SQL 1/10), 15/21 cleared at the fix |
+| 100-repo corpus | 35,765 files in about 105 s, 0 panics, identical output at 1 and 10 threads; 158 HIGH/CRITICAL candidates, including both hand-confirmed true positives |
 
 `cargo xtask corpus --list FILE` fetches a list of repositories (`owner/name@commit`, shallow and sparse; nothing in them is run), scans each one and writes per-repository reports, a `summary.json` and a table; it fails if the scanner crashes or panics on any file. [`.satori.yml`](.satori.yml) runs the same job on Satori with the list given as input (`-d CORPUS="..."`), so the corpus list never has to be committed. Keep those runs private: HEAD findings may be undisclosed vulnerabilities.
 

@@ -448,6 +448,8 @@ struct Env {
     /// Variables holding an instance of an imported class (`const shell = new ShellService()`):
     /// the imported binding of the class.
     instances: BTreeMap<String, String>,
+    /// Variables holding an instance of a class of this file: the class.
+    local_instances: BTreeMap<String, String>,
     /// Variables holding what an auth call returned (`const user = verifyToken(token)`): a
     /// falsy one means the caller is not logged in (or not an admin).
     auth_vars: BTreeMap<String, Auth>,
@@ -603,6 +605,7 @@ impl Env {
             declared: BTreeMap::new(),
             auth_vars: BTreeMap::new(),
             instances: BTreeMap::new(),
+            local_instances: BTreeMap::new(),
             branch: 0,
             function,
         }
@@ -627,6 +630,7 @@ impl Env {
             declared: self.declared.clone(),
             auth_vars: self.auth_vars.clone(),
             instances: self.instances.clone(),
+            local_instances: self.local_instances.clone(),
             branch: 0,
             function,
         }
@@ -781,6 +785,40 @@ fn auth_call_level(init: &Expression<'_>) -> Option<Auth> {
         }
         _ => None,
     }
+}
+
+/// The literal text in a `+` chain or a template: `'SELECT *' + ' WHERE n = '` gives both
+/// parts (other operands are skipped).
+fn literal_parts<'a>(expr: &'a Expression<'_>, out: &mut Vec<&'a str>) {
+    match expr.get_inner_expression() {
+        Expression::StringLiteral(lit) => {
+            if let Some(text) = lit.value.as_str() {
+                out.push(text);
+            }
+        }
+        Expression::TemplateLiteral(template) => {
+            out.extend(template.quasis.iter().map(|q| q.value.raw.as_str()));
+        }
+        Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
+            literal_parts(&b.left, out);
+            literal_parts(&b.right, out);
+        }
+        _ => {}
+    }
+}
+
+/// `{ $eq: x }`, `{ $in: [...] }`: an object of literal-comparison operators only.
+fn literal_comparison(value: &Expression<'_>) -> bool {
+    let Expression::ObjectExpression(object) = value.get_inner_expression() else {
+        return false;
+    };
+    !object.properties.is_empty()
+        && object.properties.iter().all(|p| match p {
+            ObjectPropertyKind::ObjectProperty(p) => {
+                prop_name(&p.key).is_some_and(|k| has(&m().literal_operators, &k))
+            }
+            ObjectPropertyKind::SpreadProperty(_) => false,
+        })
 }
 
 /// Whether a function body returns a value somewhere (not counting nested functions).
@@ -1615,6 +1653,26 @@ impl Walker<'_> {
                         env.instances.remove(name);
                     }
                 }
+                // `const store = new SnapshotStore()` with the class in this file.
+                let local = match init.get_inner_expression() {
+                    Expression::NewExpression(n) => match n.callee.get_inner_expression() {
+                        Expression::Identifier(id)
+                            if !self.relative.contains_key(id.name.as_str()) =>
+                        {
+                            Some(id.name.as_str().to_owned())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match local {
+                    Some(class) => {
+                        env.local_instances.insert(name.clone(), class);
+                    }
+                    None => {
+                        env.local_instances.remove(name);
+                    }
+                }
             }
             // `const router = express.Router()`, `const app = fastify()`
             if let Some(name) = &name_hint {
@@ -2105,15 +2163,31 @@ impl Walker<'_> {
         }
         // NestJS: `@Body() dto`, `@Query('q') q`, `@Param('id') id`, `@Headers() h`.
         for param in &params.items {
-            let decorated = param.decorators.iter().any(|d| match &d.expression {
-                Expression::CallExpression(call) => matches!(
-                    call.callee.get_inner_expression(),
-                    Expression::Identifier(id)
-                        if has(&m().decorators, id.name.as_str())
-                ),
-                _ => false,
+            let decorator = param.decorators.iter().find_map(|d| match &d.expression {
+                Expression::CallExpression(call) => match call.callee.get_inner_expression() {
+                    Expression::Identifier(id) if has(&m().decorators, id.name.as_str()) => {
+                        Some((id.name.as_str(), call))
+                    }
+                    _ => None,
+                },
+                _ => None,
             });
-            if decorated {
+            if let Some((name, call)) = decorator {
+                // `@Query('limit', ParseIntPipe)`: parsed into a safe value.
+                let parsed = call.arguments.iter().any(|a| {
+                    a.as_expression()
+                        .and_then(|e| match e.get_inner_expression() {
+                            Expression::NewExpression(n) => callee_name(&n.callee),
+                            other => callee_name(other),
+                        })
+                        .is_some_and(|pipe| {
+                            let pipe = pipe.split(' ').next().unwrap_or("");
+                            has(&m().sanitizing_pipes, pipe)
+                        })
+                });
+                if parsed {
+                    continue;
+                }
                 let origin = Origin {
                     kind: "http",
                     span: param.span,
@@ -2123,7 +2197,8 @@ impl Walker<'_> {
                     sqlish: false,
                     escaped: 0,
                     param: None,
-                    object: true,
+                    // `@Param('id')`, `@Headers()`: strings.
+                    object: !has(&m().scalar_decorators, name),
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -2209,7 +2284,8 @@ impl Walker<'_> {
                         sqlish: false,
                         escaped: 0,
                         param: None,
-                        object: true,
+                        // GraphQL arguments are typed by the schema.
+                        object: !has(&m().scalar_kinds, kind),
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -2486,9 +2562,11 @@ impl Walker<'_> {
                 let left = self.expr(&binary.left, env);
                 let right = self.expr(&binary.right, env);
                 if binary.operator == BinaryOperator::Addition {
+                    // Any literal text on either side: `'SELECT ...' + ' WHERE n = ' + x`.
                     let sqlish = [&binary.left, &binary.right].iter().any(|side| {
-                        matches!(side.get_inner_expression(), Expression::StringLiteral(lit)
-                            if lit.value.as_str().is_some_and(|t: &str| m().looks_like_sql(t)))
+                        let mut parts = Vec::new();
+                        literal_parts(side, &mut parts);
+                        parts.iter().any(|t| m().looks_like_sql(t))
                     });
                     let left = left.map(|mut o| {
                         o.built = true;
@@ -3762,16 +3840,47 @@ impl Walker<'_> {
             {
                 None
             }
-            Callee::Method { method, .. } if !method.is_empty() => {
-                let suffix = format!(".{method}");
-                let mut matching = self
-                    .summaries
-                    .iter()
-                    .filter(|(k, _)| k.ends_with(&suffix) || *k == method);
-                match (matching.next(), matching.next()) {
-                    (Some((k, s)), None) => Some((k.clone(), s.clone())),
-                    _ => None,
-                }
+            // Only for a receiver we know is this file's: `Class.m()`, `this.m()` in the class,
+            // a `new LocalClass()` instance, or an object literal declared here (whose methods
+            // go by their own names). Not `this.cache.read()` matched to any `*.read`.
+            Callee::Method {
+                object: Some(object),
+                method,
+            } if !method.is_empty() => {
+                let class = if object == "this" {
+                    self.current_class.clone()
+                } else {
+                    env.local_instances.get(object).cloned()
+                };
+                [
+                    Some(format!("{object}.{method}")),
+                    class.map(|c| format!("{c}.{method}")),
+                    env.fields.contains_key(object).then(|| method.clone()),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(|key| self.summaries.get(&key).map(|s| (key, s.clone())))
+            }
+            // `this._rebuild(path)`: a method of the class being walked.
+            Callee::Method {
+                object: None,
+                method,
+            } if !method.is_empty()
+                && call
+                    .callee
+                    .get_inner_expression()
+                    .as_member_expression()
+                    .is_some_and(|m| {
+                        matches!(
+                            m.object().get_inner_expression(),
+                            Expression::ThisExpression(_)
+                        )
+                    }) =>
+            {
+                self.current_class
+                    .as_ref()
+                    .map(|c| format!("{c}.{method}"))
+                    .and_then(|key| self.summaries.get(&key).map(|s| (key, s.clone())))
             }
             _ => None,
         };
@@ -4298,7 +4407,12 @@ impl Walker<'_> {
             {
                 return (Role::Plain, Shape::RouteObject);
             }
-            if has(&model.route_methods, method) && arguments.len() >= 2 {
+            // `app.get(path, handler)` on a router: a factory's product, a router-like name or a
+            // helper's parameter, never `$.get(url, cb)` or `schema.post('save', fn)`.
+            if has(&model.route_methods, method)
+                && arguments.len() >= 2
+                && object.is_some_and(|o| self.is_router(o) || env.params.iter().any(|p| p == o))
+            {
                 return (Role::Route, Shape::Callback);
             }
         }
@@ -5298,6 +5412,16 @@ impl Walker<'_> {
                                 .properties
                                 .iter()
                                 .find_map(|property| match property {
+                                    // `{ where: { email } }`: an ORM's filter (TypeORM, Sequelize
+                                    // operators cannot come from JSON); `{ email: { $eq: x } }`:
+                                    // the operand is compared as a value.
+                                    ObjectPropertyKind::ObjectProperty(p)
+                                        if prop_name(&p.key)
+                                            .is_some_and(|k| has(&m().orm_options, &k))
+                                            || literal_comparison(&p.value) =>
+                                    {
+                                        None
+                                    }
                                     ObjectPropertyKind::ObjectProperty(p) => {
                                         let mut probe = env.clone();
                                         self.expr(&p.value, &mut probe)
@@ -6401,6 +6525,96 @@ mod tests {
             ),
             vec![VulnClass::CommandInjection]
         );
+    }
+
+    #[test]
+    fn common_safe_shapes_are_not_reported() {
+        let count = |body: &str| one(body).len();
+        // A cache key or a query string is no SQL; a statement is.
+        assert_eq!(
+            count(
+                "app.get('/p', async (req, res) => { await redis.get(`rate-limit:${req.ip}:${req.query.k}`); });"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                "app.get('/p', async (req, res) => { await upstream.get(`/products?limit=${req.query.n}`); });"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                "app.get('/p', (req, res) => { db.get(`SELECT * FROM t WHERE id = ${req.query.id}`); });"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                "app.get('/p', (req, res) => { db.all('SELECT * FROM t' + ' WHERE n = ' + req.query.n); });"
+            ),
+            1
+        );
+        // A method of another object is not a same-named function of this file.
+        assert_eq!(
+            count(
+                "class SnapshotStore { read(id) { return fs.readFileSync('/snap/' + id); } }\n\
+                   app.get('/p', (req, res) => { res.json(this.cache.read(req.params.id)); });"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                "class SnapshotStore { read(id) { return fs.readFileSync('/snap/' + id); } }\n\
+                   const store = new SnapshotStore();\n\
+                   app.get('/p', (req, res) => { res.json(store.read(req.params.id)); });"
+            ),
+            1
+        );
+        // Literal comparisons and ORM filters cannot carry operator objects from JSON.
+        assert_eq!(
+            count(
+                "app.post('/l', async (req, res) => { await User.findOne({ email: { $eq: req.body.email } }); });"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                "app.post('/l', async (req, res) => { await repo.findOne({ where: { email: req.body.email } }); });"
+            ),
+            0
+        );
+        // jQuery and Mongoose callbacks are no request handlers.
+        assert_eq!(
+            count("$.get('/api/x', function (data, status) { exec('x ' + data.cmd); });"),
+            0
+        );
+        assert_eq!(
+            count(
+                "schema.post('findOneAndDelete', function (doc, next) { fs.unlinkSync(doc.path); });"
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn nest_parameters_follow_their_decorators_and_pipes() {
+        let src = |param: &str| {
+            format!(
+                "@Controller('items')\nexport class ItemsController {{\n\
+                 @Get(':id') find({param}) {{ return this.db.query('SELECT * FROM items WHERE id = ' + id); }}\n}}\n"
+            )
+        };
+        let found = |param: &str| scan(&src(param)).len();
+        assert_eq!(found("@Param('id') id"), 1);
+        assert_eq!(found("@Query('id', ParseIntPipe) id"), 0);
+        assert_eq!(found("@Query('id', new ParseIntPipe()) id"), 0);
+        // A route parameter is a string: no operator object.
+        let nosql = scan(
+            "@Controller('items')\nexport class ItemsController {\n\
+             @Get(':id') find(@Param('id') id) { return this.model.findOne({ _id: id }); }\n}\n",
+        );
+        assert!(nosql.is_empty(), "{nosql:?}");
     }
 
     #[test]

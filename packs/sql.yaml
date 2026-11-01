@@ -6,4 +6,10 @@ sinks:
     class: sql-injection
     severity: high
     args: ["built:0"]
-sql_keywords: [select, insert, update, delete, where, from, values, order by, group by, limit, join, set]
+# Literal text is SQL when its first word starts a statement or a clause (`SELECT ...`,
+# `" WHERE id = "`, `"' AND x = '"`), or when it has a pair below in order.
+sql_keywords: [select, insert, update, delete, replace, merge, with, where, and, or, not, from, join, inner, left,
+  right, outer, cross, on, values, set, order, group, having, limit, offset, union, returning, truncate, drop,
+  create, alter, call]
+sql_pairs: [[select, from], [insert, into], [update, set], [delete, from], [order, by], [group, by],
+  [inner, join], [left, join], [union, select]]

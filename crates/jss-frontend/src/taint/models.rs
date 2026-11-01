@@ -85,8 +85,17 @@ pub struct Pack {
     /// do not apply to `new C()` of them.
     #[serde(default)]
     pub plain_constructors: Vec<String>,
+    /// Query operators whose operand is compared as a value (`{ email: { $eq: x } }`), and
+    /// ORM option keys that wrap the filter (`{ where: { email } }`): not NoSQL injection points.
+    #[serde(default)]
+    pub literal_operators: Vec<String>,
+    #[serde(default)]
+    pub orm_options: Vec<String>,
     #[serde(default)]
     pub sql_keywords: Vec<String>,
+    /// Keyword pairs that make text SQL wherever they appear, in order (`select` .. `from`).
+    #[serde(default)]
+    pub sql_pairs: Vec<(String, String)>,
     /// Member reads that are client data: `process.argv`.
     #[serde(default)]
     pub member_sources: Vec<MemberSource>,
@@ -245,6 +254,16 @@ pub struct RequestSpec {
     /// Express 5 parses the query string with the simple parser.
     #[serde(default)]
     pub scalar_props_from: Vec<ScalarFrom>,
+    /// Parameter decorators whose value is always a string (`@Param('id')`, `@Headers()`).
+    #[serde(default)]
+    pub scalar_decorators: Vec<String>,
+    /// Pipes that parse a decorated parameter into a safe value (`@Query('n', ParseIntPipe)`).
+    #[serde(default)]
+    pub sanitizing_pipes: Vec<String>,
+    /// Client-source kinds whose values the framework types (GraphQL arguments): no operator
+    /// objects.
+    #[serde(default)]
+    pub scalar_kinds: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -583,6 +602,12 @@ pub struct Model {
     pub html_props: Vec<String>,
     pub plain_constructors: Vec<String>,
     pub sql_keywords: Vec<String>,
+    pub sql_pairs: Vec<(String, String)>,
+    pub literal_operators: Vec<String>,
+    pub orm_options: Vec<String>,
+    pub scalar_decorators: Vec<String>,
+    pub sanitizing_pipes: Vec<String>,
+    pub scalar_kinds: Vec<String>,
     pub sub_objects: Vec<String>,
     pub upload_objects: Vec<String>,
     pub object_props: Vec<String>,
@@ -739,9 +764,15 @@ impl Model {
         self.html_props.extend(pack.html_props);
         self.plain_constructors.extend(pack.plain_constructors);
         self.sql_keywords.extend(pack.sql_keywords);
+        self.sql_pairs.extend(pack.sql_pairs);
+        self.literal_operators.extend(pack.literal_operators);
+        self.orm_options.extend(pack.orm_options);
         self.sub_objects.extend(r.sub_objects);
         self.upload_objects.extend(r.upload_objects);
         self.object_props.extend(r.object_props);
+        self.scalar_decorators.extend(r.scalar_decorators);
+        self.sanitizing_pipes.extend(r.sanitizing_pipes);
+        self.scalar_kinds.extend(r.scalar_kinds);
         self.scalar_props_from.extend(r.scalar_props_from);
         self.member_sources.extend(pack.member_sources);
         for (kind, cap) in pack.severity_caps {
@@ -805,16 +836,24 @@ impl Model {
     /// Literal text that looks like part of an SQL statement (a keyword as a whole word).
     pub fn looks_like_sql(&self, text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
-        self.sql_keywords.iter().any(|keyword| {
-            lower.match_indices(keyword.as_str()).any(|(at, _)| {
-                let before = lower.get(..at).and_then(|s| s.chars().next_back());
-                let after = lower
-                    .get(at + keyword.len()..)
-                    .and_then(|s| s.chars().next());
-                let boundary =
-                    |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
-                boundary(before) && boundary(after)
-            })
+        let words: Vec<&str> = lower
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        // A statement or a clause starts it: `SELECT ...`, `" WHERE id = "`, `"' AND x = '"`.
+        if words
+            .first()
+            .is_some_and(|first| has(&self.sql_keywords, first))
+        {
+            return true;
+        }
+        // A statement's keywords in order: `... select name from ...`. One keyword anywhere
+        // (`rate-limit:`, `?from=`) is no SQL.
+        self.sql_pairs.iter().any(|(a, b)| {
+            words
+                .iter()
+                .position(|w| w == a)
+                .is_some_and(|at| words.iter().skip(at + 1).any(|w| w == b))
         })
     }
 

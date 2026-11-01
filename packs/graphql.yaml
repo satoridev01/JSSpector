@@ -2,3 +2,6 @@
 name: graphql
 client_sources:
   - {methods: [Query, Mutation, Subscription], shape: resolver-map, params: second, kind: graphql}
+request:
+  # Resolver arguments are typed by the schema: no operator objects.
+  scalar_kinds: [graphql]

@@ -7,3 +7,7 @@ sinks:
     severity: high
     args: ["object:0"]
   - {methods: [$where], class: code-injection, severity: critical, args: ["any:0"]}
+# The operand of these operators is compared as a value: `{ email: { $eq: x } }` is safe.
+literal_operators: [$eq, $ne, $in, $nin, $gt, $gte, $lt, $lte, $all, $size]
+# ORM options that wrap a filter (TypeORM, Sequelize): their operators cannot come from JSON.
+orm_options: [where, select, order, orderBy, include, attributes, relations, skip, take, limit]

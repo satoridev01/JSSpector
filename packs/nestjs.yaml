@@ -2,6 +2,10 @@
 name: nestjs
 request:
   decorators: [Body, Query, Param, Headers, Args, Req, UploadedFile, MessageBody]
+  # Route parameters and headers are strings.
+  scalar_decorators: [Param, Headers]
+  # `@Query('limit', ParseIntPipe)`: the pipe parses the value (or rejects the request).
+  sanitizing_pipes: [ParseIntPipe, ParseFloatPipe, ParseBoolPipe, ParseUUIDPipe, ParseEnumPipe]
 routes:
   controller_decorators: [Controller]
   route_decorators: [Get, Post, Put, Patch, Delete, All, Head, Options]

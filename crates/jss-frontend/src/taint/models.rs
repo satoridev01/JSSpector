@@ -58,6 +58,7 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
         "llm-tools",
         include_str!("../../../../packs/llm-tools.yaml"),
     ),
+    ("git-ssh", include_str!("../../../../packs/git-ssh.yaml")),
     (
         "multipart",
         include_str!("../../../../packs/multipart.yaml"),
@@ -104,6 +105,10 @@ pub struct Pack {
     /// parameter is the model's (attacker-steerable) input.
     #[serde(default)]
     pub tool_objects: Vec<ToolObjectSpec>,
+    /// Instances of a module family: what `axios.create()`, `simpleGit()` or `new NodeSSH()`
+    /// returns is the family's client, whose methods are its sinks.
+    #[serde(default)]
+    pub instances: BTreeMap<String, InstanceSpec>,
     /// Query operators whose operand is compared as a value (`{ email: { $eq: x } }`), and
     /// ORM option keys that wrap the filter (`{ where: { email } }`): not NoSQL injection points.
     #[serde(default)]
@@ -506,6 +511,21 @@ pub struct Propagation {
     pub apply_methods: Vec<String>,
 }
 
+/// How a module family makes instances (see [`Pack::instances`]).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceSpec {
+    /// Functions of the module that return an instance (`""`: the module called itself).
+    #[serde(default)]
+    pub factories: Vec<String>,
+    /// Classes of the module whose `new` is an instance.
+    #[serde(default)]
+    pub classes: Vec<String>,
+    /// Methods of an instance that return it again (`git.env(..).cwd(..)`).
+    #[serde(default)]
+    pub fluent: Vec<String>,
+}
+
 /// An LLM tool definition (see [`Pack::tool_objects`]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -793,6 +813,7 @@ pub struct Model {
     pub route_verbs: Vec<String>,
     pub service_worker: ServiceWorkerSpec,
     pub tool_objects: Vec<ToolObjectSpec>,
+    pub instances: BTreeMap<String, InstanceSpec>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -981,6 +1002,12 @@ impl Model {
         self.route_verbs
             .extend(pack.routes.verbs.iter().map(|v| v.to_ascii_lowercase()));
         self.tool_objects.extend(pack.tool_objects);
+        for (family, spec) in pack.instances {
+            let entry = self.instances.entry(family).or_default();
+            entry.factories.extend(spec.factories);
+            entry.classes.extend(spec.classes);
+            entry.fluent.extend(spec.fluent);
+        }
         if let Some(worker) = pack.service_worker {
             self.service_worker
                 .registrations

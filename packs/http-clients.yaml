@@ -16,3 +16,7 @@ sinks:
   - {module: http-client, exports: ["", get, post, put, patch, delete, head, request, stream], class: ssrf, severity: high, args: ["url:0"], ignore_kinds: [dom, props, ext-message, postmessage]}
   - {global: [fetch], class: ssrf, severity: high, args: ["url:0"], ignore_kinds: [dom, props, ext-message, postmessage]}
 url_option_keys: [url, uri, host, hostname, baseURL]
+# `const api = axios.create({ ... }); api.get(url)`: the same client (an absolute URL overrides
+# any baseURL).
+instances:
+  http-client: {factories: [create, extend, defaults]}

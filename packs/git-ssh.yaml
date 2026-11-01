@@ -1,0 +1,17 @@
+# Git and SSH clients used through instances.
+name: git-ssh
+modules:
+  simple-git: git-cli
+  node-ssh: ssh-client
+instances:
+  # `const git = simpleGit(dir).env('GIT_TERMINAL_PROMPT', '0')`
+  git-cli: {factories: ["", simpleGit], fluent: [env, cwd, outputHandler]}
+  # `const ssh = new NodeSSH()`
+  ssh-client: {classes: [NodeSSH]}
+sinks:
+  # A tainted element of a git command line: option injection (`--upload-pack=...`).
+  - {module: git-cli, exports: [raw, add, commit, checkout, clone, fetch, pull, push, log, show, revparse, reset, rm, mv,
+      tag, branch, merge, rebase, diff], class: command-injection, severity: medium, args: ["start:0", "start:1"]}
+  - {module: ssh-client, exports: [execCommand, exec], class: command-injection, severity: critical, args: ["any:0"]}
+  - {module: ssh-client, exports: [putFile, putFiles, putDirectory], class: path-traversal, severity: high, args: ["any:1"]}
+  - {module: ssh-client, exports: [getFile, getDirectory], class: path-traversal, severity: high, args: ["any:0"]}

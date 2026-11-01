@@ -2256,6 +2256,19 @@ impl Walker<'_> {
                 BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
                 _ => None,
             };
+            // `const api = axios.create()`, `const git = simpleGit().env(..)`, `new NodeSSH()`:
+            // the family's client, whose methods are its sinks.
+            if let Some(name) = &name_hint
+                && let Some(family) = self.instance_family(init)
+            {
+                self.modules.insert(
+                    name.clone(),
+                    Imported {
+                        family,
+                        export: None,
+                    },
+                );
+            }
             // `const fsApi = options.fs || fs`: an injected module (tests pass a stand-in) is
             // that module, not data: `fsApi.readFileSync(p)` is `fs.readFileSync(p)`.
             if let Some(name) = &name_hint
@@ -6321,6 +6334,53 @@ impl Walker<'_> {
         }
     }
 
+    /// The module family an initializer makes an instance of: a factory of the family
+    /// (`axios.create()`, `simpleGit()`), `new` of one of its classes, possibly followed by
+    /// fluent calls (`.env(..).cwd(..)`).
+    fn instance_family(&self, init: &Expression<'_>) -> Option<&'static str> {
+        let model = m();
+        let mut current = init.get_inner_expression();
+        for _ in 0..16 {
+            if let Expression::AwaitExpression(a) = current {
+                current = a.argument.get_inner_expression();
+                continue;
+            }
+            let Expression::CallExpression(call) = current else {
+                break;
+            };
+            let Some(member) = call.callee.get_inner_expression().as_member_expression() else {
+                break;
+            };
+            let Some(method) = member.static_property_name().and_then(|n| n.as_str()) else {
+                break;
+            };
+            if !model
+                .instances
+                .values()
+                .any(|spec| has(&spec.fluent, method))
+            {
+                break;
+            }
+            current = member.object().get_inner_expression();
+        }
+        let (callee, made_by_new) = match current {
+            Expression::CallExpression(call) => (self.callee(&call.callee), false),
+            Expression::NewExpression(new) => (self.callee(&new.callee), true),
+            _ => return None,
+        };
+        let Callee::Module { family, export } = callee else {
+            return None;
+        };
+        let spec = model.instances.get(family)?;
+        let export = export.as_deref().unwrap_or("");
+        let made = if made_by_new {
+            has(&spec.classes, export)
+        } else {
+            has(&spec.factories, export)
+        };
+        made.then_some(family)
+    }
+
     /// The module a `x || module` / `x ?? module` fallback stands for (`options.fs || fs`), whole
     /// modules only (not `opts.join || join`).
     fn module_fallback(&self, expr: &Expression<'_>) -> Option<Imported> {
@@ -9087,6 +9147,35 @@ mod tests {
         // A route configuration with array parameters; no schema.
         assert!(one("router.add({ path: '/x', parameters: [{ in: 'query' }], handler: (r) => exec('ls ' + r.q) });").is_empty());
         assert!(one("cfg({ schema: s, run: () => 1 });").is_empty());
+    }
+
+    #[test]
+    fn library_instances_are_their_clients() {
+        use Severity::*;
+        use VulnClass::*;
+        let found = scan(
+            "const axios = require('axios');\nconst c = axios.create({ timeout: 5 });\n\
+             app.get('/x', async (req, res) => { await c.get(req.query.url); });",
+        );
+        assert!(found.iter().any(|f| f.0 == Ssrf), "{found:?}");
+        assert!(scan(
+            "const axios = require('axios');\nconst c = axios.create({ baseURL: 'https://api.x.com' });\n\
+             app.get('/x', async (req, res) => { await c.get('/u/' + req.query.id); });"
+        )
+        .is_empty());
+        let found = scan(
+            "const simpleGit = require('simple-git');\nconst git = simpleGit().env('A', '1');\n\
+             app.post('/x', async (req, res) => { await git.add(req.body.paths); });",
+        );
+        assert!(
+            found.contains(&(CommandInjection, Medium, "git-cli.add".to_owned(), "http")),
+            "{found:?}"
+        );
+        let found = scan(
+            "const { NodeSSH } = require('node-ssh');\nconst ssh = new NodeSSH();\n\
+             app.post('/x', async (req, res) => { await ssh.putFile(LOCAL, req.body.dest); });",
+        );
+        assert!(found.iter().any(|f| f.0 == PathTraversal), "{found:?}");
     }
 
     #[test]

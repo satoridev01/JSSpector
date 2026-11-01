@@ -337,6 +337,36 @@ fn write_text(out: &mut impl Write, output: &ScanOutput, root: &std::path::Path)
                     st.dim, f.file, f.source.line, st.reset
                 )?;
                 writeln!(out, "  {:>8}┆ {}", f.source.line, source_code)?;
+                // Each step from the source to the sink, with its code line.
+                let mut last = (f.file.clone(), f.source.line);
+                for step in &f.trace {
+                    // Steps in another file come as `file:line: note`.
+                    let (file, line, note) = if step.line == 0 {
+                        let mut parts = step.note.splitn(3, ':');
+                        match (
+                            parts.next(),
+                            parts.next().and_then(|l| l.parse().ok()),
+                            parts.next(),
+                        ) {
+                            (Some(file), Some(line), Some(note)) => {
+                                (file.to_owned(), line, note.trim().to_owned())
+                            }
+                            _ => continue,
+                        }
+                    } else {
+                        (f.file.clone(), step.line, step.note.clone())
+                    };
+                    if (file.clone(), line) == last {
+                        continue;
+                    }
+                    writeln!(
+                        out,
+                        "          {}↳ {note}: {file}:{line}{}",
+                        st.dim, st.reset
+                    )?;
+                    writeln!(out, "  {:>8}┆ {}", line, source_line(root, &file, line))?;
+                    last = (file, line);
+                }
             }
             writeln!(out, "          ⋮┆----------------------------------------")?;
         }

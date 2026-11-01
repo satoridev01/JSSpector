@@ -272,22 +272,76 @@ fn discover_dir(root: &Path, options: &DiscoverOptions) -> Result<Discovery, Dis
     // An unreadable root is an error on the root itself, not a diagnostic.
     fs::read_dir(&canonical).map_err(io_error(root))?;
 
+    // A .gitignore whose globs `ignore` cannot compile without unbounded recursion would abort
+    // the process (a stack overflow cannot be caught): then .gitignore files are not used.
+    let respect_gitignore = options.respect_gitignore && !has_pathological_gitignore(&canonical);
     let mut walker = WalkBuilder::new(&canonical);
     walker
         // Start from no filters, then enable exactly what we want.
         .standard_filters(false)
         .hidden(true)
-        .git_ignore(options.respect_gitignore)
+        .git_ignore(respect_gitignore)
         .require_git(false)
-        .follow_links(false)
-        .threads(rayon::current_num_threads());
+        .follow_links(false);
     let found = Mutex::new(Found::default());
-    walker.build_parallel().visit(&mut VisitorBuilder {
+    // The sequential walker runs on the calling thread (a pool worker with a large stack).
+    // `ignore`'s parallel walker spawns threads with the default stack, and compiling a
+    // pathological .gitignore glob (thousands of nested `{`) overflows it, which aborts.
+    let mut builder = VisitorBuilder {
         root: &canonical,
         sink: &found,
-    });
+    };
+    let mut visitor = builder.build();
+    for entry in walker.build() {
+        if matches!(visitor.visit(entry), WalkState::Quit) {
+            break;
+        }
+    }
+    drop(visitor);
     let found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
     Ok(finish(canonical.clone(), &canonical, false, found))
+}
+
+/// .gitignore files larger than this are not compiled.
+const MAX_GITIGNORE_BYTES: u64 = 1024 * 1024;
+/// Deepest `{`/`[` nesting allowed in a .gitignore before it is considered pathological.
+const MAX_GITIGNORE_NESTING: usize = 64;
+
+/// Whether any .gitignore under `root` is too large or too deeply nested to compile safely.
+fn has_pathological_gitignore(root: &Path) -> bool {
+    let mut walker = WalkBuilder::new(root);
+    walker
+        .standard_filters(false)
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git");
+    walker.build().flatten().any(|entry| {
+        if entry.file_name() != ".gitignore" {
+            return false;
+        }
+        let Ok(meta) = entry.metadata() else {
+            return false;
+        };
+        if meta.len() > MAX_GITIGNORE_BYTES {
+            return true;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            return false;
+        };
+        let (mut depth, mut deepest) = (0usize, 0usize);
+        for byte in bytes {
+            match byte {
+                b'{' | b'[' => {
+                    depth += 1;
+                    deepest = deepest.max(depth);
+                }
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                b'\n' => depth = 0,
+                _ => {}
+            }
+        }
+        deepest > MAX_GITIGNORE_NESTING
+    })
 }
 
 fn discover_file(root: &Path) -> Result<Discovery, DiscoverError> {

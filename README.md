@@ -2,7 +2,7 @@
 
 **JSSpector** is a static analyzer (SAST) for JavaScript and TypeScript. It finds **high and critical vulnerabilities by chaining attack paths through the code**: from an entry point, through data flow across functions and files, to a dangerous sink.
 
-> **Status: pre-alpha.** `jsspector scan` v0 works today: a heuristic taint scan with same-file and cross-file (relative import) summaries. The full engine (owned IR, module linker, YAML packs, entry-point inventory) is planned in [`docs/PLAN.md`](docs/PLAN.md).
+> **Status: pre-alpha.** `jsspector scan` (taint findings) and `jsspector routes` (entry-point inventory, OpenAPI 3.1) work today. Framework knowledge lives in YAML packs ([`packs/`](packs/)); the engine lowers each file to an owned IR, links modules across files (relative imports, monorepo workspace packages, barrels) and follows values through function summaries. See [`docs/PLAN.md`](docs/PLAN.md) for the roadmap.
 
 ## Quick start
 
@@ -15,7 +15,7 @@ jsspector scan path/to/repo
   routes/files.js
   ❯❯❱ jsspector.path-traversal [HIGH]
           Data from `req.query` (http) is used as a file path without confinement.
-          in GET /invoice, auth: unknown
+          in GET /invoice, auth: none-detected
 
         15┆ fs.readFile(target, 'utf8', (err, data) => {
           ↳ source: routes/files.js:13
@@ -38,13 +38,32 @@ Each finding shows the sink, then every step from the source to it, across files
 
 The output is byte-identical for any thread count. A file that cannot be parsed is reported as skipped, never a crash.
 
-### What `scan` v0 covers
+### Entry points
 
-- **Sources:** Express/Fastify/Koa/Hono/Next.js/NestJS request data, socket.io events, Meteor methods, Electron `ipcMain` handlers, `postMessage` and browser-extension messages, archive entry names, `process.argv` (always low).
-- **Sinks:** command and code injection (`child_process`, `eval`, `Function`, `vm`, `shell.openExternal`), SQL built by concatenation or templates, path traversal (`fs`, `res.sendFile`), SSRF (the URL start is controlled), XSS (`innerHTML`, jQuery HTML), prototype pollution (`obj[k1][k2] = v`).
-- **Flow:** assignments, destructuring, templates, concatenation, string pass-through methods, `path.join`. Calls into named functions are followed two levels deep, in the same file or through a relative import.
-- **Known limits:** validation guards (regex, allowlists, `startsWith`) are not recognized; an object holding one tainted field is tainted as a whole; auth is always `unknown`. Every finding needs a human read.
-- **Debt:** sources and sinks are hard-coded in `crates/jss-frontend/src/taint/models.rs` until YAML packs exist.
+```sh
+jsspector routes path/to/repo            # table: method, full path, auth, handler, file:line, inputs
+jsspector routes --json path/to/repo
+jsspector routes --openapi path/to/repo  # OpenAPI 3.1 of the HTTP routes
+```
+
+Routes are followed through router mounts across files (`app.use('/api', require('./routes/users'))`), route tables and registration helpers. Covered: Express/Koa/Hono/Fastify routers, `fastify.route`, NestJS controllers, Next.js `app/**/route.ts` and `pages/api`, raw `http.createServer`, socket.io events, Electron IPC, GraphQL resolver maps, tRPC procedures and queue processors.
+
+### What `scan` covers
+
+- **Sources:** Express/Fastify/Koa/Hono/Next.js/NestJS request data (and helpers that take the request), socket.io events (including `onAny` and connection sockets), Meteor methods, Electron `ipcMain`, `postMessage` and extension messages, GraphQL `args`, tRPC `input`, job payloads, archive entry names, browser URL sources (`location`, `document.referrer`, `window.name`), React props (medium), `process.argv` (low).
+- **Sinks:** command and code injection (`child_process` incl. `shell: true` and argument injection, `eval`, `Function`, `vm`, `executeJavaScript`, `shell.openExternal`), SQL built from text, NoSQL operator injection (object-capable values in queries), path traversal, SSRF (attacker-chosen URL start), XSS (`innerHTML`, jQuery, `document.write`, `dangerouslySetInnerHTML`, navigation to `javascript:`), prototype pollution (`o[k1][k2] = v`, deep-set helpers).
+- **Flow:** assignments, destructuring, templates, string methods, array callbacks, object fields (field by field), instance fields across methods, return values and parameter-to-sink summaries, followed across files (up to 4 hops) through relative imports, workspace packages, barrels and constructor injection.
+- **Guards:** validation that exits (`if (!/^\w+$/.test(x)) return`), allowlists, `startsWith` containment, comparisons with constants, `typeof`/`check()` type checks (NoSQL), validators and escapers listed in packs.
+- **Auth:** each finding carries `auth` (`none-detected`, `user`, `admin`) from route middleware, `router.use`, guard decorators and in-handler checks; admin-only paths are one level lower.
+- **Output:** grouped by sink file with every step from source to sink; `--json` adds stable fingerprints for baselines.
+
+### Packs
+
+Every framework or library fact is data in [`packs/*.yaml`](packs/) (sources, sinks with argument rules, propagators, sanitizers, guards, route conventions, auth patterns). `cargo xtask ci` fails if the engine repeats a name a pack lists.
+
+### Measuring
+
+`cargo xtask replay` scores `scan` against the verified CVE-replay pairs in [`corpus/research/`](corpus/research/): the advisory's sink must be found at the vulnerable commit and gone at the fix. Repositories are fetched blobless and sparse; nothing in them is run.
 
 ## What it will do (the plan)
 

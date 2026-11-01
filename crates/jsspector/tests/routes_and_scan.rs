@@ -128,6 +128,28 @@ fn scan_links_a_route_to_a_sink_two_files_away() {
     assert_eq!(findings[0]["class"], "sql-injection");
     assert_eq!(findings[0]["file"], "src/routes/users.js");
     assert_eq!(findings[0]["sink"]["file"], "src/services/users.js");
+    // What issue trackers show: a readable title, the sink's location, a description, the fix.
+    assert_eq!(
+        findings[0]["title"],
+        "SQL injection in GET /api/v1/users/{id}: req.query reaches db.query"
+    );
+    assert_eq!(findings[0]["resource"], "src/services/users.js:3");
+    let description = findings[0]["description"].as_str().unwrap();
+    assert!(
+        description.starts_with("Data from `req.query` (http) is concatenated into an SQL query: `db.query`. Reached from GET /api/v1/users/{id} (authentication: user)."),
+        "{description}"
+    );
+    assert!(
+        description.contains("sink at src/services/users.js:3"),
+        "{description}"
+    );
+    assert!(
+        findings[0]["remediation"]
+            .as_str()
+            .is_some_and(|r| r.contains("placeholders") || r.contains("parameter")),
+        "{}",
+        findings[0]["remediation"]
+    );
 }
 
 #[test]

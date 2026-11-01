@@ -1,7 +1,7 @@
 //! One rule per vulnerability class: what it means, how to fix it, and its metadata (CWE, SARIF
 //! security severity). Shared by `scan --format sarif` and `explain`.
 
-use jss_core::{Severity, VulnClass};
+use jss_core::{Finding, Severity, VulnClass};
 
 /// Every class, in rule-index order (the SARIF `ruleIndex`).
 pub const CLASSES: [VulnClass; 8] = [
@@ -90,6 +90,95 @@ pub fn parse_severity(value: &str) -> Result<Severity, String> {
 }
 
 /// A plain-language description of what happens to the data at the sink.
+/// A finding's title, one line: its class, the entry point (or function, or file) where it is
+/// reached, and what flows into what. `Path traversal in POST /api/watch/file: req.body reaches
+/// fs.readFile`.
+pub fn title(f: &Finding) -> String {
+    let place = match &f.entry {
+        Some(entry) => entry.clone(),
+        None if !f.function.starts_with('<') => format!("{}()", f.function),
+        None => f.file.clone(),
+    };
+    format!(
+        "{} in {}: {} reaches {}",
+        rule(f.class).title,
+        clip(&place, 60),
+        clip(&f.source.expr, 48),
+        clip(&f.sink.api, 40)
+    )
+}
+
+/// Where the sink is: `file:line`.
+pub fn resource(f: &Finding) -> String {
+    format!(
+        "{}:{}",
+        f.sink.file.as_deref().unwrap_or(&f.file),
+        f.sink.line
+    )
+}
+
+/// A finding in a few sentences: what flows where, from which entry point and with what
+/// authentication, the path the value takes, and what the class lets an attacker do.
+pub fn description(f: &Finding) -> String {
+    let mut text = format!(
+        "Data from `{}` ({}) {}: `{}`.",
+        f.source.expr,
+        f.source.kind,
+        describe(f.class),
+        f.sink.api
+    );
+    match &f.entry {
+        Some(entry) => text.push_str(&format!(" Reached from {entry}")),
+        None => text.push_str(&format!(" In {}", f.function)),
+    }
+    text.push_str(&format!(
+        " (authentication: {}). Source at {}:{}, sink at {}.",
+        f.auth.name(),
+        f.file,
+        f.source.line,
+        resource(f)
+    ));
+    if !f.trace.is_empty() {
+        let steps: Vec<String> = f
+            .trace
+            .iter()
+            .take(8)
+            .map(|step| {
+                format!(
+                    "{} ({}:{})",
+                    step.note,
+                    step.file.as_deref().unwrap_or(&f.file),
+                    step.line
+                )
+            })
+            .collect();
+        text.push_str(&format!(" Path: {}", steps.join(" -> ")));
+        if f.trace.len() > 8 {
+            text.push_str(" -> ...");
+        }
+        text.push('.');
+    }
+    text.push(' ');
+    text.push_str(rule(f.class).summary);
+    text
+}
+
+/// How to fix a finding of `class`, as one paragraph.
+pub fn remediation(class: VulnClass) -> String {
+    rule(class).fix.join(" ")
+}
+
+/// `text` on one line, cut to `max` characters (ending in `…` when cut).
+fn clip(text: &str, max: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
 pub fn describe(class: VulnClass) -> &'static str {
     match class {
         VulnClass::CommandInjection => "reaches a shell command or program execution",

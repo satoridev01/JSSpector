@@ -181,7 +181,7 @@ struct ExplainArgs {
 struct ScanOutput<'a> {
     root: String,
     files_scanned: usize,
-    findings: &'a [Finding],
+    findings: Vec<ReportedFinding<'a>>,
     /// Findings left out because they are in the baseline.
     baselined: usize,
     /// Findings left out by `jsspector-ignore` comments.
@@ -190,6 +190,30 @@ struct ScanOutput<'a> {
     skipped: &'a [FileNote],
     /// Files where the walker hit its depth cap.
     truncated: &'a [String],
+}
+
+/// A finding as `scan --json` prints it: a title first, the finding, then the fields issue
+/// trackers read (Satori's `title`, `resource`, `description`, `remediation`).
+#[derive(Serialize)]
+struct ReportedFinding<'a> {
+    title: String,
+    #[serde(flatten)]
+    finding: &'a Finding,
+    resource: String,
+    description: String,
+    remediation: String,
+}
+
+impl<'a> ReportedFinding<'a> {
+    fn new(finding: &'a Finding) -> Self {
+        Self {
+            title: rules::title(finding),
+            finding,
+            resource: rules::resource(finding),
+            description: rules::description(finding),
+            remediation: rules::remediation(finding.class),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -436,7 +460,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
             let output = ScanOutput {
                 root: args.path.to_string_lossy().into_owned(),
                 files_scanned: analysis.files_scanned,
-                findings: &findings,
+                findings: findings.iter().map(ReportedFinding::new).collect(),
                 baselined: baselined.len(),
                 ignored,
                 skipped: &analysis.skipped,

@@ -7,3 +7,6 @@ routes:
   handler_keys: [handler, preHandler]
   method_keys: [method]
   path_keys: [url, path]
+  # `fastify.register(users, { prefix: '/users' })`: users(instance) registers on `instance`.
+  mount_methods: [register]
+  prefix_keys: [prefix]

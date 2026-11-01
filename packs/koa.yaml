@@ -4,3 +4,6 @@ request:
   context_names: [ctx]
 routes:
   factories: [Koa, koa, KoaRouter, Router]
+  # `new Router({ prefix: '/api' })`, `router.prefix('/api')`
+  prefix_keys: [prefix]
+  prefix_methods: [prefix]

@@ -226,16 +226,30 @@ fn locate_export(
     }
 }
 
-/// The router an export stands for: itself, or what it returns when it is a factory
-/// (`module.exports = function () { ...; return router; }`).
+/// The router an export stands for: itself, what it returns when it is a factory
+/// (`module.exports = function () { ...; return router; }`), or, for a plugin that registers
+/// on its first parameter (`async function users(fastify) { fastify.get(...) }`), that
+/// parameter.
 fn product(report: &ScanReport, exported: &str) -> String {
-    report
-        .module
-        .functions
-        .iter()
-        .find(|f| f.name == exported)
-        .and_then(|f| f.returns_local.clone())
-        .unwrap_or_else(|| exported.to_owned())
+    let function = report.module.functions.iter().find(|f| f.name == exported);
+    if let Some(local) = function.and_then(|f| f.returns_local.clone()) {
+        return local;
+    }
+    if let Some(first) = function.and_then(|f| f.params.first())
+        && (report
+            .module
+            .entries
+            .iter()
+            .any(|e| e.receiver.as_deref() == Some(first.as_str()))
+            || report
+                .module
+                .mounts
+                .iter()
+                .any(|m| m.receiver.as_deref() == Some(first.as_str())))
+    {
+        return first.clone();
+    }
+    exported.to_owned()
 }
 
 /// Every prefix a router is reachable under (`""` for a root).

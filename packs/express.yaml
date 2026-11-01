@@ -14,6 +14,10 @@ request:
 routes:
   methods: [get, post, put, patch, delete, del, all, use, options, head, route]
   mount_methods: [use]
+  # `app.route('/book').get(list).post(create)`
+  chain_methods: [route]
+  # `router.route('POST', '/users', handler)` (parse-server's PromiseRouter and the like)
+  verb_first_methods: [route]
   factories: [express, Router, express.Router, createServer, polka, connect]
   names: [app, router, server, api, routes, route, apirouter, application, express]
 sinks:

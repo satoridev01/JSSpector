@@ -989,3 +989,126 @@ fn router_factories_and_next_export_forms_are_routes() {
         "{findings:?}"
     );
 }
+
+#[test]
+fn route_shapes_array_paths_verb_first_chains_and_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/app.js",
+        "const express = require('express');\nconst nodes = require('./nodes');\nconst { r } = require('./chained');\n\
+         const app = express();\napp.use('/api/v1/node-load-method', nodes);\napp.use('/x', r);\n\
+         app.route('/book').get(listBooks).post(requireAuth, createBook);\n\
+         app.post('/secure', [validate, requireRole('admin')], (req, res) => res.end());\n\
+         module.exports = app;\n",
+    );
+    write(
+        root,
+        "src/nodes.js",
+        "const express = require('express');\nconst router = express.Router();\nconst ctl = require('./ctl');\n\
+         router.post(['/', '/:name'], ctl.loadMethod);\nmodule.exports = router;\n",
+    );
+    write(
+        root,
+        "src/ctl.js",
+        "const { exec } = require('child_process');\n\
+         exports.loadMethod = async (req, res) => { exec('node ' + req.body.script); };\n",
+    );
+    write(
+        root,
+        "src/chained.js",
+        "const { Router } = require('express');\n\
+         exports.r = Router().post('/a', (req, res) => res.end()).post('/b', (req, res) => res.end());\n",
+    );
+    // parse-server style: verb first, on `this` in a router class.
+    write(
+        root,
+        "src/routers/users.js",
+        "class UsersRouter extends PromiseRouter {\n  mountRoutes() {\n    \
+         this.route('GET', '/users', (req) => this.handleFind(req));\n    \
+         this.route('POST', '/users/:objectId', (req) => this.handleUpdate(req));\n    \
+         this.route('/not-a-route');\n    cache.route('GET', key);\n  }\n}\nmodule.exports = UsersRouter;\n",
+    );
+    write(
+        root,
+        "hono/index.ts",
+        "import { Hono } from 'hono';\nconst app = new Hono();\nconst books = new Hono();\n\
+         books.get('/', (c) => c.json([]));\napp.route('/books', books);\n\
+         const api = new Hono().basePath('/api');\napi.get('/hello', (c) => c.text('hi'));\n",
+    );
+    write(
+        root,
+        "koa/index.js",
+        "const Router = require('@koa/router');\nconst router = new Router({ prefix: '/v1' });\n\
+         router.get('/users', (ctx) => {});\nconst other = new Router();\nother.prefix('/v2');\n\
+         other.get('/items', (ctx) => {});\n",
+    );
+    write(
+        root,
+        "fastify/server.js",
+        "const fastify = require('fastify')();\nfastify.register(require('./users'), { prefix: '/users' });\n",
+    );
+    write(
+        root,
+        "fastify/users.js",
+        "module.exports = async function users(fastify, opts) {\n  fastify.get('/:id', async (request, reply) => ({}));\n};\n",
+    );
+    write(
+        root,
+        "nest/cats.controller.ts",
+        "@Controller(['v1/cats', 'cats'])\nexport class CatsController {\n  @Get([':id', 'by-id/:id'])\n  findOne() {}\n}\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap(),
+                r["auth"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for expected in [
+        "POST /api/v1/node-load-method none-detected",
+        "POST /api/v1/node-load-method/{name} none-detected",
+        "POST /x/a none-detected",
+        "POST /x/b none-detected",
+        "GET /book none-detected",
+        "POST /book user",
+        "POST /secure admin",
+        "GET /users none-detected",
+        "POST /users/{objectId} none-detected",
+        "GET /books none-detected",
+        "GET /api/hello none-detected",
+        "GET /v1/users none-detected",
+        "GET /v2/items none-detected",
+        "GET /users/{id} none-detected",
+        "GET /v1/cats/{id} none-detected",
+        "GET /cats/by-id/{id} none-detected",
+    ] {
+        assert!(
+            list.iter().any(|r| r == expected),
+            "{expected} missing from {list:?}"
+        );
+    }
+    for absent in ["/not-a-route", "ROUTE ", "/POST", "/GET"] {
+        assert!(
+            !list.iter().any(|r| r.contains(absent)),
+            "{absent} should not be a route: {list:?}"
+        );
+    }
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = scan["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|f| f["class"] == "command-injection"
+            && f["entry"]
+                .as_str()
+                .is_some_and(|e| e.starts_with("POST /api/v1/node-load-method"))),
+        "{findings:?}"
+    );
+}

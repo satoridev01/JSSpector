@@ -252,6 +252,8 @@ pub fn scan_file_program(
         router_auth: BTreeMap::new(),
         inline_names: BTreeMap::new(),
         routers: BTreeSet::new(),
+        router_prefixes: BTreeMap::new(),
+        chain_receiver: None,
         injected: BTreeMap::new(),
         export_aliases: BTreeSet::new(),
         constants: BTreeMap::new(),
@@ -274,12 +276,14 @@ pub fn scan_file_program(
         // Middleware applies to the routes registered after it, in program order: never carry
         // a later `use(auth)` into an earlier route through a previous pass.
         walker.router_auth.clear();
+        walker.router_prefixes.clear();
         let mut env = Env::new("<module>".to_owned());
         walker.statements(&program.body, &mut env);
     }
     walker.summarize = false;
     walker.modules.clear();
     walker.router_auth.clear();
+    walker.router_prefixes.clear();
     walker.result = ScanResult {
         findings: Vec::new(),
         truncated: walker.result.truncated,
@@ -736,6 +740,12 @@ struct Walker<'e> {
     inline_names: BTreeMap<String, u32>,
     /// Variables bound to a router or app from a factory: `const router = express.Router()`.
     routers: BTreeSet<String>,
+    /// A router's own path prefix: `new Router({ prefix: '/api' })`, `router.prefix('/api')`,
+    /// `new Hono().basePath('/api')`.
+    router_prefixes: BTreeMap<String, String>,
+    /// The variable a declaration being walked binds: the router of a chained registration on
+    /// a factory (`const r = Router().get('/a', h)`).
+    chain_receiver: Option<String>,
     /// Constructor-injected fields of the class being walked: `this.users` -> `UsersService`.
     injected: BTreeMap<String, String>,
     /// Names bound to `module.exports` (`const helpers = module.exports`).
@@ -1018,7 +1028,8 @@ fn literal_path(expr: &Expression<'_>) -> Option<String> {
             let text = format!("{left}{right}");
             (!text.is_empty()).then_some(text)
         }
-        Expression::CallExpression(call) => {
+        // `path.join('/api', 'users')`; never `require('./users')`, a module.
+        Expression::CallExpression(call) if require_spec(expr).is_none() => {
             let parts: Vec<String> = call
                 .arguments
                 .iter()
@@ -1063,7 +1074,6 @@ fn callee_name_within(expr: &Expression<'_>, budget: usize) -> Option<String> {
     }
 }
 
-/// `require('x')` → `x`.
 /// The authentication a wrapper call gives the handler it wraps: `withAuth(handler)`,
 /// `requireAdmin(async (req) => ...)`. Not a wrapper: none detected.
 fn wrapper_auth(expr: &Expression<'_>) -> Auth {
@@ -1075,6 +1085,7 @@ fn wrapper_auth(expr: &Expression<'_>) -> Auth {
     }
 }
 
+/// `require('x')` → `x`.
 fn require_spec(expr: &Expression<'_>) -> Option<String> {
     let Expression::CallExpression(call) = expr.get_inner_expression() else {
         return None;
@@ -1104,6 +1115,104 @@ fn object_prop<'a, 'e>(expr: &'e Expression<'a>, names: &[&str]) -> Option<&'e E
             }
             _ => None,
         })
+}
+
+/// `GET`, `post`, `Delete`: an HTTP method name, as `router.route('POST', path, h)` takes it.
+fn is_http_verb(text: &str) -> bool {
+    matches!(
+        text.to_ascii_lowercase().as_str(),
+        "get" | "post" | "put" | "patch" | "delete" | "del" | "head" | "options" | "all"
+    )
+}
+
+/// `prefix` and `path` joined with one `/` between them (`path` alone without a prefix).
+fn join_path(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        return path.to_owned();
+    }
+    let joined = format!(
+        "{}/{}",
+        prefix.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    match joined.trim_end_matches('/') {
+        "" => "/".to_owned(),
+        trimmed => trimmed.to_owned(),
+    }
+}
+
+/// A router factory's name: `express.Router`, `Router`, `Hono`.
+fn is_router_factory(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    has(&m().router_factories, last) || has(&m().router_factories, name)
+}
+
+/// What a chain of registrations starts from: `Router()` in `Router().get('/a', h).post(..)`,
+/// `app` in `app.route('/book').get(h)`, `new Hono()` in `new Hono().basePath('/api')`.
+fn chain_root<'e, 'a>(expr: &'e Expression<'a>) -> &'e Expression<'a> {
+    let model = m();
+    let mut current = expr.get_inner_expression();
+    for _ in 0..32 {
+        let Expression::CallExpression(call) = current else {
+            break;
+        };
+        let Some(member) = call.callee.get_inner_expression().as_member_expression() else {
+            break;
+        };
+        let Some(method) = member.static_property_name().and_then(|n| n.as_str()) else {
+            break;
+        };
+        if !(has(&model.route_methods, method)
+            || has(&model.route_chain_methods, method)
+            || has(&model.route_prefix_methods, method))
+        {
+            break;
+        }
+        current = member.object().get_inner_expression();
+    }
+    current
+}
+
+/// The arguments of the prefix-setting links of a chain, innermost first:
+/// `'/api'` in `new Hono().basePath('/api')`.
+fn chain_prefixes<'e, 'a>(expr: &'e Expression<'a>) -> Vec<&'e Expression<'a>> {
+    let model = m();
+    let mut found = Vec::new();
+    let mut current = expr.get_inner_expression();
+    for _ in 0..32 {
+        let Expression::CallExpression(call) = current else {
+            break;
+        };
+        let Some(member) = call.callee.get_inner_expression().as_member_expression() else {
+            break;
+        };
+        let Some(method) = member.static_property_name().and_then(|n| n.as_str()) else {
+            break;
+        };
+        if has(&model.route_prefix_methods, method)
+            && let [
+                Argument::StringLiteral(_)
+                | Argument::TemplateLiteral(_)
+                | Argument::Identifier(_)
+                | Argument::StaticMemberExpression(_),
+            ] = call.arguments.as_slice()
+            && let Some(argument) = call.arguments.first().and_then(Argument::as_expression)
+        {
+            found.push(argument);
+        } else if !(has(&model.route_methods, method) || has(&model.route_chain_methods, method)) {
+            break;
+        }
+        current = member.object().get_inner_expression();
+    }
+    found.reverse();
+    found
+}
+
+/// A route registration in one of the shapes beyond `router.get(path, handler)`.
+struct Registration {
+    receiver: Option<String>,
+    method: String,
+    paths: Vec<String>,
 }
 
 impl Walker<'_> {
@@ -1767,16 +1876,42 @@ impl Walker<'_> {
                 } else {
                     env.declared.remove(name);
                 }
-                let factory = match init.get_inner_expression() {
-                    Expression::CallExpression(c) => callee_name(&c.callee),
-                    Expression::NewExpression(n) => callee_name(&n.callee),
+                // Also through chains: `Router().get('/a', h)`, `new Hono().basePath('/api')`.
+                let root = chain_root(init);
+                let (factory, options) = match root {
+                    Expression::CallExpression(c) => (callee_name(&c.callee), Some(&c.arguments)),
+                    Expression::NewExpression(n) => (callee_name(&n.callee), Some(&n.arguments)),
+                    _ => (None, None),
+                };
+                let from_router = match root {
+                    Expression::Identifier(id)
+                        if !std::ptr::eq(root, init.get_inner_expression()) =>
+                    {
+                        self.is_router(id.name.as_str())
+                            .then(|| id.name.as_str().to_owned())
+                    }
                     _ => None,
                 };
-                if factory.is_some_and(|f| {
-                    let last = f.rsplit('.').next().unwrap_or(&f);
-                    has(&m().router_factories, last) || has(&m().router_factories, &f)
-                }) {
+                if factory.as_deref().is_some_and(is_router_factory) || from_router.is_some() {
                     self.routers.insert(name.clone());
+                    // Its own prefix: `new Router({ prefix: '/api' })`, `.basePath('/api')`.
+                    let mut prefix = match (&from_router, options) {
+                        (Some(parent), _) => self.own_prefix(Some(parent)),
+                        (None, Some(arguments)) => {
+                            self.options_prefix(arguments, env).unwrap_or_default()
+                        }
+                        (None, None) => String::new(),
+                    };
+                    for link in chain_prefixes(init) {
+                        if let Some(text) = self.resolve_text(link, env) {
+                            prefix = join_path(&prefix, &text);
+                        }
+                    }
+                    if prefix.is_empty() {
+                        self.router_prefixes.remove(name);
+                    } else {
+                        self.router_prefixes.insert(name.clone(), prefix);
+                    }
                 }
                 // `const params = new URLSearchParams()`: never a DOM node or jQuery set.
                 let plain = match init.get_inner_expression() {
@@ -1792,7 +1927,16 @@ impl Walker<'_> {
                 }
             }
             self.last_returned_fields = None;
+            // `const r = Router().get('/a', h)`: routes registered on `r`.
+            let chained =
+                name_hint.is_some() && !std::ptr::eq(chain_root(init), init.get_inner_expression());
+            let saved_receiver = if chained {
+                std::mem::replace(&mut self.chain_receiver, name_hint.clone())
+            } else {
+                self.chain_receiver.take()
+            };
             let taint = self.expr_named(init, env, name_hint.clone());
+            self.chain_receiver = saved_receiver;
             // `const launch = prepare(bin, args)`, returning `{ command, args }`: field by field.
             let is_call = match init.get_inner_expression() {
                 Expression::CallExpression(_) => true,
@@ -2038,24 +2182,28 @@ impl Walker<'_> {
             .filter_map(|name| m().controller_auth.get(&name).copied())
             .max()
             .unwrap_or_default();
-        let controller_prefix = class.decorators.iter().find_map(|d| {
+        let controller_prefix: Option<Vec<String>> = class.decorators.iter().find_map(|d| {
             let Expression::CallExpression(call) = &d.expression else {
                 return None;
             };
             let name = callee_name(&call.callee)?;
             has(&m().controller_decorators, &name).then(|| {
-                call.arguments
-                    .first()
-                    .and_then(Argument::as_expression)
-                    .and_then(|e| {
-                        // `@Controller('users')`, `@Controller(RouteKey.User)` or
-                        // `@Controller({ path: 'users' })`.
-                        let keys: Vec<&str> =
-                            m().route_path_keys.iter().map(String::as_str).collect();
-                        let path = object_prop(e, &keys).unwrap_or(e);
-                        self.resolve_text(path, env)
-                    })
-                    .unwrap_or_default()
+                // `@Controller('users')`, `@Controller(RouteKey.User)`,
+                // `@Controller({ path: 'users' })` or `@Controller(['v1/users', 'users'])`.
+                let keys: Vec<&str> = m().route_path_keys.iter().map(String::as_str).collect();
+                let argument = call.arguments.first().and_then(Argument::as_expression);
+                let paths = match argument {
+                    Some(e) => match object_prop(e, &keys) {
+                        Some(path) => self.text_list(path, env),
+                        None => self.text_list(e, env),
+                    },
+                    None => Vec::new(),
+                };
+                if paths.is_empty() {
+                    vec![String::new()]
+                } else {
+                    paths
+                }
             })
         });
         // Constructor injection: `constructor(private readonly users: UsersService)`.
@@ -2099,14 +2247,22 @@ impl Walker<'_> {
                     if !has(&m().route_decorators, &verb) {
                         continue;
                     }
-                    let sub = call
+                    let mut subs = call
                         .arguments
                         .first()
                         .and_then(Argument::as_expression)
-                        .and_then(|e| self.resolve_text(e, env))
+                        .map(|e| self.text_list(e, env))
                         .unwrap_or_default();
+                    if subs.is_empty() {
+                        subs.push(String::new());
+                    }
                     let key = prop_name(&method.key).unwrap_or_default();
-                    self.facts.routes.push(RouteFact {
+                    for (prefix, sub) in prefix
+                        .iter()
+                        .flat_map(|p| subs.iter().map(move |s| (p, s)))
+                        .take(64)
+                    {
+                        self.facts.routes.push(RouteFact {
                         receiver: None,
                         receiver_file: None,
                         method: verb.to_ascii_uppercase(),
@@ -2138,6 +2294,7 @@ impl Walker<'_> {
                         },
                         kind: "http",
                     });
+                    }
                 }
             }
             match element {
@@ -2731,6 +2888,8 @@ impl Walker<'_> {
                         .and_then(|m| m.static_property_name())
                         .and_then(|n| n.as_str().map(str::to_owned)),
                 };
+                // `exports.r = Router().get('/a', h)`: the routes of the chain are on `r`.
+                let mut chain_local: Option<String> = None;
                 // CommonJS exports: `module.exports = router`, `exports.list = list`.
                 if let Some(target) = assign
                     .left
@@ -2765,6 +2924,13 @@ impl Walker<'_> {
                             .or_else(|| k.strip_prefix("exports."))
                             .map(str::to_owned),
                     };
+                    if export.is_some()
+                        && let Expression::CallExpression(c) = assign.right.get_inner_expression()
+                        && self.chain_base(&c.callee, env).is_some()
+                    {
+                        chain_local = property.clone();
+                    }
+                    let local = local.or_else(|| chain_local.clone());
                     if let (Some(export), Some(local)) = (export, local) {
                         self.facts.exports.insert(export, local);
                     }
@@ -2783,7 +2949,15 @@ impl Walker<'_> {
                         }
                     }
                 }
+                let saved_receiver = match chain_local {
+                    Some(local) => {
+                        self.routers.insert(local.clone());
+                        self.chain_receiver.replace(local)
+                    }
+                    None => self.chain_receiver.take(),
+                };
                 let taint = self.expr_named(&assign.right, env, name);
+                self.chain_receiver = saved_receiver;
                 // `x += tainted` keeps x's own taint too.
                 let taint = if assign.operator.is_assign() {
                     taint
@@ -3592,11 +3766,26 @@ impl Walker<'_> {
 
         // How function arguments are entered.
         let (role, shape) = self.client_role(&callee, &call.callee, &call.arguments, env);
+        let registration = if role == Role::Route {
+            self.registration(&callee, &call.callee, &call.arguments, env)
+        } else {
+            None
+        };
         let route_name = match (
             &callee,
             call.arguments.first().and_then(Argument::as_expression),
+            &registration,
         ) {
-            (Callee::Method { method, object }, Some(first)) if role == Role::Route => {
+            // The name `record_entry` gives the same registration's inline handler.
+            (_, _, Some(registration)) => registration.paths.first().map(|path| {
+                self.inline_route_name(
+                    &registration.method,
+                    path,
+                    registration.receiver.as_deref(),
+                    call.span.start,
+                )
+            }),
+            (Callee::Method { method, object }, Some(first), None) if role == Role::Route => {
                 self.resolve_text(first, env).map(|path| {
                     self.inline_route_name(method, &path, object.as_deref(), call.span.start)
                 })
@@ -3606,26 +3795,43 @@ impl Walker<'_> {
         let last = call.arguments.len().saturating_sub(1);
         // Authentication middleware: `app.get(path, requireLogin, handler)`, an earlier
         // `router.use(auth)`, or `router.use(auth)` itself.
-        let receiver_name = match &callee {
-            Callee::Method {
-                object: Some(o), ..
-            } => Some(o.clone()),
+        let receiver_name = match (&registration, &callee) {
+            (Some(registration), _) => registration.receiver.clone(),
+            (
+                None,
+                Callee::Method {
+                    object: Some(o), ..
+                },
+            ) => Some(o.clone()),
             _ => None,
         };
         let middleware_auth = call
             .arguments
             .iter()
             .take(last)
-            .filter_map(|a| a.as_expression().and_then(callee_name))
+            .filter_map(Argument::as_expression)
+            // `app.post(path, [validate, requireRole('admin')], handler)`
+            .flat_map(|e| match e.get_inner_expression() {
+                Expression::ArrayExpression(list) => list
+                    .elements
+                    .iter()
+                    .filter_map(ArrayExpressionElement::as_expression)
+                    .collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .filter_map(callee_name)
             .filter_map(|name| m().auth_of(&name))
             .max()
             .unwrap_or_default();
         // What earlier `use(...)` calls on this router require under this route's path.
-        let route_path = call
-            .arguments
-            .first()
-            .and_then(Argument::as_expression)
-            .and_then(|e| self.mount_path(e, env));
+        let route_path = match &registration {
+            Some(registration) => registration.paths.first().cloned(),
+            None => call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .and_then(|e| self.mount_path(e, env)),
+        };
         let route_auth = receiver_name
             .as_deref()
             .and_then(|r| self.router_auth.get(&router_key(r, env)))
@@ -4518,6 +4724,13 @@ impl Walker<'_> {
             {
                 return (Role::Route, Shape::Callback);
             }
+            // `router.route('POST', '/x', h)`, `app.route('/x').get(h)`, `Router().get('/a', h)`.
+            if self
+                .registration(callee, callee_expr, arguments, env)
+                .is_some()
+            {
+                return (Role::Route, Shape::Callback);
+            }
         }
         (Role::Plain, Shape::Callback)
     }
@@ -4597,6 +4810,292 @@ impl Walker<'_> {
         }
     }
 
+    /// A router's own path prefix (`""` without one).
+    fn own_prefix(&self, router: Option<&str>) -> String {
+        router
+            .and_then(|r| self.router_prefixes.get(r))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The path prefix an options argument sets: `{ prefix: '/users' }`.
+    fn options_prefix(&self, arguments: &[Argument<'_>], env: &Env) -> Option<String> {
+        let keys: Vec<&str> = m().route_prefix_keys.iter().map(String::as_str).collect();
+        arguments
+            .iter()
+            .filter_map(Argument::as_expression)
+            .find_map(|e| object_prop(e, &keys))
+            .and_then(|value| self.resolve_text(value, env))
+    }
+
+    /// The literal paths of a path argument: one, or each of `['/', '/:name']`.
+    fn route_paths(&self, argument: Option<&Argument<'_>>, env: &Env) -> Vec<String> {
+        argument
+            .and_then(Argument::as_expression)
+            .map(|e| self.text_list(e, env))
+            .unwrap_or_default()
+    }
+
+    /// The texts an expression stands for: its own, or each element's of an array literal
+    /// (at most 16).
+    fn text_list(&self, expr: &Expression<'_>, env: &Env) -> Vec<String> {
+        match expr.get_inner_expression() {
+            Expression::ArrayExpression(list) => list
+                .elements
+                .iter()
+                .filter_map(ArrayExpressionElement::as_expression)
+                .filter_map(|e| self.resolve_text(e, env))
+                .take(16)
+                .collect(),
+            other => self.resolve_text(other, env).into_iter().collect(),
+        }
+    }
+
+    /// Where a chained registration registers, when the callee's object is a chain: the
+    /// router (`app` in `app.route('/book').get(h)`; the declared variable for a chain on a
+    /// factory, `Router().get('/a', h)`), the path a `route(path)` link gives, and the prefix
+    /// `basePath(...)` links give.
+    fn chain_base(
+        &self,
+        callee: &Expression<'_>,
+        env: &Env,
+    ) -> Option<(Option<String>, Option<String>, String)> {
+        let model = m();
+        let member = callee.get_inner_expression().as_member_expression()?;
+        let mut object = member.object().get_inner_expression();
+        if !matches!(
+            object,
+            Expression::CallExpression(_) | Expression::NewExpression(_)
+        ) {
+            return None;
+        }
+        let mut path: Option<String> = None;
+        let mut prefixes: Vec<String> = Vec::new();
+        for _ in 0..32 {
+            match object {
+                Expression::Identifier(id) => {
+                    let name = id.name.as_str();
+                    if !self.is_router(name) {
+                        return None;
+                    }
+                    prefixes.push(self.own_prefix(Some(name)));
+                    prefixes.reverse();
+                    let prefix = prefixes.iter().fold(String::new(), |a, p| join_path(&a, p));
+                    return Some((Some(name.to_owned()), path, prefix));
+                }
+                Expression::NewExpression(n) => {
+                    if !callee_name(&n.callee)
+                        .as_deref()
+                        .is_some_and(is_router_factory)
+                    {
+                        return None;
+                    }
+                    if let Some(own) = self.options_prefix(&n.arguments, env) {
+                        prefixes.push(own);
+                    }
+                    prefixes.reverse();
+                    let prefix = prefixes.iter().fold(String::new(), |a, p| join_path(&a, p));
+                    return Some((self.chain_receiver.clone(), path, prefix));
+                }
+                Expression::CallExpression(c) => {
+                    let inner = c.callee.get_inner_expression();
+                    let method = inner
+                        .as_member_expression()
+                        .and_then(|m| m.static_property_name())
+                        .and_then(|n| n.as_str());
+                    match (inner.as_member_expression(), method) {
+                        (Some(link), Some(method))
+                            if has(&model.route_chain_methods, method)
+                                && path.is_none()
+                                && prefixes.is_empty()
+                                && c.arguments.len() == 1 =>
+                        {
+                            // `.route('/book')`
+                            path = Some(self.resolve_text(
+                                c.arguments.first().and_then(Argument::as_expression)?,
+                                env,
+                            )?);
+                            object = link.object().get_inner_expression();
+                        }
+                        (Some(link), Some(method))
+                            if has(&model.route_prefix_methods, method)
+                                && c.arguments.len() == 1 =>
+                        {
+                            // `.basePath('/api')`
+                            prefixes.push(self.resolve_text(
+                                c.arguments.first().and_then(Argument::as_expression)?,
+                                env,
+                            )?);
+                            object = link.object().get_inner_expression();
+                        }
+                        (Some(link), Some(method)) if has(&model.route_methods, method) => {
+                            // An earlier registration of the chain: `.get('/a', h)`.
+                            object = link.object().get_inner_expression();
+                        }
+                        _ => {
+                            if !callee_name(inner).as_deref().is_some_and(is_router_factory) {
+                                return None;
+                            }
+                            if let Some(own) = self.options_prefix(&c.arguments, env) {
+                                prefixes.push(own);
+                            }
+                            prefixes.reverse();
+                            let prefix =
+                                prefixes.iter().fold(String::new(), |a, p| join_path(&a, p));
+                            return Some((self.chain_receiver.clone(), path, prefix));
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// A route registration beyond `router.get(path, handler)`: verb-first
+    /// (`router.route('POST', '/users', h)`), chained (`app.route('/book').get(h)`,
+    /// `Router().get('/a', h).post('/b', h2)`) or with several paths
+    /// (`router.post(['/', '/:name'], h)`). Its last argument must be a handler.
+    fn registration(
+        &self,
+        callee: &Callee,
+        callee_expr: &Expression<'_>,
+        arguments: &[Argument<'_>],
+        env: &Env,
+    ) -> Option<Registration> {
+        let Callee::Method { object, method } = callee else {
+            return None;
+        };
+        if method.is_empty() {
+            return None;
+        }
+        let model = m();
+        let handler_like = arguments
+            .last()
+            .and_then(Argument::as_expression)
+            .is_some_and(|e| {
+                matches!(
+                    e.get_inner_expression(),
+                    Expression::ArrowFunctionExpression(_)
+                        | Expression::FunctionExpression(_)
+                        | Expression::Identifier(_)
+                        | Expression::StaticMemberExpression(_)
+                        | Expression::CallExpression(_)
+                )
+            });
+        if !handler_like {
+            return None;
+        }
+        let first = arguments.first().and_then(Argument::as_expression);
+        // `router.route('POST', '/users', ...handlers)`
+        if has(&model.route_verb_first_methods, method)
+            && arguments.len() >= 3
+            && let Some(verb) = first
+                .and_then(|e| self.resolve_text(e, env))
+                .filter(|v| is_http_verb(v))
+        {
+            let paths = self.route_paths(arguments.get(1), env);
+            let prefix = self.own_prefix(object.as_deref());
+            return (!paths.is_empty()).then(|| Registration {
+                receiver: object.clone(),
+                method: verb.to_ascii_lowercase(),
+                paths: paths.iter().map(|p| join_path(&prefix, p)).collect(),
+            });
+        }
+        if !has(&model.route_methods, method) || has(&model.route_chain_methods, method) {
+            return None;
+        }
+        if object.is_none()
+            && let Some((receiver, path, prefix)) = self.chain_base(callee_expr, env)
+        {
+            let paths = match path {
+                // `app.route('/book').get(h)`: every argument is a handler.
+                Some(path) => vec![path],
+                None if arguments.len() >= 2 => self.route_paths(arguments.first(), env),
+                None => Vec::new(),
+            };
+            return (!paths.is_empty()).then(|| Registration {
+                receiver,
+                method: method.clone(),
+                paths: paths.iter().map(|p| join_path(&prefix, p)).collect(),
+            });
+        }
+        // `router.post(['/', '/:name'], h)`
+        if arguments.len() >= 2
+            && matches!(
+                first.map(Expression::get_inner_expression),
+                Some(Expression::ArrayExpression(_))
+            )
+            && object.as_deref().is_some_and(|o| self.is_router(o))
+        {
+            let paths = self.route_paths(arguments.first(), env);
+            let prefix = self.own_prefix(object.as_deref());
+            return (!paths.is_empty()).then(|| Registration {
+                receiver: object.clone(),
+                method: method.clone(),
+                paths: paths.iter().map(|p| join_path(&prefix, p)).collect(),
+            });
+        }
+        None
+    }
+
+    /// Records the routes (or, for `use`, the mounts) of a [`Registration`].
+    fn record_registration(
+        &mut self,
+        registration: Registration,
+        call: &CallExpression<'_>,
+        auth: Auth,
+    ) {
+        let last = call.arguments.last().and_then(Argument::as_expression);
+        let is_function = last.is_some_and(|e| {
+            matches!(
+                e.get_inner_expression(),
+                Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+            )
+        });
+        let first_path = registration.paths.first().cloned().unwrap_or_default();
+        let handler = last
+            .and_then(|e| match e.get_inner_expression() {
+                Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => None,
+                other => callee_name(other),
+            })
+            .unwrap_or_else(|| {
+                self.inline_route_name(
+                    &registration.method,
+                    &first_path,
+                    registration.receiver.as_deref(),
+                    call.span.start,
+                )
+            });
+        for path in registration.paths {
+            if has(&m().mount_methods, &registration.method) && !is_function {
+                let (target, target_file, target_export) = match last {
+                    Some(e) => self.mount_target(e),
+                    None => (None, None, None),
+                };
+                self.facts.mounts.push(MountFact {
+                    receiver: registration.receiver.clone(),
+                    prefix: path,
+                    target,
+                    target_file,
+                    target_export,
+                    auth,
+                });
+                continue;
+            }
+            self.facts.routes.push(RouteFact {
+                receiver: registration.receiver.clone(),
+                receiver_file: None,
+                method: registration.method.to_ascii_uppercase(),
+                path,
+                handler: handler.clone(),
+                span: call.span,
+                auth,
+                kind: "http",
+            });
+        }
+    }
+
     /// Records the entry point or mount a registration call makes.
     fn record_entry(
         &mut self,
@@ -4617,6 +5116,32 @@ impl Walker<'_> {
                     self.instantiate(&name, &template, defining_file.as_deref(), call, auth, env);
                 }
             }
+            return;
+        }
+        // `router.prefix('/api')` (Koa): the prefix of this router's later routes.
+        if let Callee::Method {
+            object: Some(object),
+            method,
+        } = callee
+            && has(&m().route_prefix_methods, method)
+            && call.arguments.len() == 1
+            && self.is_router(object)
+        {
+            if let Some(prefix) = call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .and_then(|e| self.resolve_text(e, env))
+            {
+                self.router_prefixes.insert(object.clone(), prefix);
+            }
+            return;
+        }
+        if role == Role::Route
+            && let Some(registration) =
+                self.registration(callee, &call.callee, &call.arguments, env)
+        {
+            self.record_registration(registration, call, auth);
             return;
         }
         // `router.get(...)`, or `router[r.method](...)` with the method from a table row or a
@@ -4747,6 +5272,13 @@ impl Walker<'_> {
             && object.as_deref().is_some_and(|o| self.is_router(o))
             && first.is_some_and(|e| self.mount_path(e, env).is_none())
         {
+            // `fastify.register(users, { prefix: '/users' })`, under the router's own prefix.
+            let prefix = join_path(
+                &self.own_prefix(object.as_deref()),
+                &self
+                    .options_prefix(&call.arguments, env)
+                    .unwrap_or_default(),
+            );
             for argument in call.arguments.iter().filter_map(Argument::as_expression) {
                 if !self.mountable(argument) {
                     continue;
@@ -4754,7 +5286,7 @@ impl Walker<'_> {
                 let (target, target_file, target_export) = self.mount_target(argument);
                 self.facts.mounts.push(MountFact {
                     receiver: object.clone(),
-                    prefix: String::new(),
+                    prefix: prefix.clone(),
                     target,
                     target_file,
                     target_export,
@@ -4766,6 +5298,7 @@ impl Walker<'_> {
         let Some(path) = first.and_then(|e| self.resolve_text(e, env)) else {
             return;
         };
+        let path = join_path(&self.own_prefix(object.as_deref()), &path);
         let object = &object;
         let method = &method;
         // Only registrations on a router or app: not `$http.get('/x', config)` in a client.

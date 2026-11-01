@@ -2,5 +2,8 @@
 name: hono
 routes:
   factories: [Hono, OpenAPIHono]
+  # `app.route('/books', books)` mounts a sub-app; `new Hono().basePath('/api')` prefixes one.
+  mount_methods: [route]
+  prefix_methods: [basePath]
 request:
   hono_context_names: [c]

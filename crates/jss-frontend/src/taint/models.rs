@@ -283,6 +283,20 @@ pub struct RouteSpec {
     /// Methods that mount a child router: `router.use('/prefix', child)`.
     #[serde(default)]
     pub mount_methods: Vec<String>,
+    /// Methods that give a route object for one path, whose method calls register handlers on
+    /// it: `app.route('/book').get(list).post(create)`.
+    #[serde(default)]
+    pub chain_methods: Vec<String>,
+    /// Methods that take the HTTP method first: `router.route('POST', '/users', handler)`.
+    #[serde(default)]
+    pub verb_first_methods: Vec<String>,
+    /// Options keys that give a router (or a mounted plugin) its path prefix:
+    /// `new Router({ prefix: '/api' })`, `fastify.register(users, { prefix: '/users' })`.
+    #[serde(default)]
+    pub prefix_keys: Vec<String>,
+    /// Methods that set a router's own path prefix: `new Hono().basePath('/api')`.
+    #[serde(default)]
+    pub prefix_methods: Vec<String>,
     /// Calls that create a router or app: `express()`, `express.Router()`, `new Koa()`.
     #[serde(default)]
     pub factories: Vec<String>,
@@ -626,6 +640,10 @@ pub struct Model {
     pub auth_setup: Vec<String>,
     pub route_method_keys: Vec<String>,
     pub mount_methods: Vec<String>,
+    pub route_chain_methods: Vec<String>,
+    pub route_verb_first_methods: Vec<String>,
+    pub route_prefix_keys: Vec<String>,
+    pub route_prefix_methods: Vec<String>,
     pub router_factories: Vec<String>,
     pub router_names: Vec<String>,
     pub controller_decorators: Vec<String>,
@@ -791,6 +809,11 @@ impl Model {
         self.input_fields.extend(pack.input_fields);
         self.route_method_keys.extend(pack.routes.method_keys);
         self.mount_methods.extend(pack.routes.mount_methods);
+        self.route_chain_methods.extend(pack.routes.chain_methods);
+        self.route_verb_first_methods
+            .extend(pack.routes.verb_first_methods);
+        self.route_prefix_keys.extend(pack.routes.prefix_keys);
+        self.route_prefix_methods.extend(pack.routes.prefix_methods);
         self.router_factories.extend(pack.routes.factories);
         self.router_names.extend(pack.routes.names);
         self.controller_decorators

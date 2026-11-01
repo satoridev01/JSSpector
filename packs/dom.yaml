@@ -18,3 +18,15 @@ sinks:
   # Navigating to an attacker URL runs `javascript:` in the page.
   - {assign: [location, location.href, window.location, window.location.href, document.location, document.location.href], class: xss, severity: medium, args: ["url:0"]}
   - {methods: [location.assign, location.replace, window.location.assign, window.location.replace, window.open], class: xss, severity: medium, args: ["url:0"]}
+# Attributes (and DOM properties) whose URL the browser navigates to or loads as a document: an
+# attacker who chooses the start of the URL chooses `javascript:`. `img`, `video` and `audio`
+# sources never run it. JSX: intrinsic elements only (`<a href>`, never `<Link href>`).
+url_attributes:
+  class: xss
+  severity: medium
+  tags: {a: [href], area: [href], base: [href], iframe: [src], frame: [src], embed: [src],
+    object: [data], form: [action], button: [formAction], input: [formAction]}
+  setters: [setAttribute]
+sanitizers:
+  # A URL whose scheme was checked (`@braintree/sanitize-url`): not an HTML escaper.
+  url_checks: [sanitizeUrl, sanitizeURL, sanitizeHref]

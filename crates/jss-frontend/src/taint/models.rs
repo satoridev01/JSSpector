@@ -98,6 +98,9 @@ pub struct Pack {
     /// HTML injection, whatever its attributes hold.
     #[serde(default)]
     pub node_factories: Vec<String>,
+    /// Element attributes (and DOM properties) whose URL the browser loads or navigates to.
+    #[serde(default)]
+    pub url_attributes: Option<UrlAttributesSpec>,
     /// What makes a file a service worker, whose `request`s are the page's.
     #[serde(default)]
     pub service_worker: Option<ServiceWorkerSpec>,
@@ -605,6 +608,10 @@ pub struct Sanitizers {
     /// Calls whose result is clean.
     #[serde(default)]
     pub calls: Vec<String>,
+    /// Calls whose result is a URL with a harmless scheme (`sanitizeUrl(u)`): the attacker no
+    /// longer chooses its start. Not an HTML escaper.
+    #[serde(default)]
+    pub url_checks: Vec<String>,
     /// Calls that, used as a guard (`if (!isValid(x)) return`), clear their argument.
     #[serde(default)]
     pub validators: Vec<String>,
@@ -690,6 +697,20 @@ impl VulnClassName {
     }
 }
 
+/// `url_attributes`: per element tag, the attributes whose URL the browser loads or navigates
+/// to (`<a href>`, `<embed src>`, `link.href = v` on `document.createElement('a')`), and the
+/// sink they make.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UrlAttributesSpec {
+    pub class: VulnClassName,
+    pub severity: SeverityName,
+    pub tags: BTreeMap<String, Vec<String>>,
+    /// Element methods that set an attribute by name: `a.setAttribute('href', v)`.
+    #[serde(default)]
+    pub setters: Vec<String>,
+}
+
 /// A severity cap for a source kind that holds unless the repository constructs one of
 /// `unless_new` anywhere (`new StreamableHTTPServerTransport(..)`).
 #[derive(Debug, Clone, Deserialize)]
@@ -698,6 +719,15 @@ pub struct LocalCapSpec {
     pub kind: String,
     pub cap: SeverityName,
     pub unless_new: Vec<String>,
+}
+
+/// [`UrlAttributesSpec`], resolved: the sink a URL attribute makes, and the attributes by tag
+/// (lower case).
+#[derive(Debug, Clone)]
+pub struct UrlAttributes {
+    pub sink: Sink,
+    pub tags: BTreeMap<String, Vec<String>>,
+    pub setters: Vec<String>,
 }
 
 /// [`LocalCapSpec`], resolved.
@@ -873,6 +903,8 @@ pub struct Model {
     pub member_sources: Vec<MemberSource>,
     pub severity_caps: BTreeMap<String, Severity>,
     pub local_caps: Vec<LocalCap>,
+    pub url_checks: Vec<String>,
+    pub url_attributes: Option<UrlAttributes>,
     pub implicit_modules: Vec<String>,
     pub module_namespaces: Vec<String>,
     pub url_option_keys: Vec<String>,
@@ -1047,6 +1079,24 @@ impl Model {
         self.pass_globals.extend(pack.propagation.pass_globals);
         self.object_globals.extend(pack.propagation.object_globals);
         self.clearing.extend(pack.sanitizers.calls);
+        self.url_checks.extend(pack.sanitizers.url_checks);
+        if let Some(spec) = pack.url_attributes {
+            self.url_attributes = Some(UrlAttributes {
+                sink: Sink {
+                    class: spec.class.class(),
+                    severity: spec.severity.severity(),
+                    args: vec![ArgRule::UrlPrefix(0)],
+                    confined_by: Vec::new(),
+                    escalate: None,
+                    also: Vec::new(),
+                    ignore_kinds: Vec::new(),
+                    cleared_by: Vec::new(),
+                    requires: Vec::new(),
+                },
+                tags: spec.tags,
+                setters: spec.setters,
+            });
+        }
         self.validators.extend(pack.sanitizers.validators);
         self.receiver_validators
             .extend(pack.sanitizers.receiver_validators);
@@ -1249,6 +1299,17 @@ impl Model {
             Some(cap) if severity < *cap => *cap,
             _ => severity,
         }
+    }
+
+    /// The sink `tag`'s attribute (or DOM property) `attribute` makes when it holds a URL the
+    /// browser loads or navigates to: `<a href>`, `<embed src>`, `a.href = v`.
+    pub fn url_attribute(&self, tag: &str, attribute: &str) -> Option<&Sink> {
+        let spec = self.url_attributes.as_ref()?;
+        spec.tags
+            .get(&tag.to_ascii_lowercase())?
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(attribute))
+            .then_some(&spec.sink)
     }
 
     /// Whether `call` (a callee name, `obj.method` or `method`) escapes data for `class`.

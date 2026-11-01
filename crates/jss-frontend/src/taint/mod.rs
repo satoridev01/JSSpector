@@ -640,6 +640,8 @@ struct Env {
     remote: BTreeMap<String, Vec<ClassRef>>,
     /// Variables bound to a DOM node created here (`document.createElement('iframe')`).
     nodes: BTreeSet<String>,
+    /// Those nodes' tags, when the factory named one (`document.createElement('a')`).
+    node_tags: BTreeMap<String, String>,
     /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
     /// bindings, inner functions): writes to any other name are writes to its parent's.
     locals: BTreeSet<String>,
@@ -835,6 +837,7 @@ impl Env {
             remote: BTreeMap::new(),
             tuples: BTreeMap::new(),
             nodes: BTreeSet::new(),
+            node_tags: BTreeMap::new(),
             locals: BTreeSet::new(),
             branch: 0,
             function,
@@ -864,6 +867,7 @@ impl Env {
             remote: self.remote.clone(),
             tuples: self.tuples.clone(),
             nodes: self.nodes.clone(),
+            node_tags: self.node_tags.clone(),
             locals: BTreeSet::new(),
             branch: 0,
             function,
@@ -2539,6 +2543,26 @@ impl Walker<'_> {
                     env.nodes.insert(name.clone());
                 } else {
                     env.nodes.remove(name);
+                }
+                // `document.createElement('a')`: an anchor, whose `href` is a URL sink.
+                let tag = match init.get_inner_expression() {
+                    Expression::CallExpression(c) if node => c
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|a| match a.get_inner_expression() {
+                            Expression::StringLiteral(l) => l.value.as_str().map(str::to_owned),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                match tag {
+                    Some(tag) => {
+                        env.node_tags.insert(name.clone(), tag.to_ascii_lowercase());
+                    }
+                    None => {
+                        env.node_tags.remove(name);
+                    }
                 }
             }
             self.last_returned_fields = None;
@@ -4216,6 +4240,27 @@ impl Walker<'_> {
                         o
                     })
                 };
+                // `a.href = value` on `document.createElement('a')`
+                if let Some(origin) = &taint
+                    && let Some(member) = assign
+                        .left
+                        .as_simple_assignment_target()
+                        .and_then(SimpleAssignmentTarget::as_member_expression)
+                    && let Expression::Identifier(object) = member.object().get_inner_expression()
+                    && let Some(tag) = env.node_tags.get(object.name.as_str())
+                    && let Some(property) = member.static_property_name().and_then(|n| n.as_str())
+                    && let Some(sink) = m().url_attribute(tag, property)
+                {
+                    let api = format!("{}.{property} =", object.name.as_str());
+                    self.url_sink(
+                        sink,
+                        api,
+                        assign.right.span(),
+                        assign.span,
+                        origin.clone(),
+                        env,
+                    );
+                }
                 // `location.href = value`
                 if let Some(origin) = &taint
                     && let Some(target) =
@@ -4417,9 +4462,15 @@ impl Walker<'_> {
                         env,
                     );
                 }
-                // `new Executor(config)`: what the constructor's fields reach in any method.
-                if let Callee::Global(class) = &callee
-                    && let Some((name, summaries)) = self.constructor_summaries(class)
+                // `new Executor(config)`: what the constructor's fields reach in any method;
+                // `new this(basic)` in a static factory: the class's own constructor.
+                let class = match (&callee, new.callee.get_inner_expression()) {
+                    (Callee::Global(class), _) => Some(class.clone()),
+                    (_, Expression::ThisExpression(_)) => self.current_class.clone(),
+                    _ => None,
+                };
+                if let Some(class) = class
+                    && let Some((name, summaries)) = self.constructor_summaries(&class)
                 {
                     self.apply_summaries(
                         &name,
@@ -4507,10 +4558,15 @@ impl Walker<'_> {
 
     /// Walks a JSX element: raw-HTML props are sinks; expressions and children are walked.
     fn jsx_element(&mut self, element: &oxc_ast::ast::JSXElement<'_>, env: &mut Env) {
-        use oxc_ast::ast::{JSXAttributeItem, JSXAttributeName, JSXAttributeValue};
+        use oxc_ast::ast::{JSXAttributeItem, JSXAttributeName, JSXAttributeValue, JSXElementName};
         if !self.enter() {
             return;
         }
+        // An intrinsic element (`<a>`, `<embed>`), never a component (`<Link>`).
+        let tag = match &element.opening_element.name {
+            JSXElementName::Identifier(id) => Some(id.name.as_str()),
+            _ => None,
+        };
         for item in &element.opening_element.attributes {
             match item {
                 JSXAttributeItem::SpreadAttribute(spread) => {
@@ -4526,7 +4582,21 @@ impl Walker<'_> {
                             let Some(expr) = container.expression.as_expression() else {
                                 continue;
                             };
-                            if has(&m().jsx_html_props, name) {
+                            if let Some((tag, sink)) =
+                                tag.and_then(|t| m().url_attribute(t, name).map(|s| (t, s)))
+                            {
+                                // `<a href={url}>`, `<embed src={href}>`
+                                if let Some(origin) = self.expr(expr, env) {
+                                    self.url_sink(
+                                        sink,
+                                        format!("<{tag} {name}>"),
+                                        expr.span(),
+                                        attribute.span,
+                                        origin,
+                                        env,
+                                    );
+                                }
+                            } else if has(&m().jsx_html_props, name) {
                                 // `dangerouslySetInnerHTML={{ __html: value }}`
                                 let keys: Vec<&str> =
                                     m().jsx_html_value_keys.iter().map(String::as_str).collect();
@@ -4565,6 +4635,37 @@ impl Walker<'_> {
         }
         self.jsx_children(&element.children, env);
         self.leave();
+    }
+
+    /// A URL sink (`<a href={v}>`, `a.href = v` on an anchor): reported when the attacker
+    /// chooses the start of the URL, and so its scheme (`javascript:`).
+    fn url_sink(
+        &mut self,
+        sink: &models::Sink,
+        api: String,
+        arg: Span,
+        call: Span,
+        origin: Origin,
+        env: &Env,
+    ) {
+        if !origin.prefix {
+            return;
+        }
+        self.emit(
+            RawFinding {
+                class: sink.class,
+                severity: m().cap(origin.kind, sink.severity),
+                api,
+                arg,
+                call,
+                function: env.function.clone(),
+                origin,
+                ext: None,
+                auth: Auth::NoneDetected,
+                start: true,
+            },
+            env,
+        );
     }
 
     fn jsx_children(&mut self, children: &[oxc_ast::ast::JSXChild<'_>], env: &mut Env) {
@@ -5791,6 +5892,29 @@ impl Walker<'_> {
                 .push((callee_text, call.span.start, args));
         }
 
+        // `a.setAttribute('href', v)` on `document.createElement('a')`.
+        if let Callee::Method {
+            object: Some(object),
+            method,
+        } = &callee
+            && let Some(tag) = env.node_tags.get(object)
+            && m()
+                .url_attributes
+                .as_ref()
+                .is_some_and(|u| has(&u.setters, method))
+            && let Some(Expression::StringLiteral(attribute)) = call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .map(Expression::get_inner_expression)
+            && let Some(attribute) = attribute.value.as_str()
+            && let Some(sink) = m().url_attribute(tag, attribute)
+            && let Some(Some(origin)) = taints.get(1)
+            && let Some(value) = call.arguments.get(1)
+        {
+            let api = format!("{object}.{method}('{attribute}')");
+            self.url_sink(sink, api, value.span(), call.span, origin.clone(), env);
+        }
         // `handleToolCall(request)` in an MCP handler: the kind of request the first argument is.
         if let Callee::Global(name) = &callee {
             let passed = match call
@@ -6324,6 +6448,16 @@ impl Walker<'_> {
         {
             origin.escaped |= escaped;
             return Some(origin.step(call.span.start, format!("escaped by `{callee_text}()`")));
+        }
+        // `sanitizeUrl(u)` (a helper of ours by that name too): a URL with a harmless scheme.
+        if let Some(mut origin) = returned.clone()
+            && m()
+                .url_checks
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&last_segment))
+        {
+            origin.prefix = false;
+            return Some(origin.step(call.span.start, format!("URL checked by `{callee_text}()`")));
         }
         if returned.is_some() {
             return returned;
@@ -9438,7 +9572,7 @@ mod tests {
 
     #[test]
     fn appending_a_created_node_is_no_html_injection() {
-        assert!(scan("const iframe = document.createElement('iframe'); iframe.src = location.hash; shadowRoot.append(iframe);").is_empty());
+        assert!(scan("const iframe = document.createElement('iframe'); iframe.title = location.hash; shadowRoot.append(iframe);").is_empty());
         let found = scan("const html = '<b>' + location.hash + '</b>'; $(el).append(html);");
         assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
     }
@@ -9776,6 +9910,12 @@ mod tests {
             ))
             .is_empty()
         );
+        // `new this(o)` in a static factory runs the class's own constructor.
+        let found = one(
+            "class Conn { constructor(o) { this.cmd = o.cmd; } go() { exec(this.cmd); } static create(o) { const c = new this(o); return c; } }\n\
+             app.get('/x', (req, res) => { Conn.create(req.query); });",
+        );
+        assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
         // A TypeScript return type names the class.
         let head = "const { exec } = require('child_process');\nclass Svc { run(x: string) { exec('ls ' + x); } }\n";
         let found = scan_ts(&format!(
@@ -10257,6 +10397,48 @@ mod tests {
             .into_iter()
             .map(|f| (f.class, f.severity, f.api, f.origin.kind))
             .collect()
+    }
+
+    #[test]
+    fn url_attributes_of_elements_are_url_sinks() {
+        use VulnClass::Xss;
+        // A component prop into an anchor's href: medium (props), the start is the attacker's.
+        let found = scan_jsx("function L({ url }) { return <a href={url}>x</a>; }");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].0, found[0].1), (Xss, Severity::Medium));
+        assert_eq!(found[0].2, "<a href>");
+        let found = scan_jsx(
+            "function Pdf(props) { const { href } = props.node.attrs; return <embed src={href} />; }",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        // A fixed start, an image, a component, a checked URL: none.
+        for quiet in [
+            "function L({ id }) { return <a href={'/u/' + id}>x</a>; }",
+            "function I({ url }) { return <img src={url} />; }",
+            "function L({ url }) { return <Link href={url}>x</Link>; }",
+            "function L({ url }) { return <a href={sanitizeUrl(url)}>x</a>; }",
+            "function sanitizeUrl(u) { return u; }\nfunction L({ url }) { return <a href={sanitizeUrl(url)}>x</a>; }",
+        ] {
+            assert!(scan_jsx(quiet).is_empty(), "{quiet}: {:?}", scan_jsx(quiet));
+        }
+        // DOM: a created anchor's href, set or assigned.
+        let found = scan(
+            "const a = document.createElement('a'); a.href = location.hash.slice(1); a.click();",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].3, "dom");
+        let found = scan(
+            "const f = document.createElement('iframe'); f.setAttribute('src', location.hash.slice(1));",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            scan("const i = document.createElement('img'); i.src = location.hash.slice(1);")
+                .is_empty()
+        );
+        assert!(
+            scan("const a = document.createElement('a'); a.href = '/p/' + location.hash.slice(1);")
+                .is_empty()
+        );
     }
 
     #[test]

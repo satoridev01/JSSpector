@@ -6,7 +6,8 @@
 //! for a `./x.ts` source is honored. Bare specifiers (packages) are not files of the root and do
 //! not resolve here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// Extensions tried, in order, when a specifier has none (or names a compiled `.js`).
 pub const EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"];
@@ -23,6 +24,105 @@ pub fn resolve(from: &str, spec: &str, files: &BTreeSet<String>) -> Option<Strin
     };
     let joined = normalize(&format!("{dir}/{spec}"))?;
     candidates(&joined).into_iter().find(|c| files.contains(c))
+}
+
+/// The packages of a workspace (monorepo): package name -> (directory, entry points), from the
+/// `package.json` files under the scan root (outside `node_modules`).
+#[derive(Debug, Clone, Default)]
+pub struct Workspace {
+    packages: BTreeMap<String, (String, Vec<String>)>,
+}
+
+impl Workspace {
+    /// Reads every `package.json` under `root`.
+    pub fn load(root: &Path) -> Self {
+        let mut packages = BTreeMap::new();
+        let walker = ignore::WalkBuilder::new(root)
+            .standard_filters(false)
+            .hidden(true)
+            .filter_entry(|e| e.file_name() != "node_modules" && e.file_name() != ".git")
+            .build();
+        for entry in walker.flatten() {
+            if entry.file_name() != "package.json" {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let Some(name) = json.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let Some(dir) = entry
+                .path()
+                .parent()
+                .and_then(|d| d.strip_prefix(root).ok())
+                .map(|d| d.to_string_lossy().replace('\\', "/"))
+            else {
+                continue;
+            };
+            let mut entries = Vec::new();
+            for field in ["source", "module", "main", "types", "typings"] {
+                if let Some(value) = json.get(field).and_then(|v| v.as_str()) {
+                    entries.push(value.trim_start_matches("./").to_owned());
+                }
+            }
+            packages.insert(name.to_owned(), (dir, entries));
+        }
+        Self { packages }
+    }
+
+    /// The file a bare specifier names when it is a package of this workspace.
+    pub fn resolve(&self, spec: &str, files: &BTreeSet<String>) -> Option<String> {
+        let (name, (dir, entries)) = self
+            .packages
+            .iter()
+            .filter(|(name, _)| spec == name.as_str() || spec.starts_with(&format!("{name}/")))
+            .max_by_key(|(name, _)| name.len())?;
+        let join = |rest: &str| {
+            if dir.is_empty() {
+                rest.to_owned()
+            } else {
+                format!("{dir}/{rest}")
+            }
+        };
+        let subpath = spec.get(name.len()..).unwrap_or("").trim_start_matches('/');
+        let mut bases = Vec::new();
+        if subpath.is_empty() {
+            for entry in entries {
+                let entry = entry.trim_end_matches(".d.ts");
+                bases.push(join(entry));
+                // Built output points back at the sources: dist/index.js -> src/index.ts.
+                for built in ["dist/", "lib/", "build/", "out/"] {
+                    if let Some(rest) = entry.strip_prefix(built) {
+                        bases.push(join(&format!("src/{rest}")));
+                    }
+                }
+            }
+            bases.push(join("src/index"));
+            bases.push(join("index"));
+        } else {
+            bases.push(join(subpath));
+            bases.push(join(&format!("src/{subpath}")));
+        }
+        bases.iter().find_map(|base| {
+            let stem = base
+                .strip_suffix(".js")
+                .or_else(|| base.strip_suffix(".mjs"))
+                .or_else(|| base.strip_suffix(".cjs"))
+                .unwrap_or(base);
+            candidates(base)
+                .into_iter()
+                .chain(candidates(stem))
+                .find(|c| files.contains(c))
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty()
+    }
 }
 
 /// Every path `base` may name, in resolution order.

@@ -134,14 +134,15 @@ fn scan_program(program: &Program<'_>, _text: &str) -> ScanResult {
 /// Scans a parsed program, with summaries of the repository's other files.
 pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanResult {
     let files = BTreeSet::new();
-    scan_file_program(
-        program,
-        &Linking {
-            file: "",
-            files: &files,
-        },
-        external,
-    )
+    let workspace = jss_core::resolve::Workspace::default();
+    let reexports = BTreeMap::new();
+    let linking = Linking {
+        file: "",
+        files: &files,
+        workspace: &workspace,
+        reexports: &reexports,
+    };
+    scan_file_program(program, &linking, external)
 }
 
 /// Where a program sits in its scan root: its path and every file next to it, for resolving
@@ -150,6 +151,26 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
 pub struct Linking<'a> {
     pub file: &'a str,
     pub files: &'a BTreeSet<String>,
+    /// The monorepo's own packages, for bare specifiers that name one.
+    pub workspace: &'a jss_core::resolve::Workspace,
+    /// File -> every file it re-exports (transitively): barrels (`export * from './x'`).
+    pub reexports: &'a BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Linking<'_> {
+    /// The file `spec` names from this file: relative, or a package of the workspace.
+    pub fn resolve(&self, spec: &str) -> Option<String> {
+        if spec.starts_with('.') {
+            jss_core::resolve::resolve(self.file, spec, self.files)
+        } else {
+            self.workspace.resolve(spec, self.files)
+        }
+    }
+
+    /// Whether `spec` is one of our own modules (relative, or a workspace package).
+    pub fn is_own(&self, spec: &str) -> bool {
+        spec.starts_with('.') || (!self.workspace.is_empty() && self.resolve(spec).is_some())
+    }
 }
 
 /// Scans a parsed program that is `linking.file` in a scan root, with the root's summaries.
@@ -204,7 +225,7 @@ pub fn scan_file_program(
             local: local.clone(),
             specifier: spec.clone(),
             export: export.clone(),
-            resolved: jss_core::resolve::resolve(linking.file, spec, linking.files),
+            resolved: linking.resolve(spec),
         });
     }
     result.facts = facts;
@@ -220,6 +241,8 @@ pub struct FileFacts {
     pub exports: BTreeMap<String, String>,
     /// Relative imports, resolved where the file exists in the scan root.
     pub imports: Vec<jss_core::ir::Import>,
+    /// Files this one re-exports from (`export * from`, `export { x } from`).
+    pub reexports: Vec<String>,
     /// Request inputs each function reads: function -> (location, name).
     pub inputs: BTreeMap<String, BTreeSet<(String, String)>>,
     /// Named functions: name -> (start offset, parameter names).
@@ -825,7 +848,7 @@ impl Walker<'_> {
         match module {
             ModuleDeclaration::ImportDeclaration(import) => {
                 let spec = import.source.value.as_str().unwrap_or("");
-                if spec.starts_with('.') {
+                if self.linking.is_own(spec) {
                     for specifier in import.specifiers.iter().flatten() {
                         use oxc_ast::ast::ImportDeclarationSpecifier as S;
                         let (local, export) = match specifier {
@@ -860,6 +883,26 @@ impl Walker<'_> {
                             export: (!export.is_empty()).then_some(export),
                         },
                     );
+                }
+            }
+            ModuleDeclaration::ExportAllDeclaration(export) => {
+                if let Some(target) = export
+                    .source
+                    .value
+                    .as_str()
+                    .and_then(|s| self.linking.resolve(s))
+                {
+                    self.facts.reexports.push(target);
+                }
+            }
+            ModuleDeclaration::ExportFromDeclaration(export) => {
+                if let Some(target) = export
+                    .source
+                    .value
+                    .as_str()
+                    .and_then(|s| self.linking.resolve(s))
+                {
+                    self.facts.reexports.push(target);
                 }
             }
             ModuleDeclaration::ExportNamedDeclaration(export) => {
@@ -1061,7 +1104,7 @@ impl Walker<'_> {
 
     /// Binds `const x = require(spec)` and `const { a, b: c } = require(spec)`.
     fn bind_require(&mut self, pattern: &BindingPattern<'_>, spec: &str, export: Option<String>) {
-        if spec.starts_with('.') {
+        if self.linking.is_own(spec) {
             match pattern {
                 BindingPattern::BindingIdentifier(id) => {
                     self.relative
@@ -3301,13 +3344,7 @@ impl Walker<'_> {
                         }
                         Some(e) => (
                             None,
-                            require_spec(e).and_then(|spec| {
-                                jss_core::resolve::resolve(
-                                    self.linking.file,
-                                    &spec,
-                                    self.linking.files,
-                                )
-                            }),
+                            require_spec(e).and_then(|spec| self.linking.resolve(&spec)),
                         ),
                         None => (None, None),
                     };
@@ -3400,8 +3437,17 @@ impl Walker<'_> {
         if self.linking.files.is_empty() {
             return spec_names_file(spec, file);
         }
-        jss_core::resolve::resolve(self.linking.file, spec, self.linking.files).as_deref()
-            == Some(file)
+        match self.linking.resolve(spec) {
+            Some(resolved) => {
+                resolved == file
+                    || self
+                        .linking
+                        .reexports
+                        .get(&resolved)
+                        .is_some_and(|set| set.contains(file))
+            }
+            None => false,
+        }
     }
 
     /// Reports each summary whose parameter receives a tainted value at a call.

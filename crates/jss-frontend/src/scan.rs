@@ -43,6 +43,13 @@ pub struct ScanReport {
     pub module: ir::Module,
 }
 
+/// What every file's scan needs to know about the scan root.
+struct Context<'a> {
+    all: &'a BTreeSet<String>,
+    workspace: &'a jss_core::resolve::Workspace,
+    reexports: BTreeMap<String, BTreeSet<String>>,
+}
+
 impl ParsePool {
     /// Scans every file of a class in `selection`, in parallel. Reports come back in input
     /// order; files that are not scanned have no report.
@@ -52,12 +59,27 @@ impl ParsePool {
     /// name, and only names that are unique in the scan root are used.
     pub fn scan(&self, files: &[SourceFile], selection: ClassSet) -> Vec<ScanReport> {
         let all: BTreeSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
-        let run = |external: &Summaries| -> Vec<ScanReport> {
+        // The scan root, from any file: its absolute path minus its root-relative one.
+        let root = files.first().and_then(|f| {
+            let abs = f.abs_path.to_string_lossy().replace('\\', "/");
+            abs.strip_suffix(&f.rel_path).map(std::path::PathBuf::from)
+        });
+        let workspace = root
+            .map(|r| jss_core::resolve::Workspace::load(&r))
+            .unwrap_or_default();
+        let run = |external: &Summaries,
+                   reexports: BTreeMap<String, BTreeSet<String>>|
+         -> Vec<ScanReport> {
+            let context = Context {
+                all: &all,
+                workspace: &workspace,
+                reexports,
+            };
             self.install(|| {
                 files
                     .par_iter()
                     .filter_map(|file| {
-                        match guarded(|| scan_file(file, selection, external, &all)) {
+                        match guarded(|| scan_file(file, selection, external, &context)) {
                             Ok(report) => report,
                             Err(panic) => Some(report(file, ScanStatus::Panicked(panic))),
                         }
@@ -68,12 +90,13 @@ impl ParsePool {
         // Each round lets a summary cross one more file: a route, its controller, a service,
         // a helper. Stop when nothing new is learned (at most `CROSS_FILE_HOPS` rounds).
         let mut external = Summaries::new();
-        let mut reports = run(&external);
+        let mut reports = run(&external, BTreeMap::new());
         for _ in 1..CROSS_FILE_HOPS {
+            let reexports = reexport_closure(&reports);
             let merged = merge(reports);
             let grew = count(&merged) > count(&external);
             external = merged;
-            reports = run(&external);
+            reports = run(&external, reexports);
             if !grew {
                 break;
             }
@@ -84,6 +107,32 @@ impl ParsePool {
 
 /// Most files a value is followed across: route -> controller -> service -> helper.
 pub const CROSS_FILE_HOPS: usize = 4;
+
+/// File -> every file it re-exports, followed through chains of barrels.
+fn reexport_closure(reports: &[ScanReport]) -> BTreeMap<String, BTreeSet<String>> {
+    let direct: BTreeMap<&str, &[String]> = reports
+        .iter()
+        .map(|r| (r.rel_path.as_str(), r.module.reexports.as_slice()))
+        .collect();
+    let mut closure = BTreeMap::new();
+    for (file, targets) in &direct {
+        if targets.is_empty() {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<&str> = targets.iter().map(String::as_str).collect();
+        while let Some(next) = stack.pop() {
+            if seen.len() > 500 || !seen.insert(next.to_owned()) {
+                continue;
+            }
+            if let Some(more) = direct.get(next) {
+                stack.extend(more.iter().map(String::as_str));
+            }
+        }
+        closure.insert((*file).to_owned(), seen);
+    }
+    closure
+}
 
 fn count(summaries: &Summaries) -> usize {
     summaries.values().map(Vec::len).sum()
@@ -116,7 +165,7 @@ fn scan_file(
     file: &SourceFile,
     selection: ClassSet,
     external: &Summaries,
-    all: &BTreeSet<String>,
+    context: &Context<'_>,
 ) -> Option<ScanReport> {
     if !matches!(file.work(selection), Work::Parse) {
         return None;
@@ -141,7 +190,7 @@ fn scan_file(
         Err(skip) => return Some(report(file, ScanStatus::Skipped(skip.message))),
     };
     let outcome = on_parser_stack(text, |allocator| {
-        scan_text(allocator, file, text, external, all)
+        scan_text(allocator, file, text, external, context)
     });
     Some(match outcome {
         Ok(Ok((findings, truncated, summaries, module))) => ScanReport {
@@ -168,7 +217,7 @@ fn scan_text(
     file: &SourceFile,
     text: &str,
     external: &Summaries,
-    all: &BTreeSet<String>,
+    context: &Context<'_>,
 ) -> Result<(Vec<Finding>, bool, Summaries, ir::Module), String> {
     let primary = source_type(file.kind, file.package_type);
     let mut candidates = vec![primary];
@@ -204,7 +253,7 @@ fn scan_text(
             }
             continue;
         }
-        return Ok(analyze(&ret.program, file, text, external, all));
+        return Ok(analyze(&ret.program, file, text, external, context));
     }
     // Flow-typed JavaScript: blank the Flow-only syntax (offsets kept) and read it as TypeScript.
     if let Some(fallbacks) = typed_fallbacks(file.kind, file.package_type) {
@@ -217,7 +266,7 @@ fn scan_text(
                 .with_options(parse_options())
                 .parse();
             if !ret.fatal_error {
-                return Ok(analyze(&ret.program, file, text, external, all));
+                return Ok(analyze(&ret.program, file, text, external, context));
             }
         }
     }
@@ -233,11 +282,13 @@ fn analyze(
     file: &SourceFile,
     text: &str,
     external: &Summaries,
-    all: &BTreeSet<String>,
+    context: &Context<'_>,
 ) -> (Vec<Finding>, bool, Summaries, ir::Module) {
     let linking = Linking {
         file: &file.rel_path,
-        files: all,
+        files: context.all,
+        workspace: context.workspace,
+        reexports: &context.reexports,
     };
     let result = taint::scan_file_program(program, &linking, external);
     let index = LineIndex::new(text);
@@ -353,6 +404,7 @@ fn analyze(
                     .unwrap_or_default(),
             })
             .collect(),
+        reexports: facts.reexports,
         mounts: facts
             .mounts
             .into_iter()

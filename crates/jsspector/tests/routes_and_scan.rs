@@ -262,3 +262,44 @@ fn ir_lowers_modules_and_links_calls_across_files() {
     );
     assert!(ir["call_graph"]["cross_module"].as_u64().unwrap() >= 1);
 }
+
+#[test]
+fn workspace_packages_and_barrels_are_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "packages/components/package.json",
+        r#"{ "name": "acme-components", "main": "dist/index.js" }"#,
+    );
+    write(
+        root,
+        "packages/components/src/index.ts",
+        "export * from './storage';\n",
+    );
+    write(
+        root,
+        "packages/components/src/storage.ts",
+        "import fs from 'fs';\nimport path from 'path';\n\
+         export const streamFile = (id: string, name: string) => fs.createReadStream(path.join('/data', id, name));\n",
+    );
+    write(
+        root,
+        "packages/server/package.json",
+        r#"{ "name": "acme-server" }"#,
+    );
+    write(
+        root,
+        "packages/server/src/controller.ts",
+        "import { streamFile } from 'acme-components';\n\
+         export const download = (req: any, res: any) => streamFile(req.query.id, req.query.name).pipe(res);\n",
+    );
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["class"], "path-traversal");
+    assert_eq!(
+        findings[0]["sink"]["file"],
+        "packages/components/src/storage.ts"
+    );
+}

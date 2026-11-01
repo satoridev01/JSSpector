@@ -26,6 +26,8 @@ pub struct Module {
     pub entries: Vec<Entry>,
     /// Routers mounted under a prefix here.
     pub mounts: Vec<Mount>,
+    /// Files re-exported from here (`export * from './x'`).
+    pub reexports: Vec<String>,
 }
 
 /// `import x from './y'` / `const x = require('./y')`.

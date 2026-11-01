@@ -1,0 +1,4 @@
+# GraphQL resolvers: `(parent, args, context, info)`; `args` is client data.
+name: graphql
+client_sources:
+  - {methods: [Query, Mutation, Subscription], shape: resolver-map, params: second, kind: graphql}

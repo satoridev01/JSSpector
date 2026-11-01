@@ -1,0 +1,9 @@
+# Browser and extension sources, DOM HTML sinks.
+name: browser
+client_sources:
+  - {methods: [addEventListener], event: message, params: first, kind: postmessage}
+  - {methods: [addListener], via: [onMessage, onMessageExternal, onConnectExternal], params: first, kind: ext-message}
+html_props: [innerHTML, outerHTML]
+sinks:
+  - {methods: [insertAdjacentHTML], class: xss, severity: high, args: ["any:1"]}
+  - {methods: [html, append, prepend, after, before, replaceWith, writeln], class: xss, severity: high, args: ["html:0"]}

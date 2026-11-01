@@ -1,0 +1,16 @@
+# Express, and the request shape Fastify, Hapi and Node's IncomingMessage share.
+name: express
+request:
+  server_factories: [createServer]
+  names: [req, request]
+  props: [body, query, params, headers, cookies, signedCookies, payload, files, file, url, originalUrl, path]
+  methods: [get, param, header, json, text, formData, query, parseBody]
+  upload_server_fields: [path, filename, destination, size]
+  upload_objects: [file, files]
+  sub_objects: [request, req]
+  object_props: [body, query, payload]
+routes:
+  methods: [get, post, put, patch, delete, del, all, use, options, head, route]
+sinks:
+  # A `root` option confines these (engine rule).
+  - {methods: [sendFile, download], class: path-traversal, severity: high, args: ["any:0"], confined_by: [root]}

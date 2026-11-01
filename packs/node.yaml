@@ -1,0 +1,71 @@
+# Node.js core: module families, sinks and how strings propagate.
+name: node
+modules:
+  child_process: child_process
+  fs: fs
+  fs/promises: fs
+  fs-extra: fs
+  graceful-fs: fs
+  original-fs: fs
+  vm: vm
+  path: path
+  path/posix: path
+  path/win32: path
+  upath: path
+  http: http
+  https: http
+  http2: http
+  util: util
+  shelljs: shelljs
+  execa: execa
+sinks:
+  - {module: child_process, exports: [exec, execSync], class: command-injection, severity: critical, args: ["any:0"]}
+  # A tainted program name; `shell: true` makes every argument shell text (engine rule).
+  - module: child_process
+    exports: [spawn, spawnSync, execFile, execFileSync, fork]
+    class: command-injection
+    severity: high
+    args: ["any:0"]
+    # `shell: true` makes every argument shell text.
+    escalate: {option: shell, severity: critical, args: ["any:0", "any:1"]}
+  - {module: shelljs, exports: [exec], class: command-injection, severity: critical, args: ["any:0"]}
+  - {module: execa, exports: [execaCommand, execaCommandSync, command, commandSync], class: command-injection, severity: critical, args: ["any:0"]}
+  - {module: execa, exports: ["", execa, execaSync], class: command-injection, severity: high, args: ["any:0"]}
+  - {module: vm, exports: [runInNewContext, runInThisContext, runInContext, compileFunction, Script], class: code-injection, severity: critical, args: ["any:0"]}
+  - module: fs
+    exports: [readFile, readFileSync, writeFile, writeFileSync, appendFile, appendFileSync, createReadStream,
+      createWriteStream, unlink, unlinkSync, rm, rmSync, rmdir, rmdirSync, readdir, readdirSync, open, openSync,
+      outputFile, outputFileSync, remove, removeSync, readJson, readJsonSync, writeJson, writeJsonSync, mkdir,
+      mkdirSync, ensureDir, ensureDirSync, mkdirp, mkdirs]
+    class: path-traversal
+    severity: high
+    args: ["any:0"]
+  - module: fs
+    exports: [rename, renameSync, copyFile, copyFileSync, cp, cpSync, copy, copySync, move, moveSync, symlink, symlinkSync]
+    class: path-traversal
+    severity: high
+    args: ["any:0", "any:1"]
+  - {module: http, exports: [get, request], class: ssrf, severity: high, args: ["url:0"]}
+  - {global: [eval, Function], class: code-injection, severity: critical, args: ["any:0", "any:1", "any:2"]}
+propagation:
+  pass_methods: [trim, trimStart, trimEnd, toLowerCase, toUpperCase, toLocaleLowerCase, toLocaleUpperCase, replace,
+    replaceAll, slice, substring, substr, split, join, concat, toString, padStart, padEnd, normalize, at, valueOf, repeat]
+  build_methods: [concat, join, format]
+  pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, util.format]
+sanitizers:
+  calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN]
+  # Used as a guard (`if (!isValid(x)) return;`), these clear their argument on the passing path.
+  validators: [isUUID, isUuid, uuidValidate, validate, isValid, isValidId, isSafe, isSafeName, isAlphanumeric,
+    isInt, isNumeric, isEmail, isURL, isMongoId, isValidObjectId, isSafeMapKey, isFinite, isInteger, includes, has]
+  escapers:
+    sql-injection: [escape, escapeId, format, mysql.escape, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
+    xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss]
+    command-injection: [quote, shellescape, shellEscape, escapeShellArg]
+member_sources:
+  - {object: process, property: argv, kind: cli}
+# Arguments of the user's own command line are not an attack surface on their machine.
+severity_caps:
+  cli: low
+implicit_modules: [child_process, fs, vm, path]
+module_namespaces: [promises]
+module_pass: [path.join, path.resolve, path.normalize, path.format, path.relative, util.format]

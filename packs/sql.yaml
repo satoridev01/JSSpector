@@ -1,0 +1,9 @@
+# SQL drivers and query builders: text built from tainted data that looks like SQL.
+name: sql
+sinks:
+  - methods: [query, execute, raw, whereRaw, orderByRaw, havingRaw, joinRaw, $queryRawUnsafe, $executeRawUnsafe,
+      unsafe, exec, all, run, get, prepare, each]
+    class: sql-injection
+    severity: high
+    args: ["built:0"]
+sql_keywords: [select, insert, update, delete, where, from, values, order by, group by, limit, join, set]

@@ -1,0 +1,10 @@
+# socket.io / ws: event callback arguments are client data.
+name: socketio
+sockets:
+  name_contains: [socket]
+  names: [client, ws]
+  methods: [on, once]
+  connection_events: [connection, connect]
+  builtin_events: [connect, connection, disconnect, disconnecting, error, connect_error, reconnect]
+  ack_names: [cb, callback, ack, fn, done, next]
+  any_methods: [onAny]

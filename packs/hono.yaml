@@ -1,0 +1,4 @@
+# Hono: a single `c` parameter is the context; request data is under `c.req`.
+name: hono
+request:
+  hono_context_names: [c]

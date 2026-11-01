@@ -276,6 +276,7 @@ fn describe(class: jss_core::VulnClass) -> &'static str {
         C::CommandInjection => "reaches a shell command or program execution",
         C::CodeInjection => "is evaluated as code",
         C::SqlInjection => "is concatenated into an SQL query",
+        C::NosqlInjection => "is used in a database query, where an object changes its meaning",
         C::PathTraversal => "is used as a file path without confinement",
         C::Ssrf => "controls the URL of a server-side request",
         C::Xss => "is written into the page as HTML",

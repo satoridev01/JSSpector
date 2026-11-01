@@ -1,0 +1,4 @@
+# NestJS parameter decorators that inject request data.
+name: nestjs
+request:
+  decorators: [Body, Query, Param, Headers]

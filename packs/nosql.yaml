@@ -1,0 +1,9 @@
+# MongoDB / Mongoose: a tainted value that may be an object (`{ "$ne": null }`) used as a query.
+name: nosql
+sinks:
+  - methods: [find, findOne, findOneAndUpdate, findOneAndDelete, findOneAndReplace, updateOne, updateMany,
+      deleteOne, deleteMany, countDocuments, findById, exists, aggregate, distinct, replaceOne]
+    class: nosql-injection
+    severity: high
+    args: ["object:0"]
+  - {methods: [$where], class: code-injection, severity: critical, args: ["any:0"]}

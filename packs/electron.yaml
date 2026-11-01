@@ -1,0 +1,6 @@
+# Electron: renderer-to-main IPC and opening URLs.
+name: electron
+client_sources:
+  - {object: ipcMain, methods: [on, handle, once, handleOnce], params: after-first, kind: ipc}
+sinks:
+  - {methods: [openExternal], class: command-injection, severity: high, args: ["url:0"]}

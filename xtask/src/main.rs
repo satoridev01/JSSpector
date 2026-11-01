@@ -25,6 +25,7 @@ fn main() -> Result<()> {
 }
 
 fn ci() -> Result<()> {
+    packs_only()?;
     cargo(&["fmt", "--all", "--check"])?;
     cargo(&[
         "clippy",
@@ -37,6 +38,76 @@ fn ci() -> Result<()> {
     ])?;
     cargo(&["test", "--workspace", "--locked"])?;
     eprintln!("xtask ci: all checks passed");
+    Ok(())
+}
+
+/// Engine files that must not hold framework or library knowledge.
+const ENGINE_FILES: &[&str] = &["crates/jss-frontend/src/taint/mod.rs"];
+
+/// Generic labels the engine may use although a pack also mentions them.
+const ENGINE_LABELS: &[&str] = &[
+    // Source-kind labels.
+    "http",
+    "socket",
+    "param",
+    "context",
+    // Pack schema vocabulary.
+    "all",
+    "first",
+    "second",
+    "after-first",
+    "input",
+    "callback",
+    "last-callback",
+    "object-of-functions",
+    "resolver-map",
+];
+
+/// The plan's rule: all framework knowledge lives in the YAML packs. Fails when a string literal
+/// in the engine (outside its tests) is a name some pack lists.
+fn packs_only() -> Result<()> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("workspace root")?;
+    let mut names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(root.join("packs")).context("packs/")? {
+        let text = std::fs::read_to_string(entry?.path())?;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("");
+            // Values only: list items and the right side of `key: value`.
+            let values = match line.split_once(':') {
+                Some((_, rest)) => rest,
+                None => line,
+            };
+            for word in values.split(|c: char| !(c.is_alphanumeric() || "_$./-".contains(c))) {
+                if word.len() > 2 && !word.chars().all(|c| c.is_ascii_digit()) {
+                    names.insert(word.to_owned());
+                }
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    for file in ENGINE_FILES {
+        let text = std::fs::read_to_string(root.join(file))?;
+        let engine = text.split("\nmod tests {").next().unwrap_or(&text);
+        for (number, line) in engine.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for literal in line.split('"').skip(1).step_by(2) {
+                if names.contains(literal) && !ENGINE_LABELS.contains(&literal) {
+                    offenders.push(format!("{file}:{}: \"{literal}\"", number + 1));
+                }
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        bail!(
+            "framework names in the engine (move them to a pack):\n{}",
+            offenders.join("\n")
+        );
+    }
+    eprintln!("xtask ci: the engine holds no pack names");
     Ok(())
 }
 

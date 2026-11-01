@@ -1,0 +1,18 @@
+# Outbound HTTP clients: a tainted URL start is SSRF.
+name: http-clients
+modules:
+  axios: http-client
+  got: http-client
+  node-fetch: http-client
+  undici: http-client
+  request: http-client
+  superagent: http-client
+  needle: http-client
+  cross-fetch: http-client
+  isomorphic-fetch: http-client
+  ky: http-client
+  phin: http-client
+sinks:
+  - {module: http-client, exports: ["", get, post, put, patch, delete, head, request, stream], class: ssrf, severity: high, args: ["url:0"]}
+  - {global: [fetch], class: ssrf, severity: high, args: ["url:0"]}
+url_option_keys: [url, uri, host, hostname, baseURL]

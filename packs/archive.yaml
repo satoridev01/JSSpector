@@ -1,0 +1,6 @@
+# Archive readers: entry names are chosen by the archive's author.
+name: archive
+client_sources:
+  - {methods: [on], event: entry, params: first, kind: archive}
+result_sources:
+  - {methods: [getEntries], kind: archive}

@@ -1,0 +1,4 @@
+# Meteor: arguments of methods registered with Meteor.methods come from any client.
+name: meteor
+client_sources:
+  - {object: Meteor, methods: [methods], shape: object-of-functions, params: all, kind: meteor}

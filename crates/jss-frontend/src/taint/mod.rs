@@ -24,7 +24,11 @@ use oxc_ast::ast::{
 use oxc_ast::ast::{BinaryOperator, SimpleAssignmentTarget};
 use oxc_span::{GetSpan, Span};
 
-use models::ArgRule;
+use models::{ArgRule, Model, has};
+
+fn m() -> &'static Model {
+    models::model()
+}
 
 /// Deepest AST recursion the walker follows before giving up on a subtree.
 pub const MAX_DEPTH: u32 = 300;
@@ -46,9 +50,28 @@ pub struct Origin {
     pub sqlish: bool,
     /// Summary pass only: this is the value of the enclosing function's parameter `n`.
     pub param: Option<usize>,
+    /// Can be an object (JSON body, qs query, socket payload), not only a string.
+    pub object: bool,
 }
 
+/// The request-kind marker for a context object whose request data is under `.req`.
+const CONTEXT: &str = "context";
+
 impl Origin {
+    /// A fresh source of `kind` at `span`.
+    fn source(kind: &'static str, span: Span) -> Self {
+        Origin {
+            kind,
+            span,
+            steps: Vec::new(),
+            built: false,
+            prefix: true,
+            sqlish: false,
+            param: None,
+            object: true,
+        }
+    }
+
     fn step(mut self, offset: u32, note: String) -> Self {
         if self.steps.len() < MAX_STEPS {
             self.steps.push((offset, note));
@@ -164,6 +187,8 @@ struct Env {
     requests: BTreeMap<String, &'static str>,
     /// Names bound to a connected client socket (`io.on('connection', (s) => ...)`).
     sockets: BTreeSet<String>,
+    /// Names whose `.input` field is client data (tRPC procedure options).
+    inputs: BTreeMap<String, &'static str>,
     /// Inside a branch or loop: assignments only add taint.
     branch: u32,
     function: String,
@@ -175,6 +200,7 @@ impl Env {
             vars: BTreeMap::new(),
             requests: BTreeMap::new(),
             sockets: BTreeSet::new(),
+            inputs: BTreeMap::new(),
             branch: 0,
             function,
         }
@@ -185,6 +211,7 @@ impl Env {
             vars: self.vars.clone(),
             requests: self.requests.clone(),
             sockets: self.sockets.clone(),
+            inputs: self.inputs.clone(),
             branch: 0,
             function,
         }
@@ -209,15 +236,53 @@ enum Role {
     Plain,
     /// Registered as a route handler (`app.post(path, fn)`).
     Route,
-    /// A socket.io event callback: its parameters are client data.
-    /// Client data: every parameter is tainted with this source kind.
-    Client(&'static str),
+    /// A callback whose selected parameters are client data of this source kind.
+    Client(&'static str, Params),
     /// A server's connection callback: the first parameter is a client socket.
     SocketConnection,
-    /// Only the first parameter is client data.
-    ClientFirst(&'static str),
-    /// Every parameter but the first (an event object) is client data.
-    ClientAfterFirst(&'static str),
+}
+
+/// Which parameters of a client callback carry client data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Params {
+    All,
+    First,
+    Second,
+    /// All but the first (an event object).
+    AfterFirst,
+    /// The `input` field of the first parameter (tRPC).
+    Input,
+}
+
+impl Params {
+    fn parse(text: &str) -> Self {
+        match text {
+            "first" => Self::First,
+            "second" => Self::Second,
+            "after-first" => Self::AfterFirst,
+            "input" => Self::Input,
+            _ => Self::All,
+        }
+    }
+
+    fn wants(self, index: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::First | Self::Input => index == 0,
+            Self::Second => index == 1,
+            Self::AfterFirst => index > 0,
+        }
+    }
+}
+
+/// Which arguments of a registration are its callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Callback,
+    LastCallback,
+    ObjectOfFunctions,
+    /// `fastify.route({ method, url, handler })`
+    RouteObject,
 }
 
 struct Walker<'e> {
@@ -457,7 +522,7 @@ impl Walker<'_> {
                     }
                     return;
                 }
-                let Some(family) = models::module_family(spec) else {
+                let Some(family) = m().module_family(spec) else {
                     return;
                 };
                 for specifier in import.specifiers.iter().flatten() {
@@ -481,10 +546,7 @@ impl Walker<'_> {
             ModuleDeclaration::ExportDeclaration(export) => match &export.declaration {
                 Declaration::FunctionDeclaration(f) => {
                     let name = f.id.as_ref().map(|id| id.name.as_str().to_owned());
-                    let role = if name
-                        .as_deref()
-                        .is_some_and(|n| contains(models::ROUTE_EXPORTS, n))
-                    {
+                    let role = if name.as_deref().is_some_and(|n| has(&m().route_exports, n)) {
                         Role::Route
                     } else {
                         Role::Plain
@@ -588,11 +650,11 @@ impl Walker<'_> {
             }
             return;
         }
-        let Some(family) = models::module_family(spec) else {
+        let Some(family) = m().module_family(spec) else {
             return;
         };
         // `require('fs').promises` is still fs.
-        let export = export.filter(|e| e != "promises");
+        let export = export.filter(|e| !has(&m().module_namespaces, e));
         match pattern {
             BindingPattern::BindingIdentifier(id) => {
                 self.modules
@@ -604,7 +666,11 @@ impl Walker<'_> {
                         continue;
                     };
                     if let BindingPattern::BindingIdentifier(local) = &property.value {
-                        let export = if key == "promises" { None } else { Some(key) };
+                        let export = if has(&m().module_namespaces, &key) {
+                            None
+                        } else {
+                            Some(key)
+                        };
                         self.modules
                             .insert(local.name.as_str().to_owned(), Imported { family, export });
                     }
@@ -636,7 +702,7 @@ impl Walker<'_> {
                 for property in &object.properties {
                     let key = prop_name(&property.key);
                     let field = match (request, key.as_deref()) {
-                        (Some((kind, _)), Some(key)) if contains(models::REQUEST_PROPS, key) => {
+                        (Some((kind, _)), Some(key)) if has(&m().request_props, key) => {
                             Some(Origin {
                                 kind,
                                 span: property.span,
@@ -645,6 +711,7 @@ impl Walker<'_> {
                                 prefix: true,
                                 sqlish: false,
                                 param: None,
+                                object: true,
                             })
                         }
                         (Some(_), _) => None,
@@ -740,7 +807,7 @@ impl Walker<'_> {
                 Expression::CallExpression(call) => matches!(
                     call.callee.get_inner_expression(),
                     Expression::Identifier(id)
-                        if contains(models::NEST_PARAM_DECORATORS, id.name.as_str())
+                        if has(&m().decorators, id.name.as_str())
                 ),
                 _ => false,
             });
@@ -753,6 +820,7 @@ impl Walker<'_> {
                     prefix: true,
                     sqlish: false,
                     param: None,
+                    object: true,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -767,22 +835,43 @@ impl Walker<'_> {
                     prefix: true,
                     sqlish: false,
                     param: Some(index),
+                    object: true,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
         }
         match role {
-            Role::Client(kind) | Role::ClientFirst(kind) | Role::ClientAfterFirst(kind) => {
+            Role::Client(kind, selected) => {
                 for (index, (param, name)) in params.items.iter().zip(&names).enumerate() {
-                    let wanted = match role {
-                        Role::ClientFirst(_) => index == 0,
-                        Role::ClientAfterFirst(_) => index > 0,
-                        _ => true,
-                    };
-                    if !wanted {
+                    if !selected.wants(index) {
                         continue;
                     }
-                    if name.is_some_and(|n| contains(models::SOCKET_ACK_NAMES, n)) {
+                    if selected == Params::Input {
+                        // tRPC: `({ input, ctx }) => ...` or `(opts) => opts.input`
+                        match &param.pattern {
+                            BindingPattern::ObjectPattern(object) => {
+                                for property in &object.properties {
+                                    if prop_name(&property.key)
+                                        .is_some_and(|k| has(&m().input_fields, &k))
+                                    {
+                                        let origin = Origin::source(kind, property.span);
+                                        self.bind_pattern(
+                                            &property.value,
+                                            Some(origin),
+                                            None,
+                                            &mut env,
+                                        );
+                                    }
+                                }
+                            }
+                            BindingPattern::BindingIdentifier(id) => {
+                                env.inputs.insert(id.name.as_str().to_owned(), kind);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if name.is_some_and(|n| has(&m().socket_ack_names, n)) {
                         continue;
                     }
                     let origin = Origin {
@@ -793,6 +882,7 @@ impl Walker<'_> {
                         prefix: true,
                         sqlish: false,
                         param: None,
+                        object: true,
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -803,14 +893,20 @@ impl Walker<'_> {
                 }
             }
             Role::Route | Role::Plain => {
-                let conventional = first.is_some_and(|n| contains(models::REQUEST_NAMES, n))
+                let model = m();
+                let conventional = first.is_some_and(|n| has(&model.request_names, n))
                     && (names.len() >= 2 || role == Role::Route);
                 if let Some(first) = first {
-                    if first == "ctx" && (role == Role::Route || names.len() <= 2) {
-                        env.requests.insert("ctx".to_owned(), "koa");
-                    } else if role == Role::Route && names.len() == 1 && first == "c" {
-                        // Hono: the context; request data is under `c.req`.
-                        env.requests.insert("c".to_owned(), "hono");
+                    if has(&model.context_names, first) && (role == Role::Route || names.len() <= 2)
+                    {
+                        // Koa: the context is the request too.
+                        env.requests.insert(first.to_owned(), "http");
+                    } else if role == Role::Route
+                        && names.len() == 1
+                        && has(&model.hono_context_names, first)
+                    {
+                        // Hono: request data is under `c.req`; `c` itself is context.
+                        env.requests.insert(first.to_owned(), CONTEXT);
                     } else if conventional || (role == Role::Route && names.len() >= 2) {
                         env.requests.insert(first.to_owned(), "http");
                     }
@@ -879,10 +975,7 @@ impl Walker<'_> {
         name: Option<String>,
     ) -> Option<Origin> {
         // `export const POST = async (request) => ...` (Next.js route handlers)
-        let role = if name
-            .as_deref()
-            .is_some_and(|n| contains(models::ROUTE_EXPORTS, n))
-        {
+        let role = if name.as_deref().is_some_and(|n| has(&m().route_exports, n)) {
             Role::Route
         } else {
             Role::Plain
@@ -916,7 +1009,7 @@ impl Walker<'_> {
                         origin.sqlish |= template
                             .quasis
                             .iter()
-                            .any(|q| models::looks_like_sql(q.value.raw.as_str()));
+                            .any(|q| m().looks_like_sql(q.value.raw.as_str()));
                         let leading = index == 0
                             && template.quasis.first().is_some_and(|q| {
                                 q.value
@@ -949,7 +1042,7 @@ impl Walker<'_> {
                 if binary.operator == BinaryOperator::Addition {
                     let sqlish = [&binary.left, &binary.right].iter().any(|side| {
                         matches!(side.get_inner_expression(), Expression::StringLiteral(lit)
-                            if lit.value.as_str().is_some_and(models::looks_like_sql))
+                            if lit.value.as_str().is_some_and(|t: &str| m().looks_like_sql(t)))
                     });
                     let left = left.map(|mut o| {
                         o.built = true;
@@ -1051,7 +1144,31 @@ impl Walker<'_> {
                                 self.expr(key, env);
                             }
                             let name = prop_name(&p.key);
-                            self.expr_named(&p.value, env, name)
+                            // GraphQL: `{ Query: { user(parent, args) { ... } } }`
+                            let resolver = name.as_deref().and_then(|key| {
+                                m().client_sources.iter().find(|s| {
+                                    s.shape.as_deref() == Some("resolver-map")
+                                        && has(&s.methods, key)
+                                })
+                            });
+                            match (resolver, p.value.get_inner_expression()) {
+                                (Some(source), Expression::ObjectExpression(map)) => {
+                                    let role = Role::Client(
+                                        source.kind.as_str(),
+                                        Params::parse(&source.params),
+                                    );
+                                    for field in &map.properties {
+                                        if let ObjectPropertyKind::ObjectProperty(f) = field {
+                                            let field_name = prop_name(&f.key).map(|n| {
+                                                format!("{} {n}", name.as_deref().unwrap_or(""))
+                                            });
+                                            self.maybe_function(&f.value, env, field_name, role);
+                                        }
+                                    }
+                                    None
+                                }
+                                _ => self.expr_named(&p.value, env, name),
+                            }
                         }
                         ObjectPropertyKind::SpreadProperty(s) => self.expr(&s.argument, env),
                     };
@@ -1068,13 +1185,20 @@ impl Walker<'_> {
                 }
                 let sink = match &callee {
                     Callee::Module { family, export } => {
-                        models::module_sink(family, export.as_deref().unwrap_or(""))
+                        m().module_sink(family, export.as_deref().unwrap_or(""))
                     }
-                    Callee::Global(name) => models::global_sink(name),
+                    Callee::Global(name) => m().global_sink(name),
                     Callee::Method { .. } => None,
                 };
                 if let Some(sink) = sink {
-                    self.check_sink(sink, &callee, &new.arguments, &taints, new.span, env);
+                    self.check_sink(
+                        sink.clone(),
+                        &callee,
+                        &new.arguments,
+                        &taints,
+                        new.span,
+                        env,
+                    );
                 }
                 None
             }
@@ -1157,7 +1281,7 @@ impl Walker<'_> {
                     if let Some(origin) = &taint
                         && member
                             .static_property_name()
-                            .is_some_and(|p| contains(models::HTML_PROPS, p.as_str().unwrap_or("")))
+                            .is_some_and(|p| has(&m().html_props, p.as_str().unwrap_or("")))
                     {
                         let property = member
                             .static_property_name()
@@ -1213,7 +1337,7 @@ impl Walker<'_> {
         if let Some(kind) = self.request_kind(object, env)
             && property
                 .as_deref()
-                .is_some_and(|p| contains(models::REQUEST_PROPS, p))
+                .is_some_and(|p| has(&m().request_props, p))
         {
             return Some(Origin {
                 kind,
@@ -1223,18 +1347,26 @@ impl Walker<'_> {
                 prefix: true,
                 sqlish: false,
                 param: None,
+                object: property
+                    .as_deref()
+                    .is_some_and(|p| has(&m().object_props, p)),
             });
         }
-        if object.is_specific_id("process") && property.as_deref() == Some("argv") {
-            return Some(Origin {
-                kind: "cli",
-                span: member.span(),
-                steps: Vec::new(),
-                built: false,
-                prefix: true,
-                sqlish: false,
-                param: None,
-            });
+        // tRPC: `opts.input`
+        if let (Expression::Identifier(id), Some(field)) = (object, property.as_deref())
+            && has(&m().input_fields, field)
+            && let Some(kind) = env.inputs.get(id.name.as_str())
+        {
+            return Some(Origin::source(kind, member.span()));
+        }
+        // Pack member sources: `process.argv`.
+        if let (Expression::Identifier(id), Some(property)) = (object, property.as_deref())
+            && let Some(source) = m()
+                .member_sources
+                .iter()
+                .find(|s| s.object == id.name.as_str() && s.property == property)
+        {
+            return Some(Origin::source(source.kind.as_str(), member.span()));
         }
         // multer: the server chooses where an upload is stored (`req.file.path`,
         // `req.files[0].path`, `req.files.avatar[0].path`).
@@ -1248,10 +1380,10 @@ impl Walker<'_> {
         if let Some(inner) = upload.as_member_expression()
             && inner
                 .static_property_name()
-                .is_some_and(|p| p == "file" || p == "files")
+                .is_some_and(|p| has(&m().upload_objects, p.as_str().unwrap_or("")))
             && property
                 .as_deref()
-                .is_some_and(|p| contains(models::UPLOAD_SERVER_FIELDS, p))
+                .is_some_and(|p| has(&m().upload_server_fields, p))
             && self
                 .request_kind(inner.object().get_inner_expression(), env)
                 .is_some()
@@ -1269,15 +1401,15 @@ impl Walker<'_> {
                 .requests
                 .get(id.name.as_str())
                 .copied()
-                .filter(|kind| *kind != "hono"),
-            Expression::StaticMemberExpression(m)
-                if m.property.name == "request" || m.property.name == "req" =>
+                .filter(|kind| *kind != CONTEXT),
+            Expression::StaticMemberExpression(mem)
+                if has(&m().sub_objects, mem.property.name.as_str()) =>
             {
-                match m.object.get_inner_expression() {
+                match mem.object.get_inner_expression() {
                     Expression::Identifier(id) => env
                         .requests
                         .get(id.name.as_str())
-                        .map(|kind| if *kind == "hono" { "http" } else { kind }),
+                        .map(|kind| if *kind == CONTEXT { "http" } else { kind }),
                     _ => None,
                 }
             }
@@ -1332,12 +1464,12 @@ impl Walker<'_> {
                         .map(|imported| imported.family)
                         .or_else(|| {
                             // Unimported but conventional: `child_process.exec`, `fs.readFile`.
-                            models::module_family(id.name.as_str())
-                                .filter(|f| matches!(*f, "child_process" | "fs" | "vm" | "path"))
+                            m().module_family(id.name.as_str())
+                                .filter(|f| has(&m().implicit_modules, f))
                         }),
                     // `fs.promises.readFile`
                     Expression::StaticMemberExpression(inner)
-                        if inner.property.name == "promises" =>
+                        if has(&m().module_namespaces, inner.property.name.as_str()) =>
                     {
                         match inner.object.get_inner_expression() {
                             Expression::Identifier(id) => {
@@ -1346,7 +1478,7 @@ impl Walker<'_> {
                             _ => None,
                         }
                     }
-                    other => require_spec(other).and_then(|spec| models::module_family(&spec)),
+                    other => require_spec(other).and_then(|spec| m().module_family(&spec)),
                 };
                 match family {
                     Some(family) => Callee::Module {
@@ -1360,7 +1492,7 @@ impl Walker<'_> {
                         };
                         // `Buffer.from`, `JSON.parse`, `util.format` as globals.
                         if let Some(object) = &object_name
-                            && contains(models::PASS_GLOBALS, &format!("{object}.{method}"))
+                            && has(&m().pass_globals, &format!("{object}.{method}"))
                         {
                             return Callee::Global(format!("{object}.{method}"));
                         }
@@ -1386,77 +1518,7 @@ impl Walker<'_> {
         };
 
         // How function arguments are entered.
-        let role = match &callee {
-            Callee::Method { method, object } if method == "on" || method == "once" => {
-                let socketish = object.as_deref().is_some_and(|o| {
-                    if env.sockets.contains(o) {
-                        return true;
-                    }
-                    let o = o.to_ascii_lowercase();
-                    o.contains("socket") || o == "client" || o == "ws"
-                });
-                let event = match call.arguments.first() {
-                    Some(Argument::StringLiteral(lit)) => lit.value.as_str(),
-                    _ => None,
-                };
-                if matches!(event, Some("connection" | "connect")) {
-                    Role::SocketConnection
-                } else if matches!(event, Some("entry")) {
-                    // yauzl / unzipper / tar: an archive entry, named by the archive's author.
-                    Role::ClientFirst("archive")
-                } else if socketish
-                    && event.is_some_and(|e| !contains(models::SOCKET_BUILTIN_EVENTS, e))
-                {
-                    Role::Client("socket")
-                } else {
-                    Role::Plain
-                }
-            }
-            // Electron: `ipcMain.on(channel, (event, ...args) => ...)`
-            Callee::Method {
-                method,
-                object: Some(object),
-            } if object == "ipcMain"
-                && matches!(method.as_str(), "on" | "handle" | "once" | "handleOnce") =>
-            {
-                Role::ClientAfterFirst("ipc")
-            }
-            // `window.addEventListener('message', (event) => ...)`
-            Callee::Method { method, .. } | Callee::Global(method)
-                if method == "addEventListener"
-                    && matches!(call.arguments.first(), Some(Argument::StringLiteral(l)) if l.value.as_str() == Some("message")) =>
-            {
-                Role::ClientFirst("postmessage")
-            }
-            // `chrome.runtime.onMessage.addListener((message, sender, reply) => ...)`
-            Callee::Method { method, .. }
-                if method == "addListener"
-                    && call
-                        .callee
-                        .get_inner_expression()
-                        .as_member_expression()
-                        .is_some_and(|m| {
-                            m.object()
-                                .as_member_expression()
-                                .and_then(|o| o.static_property_name())
-                                .is_some_and(|p| {
-                                    p == "onMessage"
-                                        || p == "onMessageExternal"
-                                        || p == "onConnectExternal"
-                                })
-                        }) =>
-            {
-                Role::ClientFirst("ext-message")
-            }
-            // tar `{ onentry(entry) }` / `{ filter(path, entry) }` options are handled as objects;
-            // adm-zip `zip.forEach((entry) => ...)` is covered by getEntries() below.
-            Callee::Method { method, .. }
-                if contains(models::ROUTE_METHODS, method) && call.arguments.len() >= 2 =>
-            {
-                Role::Route
-            }
-            _ => Role::Plain,
-        };
+        let (role, shape) = self.client_role(&callee, call, env);
         let route_name = match (&callee, call.arguments.first()) {
             (Callee::Method { method, .. }, Some(Argument::StringLiteral(path)))
                 if role == Role::Route =>
@@ -1469,38 +1531,92 @@ impl Walker<'_> {
             }
             _ => None,
         };
+        let last = call.arguments.len().saturating_sub(1);
         let mut taints = Vec::with_capacity(call.arguments.len());
-        for argument in &call.arguments {
+        for (index, argument) in call.arguments.iter().enumerate() {
+            let arg_role = match shape {
+                Shape::LastCallback if index != last => Role::Plain,
+                Shape::ObjectOfFunctions => Role::Plain,
+                _ => role,
+            };
+            let callbacks_object = matches!(shape, Shape::ObjectOfFunctions | Shape::RouteObject)
+                && matches!(
+                    argument
+                        .as_expression()
+                        .map(Expression::get_inner_expression),
+                    Some(Expression::ObjectExpression(_))
+                );
             let taint = match (argument.as_expression(), &route_name) {
-                (Some(expr), Some(name)) if role == Role::Route => {
-                    if self.maybe_function(expr, env, Some(name.clone()), role) {
+                // Walked below, once, as callbacks.
+                _ if callbacks_object => None,
+                (Some(expr), Some(name)) if arg_role == Role::Route => {
+                    if self.maybe_function(expr, env, Some(name.clone()), arg_role) {
                         None
                     } else {
                         self.expr(expr, env)
                     }
                 }
-                _ => self.argument(argument, env, role),
+                _ => self.argument(argument, env, arg_role),
             };
             taints.push(taint);
         }
-
-        // `Meteor.methods({ name(args) { ... } })`: method arguments come from any client.
-        if let Callee::Method {
-            object: Some(object),
-            method,
-        } = &callee
-            && object == "Meteor"
-            && method == "methods"
-            && let Some(Expression::ObjectExpression(methods)) = call
-                .arguments
-                .first()
-                .and_then(Argument::as_expression)
-                .map(Expression::get_inner_expression)
-        {
-            for property in &methods.properties {
-                if let ObjectPropertyKind::ObjectProperty(p) = property {
-                    let name = prop_name(&p.key).map(|n| format!("Meteor.methods {n}"));
-                    self.maybe_function(&p.value, env, name, Role::Client("meteor"));
+        // `Meteor.methods({ name(args) { ... } })`, `fastify.route({ method, url, handler })`:
+        // the function-valued properties of an object argument are the callbacks.
+        if shape == Shape::ObjectOfFunctions || shape == Shape::RouteObject {
+            for argument in &call.arguments {
+                let Some(Expression::ObjectExpression(object)) = argument
+                    .as_expression()
+                    .map(Expression::get_inner_expression)
+                else {
+                    continue;
+                };
+                let route = (shape == Shape::RouteObject).then(|| {
+                    let text = |key: &str| {
+                        object_prop(argument.as_expression()?, &[key]).and_then(|v| {
+                            match v.get_inner_expression() {
+                                Expression::StringLiteral(l) => l.value.as_str().map(str::to_owned),
+                                _ => None,
+                            }
+                        })
+                    };
+                    format!(
+                        "{} {}",
+                        m().route_method_keys
+                            .iter()
+                            .find_map(|k| text(k))
+                            .unwrap_or_default()
+                            .to_ascii_uppercase(),
+                        m().route_path_keys
+                            .iter()
+                            .find_map(|k| text(k))
+                            .unwrap_or_default()
+                    )
+                });
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(p) = property else {
+                        continue;
+                    };
+                    let key = prop_name(&p.key);
+                    if shape == Shape::RouteObject {
+                        if key
+                            .as_deref()
+                            .is_some_and(|k| has(&m().route_handler_keys, k))
+                        {
+                            self.maybe_function(&p.value, env, route.clone(), Role::Route);
+                        }
+                        continue;
+                    }
+                    let name = match (&callee, key) {
+                        (
+                            Callee::Method {
+                                object: Some(o),
+                                method,
+                            },
+                            Some(k),
+                        ) => Some(format!("{o}.{method} {k}")),
+                        (_, key) => key,
+                    };
+                    self.maybe_function(&p.value, env, name, role);
                 }
             }
         }
@@ -1508,13 +1624,20 @@ impl Walker<'_> {
         // Sinks.
         let sink = match &callee {
             Callee::Module { family, export } => {
-                models::module_sink(family, export.as_deref().unwrap_or(""))
+                m().module_sink(family, export.as_deref().unwrap_or(""))
             }
-            Callee::Global(name) => models::global_sink(name),
-            Callee::Method { method, .. } => models::method_sink(method),
+            Callee::Global(name) => m().global_sink(name),
+            Callee::Method { method, .. } => m().method_sink(method),
         };
         if let Some(sink) = sink {
-            self.check_sink(sink, &callee, &call.arguments, &taints, call.span, env);
+            self.check_sink(
+                sink.clone(),
+                &callee,
+                &call.arguments,
+                &taints,
+                call.span,
+                env,
+            );
         }
 
         // Same-file helpers whose parameters reach a sink.
@@ -1577,7 +1700,7 @@ impl Walker<'_> {
             self.apply_summaries(&name, &summaries, &taints, call.span, env);
         }
         // Handlers passed by reference: `socket.on('ev', onEvent)`, `ipcMain.handle(ch, fn)`.
-        if let Role::Client(kind) | Role::ClientFirst(kind) | Role::ClientAfterFirst(kind) = role {
+        if let Role::Client(kind, selected) = role {
             for argument in &call.arguments {
                 let Some(expr) = argument.as_expression() else {
                     continue;
@@ -1604,12 +1727,7 @@ impl Walker<'_> {
                 let most = summaries.iter().map(|s| s.param + 1).max().unwrap_or(0);
                 let synthetic: Vec<Option<Origin>> = (0..most)
                     .map(|index| {
-                        let wanted = match role {
-                            Role::ClientFirst(_) => index == 0,
-                            Role::ClientAfterFirst(_) => index > 0,
-                            _ => true,
-                        };
-                        wanted.then(|| Origin {
+                        selected.wants(index).then(|| Origin {
                             kind,
                             span: expr.span(),
                             steps: Vec::new(),
@@ -1617,6 +1735,7 @@ impl Walker<'_> {
                             prefix: true,
                             sqlish: false,
                             param: None,
+                            object: true,
                         })
                     })
                     .collect();
@@ -1632,7 +1751,7 @@ impl Walker<'_> {
                 if let Some(member) = call.callee.get_inner_expression().as_member_expression()
                     && let Some(kind) =
                         self.request_kind(member.object().get_inner_expression(), env)
-                    && contains(models::REQUEST_METHODS, method)
+                    && has(&m().request_methods, method)
                 {
                     return Some(Origin {
                         kind,
@@ -1642,25 +1761,19 @@ impl Walker<'_> {
                         prefix: true,
                         sqlish: false,
                         param: None,
+                        object: true,
                     });
                 }
-                // adm-zip: `zip.getEntries()` lists entries named by the archive's author.
-                if method == "getEntries" {
-                    return Some(Origin {
-                        kind: "archive",
-                        span: call.span,
-                        steps: Vec::new(),
-                        built: false,
-                        prefix: true,
-                        sqlish: false,
-                        param: None,
-                    });
+                // Pack result sources: `zip.getEntries()`.
+                if let Some(source) = m().result_sources.iter().find(|s| has(&s.methods, method)) {
+                    return Some(Origin::source(source.kind.as_str(), call.span));
                 }
-                if contains(models::PASS_METHODS, method) {
-                    let built = contains(models::BUILD_METHODS, method);
+                if has(&m().pass_methods, method) {
+                    let built = has(&m().build_methods, method);
                     let taint = union(receiver, any_arg());
                     return taint.map(|mut o| {
                         o.built |= built;
+                        o.object = false;
                         o.step(call.span.start, format!("through .{method}()"))
                     });
                 }
@@ -1668,24 +1781,28 @@ impl Walker<'_> {
             }
             Callee::Module { family, export } => {
                 let export = export.as_deref().unwrap_or("");
-                if *family == "path" && contains(models::PATH_PASS, export) {
-                    return any_arg()
-                        .map(|o| o.step(call.span.start, format!("through path.{export}()")));
+                let qualified = format!("{family}.{export}");
+                if has(&m().clearing, &qualified) {
+                    return None;
                 }
-                if *family == "util" && export == "format" {
+                if has(&m().module_pass, &qualified) {
+                    let built = has(&m().build_methods, export);
                     return any_arg().map(|mut o| {
-                        o.built = true;
-                        o.step(call.span.start, "through util.format()".to_owned())
+                        o.built |= built;
+                        o.step(call.span.start, format!("through {qualified}()"))
                     });
                 }
                 None
             }
             Callee::Global(name) => {
-                if contains(models::CLEARING, name) {
+                if has(&m().clearing, name) {
                     return None;
                 }
-                if contains(models::PASS_GLOBALS, name) {
-                    let built = name == "util.format";
+                if has(&m().pass_globals, name) {
+                    let built = name
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|last| last != name && has(&m().build_methods, last));
                     return any_arg().map(|mut o| {
                         o.built |= built;
                         o.step(call.span.start, format!("through {name}()"))
@@ -1694,6 +1811,88 @@ impl Walker<'_> {
                 None
             }
         }
+    }
+
+    /// How a call's function arguments are entered, from the packs' route, socket and
+    /// client-source conventions.
+    fn client_role(&self, callee: &Callee, call: &CallExpression<'_>, env: &Env) -> (Role, Shape) {
+        let model = m();
+        let event = match call.arguments.first() {
+            Some(Argument::StringLiteral(lit)) => lit.value.as_str(),
+            _ => None,
+        };
+        let (object, method) = match callee {
+            Callee::Method { object, method } => (object.as_deref(), method.as_str()),
+            Callee::Global(name) => (None, name.as_str()),
+            Callee::Module { export, .. } => (None, export.as_deref().unwrap_or("")),
+        };
+        // The property the receiver was read from: `chrome.runtime.onMessage.addListener`.
+        let via = call
+            .callee
+            .get_inner_expression()
+            .as_member_expression()
+            .and_then(|mem| mem.object().as_member_expression())
+            .and_then(|o| o.static_property_name())
+            .and_then(|p| p.as_str().map(str::to_owned));
+        for source in &model.client_sources {
+            if !has(&source.methods, method)
+                || source.object.as_deref().is_some_and(|o| object != Some(o))
+                || source.event.as_deref().is_some_and(|e| event != Some(e))
+                || (!source.via.is_empty() && !via.as_deref().is_some_and(|v| has(&source.via, v)))
+                || source.shape.as_deref() == Some("resolver-map")
+            {
+                continue;
+            }
+            let params = Params::parse(&source.params);
+            let shape = match source.shape.as_deref() {
+                Some("last-callback") => Shape::LastCallback,
+                Some("object-of-functions") => Shape::ObjectOfFunctions,
+                _ => Shape::Callback,
+            };
+            return (Role::Client(source.kind.as_str(), params), shape);
+        }
+        if has(&model.socket_methods, method) || has(&model.socket_any_methods, method) {
+            if event.is_some_and(|e| has(&model.socket_connection_events, e)) {
+                return (Role::SocketConnection, Shape::Callback);
+            }
+            let socketish = object.is_some_and(|o| {
+                env.sockets.contains(o) || {
+                    let lower = o.to_ascii_lowercase();
+                    model
+                        .socket_name_contains
+                        .iter()
+                        .any(|n| lower.contains(n.as_str()))
+                        || has(&model.socket_names, &lower)
+                }
+            });
+            if socketish && has(&model.socket_any_methods, method) {
+                // `socket.onAny((event, ...args) => ...)`
+                return (Role::Client("socket", Params::AfterFirst), Shape::Callback);
+            }
+            if socketish && event.is_some_and(|e| !has(&model.socket_builtin_events, e)) {
+                return (Role::Client("socket", Params::All), Shape::Callback);
+            }
+        }
+        if has(&model.server_factories, method) {
+            return (Role::Route, Shape::Callback);
+        }
+        if let Callee::Method { .. } = callee {
+            if has(&model.route_object_methods, method)
+                && matches!(
+                    call.arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .map(Expression::get_inner_expression),
+                    Some(Expression::ObjectExpression(_))
+                )
+            {
+                return (Role::Plain, Shape::RouteObject);
+            }
+            if has(&model.route_methods, method) && call.arguments.len() >= 2 {
+                return (Role::Route, Shape::Callback);
+            }
+        }
+        (Role::Plain, Shape::Callback)
     }
 
     /// Reports each summary whose parameter receives a tainted value at a call.
@@ -1710,8 +1909,12 @@ impl Walker<'_> {
                 continue;
             };
             let at_sink = &summary.at_sink;
-            let url_rule =
-                summary.class == VulnClass::Ssrf || summary.api.ends_with("openExternal");
+            let url_rule = summary.class == VulnClass::Ssrf || {
+                let last = summary.api.rsplit('.').next().unwrap_or("");
+                m().method_sink(last)
+                    .or_else(|| m().global_sink(last))
+                    .is_some_and(|s| s.args.iter().any(|r| matches!(r, ArgRule::UrlPrefix(_))))
+            };
             // The helper used the parameter as the URL start: the caller must control it.
             if url_rule && at_sink.prefix && !origin.prefix {
                 continue;
@@ -1757,9 +1960,7 @@ impl Walker<'_> {
     /// Records a finding, or in the summary pass, a summary of a parameter that reaches a sink.
     fn emit(&mut self, mut finding: RawFinding, env: &Env) {
         // The CLI is the user's own machine: never above low.
-        if finding.origin.kind == "cli" {
-            finding.severity = Severity::Low;
-        }
+        finding.severity = m().cap(finding.origin.kind, finding.severity);
         match (self.summarize, finding.origin.param) {
             (true, Some(param)) => {
                 let list = self.summaries.entry(env.function.clone()).or_default();
@@ -1805,38 +2006,34 @@ impl Walker<'_> {
                 None => format!(".{method}"),
             },
         };
-        // `res.sendFile(p, { root })` confines the path.
-        if matches!(callee, Callee::Method { method, .. } if method == "sendFile" || method == "download")
-            && arguments
-                .iter()
-                .skip(1)
-                .filter_map(Argument::as_expression)
-                .any(|e| object_prop(e, &["root"]).is_some())
-        {
+        // An option that confines the sink: `res.sendFile(p, { root })`.
+        let confined = arguments
+            .iter()
+            .skip(1)
+            .filter_map(Argument::as_expression)
+            .any(|e| {
+                sink.confined_by
+                    .iter()
+                    .any(|key| object_prop(e, &[key.as_str()]).is_some())
+            });
+        if confined {
             return;
         }
         let mut severity = sink.severity;
-        let mut rules: Vec<ArgRule> = sink.args.to_vec();
-        // spawn/execFile with `shell: true`: every argument is shell text.
-        if let Callee::Module {
-            family: "child_process",
-            export: Some(export),
-        } = callee
-            && matches!(
-                export.as_str(),
-                "spawn" | "spawnSync" | "execFile" | "execFileSync"
-            )
+        let mut rules: Vec<ArgRule> = sink.args.clone();
+        // An option that escalates: `spawn(cmd, args, { shell: true })`.
+        if let Some((option, escalated, escalated_rules)) = &sink.escalate
             && arguments
                 .iter()
                 .filter_map(Argument::as_expression)
                 .any(|e| {
-                    object_prop(e, &["shell"]).is_some_and(|v| {
+                    object_prop(e, &[option.as_str()]).is_some_and(|v| {
                     !matches!(v.get_inner_expression(), Expression::BooleanLiteral(b) if !b.value)
                 })
                 })
         {
-            severity = Severity::Critical;
-            rules = vec![ArgRule::Any(0), ArgRule::Any(1)];
+            severity = *escalated;
+            rules = escalated_rules.clone();
         }
         for rule in rules {
             let (index, origin) = match rule {
@@ -1845,6 +2042,34 @@ impl Walker<'_> {
                     index,
                     taints.get(index).cloned().flatten().filter(|o| o.built),
                 ),
+                ArgRule::Object(index) => {
+                    // `find(req.body.filter)` or `find({ email: req.body.email })`: a value that
+                    // JSON or qs can turn into `{ "$ne": null }`.
+                    let arg = arguments.get(index).and_then(Argument::as_expression);
+                    let from_fields = match arg.map(Expression::get_inner_expression) {
+                        Some(Expression::ObjectExpression(object)) => object
+                            .properties
+                            .iter()
+                            .find_map(|property| match property {
+                                ObjectPropertyKind::ObjectProperty(p) => {
+                                    let mut probe = env.clone();
+                                    self.expr(&p.value, &mut probe)
+                                        .filter(|o| !o.built && o.object)
+                                }
+                                ObjectPropertyKind::SpreadProperty(_) => None,
+                            }),
+                        _ => None,
+                    };
+                    let direct = taints.get(index).cloned().flatten().filter(|o| {
+                        !o.built
+                            && o.object
+                            && !matches!(
+                                arg.map(Expression::get_inner_expression),
+                                Some(Expression::ObjectExpression(_))
+                            )
+                    });
+                    (index, from_fields.or(direct))
+                }
                 ArgRule::Built(index) => (
                     index,
                     taints
@@ -1869,7 +2094,9 @@ impl Walker<'_> {
                         .get(index)
                         .and_then(Argument::as_expression)
                         .and_then(|e| {
-                            object_prop(e, &["url", "uri", "host", "hostname", "baseURL"])
+                            let keys: Vec<&str> =
+                                m().url_option_keys.iter().map(String::as_str).collect();
+                            object_prop(e, &keys)
                         })
                         .and_then(|value| {
                             let mut probe = env.clone();
@@ -1881,11 +2108,7 @@ impl Walker<'_> {
             };
             let Some(origin) = origin else { continue };
             // The CLI is the user's own machine: never above low.
-            let severity = if origin.kind == "cli" {
-                Severity::Low
-            } else {
-                severity
-            };
+            let severity = m().cap(origin.kind, severity);
             let Some(arg) = arguments.get(index) else {
                 continue;
             };
@@ -2190,6 +2413,54 @@ mod tests {
         assert_eq!(one(src).len(), 1);
         let ipc = "function openIt(event, url) { exec(url); }\nipcMain.handle('open', openIt);";
         assert_eq!(one(ipc).len(), 1);
+    }
+
+    #[test]
+    fn nosql_operator_injection_needs_an_object_capable_value() {
+        let tp = one(
+            "app.post('/login', async (req, res) => { await User.findOne({ email: req.body.email, password: req.body.password }); });",
+        );
+        assert_eq!(tp.len(), 1, "{tp:?}");
+        assert_eq!(tp[0].0, VulnClass::NosqlInjection);
+        assert!(one("app.post('/l', async (req, res) => { await User.findOne({ email: String(req.body.email) + '' }); });").is_empty());
+        // Route params are always strings.
+        assert!(
+            one("app.get('/u/:id', async (req, res) => { await User.findById(req.params.id); });")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn raw_http_servers_and_fastify_route_objects_are_routes() {
+        let raw = scan(
+            "const http = require('http');\nconst { exec } = require('child_process');\nhttp.createServer((req, res) => { exec('ls ' + req.url); });",
+        );
+        assert_eq!(raw.len(), 1, "{raw:?}");
+        let fastify = one(
+            "fastify.route({ method: 'GET', url: '/x', handler: async (request, reply) => { exec('ls ' + request.query.d); } });",
+        );
+        assert_eq!(fastify.len(), 1, "{fastify:?}");
+    }
+
+    #[test]
+    fn graphql_trpc_queues_and_socket_on_any() {
+        let gql = one(
+            "const resolvers = { Query: { file(parent, args) { return fs.readFileSync(args.path); } } };",
+        );
+        assert_eq!(gql.len(), 1, "{gql:?}");
+        assert_eq!(gql[0].3, "graphql");
+        let trpc = one(
+            "const r = t.procedure.input(z.string()).mutation(({ input, ctx }) => exec('ls ' + input));",
+        );
+        assert_eq!(trpc.len(), 1, "{trpc:?}");
+        let trpc_opts = one("const r = t.procedure.query((opts) => exec('ls ' + opts.input.dir));");
+        assert_eq!(trpc_opts.len(), 1, "{trpc_opts:?}");
+        let queue =
+            one("queue.process('convert', async (job) => { exec('convert ' + job.data.file); });");
+        assert_eq!(queue.len(), 1, "{queue:?}");
+        let any =
+            one("io.on('connection', (socket) => { socket.onAny((event, data) => exec(data)); });");
+        assert_eq!(any.len(), 1, "{any:?}");
     }
 
     #[test]

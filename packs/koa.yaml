@@ -1,0 +1,4 @@
+# Koa: `ctx` is the request; `ctx.request` too.
+name: koa
+request:
+  context_names: [ctx]

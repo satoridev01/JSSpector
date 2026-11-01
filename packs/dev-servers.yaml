@@ -1,0 +1,8 @@
+# Development servers: middleware registered on Vite / webpack-dev-server / connect instances.
+# Their handlers see real requests, but only while developing: medium at most.
+name: dev-servers
+routes:
+  # `server.middlewares.use((req, res, next) => ...)` in a Vite plugin's configureServer.
+  middleware_registrations: [{via: [middlewares], methods: [use], kind: dev-server}]
+severity_caps:
+  dev-server: medium

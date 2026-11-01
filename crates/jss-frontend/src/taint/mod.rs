@@ -204,6 +204,7 @@ pub fn scan_file_program(
         facts: FileFacts::default(),
         field_of: BTreeMap::new(),
         pending_auth: Auth::NoneDetected,
+        pending_request_kind: std::cell::Cell::new(None),
         router_auth: BTreeMap::new(),
         routers: BTreeSet::new(),
         injected: BTreeMap::new(),
@@ -520,6 +521,8 @@ struct Walker<'e> {
     field_of: BTreeMap<u32, String>,
     /// Authentication for the next function entered (route middleware, guard decorators).
     pending_auth: Auth,
+    /// The request kind for the next route handler entered (`dev-server`), when not plain `http`.
+    pending_request_kind: std::cell::Cell<Option<&'static str>>,
     /// Routers with authentication middleware applied to every later route: `router.use(auth)`.
     router_auth: BTreeMap<String, Auth>,
     /// Variables bound to a router or app from a factory: `const router = express.Router()`.
@@ -1737,7 +1740,12 @@ impl Walker<'_> {
                         // Hono: request data is under `c.req`; `c` itself is context.
                         env.requests.insert(first.to_owned(), CONTEXT);
                     } else if conventional || (role == Role::Route && names.len() >= 2) {
-                        env.requests.insert(first.to_owned(), "http");
+                        let kind = if role == Role::Route {
+                            self.pending_request_kind.take().unwrap_or("http")
+                        } else {
+                            "http"
+                        };
+                        env.requests.insert(first.to_owned(), kind);
                     }
                 } else if role == Role::Route
                     && let Some(param) = params.items.first()
@@ -3343,6 +3351,7 @@ impl Walker<'_> {
         env: &Env,
     ) -> (Role, Shape) {
         let model = m();
+        self.pending_request_kind.set(None);
         let event = match arguments.first() {
             Some(Argument::StringLiteral(lit)) => lit.value.as_str(),
             _ => None,
@@ -3412,6 +3421,16 @@ impl Walker<'_> {
             }
         }
         if has(&model.server_factories, method) {
+            return (Role::Route, Shape::Callback);
+        }
+        // `server.middlewares.use((req, res, next) => ...)`: a dev server's handlers.
+        if let Some(registration) = model
+            .middleware_registrations
+            .iter()
+            .find(|r| has(&r.methods, method) && via.as_deref().is_some_and(|v| has(&r.via, v)))
+        {
+            self.pending_request_kind
+                .set(Some(registration.kind.as_str()));
             return (Role::Route, Shape::Callback);
         }
         if let Callee::Method { .. } = callee {
@@ -3530,6 +3549,43 @@ impl Walker<'_> {
             role
         };
         let first = call.arguments.first().and_then(Argument::as_expression);
+        // A client source: an event, channel or schema name (`socket.on('join', ...)`,
+        // `server.setRequestHandler(CallToolRequestSchema, ...)`), never the callback itself.
+        if let Role::Client(kind, _) = role {
+            let event = match call.arguments.first() {
+                _ if call.arguments.len() < 2 => None,
+                Some(Argument::StringLiteral(name)) => name.value.as_str().map(str::to_owned),
+                Some(Argument::Identifier(id)) => Some(
+                    self.constant(id.name.as_str())
+                        .unwrap_or_else(|| id.name.as_str().to_owned()),
+                ),
+                _ => None,
+            };
+            if let Some(event) =
+                event.filter(|n| !n.is_empty() && !n.contains(char::is_whitespace) && n.len() < 120)
+            {
+                let handler = call
+                    .arguments
+                    .last()
+                    .and_then(Argument::as_expression)
+                    .and_then(|e| match e.get_inner_expression() {
+                        Expression::ArrowFunctionExpression(_)
+                        | Expression::FunctionExpression(_) => None,
+                        other => callee_name(other),
+                    })
+                    .unwrap_or_else(|| format!("{} {event}", kind.to_ascii_uppercase()));
+                self.facts.routes.push(RouteFact {
+                    receiver: object.clone(),
+                    method: kind.to_ascii_uppercase(),
+                    path: event,
+                    handler,
+                    span: call.span,
+                    auth,
+                    kind,
+                });
+            }
+            return;
+        }
         // `function add(path, h) { router.get(path, h) }`: a template, not a route.
         let parts = first.and_then(|e| self.path_parts(e, env));
         let receiver_param = object
@@ -3650,22 +3706,6 @@ impl Walker<'_> {
                     kind: "http",
                 });
             }
-            // An event or channel name (`socket.on('join', ...)`), not any text.
-            Role::Client(_, _)
-                if !matches!(
-                    call.arguments.first(),
-                    Some(Argument::StringLiteral(name))
-                        if name.value.as_str().is_some_and(|n| !n.is_empty() && !n.contains(char::is_whitespace))
-                ) => {}
-            Role::Client(kind, _) => self.facts.routes.push(RouteFact {
-                receiver: object.clone(),
-                method: kind.to_ascii_uppercase(),
-                path,
-                handler,
-                span: call.span,
-                auth,
-                kind,
-            }),
             _ => {}
         }
     }
@@ -4906,6 +4946,42 @@ mod tests {
             "const _ = require('lodash');\napp.post('/s', (req, res) => { _.set(settings, req.body.path, 1); });",
         );
         assert_eq!(found[0].1, Severity::Medium);
+    }
+
+    #[test]
+    fn dev_server_middleware_is_capped_and_mcp_tool_arguments_are_sources() {
+        let dev = one(
+            "export default { plugins: [{ configureServer(server) { server.middlewares.use((req, res, next) => { res.end(fs.readFileSync(path.join(root, req.url))); }); } }] };",
+        );
+        assert_eq!(
+            dev,
+            vec![(
+                VulnClass::PathTraversal,
+                Severity::Medium,
+                "fs.readFileSync".to_owned(),
+                "dev-server"
+            )]
+        );
+        let mcp = one(
+            "server.tool('run', 'Run a command', { cmd: z.string() }, async ({ cmd }) => { exec(cmd); });",
+        );
+        assert_eq!(
+            mcp,
+            vec![(
+                VulnClass::CommandInjection,
+                Severity::Critical,
+                "child_process.exec".to_owned(),
+                "mcp"
+            )]
+        );
+        let low_level = one(
+            "server.setRequestHandler(CallToolRequestSchema, async (request) => { const { path } = request.params.arguments; return fs.readFileSync(path); });",
+        );
+        assert_eq!(low_level.len(), 1, "{low_level:?}");
+        let fastmcp = one(
+            "server.addTool({ name: 'read', execute: async (args) => fs.readFileSync(args.file) });",
+        );
+        assert_eq!(fastmcp.len(), 1, "{fastmcp:?}");
     }
 
     #[test]

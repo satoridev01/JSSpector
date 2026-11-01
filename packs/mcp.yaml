@@ -1,0 +1,10 @@
+# Model Context Protocol servers: tool, prompt and resource arguments come from the client (and,
+# through it, from whatever text the model read).
+name: mcp
+client_sources:
+  # @modelcontextprotocol/sdk McpServer: server.tool(name, [description], [schema], handler)
+  - {methods: [tool, registerTool, prompt, registerPrompt, resource, registerResource], shape: last-callback, params: first, kind: mcp}
+  # Low-level Server: server.setRequestHandler(CallToolRequestSchema, async (request) => ...)
+  - {methods: [setRequestHandler], shape: last-callback, params: first, kind: mcp}
+  # FastMCP: server.addTool({ name, parameters, execute: async (args) => ... })
+  - {methods: [addTool, addPrompt, addResource, addResourceTemplate], shape: object-of-functions, params: first, kind: mcp}

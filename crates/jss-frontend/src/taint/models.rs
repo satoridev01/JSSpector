@@ -45,6 +45,11 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
         "prototype-pollution",
         include_str!("../../../../packs/prototype-pollution.yaml"),
     ),
+    (
+        "dev-servers",
+        include_str!("../../../../packs/dev-servers.yaml"),
+    ),
+    ("mcp", include_str!("../../../../packs/mcp.yaml")),
 ];
 
 /// One pack file, as written.
@@ -263,6 +268,18 @@ pub struct RouteSpec {
     pub public_options: Vec<String>,
     #[serde(default)]
     pub path_keys: Vec<String>,
+    /// Handler registrations on a property of a server: `server.middlewares.use(handler)`.
+    #[serde(default)]
+    pub middleware_registrations: Vec<MiddlewareRegistration>,
+}
+
+/// `X.<via>.<method>(handler)` registers `(req, res)` handlers whose requests are `kind`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareRegistration {
+    pub via: Vec<String>,
+    pub methods: Vec<String>,
+    pub kind: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -535,6 +552,7 @@ pub struct Model {
     pub route_decorators: Vec<String>,
     pub controller_auth: BTreeMap<String, jss_core::Auth>,
     pub public_options: Vec<String>,
+    pub middleware_registrations: Vec<MiddlewareRegistration>,
     pub route_path_keys: Vec<String>,
     /// Packs that failed to load, with the reason.
     pub errors: Vec<String>,
@@ -687,6 +705,8 @@ impl Model {
             self.controller_auth.insert(decorator, auth);
         }
         self.public_options.extend(pack.routes.public_options);
+        self.middleware_registrations
+            .extend(pack.routes.middleware_registrations);
         self.route_path_keys.extend(pack.routes.path_keys);
     }
 

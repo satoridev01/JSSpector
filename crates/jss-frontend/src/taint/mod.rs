@@ -234,6 +234,10 @@ impl Linking<'_> {
     }
 }
 
+/// Most summary passes over one file: enough for a chain of helpers five deep declared
+/// callers first.
+const MAX_SUMMARY_PASSES: usize = 6;
+
 /// Scans a parsed program that is `linking.file` in a scan root, with the root's summaries.
 pub fn scan_file_program(
     program: &Program<'_>,
@@ -270,8 +274,12 @@ pub fn scan_file_program(
         summarize: true,
         summaries: BTreeMap::new(),
     };
-    // Two summary passes: the second sees the first's summaries (helpers calling helpers).
-    for _ in 0..2 {
+    // Summary passes until a pass learns nothing new: each pass sees the previous one's
+    // summaries, so a helper declared before the helper it calls gets its summary one pass
+    // later (`a -> b -> c -> exec` declared in that order needs three). At least two, at most
+    // `MAX_SUMMARY_PASSES`.
+    let mut learned = usize::MAX;
+    for pass in 0..MAX_SUMMARY_PASSES {
         walker.modules.clear();
         // Middleware applies to the routes registered after it, in program order: never carry
         // a later `use(auth)` into an earlier route through a previous pass.
@@ -279,6 +287,18 @@ pub fn scan_file_program(
         walker.router_prefixes.clear();
         let mut env = Env::new("<module>".to_owned());
         walker.statements(&program.body, &mut env);
+        // Summaries and instance fields are only ever added (deduplicated), so their count
+        // grows until nothing changes.
+        let now = walker.summaries.values().map(Vec::len).sum::<usize>()
+            + walker
+                .class_fields
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>();
+        if pass >= 1 && now == learned {
+            break;
+        }
+        learned = now;
     }
     walker.summarize = false;
     walker.modules.clear();
@@ -6291,6 +6311,47 @@ mod tests {
                 "child_process.exec".to_owned(),
                 "http"
             )]
+        );
+    }
+
+    #[test]
+    fn helpers_declared_callers_first_get_summaries() {
+        // Four levels, each helper declared before the one it calls.
+        let found = one("app.get('/x', (req, res) => { a1(req.query.x); });\n\
+             function a1(v) { b1(v); }\nfunction b1(v) { c1(v); }\nfunction c1(v) { d1(v); }\n\
+             function d1(v) { exec('ls ' + v); }\n");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, VulnClass::CommandInjection);
+        // The same chain with a number at the end: nothing.
+        assert!(
+            one(
+                "app.get('/x', (req, res) => { a1(req.query.x); });\n\
+                 function a1(v) { b1(v); }\nfunction b1(v) { c1(v); }\nfunction c1(v) { d1(parseInt(v, 10)); }\n\
+                 function d1(v) { exec('ls ' + v); }\n",
+            )
+            .is_empty()
+        );
+        // A self-recursive walker with no sink converges with no finding.
+        assert!(
+            one(
+                "app.get('/x', (req, res) => { walk(req.body, 0); });\n\
+                 function walk(o, d) { if (d > 3) return o; for (const k in o) walk(o[k], d + 1); return o; }\n",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_class_field_calling_a_later_method_gets_its_summary() {
+        let found = one(
+            "class Node {\n  loadMethods = { list: async (data) => { await this.getTools(data); } };\n\
+             async getTools(data) { return run(data.inputs.config); }\n}\n\
+             function run(text) { return convert(text); }\nfunction convert(s) { return Function('return ' + s)(); }\n\
+             const n = new Node();\napp.post('/x', async (req, res) => { await n.getTools(req.body); });\n",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::CodeInjection),
+            "{found:?}"
         );
     }
 

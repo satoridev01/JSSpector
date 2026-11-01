@@ -248,8 +248,9 @@ fn major_version(spec: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// Most files a value is followed across: route -> controller -> service -> helper.
-pub const CROSS_FILE_HOPS: usize = 4;
+/// Most files a value is followed across: route -> controller -> registry -> service ->
+/// storage -> adapter -> helper. Rounds stop earlier once a round learns nothing new.
+pub const CROSS_FILE_HOPS: usize = 8;
 
 /// File -> every file it re-exports, followed through chains of barrels.
 fn reexport_closure(reports: &[ScanReport]) -> BTreeMap<String, BTreeSet<String>> {

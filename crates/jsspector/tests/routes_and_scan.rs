@@ -1112,3 +1112,33 @@ fn route_shapes_array_paths_verb_first_chains_and_prefixes() {
         "{findings:?}"
     );
 }
+
+#[test]
+fn a_value_is_followed_across_six_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "route.js",
+        "const s1 = require('./s1');\napp.get('/x', (req, res) => s1.go(req.query.x));\n\
+         app.get('/y', (req, res) => s1.go(String(parseInt(req.query.y, 10))));\n",
+    );
+    for (i, next) in [(1, 2), (2, 3), (3, 4), (4, 5)] {
+        write(
+            root,
+            &format!("s{i}.js"),
+            &format!("const n = require('./s{next}');\nexports.go = (v) => n.go(v);\n"),
+        );
+    }
+    write(
+        root,
+        "s5.js",
+        "const { exec } = require('child_process');\nexports.go = (v) => exec('ls ' + v);\n",
+    );
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = scan["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["class"], "command-injection");
+    assert_eq!(findings[0]["sink"]["file"], "s5.js");
+    assert_eq!(findings[0]["entry"], "GET /x");
+}

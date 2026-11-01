@@ -460,6 +460,7 @@ pub fn scan_file_program(
         fn_tables: BTreeMap::new(),
         promised: BTreeSet::new(),
         keyed_entries: BTreeMap::new(),
+        jumps: Vec::new(),
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -710,6 +711,10 @@ struct Env {
     remote: BTreeMap<String, Vec<ClassRef>>,
     /// Variables bound to a DOM node created here (`document.createElement('iframe')`).
     nodes: BTreeSet<String>,
+    /// Variables built, unchanged, from one tainted variable and clean parts
+    /// (`const file = join(root, dir, name)`): variable -> that one. A later check that the
+    /// variable is clean cleans what was built from it.
+    derived: BTreeMap<String, String>,
     /// Those nodes' tags, when the factory named one (`document.createElement('a')`).
     node_tags: BTreeMap<String, String>,
     /// Argument arrays that already hold `"--"`: what is pushed after it is positional.
@@ -750,6 +755,8 @@ struct PathState {
     scalars: BTreeSet<String>,
     partial: BTreeMap<String, u8>,
     fields: BTreeMap<String, BTreeMap<String, Origin>>,
+    nodes: BTreeSet<String>,
+    node_tags: BTreeMap<String, String>,
 }
 
 /// The value after two paths meet: tainted if either path left it tainted, with the weaker
@@ -773,6 +780,8 @@ impl Env {
             scalars: self.scalars.clone(),
             partial: self.partial.clone(),
             fields: self.fields.clone(),
+            nodes: self.nodes.clone(),
+            node_tags: self.node_tags.clone(),
         }
     }
 
@@ -782,6 +791,8 @@ impl Env {
         self.scalars = state.scalars;
         self.partial = state.partial;
         self.fields = state.fields;
+        self.nodes = state.nodes;
+        self.node_tags = state.node_tags;
     }
 
     /// Joins another path's state into this one: taint from either, facts from both.
@@ -796,6 +807,10 @@ impl Env {
         }
         self.clean.retain(|k| other.clean.contains(k));
         self.scalars.retain(|k| other.scalars.contains(k));
+        // A node on both paths only: `let x = markup; if (c) { x = doc.createElement('b') }`.
+        self.nodes.retain(|k| other.nodes.contains(k));
+        self.node_tags
+            .retain(|k, tag| other.node_tags.get(k) == Some(tag));
         self.partial
             .retain(|k, classes| match other.partial.get(k) {
                 Some(theirs) => {
@@ -856,6 +871,23 @@ impl Env {
 
     /// Records what a guard established.
     fn learn(&mut self, facts: Vec<(String, guards::Fact)>) {
+        // `if (!/^\d+\.webp$/.test(name)) return` after `file = join(root, name)`: `file` was
+        // built from `name` alone, unchanged, so it is as clean.
+        let mut facts = facts;
+        let built: Vec<(String, guards::Fact)> = facts
+            .iter()
+            .filter_map(|(key, fact)| match fact {
+                guards::Fact::Clean(classes) => Some((key, *classes)),
+                _ => None,
+            })
+            .flat_map(|(key, classes)| {
+                self.derived
+                    .iter()
+                    .filter(move |(_, from)| *from == key)
+                    .map(move |(built, _)| (built.clone(), guards::Fact::Clean(classes)))
+            })
+            .collect();
+        facts.extend(built);
         for (key, fact) in facts {
             let fact = match fact {
                 // A base the attacker chose confines nothing.
@@ -920,6 +952,7 @@ impl Env {
             tuples: BTreeMap::new(),
             nodes: BTreeSet::new(),
             node_tags: BTreeMap::new(),
+            derived: BTreeMap::new(),
             options_ended: BTreeSet::new(),
             encoded: BTreeSet::new(),
             found_by: BTreeMap::new(),
@@ -954,6 +987,7 @@ impl Env {
             tuples: self.tuples.clone(),
             nodes: self.nodes.clone(),
             node_tags: self.node_tags.clone(),
+            derived: self.derived.clone(),
             options_ended: self.options_ended.clone(),
             encoded: self.encoded.clone(),
             found_by: self.found_by.clone(),
@@ -973,6 +1007,8 @@ impl Env {
     /// the `if` `p` is the caller's again).
     fn bind(&mut self, name: &str, taint: Option<Origin>) {
         self.forget(name);
+        // What was built from the value `name` had before this write is not built from it now.
+        self.derived.retain(|_, from| from != name);
         match taint {
             Some(origin) => {
                 self.vars.insert(name.to_owned(), origin);
@@ -1124,6 +1160,9 @@ struct Walker<'e> {
     /// Registrations listed under an object key (`{ list: publicProcedure.query(fn) }`), by
     /// call span: the entry they are, which also names their callback.
     keyed_entries: BTreeMap<(u32, u32), String>,
+    /// The states at `break` / `continue` in the loops, switches and labeled statements being
+    /// walked (innermost last): each joins the state where its jump lands.
+    jumps: Vec<Vec<PathState>>,
     /// The fields each call that returns an object literal gave this walk: (call span) ->
     /// field -> taint (a field it does not list is clean).
     call_fields: BTreeMap<(u32, u32), BTreeMap<String, Origin>>,
@@ -1568,6 +1607,40 @@ fn any_contains<'n>(mut names: impl Iterator<Item = &'n str>, needles: &[String]
         let lower = name.to_ascii_lowercase();
         needles.iter().any(|n| lower.contains(n.as_str()))
     })
+}
+
+/// Whether evaluating `expr` can assign a variable or field (`flag && (x = 'ls')`), not counting
+/// nested functions.
+fn may_assign(expr: &Expression<'_>) -> bool {
+    fn walk(expr: &Expression<'_>, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        let deeper = |e: &Expression<'_>| walk(e, depth + 1);
+        let arg = |a: &Argument<'_>| a.as_expression().is_some_and(|e| walk(e, depth + 1));
+        match expr.get_inner_expression() {
+            Expression::AssignmentExpression(_) | Expression::UpdateExpression(_) => true,
+            Expression::SequenceExpression(seq) => seq.expressions.iter().any(deeper),
+            Expression::LogicalExpression(l) => deeper(&l.left) || deeper(&l.right),
+            Expression::BinaryExpression(b) => deeper(&b.left) || deeper(&b.right),
+            Expression::ConditionalExpression(c) => {
+                deeper(&c.test) || deeper(&c.consequent) || deeper(&c.alternate)
+            }
+            Expression::UnaryExpression(u) => deeper(&u.argument),
+            Expression::AwaitExpression(a) => deeper(&a.argument),
+            Expression::CallExpression(c) => deeper(&c.callee) || c.arguments.iter().any(arg),
+            Expression::NewExpression(n) => deeper(&n.callee) || n.arguments.iter().any(arg),
+            Expression::ArrayExpression(a) => a
+                .elements
+                .iter()
+                .any(|e| e.as_expression().is_some_and(|e| walk(e, depth + 1))),
+            Expression::TemplateLiteral(t) => t.expressions.iter().any(deeper),
+            other => other
+                .as_member_expression()
+                .is_some_and(|m| deeper(m.object())),
+        }
+    }
+    walk(expr, 0)
 }
 
 /// The names a callee's receiver is built from, outermost first: `input`, `procedure`, `t` for
@@ -2322,7 +2395,9 @@ impl Walker<'_> {
                     self.expr(update, env);
                 }
                 let before = env.save();
+                self.jumps.push(Vec::new());
                 self.statement(&s.body, env);
+                self.land_jumps(env);
                 env.join_with(&before);
                 env.branch -= 1;
             }
@@ -2345,7 +2420,9 @@ impl Walker<'_> {
                     (Some(array), Some(positions)) => self.bind_positions(array, &positions, env),
                     _ => self.for_left(&s.left, taint, env),
                 }
+                self.jumps.push(Vec::new());
                 self.statement(&s.body, env);
+                self.land_jumps(env);
                 env.join_with(&before);
                 env.branch -= 1;
                 // `for (const r of routes) router[r.method](r.path, r.handler)`: one record-only
@@ -2363,7 +2440,10 @@ impl Walker<'_> {
                         let mut inner = env.clone();
                         inner.rows.insert(var.name.as_str().to_owned(), row);
                         let saved = std::mem::replace(&mut self.record_only, true);
+                        // A row walk's jumps land in its own copy, which is dropped.
+                        self.jumps.push(Vec::new());
                         self.statement(&s.body, &mut inner);
+                        self.jumps.pop();
                         self.record_only = saved;
                     }
                 }
@@ -2375,19 +2455,25 @@ impl Walker<'_> {
                 env.branch += 1;
                 let before = env.save();
                 self.for_left(&s.left, taint, env);
+                self.jumps.push(Vec::new());
                 self.statement(&s.body, env);
+                self.land_jumps(env);
                 env.join_with(&before);
                 env.branch -= 1;
             }
             Statement::WhileStatement(s) => {
                 self.expr(&s.test, env);
                 let before = env.save();
+                self.jumps.push(Vec::new());
                 self.branch(&s.body, env);
+                self.land_jumps(env);
                 env.join_with(&before);
             }
             Statement::DoWhileStatement(s) => {
                 let before = env.save();
+                self.jumps.push(Vec::new());
                 self.branch(&s.body, env);
+                self.land_jumps(env);
                 env.join_with(&before);
                 self.expr(&s.test, env);
             }
@@ -2398,6 +2484,7 @@ impl Walker<'_> {
                 // established does not hold in another, nor after the switch.
                 let before = env.save();
                 let mut paths: Vec<PathState> = Vec::new();
+                self.jumps.push(Vec::new());
                 for case in &s.cases {
                     env.restore(before.clone());
                     if let Some(test) = &case.test {
@@ -2410,11 +2497,21 @@ impl Walker<'_> {
                 for path in &paths {
                     env.join_with(path);
                 }
+                self.land_jumps(env);
                 env.branch -= 1;
+            }
+            // `if (k) { x = req.query.c; break; }`: this path goes on where the jump lands.
+            Statement::BreakStatement(_) | Statement::ContinueStatement(_) => {
+                let state = env.save();
+                if let Some(frame) = self.jumps.last_mut() {
+                    frame.push(state);
+                }
             }
             Statement::LabeledStatement(s) => {
                 let before = env.save();
+                self.jumps.push(Vec::new());
                 self.statement(&s.body, env);
+                self.land_jumps(env);
                 env.join_with(&before);
             }
             // TypeScript `import shell = require('./shell')`: as `const shell = require(...)`.
@@ -2988,6 +3085,24 @@ impl Walker<'_> {
                     env.encoded.insert(name.clone());
                 } else {
                     env.encoded.remove(name);
+                }
+                // `const file = join(root, dir, name)`: built from one tainted variable, unchanged.
+                let mut parts = Vec::new();
+                let tainted: BTreeSet<String> = if self.built_from(init, &mut parts) {
+                    parts
+                        .into_iter()
+                        .filter(|part| env.vars.contains_key(part))
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
+                match tainted.iter().next() {
+                    Some(from) if tainted.len() == 1 && from != name => {
+                        env.derived.insert(name.clone(), from.clone());
+                    }
+                    _ => {
+                        env.derived.remove(name);
+                    }
                 }
                 // `const iframe = document.createElement('iframe')`: a node, not markup.
                 if creates_node(init) {
@@ -4668,7 +4783,13 @@ impl Walker<'_> {
             }
             Expression::LogicalExpression(logical) => {
                 let left = self.expr(&logical.left, env);
+                // `flag && (x = 'ls')`: the right side runs on one path only; what it assigns
+                // joins the path that skipped it.
+                let skipped = may_assign(&logical.right).then(|| env.save());
                 let right = self.expr(&logical.right, env);
+                if let Some(skipped) = skipped {
+                    env.join_with(&skipped);
+                }
                 // `options.path || path`: a module object, not data.
                 if self.module_fallback(expr).is_some() {
                     return None;
@@ -4682,6 +4803,18 @@ impl Walker<'_> {
                 guards::facts(&c.test, true, &mut held);
                 let mut failed = Vec::new();
                 guards::facts(&c.test, false, &mut failed);
+                // `flag ? (x = 'ls') : 0`: each branch on its own path, joined after.
+                if may_assign(&c.consequent) || may_assign(&c.alternate) {
+                    let before = env.save();
+                    env.learn(held);
+                    let a = self.expr(&c.consequent, env);
+                    let then_path = env.save();
+                    env.restore(before);
+                    env.learn(failed);
+                    let b = self.expr(&c.alternate, env);
+                    env.join_with(&then_path);
+                    return union(a, b);
+                }
                 let a = if held.is_empty() {
                     self.expr(&c.consequent, env)
                 } else {
@@ -4968,15 +5101,22 @@ impl Walker<'_> {
                 if assign.operator.is_assign() {
                     self.type_assignment(&assign.left, &assign.right, env);
                 }
-                // `video = doc.createElement('video')` on a `let video` declared earlier: a node.
+                // `video = doc.createElement('video')` on a `let video` declared earlier: a node;
+                // `re = new RegExp(input)`: no longer the regex it was declared with.
                 if assign.operator.is_assign()
                     && let Some(SimpleAssignmentTarget::AssignmentTargetIdentifier(id)) =
                         assign.left.as_simple_assignment_target()
                 {
+                    let name = id.name.as_str().to_owned();
                     if creates_node(&assign.right) {
-                        env.nodes.insert(id.name.as_str().to_owned());
+                        env.nodes.insert(name.clone());
                     } else {
-                        env.nodes.remove(id.name.as_str());
+                        env.nodes.remove(&name);
+                    }
+                    if is_regex(&assign.right) {
+                        self.regexes.insert(name, capture_mask(&assign.right));
+                    } else {
+                        self.regexes.remove(&name);
                     }
                 }
                 // `_mounts.main = (app) => { ... }`: one more function of the table.
@@ -5794,6 +5934,8 @@ impl Walker<'_> {
                     taint.map(|o| o.step(id.span.start, format!("assigned to `{}`", id.name)));
                 env.fields.remove(id.name.as_str());
                 env.bind(id.name.as_str(), taint);
+                // `file = other`: no longer built from what it was.
+                env.derived.remove(id.name.as_str());
             }
             other => {
                 if let Some(member) = other
@@ -7737,7 +7879,7 @@ impl Walker<'_> {
                 // an anchored allowlist admits: `/^(\d+)\.png$/` leaves nothing to attack).
                 if has(&m().regex_methods, method)
                     && let Some(member) = call.callee.get_inner_expression().as_member_expression()
-                    && let Some(classes) = self.regex_mask(member.object())
+                    && let Some(classes) = self.regex_mask(member.object(), env)
                 {
                     if classes == guards::ALL {
                         return None;
@@ -7757,7 +7899,7 @@ impl Walker<'_> {
                         .arguments
                         .first()
                         .and_then(Argument::as_expression)
-                        .and_then(|regex| self.regex_mask(regex))
+                        .and_then(|regex| self.regex_mask(regex, env))
                 {
                     if classes == guards::ALL {
                         return None;
@@ -10019,14 +10161,60 @@ impl Walker<'_> {
         })
     }
 
+    /// Whether `expr` is built from variables passed through unchanged (`+`, template literals,
+    /// a pack's path joins like `path.join(root, dir, name)`), with literals; `parts` gets those
+    /// variables. Anything else taking part (`decodeURIComponent(name)`, a member read) may
+    /// change the value: `false`.
+    fn built_from(&self, expr: &Expression<'_>, parts: &mut Vec<String>) -> bool {
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) => {
+                parts.push(id.name.as_str().to_owned());
+                true
+            }
+            Expression::StringLiteral(_) | Expression::NumericLiteral(_) => true,
+            Expression::TemplateLiteral(t) => {
+                t.expressions.iter().all(|e| self.built_from(e, parts))
+            }
+            Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
+                self.built_from(&b.left, parts) && self.built_from(&b.right, parts)
+            }
+            Expression::CallExpression(c) => {
+                let joins = match self.callee(&c.callee) {
+                    Callee::Module {
+                        family,
+                        export: Some(export),
+                    } => has(&m().root_joins, &format!("{family}.{export}")),
+                    _ => false,
+                };
+                joins
+                    && c.arguments
+                        .iter()
+                        .all(|a| a.as_expression().is_some_and(|e| self.built_from(e, parts)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Joins the states of the `break` / `continue` jumps that land here (see [`Walker::jumps`]).
+    fn land_jumps(&mut self, env: &mut Env) {
+        for state in self.jumps.pop().unwrap_or_default() {
+            env.join_with(&state);
+        }
+    }
+
     /// The classes a regular expression's captures are safe for: a literal, a local
     /// `const re = /.../`, or a property of a local or imported object of them
     /// (`regexes.profile` from `lib/utils/location.js`).
-    fn regex_mask(&self, expr: &Expression<'_>) -> Option<u8> {
+    fn regex_mask(&self, expr: &Expression<'_>, env: &Env) -> Option<u8> {
         if is_regex(expr) {
             return Some(capture_mask(expr));
         }
         let key = guards::path_key(expr)?;
+        // A parameter is whatever the caller passes, not a regex of this file of that name.
+        let head = key.split('.').next().unwrap_or(&key);
+        if env.params.iter().any(|p| p == head) {
+            return None;
+        }
         if let Some(mask) = self.regexes.get(&key) {
             return Some(*mask);
         }
@@ -11138,6 +11326,42 @@ mod tests {
             "let video = null; video = '<video src=' + location.hash + '>'; $(media).append(video);",
         );
         assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn a_check_after_building_a_path_cleans_what_was_built() {
+        let head = "import { join } from 'path';\nimport { readFileSync } from 'fs';\n";
+        // openGym: the file is joined first, the name checked after, the file read last.
+        assert!(route(&format!("{head}app.get('/m', (req, res) => {{ const name = req.query.n; const file = join(root, 'still', name); if (!/^\\d{{4,5}}\\.(webp|mp4)$/.test(name)) {{ return res.end(); }} res.end(readFileSync(file)); }});")).is_empty());
+        // A value changed on the way (decoded) is not what the check saw.
+        assert_eq!(route(&format!("{head}app.get('/d', (req, res) => {{ const raw = req.query.n; const file = join(root, decodeURIComponent(raw)); if (!/^[a-z%0-9]+$/.test(raw)) {{ return res.end(); }} res.end(readFileSync(file)); }});")).len(), 1);
+        // Built from the old value of a name written since.
+        assert_eq!(route(&format!("{head}app.get('/r', (req, res) => {{ let name = req.query.a; const file = join(root, name); name = req.query.b; if (!/^\\d+$/.test(name)) {{ return res.end(); }} res.end(readFileSync(file)); }});")).len(), 1);
+        // Two attacker parts: a check on one leaves the other.
+        assert_eq!(route(&format!("{head}app.get('/t', (req, res) => {{ const a = req.query.a; const b = req.query.b; const file = join(root, a, b); if (!/^\\d+$/.test(a)) {{ return res.end(); }} res.end(readFileSync(file)); }});")).len(), 1);
+    }
+
+    #[test]
+    fn jumps_and_conditional_expressions_join_their_paths() {
+        // `break` after a tainted assignment: the value leaves the loop with it.
+        assert_eq!(route("app.get('/a', (req, res) => { let x = 'ls'; for (const k of [1, 2]) { if (k) { x = req.query.c; break; } } exec(x); });").len(), 1);
+        // A guard that `continue`s still holds for the rest of the body.
+        assert!(route("app.post('/b', (req, res) => { for (const f of req.body.files) { if (!/^[a-z]+$/.test(f)) continue; exec('x ' + f); } });").is_empty());
+        // An assignment in one branch of `?:` or `&&` leaves the other path's value.
+        assert_eq!(route("app.get('/c', (req, res) => { let x = req.query.c; req.query.f ? (x = 'ls') : 0; exec(x); });").len(), 1);
+        assert_eq!(route("app.get('/d', (req, res) => { let x = req.query.c; req.query.f && (x = 'ls'); exec(x); });").len(), 1);
+        // A node on one path only is still markup on the other.
+        let found = scan(
+            "let x = '<b>' + location.hash + '</b>'; if (window.cond) { x = document.createElement('b'); } $(el).append(x);",
+        );
+        assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn a_parameter_never_borrows_a_named_regex() {
+        // `re` is the caller's regex, not the file's `const re`; a `let` reassigned is neither.
+        assert_eq!(route("function safe(s) { const re = /^[a-z]+$/; return re.test(s); }\nfunction pick(s, re) { const m = s.match(re); return m && m[0]; }\napp.get('/a', (req, res) => { exec('x ' + pick(req.query.s, new RegExp(req.query.r))); });").len(), 1);
+        assert_eq!(route("app.get('/b', (req, res) => { let re = /^[a-z]+$/; re = new RegExp(req.query.r); const m = req.query.s.match(re); exec('x ' + m[0]); });").len(), 1);
     }
 
     #[test]

@@ -1,0 +1,15 @@
+# LLM tool definitions: the model chooses a tool's arguments, and documents, web pages or emails
+# it read can steer them (prompt injection). anything-llm `aibitat.function({ parameters,
+# handler })`, Vercel AI `tool({ inputSchema, execute })`, LangChain `new DynamicStructuredTool({
+# schema, func })`, OpenAI Agents `tool({ parameters, execute })`.
+name: llm-tools
+tool_objects:
+  # An object literal with a (non-array) schema and a function under a handler key; never a
+  # route configuration (`{ url, schema, handler }`).
+  - schema_keys: [parameters, inputSchema, input_schema, schema, argsSchema]
+    handler_keys: [handler, execute, func, run, invoke, call]
+    not_keys: [url, path, method, route, routes]
+    kind: llm-tool
+# Reached only through what the model read (indirect, like component props): medium at most.
+severity_caps:
+  llm-tool: medium

@@ -1274,6 +1274,47 @@ fn annotated_class(annotation: Option<&oxc_ast::ast::TSTypeAnnotation<'_>>) -> O
         .then(|| name.to_owned())
 }
 
+/// The handler key and source kind of an object literal that defines an LLM tool: a schema under
+/// one of the pack's schema keys (not an array) and a function under a handler key, and none of
+/// the keys of a route configuration.
+fn tool_object(object: &ObjectExpression<'_>) -> Option<(&'static str, &'static str)> {
+    m().tool_objects.iter().find_map(|spec| {
+        let mut schema = false;
+        let mut handler: Option<&'static str> = None;
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(p) = property else {
+                continue;
+            };
+            let Some(key) = prop_name(&p.key) else {
+                continue;
+            };
+            if has(&spec.not_keys, &key) {
+                return None;
+            }
+            let value = p.value.get_inner_expression();
+            if has(&spec.schema_keys, &key)
+                && matches!(
+                    value,
+                    Expression::ObjectExpression(_)
+                        | Expression::CallExpression(_)
+                        | Expression::Identifier(_)
+                        | Expression::StaticMemberExpression(_)
+                )
+            {
+                schema = true;
+            }
+            if matches!(
+                value,
+                Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+            ) && let Some(found) = spec.handler_keys.iter().find(|k| **k == key)
+            {
+                handler = Some(found.as_str());
+            }
+        }
+        handler.filter(|_| schema).map(|h| (h, spec.kind.as_str()))
+    })
+}
+
 /// A regular expression: `/a(.*)/` or `new RegExp(...)`.
 fn is_regex(expr: &Expression<'_>) -> bool {
     match expr.get_inner_expression() {
@@ -3799,6 +3840,8 @@ impl Walker<'_> {
             }
             Expression::ObjectExpression(object) => {
                 let mut taint = None;
+                // `{ parameters, handler: async (args) => ... }`: an LLM tool.
+                let tool = tool_object(object);
                 for property in &object.properties {
                     let t = match property {
                         ObjectPropertyKind::ObjectProperty(p) => {
@@ -3808,6 +3851,17 @@ impl Walker<'_> {
                                 self.expr(key, env);
                             }
                             let name = prop_name(&p.key);
+                            if let (Some((handler, kind)), Some(key)) = (tool, name.as_deref())
+                                && key == handler
+                                && self.maybe_function(
+                                    &p.value,
+                                    env,
+                                    name.clone(),
+                                    Role::Client(kind, Params::First),
+                                )
+                            {
+                                continue;
+                            }
                             // GraphQL: `{ Query: { user(parent, args) { ... } } }`
                             let resolver = name.as_deref().and_then(|key| {
                                 m().client_sources.iter().find(|s| {
@@ -9013,6 +9067,26 @@ mod tests {
         assert!(scan("class L { execute() { let location = this.getNodeParameter('loc', 0); location = location.trim(); } }").is_empty());
         assert!(scan("class Q { async execute() { const q = this.getNodeParameter('query', 0); await conn.query(q); } }").is_empty());
         assert!(scan("const { exec } = require('child_process');\nclass E { execute() { exec('ls ' + parseInt(this.getNodeParameter('n', 0), 10)); } }").is_empty());
+    }
+
+    #[test]
+    fn llm_tool_handlers_take_model_input() {
+        use Severity::*;
+        use VulnClass::*;
+        let found = one(
+            "x.function({ name: 's', parameters: { type: 'object' }, handler: async ({ pattern = '' }) => exec('rg ' + pattern) });",
+        );
+        assert_eq!(
+            found.iter().map(|f| (f.0, f.1, f.3)).collect::<Vec<_>>(),
+            vec![(CommandInjection, Medium, "llm-tool")]
+        );
+        let found = one(
+            "tool({ inputSchema: z.object({ q: z.string() }), execute: async ({ q }) => db.query('SELECT * FROM t WHERE a = ' + q) });",
+        );
+        assert!(found.iter().any(|f| f.0 == SqlInjection), "{found:?}");
+        // A route configuration with array parameters; no schema.
+        assert!(one("router.add({ path: '/x', parameters: [{ in: 'query' }], handler: (r) => exec('ls ' + r.q) });").is_empty());
+        assert!(one("cfg({ schema: s, run: () => 1 });").is_empty());
     }
 
     #[test]

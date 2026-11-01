@@ -55,6 +55,10 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
         include_str!("../../../../packs/n8n-nodes.yaml"),
     ),
     (
+        "llm-tools",
+        include_str!("../../../../packs/llm-tools.yaml"),
+    ),
+    (
         "multipart",
         include_str!("../../../../packs/multipart.yaml"),
     ),
@@ -96,6 +100,10 @@ pub struct Pack {
     /// What makes a file a service worker, whose `request`s are the page's.
     #[serde(default)]
     pub service_worker: Option<ServiceWorkerSpec>,
+    /// Object literals that define a tool for a language model: their handler's first
+    /// parameter is the model's (attacker-steerable) input.
+    #[serde(default)]
+    pub tool_objects: Vec<ToolObjectSpec>,
     /// Query operators whose operand is compared as a value (`{ email: { $eq: x } }`), and
     /// ORM option keys that wrap the filter (`{ where: { email } }`): not NoSQL injection points.
     #[serde(default)]
@@ -498,6 +506,20 @@ pub struct Propagation {
     pub apply_methods: Vec<String>,
 }
 
+/// An LLM tool definition (see [`Pack::tool_objects`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolObjectSpec {
+    /// Keys of the argument schema (a non-array value).
+    pub schema_keys: Vec<String>,
+    /// Keys of the handler function.
+    pub handler_keys: Vec<String>,
+    /// Keys that make the object something else (a route configuration).
+    #[serde(default)]
+    pub not_keys: Vec<String>,
+    pub kind: String,
+}
+
 /// A service worker (see [`Pack::service_worker`]): `self.addEventListener('fetch', ...)`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -770,6 +792,7 @@ pub struct Model {
     pub assertion_prefixes: Vec<String>,
     pub route_verbs: Vec<String>,
     pub service_worker: ServiceWorkerSpec,
+    pub tool_objects: Vec<ToolObjectSpec>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -957,6 +980,7 @@ impl Model {
             .extend(pack.sanitizers.assertion_prefixes);
         self.route_verbs
             .extend(pack.routes.verbs.iter().map(|v| v.to_ascii_lowercase()));
+        self.tool_objects.extend(pack.tool_objects);
         if let Some(worker) = pack.service_worker {
             self.service_worker
                 .registrations

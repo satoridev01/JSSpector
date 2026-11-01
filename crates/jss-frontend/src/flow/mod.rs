@@ -73,6 +73,18 @@ pub(crate) fn parse_repaired(
     repair
 }
 
+/// `source` with its Flow-only syntax blanked (offsets kept), when that makes it parse as
+/// `source_type` without a fatal error: for analyses that need the AST, not only the outcome.
+pub(crate) fn erased_text(source: &str, source_type: SourceType, pragma: bool) -> Option<String> {
+    let first = crate::parse::parse_with(&Allocator::default(), source, source_type);
+    if !first.fatal {
+        return None;
+    }
+    let (text, repair, _) =
+        repair_rounds(source, source_type, crate::parse::parse_with, first, pragma);
+    (!repair.outcome.fatal && repair.edits > 0).then_some(text)
+}
+
 /// Prints each repair as it is made when `JSS_FLOW_TRACE` is set: which rule fixed which error.
 /// For working out why a file is repaired the way it is; off in normal runs.
 fn trace(rule: &str, text: &str, offset: usize, message: &str) {

@@ -226,67 +226,93 @@ fn scan_text(
             }
             continue;
         }
-        let linking = Linking {
-            file: &file.rel_path,
-            files: all,
-        };
-        let result = taint::scan_file_program(&ret.program, &linking, external);
-        let index = LineIndex::new(text);
-        let findings = result
-            .findings
-            .iter()
-            .map(|raw| to_finding(raw, &file.rel_path, text, &index))
-            .collect();
-        let mut summaries = result.summaries;
-        for summary in summaries.values_mut().flatten() {
-            if summary.ext.is_none() {
-                let at = index.line_col(summary.call.start);
-                summary.ext = Some(ExtSink {
-                    file: file.rel_path.clone(),
-                    line: at.line,
-                    col: at.column,
-                    arg: snippet(text, summary.arg),
-                    steps: summary
-                        .steps
-                        .iter()
-                        .map(|(offset, note)| {
-                            let step = index.line_col(*offset);
-                            format!("{}:{}: {note}", file.rel_path, step.line)
-                        })
-                        .collect(),
-                });
+        return Ok(analyze(&ret.program, file, text, external, all));
+    }
+    // Flow-typed JavaScript: blank the Flow-only syntax (offsets kept) and read it as TypeScript.
+    if let Some(fallbacks) = typed_fallbacks(file.kind, file.package_type) {
+        let pragma = text.contains("@flow");
+        for typed in fallbacks {
+            let Some(erased) = crate::flow::erased_text(text, typed, pragma) else {
+                continue;
+            };
+            let ret = Parser::new(allocator, &erased, typed)
+                .with_options(parse_options())
+                .parse();
+            if !ret.fatal_error {
+                return Ok(analyze(&ret.program, file, text, external, all));
             }
         }
-        let facts = result.facts;
-        let entries = FileEntries {
-            routes: facts
-                .routes
-                .iter()
-                .map(|r| RouteEntry {
-                    receiver: r.receiver.clone(),
-                    method: r.method.clone(),
-                    path: r.path.clone(),
-                    handler: r.handler.clone(),
-                    line: index.line_col(r.span.start).line,
-                    auth: r.auth,
-                    kind: r.kind.to_owned(),
-                    inputs: facts
-                        .inputs
-                        .get(&r.handler)
-                        .map(|set| set.iter().cloned().collect())
-                        .unwrap_or_default(),
-                })
-                .collect(),
-            mounts: facts.mounts,
-            exports: facts.exports,
-            imports: facts.imports,
-        };
-        return Ok((findings, result.truncated, summaries, entries));
     }
     Err(format!(
         "fatal syntax error: {}",
         first_error.unwrap_or_else(|| "unknown".to_owned())
     ))
+}
+
+/// Walks a parsed program (whose offsets are those of `text`) and packages what it found.
+fn analyze(
+    program: &oxc_ast::ast::Program<'_>,
+    file: &SourceFile,
+    text: &str,
+    external: &Summaries,
+    all: &BTreeSet<String>,
+) -> (Vec<Finding>, bool, Summaries, FileEntries) {
+    let linking = Linking {
+        file: &file.rel_path,
+        files: all,
+    };
+    let result = taint::scan_file_program(program, &linking, external);
+    let index = LineIndex::new(text);
+    let findings = result
+        .findings
+        .iter()
+        .map(|raw| to_finding(raw, &file.rel_path, text, &index))
+        .collect();
+    let mut summaries = result.summaries;
+    for summary in summaries.values_mut().flatten() {
+        if summary.ext.is_none() {
+            let at = index.line_col(summary.call.start);
+            summary.ext = Some(ExtSink {
+                file: file.rel_path.clone(),
+                line: at.line,
+                col: at.column,
+                arg: snippet(text, summary.arg),
+                steps: summary
+                    .steps
+                    .iter()
+                    .map(|(offset, note)| {
+                        let step = index.line_col(*offset);
+                        format!("{}:{}: {note}", file.rel_path, step.line)
+                    })
+                    .collect(),
+            });
+        }
+    }
+    let facts = result.facts;
+    let entries = FileEntries {
+        routes: facts
+            .routes
+            .iter()
+            .map(|r| RouteEntry {
+                receiver: r.receiver.clone(),
+                method: r.method.clone(),
+                path: r.path.clone(),
+                handler: r.handler.clone(),
+                line: index.line_col(r.span.start).line,
+                auth: r.auth,
+                kind: r.kind.to_owned(),
+                inputs: facts
+                    .inputs
+                    .get(&r.handler)
+                    .map(|set| set.iter().cloned().collect())
+                    .unwrap_or_default(),
+            })
+            .collect(),
+        mounts: facts.mounts,
+        exports: facts.exports,
+        imports: facts.imports,
+    };
+    (findings, result.truncated, summaries, entries)
 }
 
 fn snippet(text: &str, span: Span) -> String {

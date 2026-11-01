@@ -169,6 +169,9 @@ pub fn scan_file_program(
         injected: BTreeMap::new(),
         route_templates: BTreeMap::new(),
         record_only: false,
+        current_class: None,
+        class_fields: BTreeMap::new(),
+        ctor_params: BTreeMap::new(),
         modules: BTreeMap::new(),
         relative: BTreeMap::new(),
         result: ScanResult::default(),
@@ -452,6 +455,13 @@ struct Walker<'e> {
     route_templates: BTreeMap<String, Vec<RouteTemplate>>,
     /// Re-walking a route-table loop for one row: record routes, emit no findings.
     record_only: bool,
+    /// The named class whose methods are being walked.
+    current_class: Option<String>,
+    /// Taint stored in instance fields (`this.url = url`), per class.
+    class_fields: BTreeMap<String, BTreeMap<String, Origin>>,
+    /// Summary pass: constructor parameter spans, so what reaches a sink through a field is
+    /// summarized under `Class.constructor`.
+    ctor_params: BTreeMap<u32, String>,
     modules: BTreeMap<String, Imported>,
     /// Local names bound to relative modules: name -> (specifier, export or None).
     relative: BTreeMap<String, (String, Option<String>)>,
@@ -1251,7 +1261,23 @@ impl Walker<'_> {
                     });
                     self.pending_auth =
                         class_auth.max(guarded(&method.decorators).unwrap_or_default());
+                    if self.summarize
+                        && method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+                        && let Some(class) = &class_name
+                    {
+                        for param in &method.value.params.items {
+                            self.ctor_params.insert(param.span.start, class.clone());
+                            if let BindingPattern::ObjectPattern(object) = &param.pattern {
+                                for property in &object.properties {
+                                    self.ctor_params.insert(property.span.start, class.clone());
+                                }
+                            }
+                        }
+                    }
+                    let saved_class =
+                        std::mem::replace(&mut self.current_class, class_name.clone());
                     self.function(&method.value, env, name, Role::Plain);
+                    self.current_class = saved_class;
                 }
                 ClassElement::PropertyDefinition(property) => {
                     if let Some(value) = &property.value {
@@ -1913,6 +1939,19 @@ impl Walker<'_> {
                         env,
                     );
                 }
+                // `new Executor(config)`: what the constructor's fields reach in any method.
+                if let Callee::Global(class) = &callee
+                    && let Some((name, summaries)) = self.constructor_summaries(class)
+                {
+                    self.apply_summaries(
+                        &name,
+                        &summaries,
+                        &taints,
+                        Some(&new.arguments),
+                        new.span,
+                        env,
+                    );
+                }
                 None
             }
             Expression::ChainExpression(chain) => {
@@ -2103,6 +2142,28 @@ impl Walker<'_> {
                             env,
                         );
                     }
+                    // `this.url = url` in a class: remembered for the class's other methods.
+                    if let (Expression::ThisExpression(_), Some(class), Some(field)) = (
+                        member.object().get_inner_expression(),
+                        self.current_class.clone(),
+                        member
+                            .static_property_name()
+                            .and_then(|p| p.as_str().map(str::to_owned)),
+                    ) {
+                        let fields = self.class_fields.entry(class).or_default();
+                        match taint {
+                            Some(origin) => {
+                                let origin = origin
+                                    .step(member.span().start, format!("stored in `this.{field}`"));
+                                fields.insert(field, origin);
+                            }
+                            None if env.branch == 0 => {
+                                fields.remove(&field);
+                            }
+                            None => {}
+                        }
+                        return;
+                    }
                     // `opts.ids = tainted` on a tracked object: that field only.
                     if let (Expression::Identifier(root), Some(property)) = (
                         member.object().get_inner_expression(),
@@ -2203,6 +2264,13 @@ impl Walker<'_> {
                     .as_deref()
                     .is_some_and(|p| has(&m().object_props, p)),
             });
+        }
+        // `this.url` in a class method: what another method stored there.
+        if let (Expression::ThisExpression(_), Some(field), Some(class)) =
+            (object, property.as_deref(), self.current_class.as_ref())
+            && let Some(origin) = self.class_fields.get(class).and_then(|f| f.get(field))
+        {
+            return Some(origin.clone());
         }
         // tRPC: `opts.input`
         if let (Expression::Identifier(id), Some(field)) = (object, property.as_deref())
@@ -3219,6 +3287,32 @@ impl Walker<'_> {
         }
     }
 
+    /// The summaries of `class`'s constructor: this file's, or the imported class's.
+    fn constructor_summaries(&self, class: &str) -> Option<(String, Vec<Summary>)> {
+        let key = format!("{class}.constructor");
+        if let Some(list) = self.summaries.get(&key) {
+            return Some((key, list.clone()));
+        }
+        let (spec, export) = self.relative.get(class)?;
+        let exported = match export.as_deref() {
+            Some(e) if e != "default" => e.to_owned(),
+            _ => class.to_owned(),
+        };
+        let key = format!("{exported}.constructor");
+        let list: Vec<Summary> = self
+            .external
+            .get(&key)?
+            .iter()
+            .filter(|s| {
+                s.ext
+                    .as_ref()
+                    .is_some_and(|e| self.names_file(spec, &e.file))
+            })
+            .cloned()
+            .collect();
+        (!list.is_empty()).then_some((key, list))
+    }
+
     /// Whether `object.method` is a function of one of our own modules that a summary describes
     /// (so the call is followed into it, rather than matched as a library sink by its name).
     fn own_function_followed(&self, object: &str, method: &str) -> bool {
@@ -3344,7 +3438,12 @@ impl Walker<'_> {
         finding.severity = m().cap(finding.origin.kind, finding.severity);
         match (self.summarize, finding.origin.param) {
             (true, Some(param)) => {
-                let list = self.summaries.entry(env.function.clone()).or_default();
+                // Reached through an instance field set from a constructor parameter.
+                let owner = match self.ctor_params.get(&finding.origin.span.start) {
+                    Some(class) => format!("{class}.constructor"),
+                    None => env.function.clone(),
+                };
+                let list = self.summaries.entry(owner).or_default();
                 let duplicate = list
                     .iter()
                     .any(|s| s.param == param && s.call == finding.call && s.api == finding.api);
@@ -4080,6 +4179,18 @@ mod tests {
         assert!(scan("const _ = require('lodash');\napp.post('/s', (req, res) => { _.set(settings, 'theme', req.body.value); });").is_empty());
         // Map.set is not a deep write
         assert!(scan("app.post('/s', (req, res) => { cache.set(req.body.k, 1); });").is_empty());
+    }
+
+    #[test]
+    fn instance_fields_carry_taint_between_methods_and_through_constructors() {
+        let class = "class Executor {\n  constructor(config) { this.url = config.url; }\n  execute() { return axios.get(this.url); }\n}\n";
+        let found = one(&format!(
+            "{class}app.post('/run', async (req, res) => {{ const e = new Executor(req.body); await e.execute(); }});"
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, VulnClass::Ssrf);
+        // a constant field stays clean
+        assert!(one("class E { constructor() { this.url = 'https://api.example.com'; } run() { return axios.get(this.url); } }").is_empty());
     }
 
     #[test]

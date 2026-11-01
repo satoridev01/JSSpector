@@ -28,6 +28,8 @@ sinks:
     args: ["any:0"]
     # `shell: true` makes every argument shell text.
     escalate: {option: shell, severity: critical, args: ["any:0", "any:1"]}
+    # A tainted element of the argument list: argument injection (`--upload-pack=...`).
+    also: [{args: ["any:1"], severity: medium}]
   - {module: shelljs, exports: [exec], class: command-injection, severity: critical, args: ["any:0"]}
   - {module: execa, exports: [execaCommand, execaCommandSync, command, commandSync], class: command-injection, severity: critical, args: ["any:0"]}
   - {module: execa, exports: ["", execa, execaSync], class: command-injection, severity: high, args: ["any:0"]}

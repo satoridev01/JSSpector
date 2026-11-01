@@ -87,9 +87,28 @@ impl ParsePool {
                     .collect()
             })
         };
-        let first = run(&Summaries::new());
-        run(&merge(first))
+        // Each round lets a summary cross one more file: a route, its controller, a service,
+        // a helper. Stop when nothing new is learned (at most `CROSS_FILE_HOPS` rounds).
+        let mut external = Summaries::new();
+        let mut reports = run(&external);
+        for _ in 1..CROSS_FILE_HOPS {
+            let merged = merge(reports);
+            let grew = count(&merged) > count(&external);
+            external = merged;
+            reports = run(&external);
+            if !grew {
+                break;
+            }
+        }
+        reports
     }
+}
+
+/// Most files a value is followed across: route -> controller -> service -> helper.
+pub const CROSS_FILE_HOPS: usize = 4;
+
+fn count(summaries: &Summaries) -> usize {
+    summaries.values().map(Vec::len).sum()
 }
 
 /// Merges per-file summaries. A name defined in several files keeps every definition: callers

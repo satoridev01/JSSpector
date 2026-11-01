@@ -211,9 +211,18 @@ fn matching(report: &Value, pair: &Pair) -> bool {
                 .as_str()
                 .or_else(|| get(f, "file").as_str())
                 .unwrap_or("");
-            get(f, "class").as_str() == Some(pair.class.as_str()) && file == pair.sink_file
+            family(get(f, "class").as_str().unwrap_or("")) == family(&pair.class)
+                && file == pair.sink_file
         })
     })
+}
+
+/// Classes scored as one: command and code injection are both code execution.
+fn family(class: &str) -> &str {
+    match class {
+        "command-injection" | "code-injection" => "code-execution",
+        other => other,
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<()> {

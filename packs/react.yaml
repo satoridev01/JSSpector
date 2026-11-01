@@ -1,0 +1,14 @@
+# React / JSX: raw HTML props, component props as (second-order) input, markdown renderers.
+name: react
+jsx:
+  html_props: [dangerouslySetInnerHTML]
+  html_value_keys: [__html]
+  # Component props (functions named in PascalCase) carry stored or user data.
+  props_kind: props
+severity_caps:
+  props: medium
+propagation:
+  # Markdown and HTML renderers keep the input's markup.
+  pass_globals: [renderMarkdown, marked, marked.parse, md.render, markdownIt.render, converter.makeHtml, micromark, parseMarkdown]
+  # Callbacks of these array methods receive the receiver's elements.
+  iteration_methods: [map, forEach, filter, find, some, every, flatMap, findLast]

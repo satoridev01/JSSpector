@@ -1303,6 +1303,23 @@ impl Walker<'_> {
         }
         let first = names.first().copied().flatten();
         env.params = names.iter().map(|n| n.unwrap_or("").to_owned()).collect();
+        // A component (`function UserCard(props)` / `const UserCard = ({ name }) => ...`): its
+        // props carry stored or user data.
+        if role == Role::Plain
+            && !self.summarize
+            && names.len() <= 2
+            && let Some(kind) = m().props_kind.as_deref()
+            && env.function.chars().next().is_some_and(char::is_uppercase)
+            && !env.function.contains(['.', ' '])
+            && let Some(param) = params.items.first()
+        {
+            self.bind_pattern(
+                &param.pattern,
+                Some(Origin::source(kind, param.span)),
+                None,
+                &mut env,
+            );
+        }
         // NestJS: `@Body() dto`, `@Query('q') q`, `@Param('id') id`, `@Headers() h`.
         for param in &params.items {
             let decorated = param.decorators.iter().any(|d| match &d.expression {
@@ -1842,7 +1859,93 @@ impl Walker<'_> {
                 self.expr(&import.source, env);
                 None
             }
+            Expression::JSXElement(element) => {
+                self.jsx_element(element, env);
+                None
+            }
+            Expression::JSXFragment(fragment) => {
+                self.jsx_children(&fragment.children, env);
+                None
+            }
             _ => None,
+        }
+    }
+
+    /// Walks a JSX element: raw-HTML props are sinks; expressions and children are walked.
+    fn jsx_element(&mut self, element: &oxc_ast::ast::JSXElement<'_>, env: &mut Env) {
+        use oxc_ast::ast::{JSXAttributeItem, JSXAttributeName, JSXAttributeValue};
+        if !self.enter() {
+            return;
+        }
+        for item in &element.opening_element.attributes {
+            match item {
+                JSXAttributeItem::SpreadAttribute(spread) => {
+                    self.expr(&spread.argument, env);
+                }
+                JSXAttributeItem::Attribute(attribute) => {
+                    let name = match &attribute.name {
+                        JSXAttributeName::Identifier(id) => id.name.as_str(),
+                        JSXAttributeName::NamespacedName(_) => "",
+                    };
+                    match &attribute.value {
+                        Some(JSXAttributeValue::ExpressionContainer(container)) => {
+                            let Some(expr) = container.expression.as_expression() else {
+                                continue;
+                            };
+                            if has(&m().jsx_html_props, name) {
+                                // `dangerouslySetInnerHTML={{ __html: value }}`
+                                let keys: Vec<&str> =
+                                    m().jsx_html_value_keys.iter().map(String::as_str).collect();
+                                let value = object_prop(expr, &keys).unwrap_or(expr);
+                                if let Some(origin) = self.expr(value, env) {
+                                    self.emit(
+                                        RawFinding {
+                                            class: VulnClass::Xss,
+                                            severity: Severity::High,
+                                            api: name.to_owned(),
+                                            arg: value.span(),
+                                            call: attribute.span,
+                                            function: env.function.clone(),
+                                            origin,
+                                            ext: None,
+                                            auth: Auth::NoneDetected,
+                                        },
+                                        env,
+                                    );
+                                }
+                            } else if !self.maybe_function(expr, env, None, Role::Plain) {
+                                self.expr(expr, env);
+                            }
+                        }
+                        Some(JSXAttributeValue::Element(child)) => self.jsx_element(child, env),
+                        Some(JSXAttributeValue::Fragment(child)) => {
+                            self.jsx_children(&child.children, env);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.jsx_children(&element.children, env);
+        self.leave();
+    }
+
+    fn jsx_children(&mut self, children: &[oxc_ast::ast::JSXChild<'_>], env: &mut Env) {
+        use oxc_ast::ast::JSXChild;
+        for child in children {
+            match child {
+                JSXChild::Element(element) => self.jsx_element(element, env),
+                JSXChild::Fragment(fragment) => self.jsx_children(&fragment.children, env),
+                JSXChild::ExpressionContainer(container) => {
+                    if let Some(expr) = container.expression.as_expression() {
+                        self.expr(expr, env);
+                    }
+                }
+                JSXChild::Spread(spread) => {
+                    self.expr(&spread.expression, env);
+                }
+                JSXChild::Text(_) => {}
+            }
         }
     }
 
@@ -2299,7 +2402,7 @@ impl Walker<'_> {
                 object: Some(table),
                 method,
             } = &callee
-                && method == "forEach"
+                && has(&m().iteration_methods, method)
                 && let Some(rows) = env.tables.get(table).cloned()
                 && let Some(callback) = call.arguments.first().and_then(Argument::as_expression)
             {
@@ -2331,6 +2434,15 @@ impl Walker<'_> {
                 Shape::LastCallback if index != last => Role::Plain,
                 Shape::ObjectOfFunctions => Role::Plain,
                 _ => role,
+            };
+            // `items.map((item) => ...)` on tainted items: the callback's element is tainted.
+            let arg_role = match (&callee, &receiver) {
+                (Callee::Method { method, .. }, Some(origin))
+                    if arg_role == Role::Plain && has(&m().iteration_methods, method) =>
+                {
+                    Role::Client(origin.kind, Params::First)
+                }
+                _ => arg_role,
             };
             let callbacks_object = matches!(shape, Shape::ObjectOfFunctions | Shape::RouteObject)
                 && matches!(
@@ -3184,7 +3296,29 @@ impl Walker<'_> {
             severity = *escalated;
             rules = escalated_rules.clone();
         }
-        for rule in rules {
+        let mut groups = vec![(severity, rules)];
+        groups.extend(sink.also.iter().cloned());
+        for (severity, rules) in groups {
+            if self.check_rules(&sink, &api, severity, &rules, arguments, taints, span, env) {
+                return;
+            }
+        }
+    }
+
+    /// Checks one group of argument rules; true when a finding was recorded.
+    #[allow(clippy::too_many_arguments)]
+    fn check_rules(
+        &mut self,
+        sink: &models::Sink,
+        api: &str,
+        severity: Severity,
+        rules: &[ArgRule],
+        arguments: &[Argument<'_>],
+        taints: &[Option<Origin>],
+        span: Span,
+        env: &Env,
+    ) -> bool {
+        for &rule in rules {
             let (index, origin) = match rule {
                 ArgRule::Any(index) => (index, taints.get(index).cloned().flatten()),
                 ArgRule::Html(index) => (
@@ -3265,7 +3399,7 @@ impl Walker<'_> {
                 RawFinding {
                     class: sink.class,
                     severity,
-                    api: api.clone(),
+                    api: api.to_owned(),
                     arg: arg.span(),
                     call: span,
                     function: env.function.clone(),
@@ -3275,8 +3409,9 @@ impl Walker<'_> {
                 },
                 env,
             );
-            break;
+            return true;
         }
+        false
     }
 }
 
@@ -3695,6 +3830,61 @@ mod tests {
                 "app.get('/p', (req, res) => { if (!req.user) { return res.sendStatus(401); } exec('ping ' + req.query.h); });"
             ),
             vec![(Auth::User, Severity::Critical)]
+        );
+    }
+
+    fn scan_jsx(src: &str) -> Vec<(VulnClass, Severity, String, &'static str)> {
+        let allocator = Allocator::default();
+        let ret = Parser::new(
+            &allocator,
+            src,
+            source_type(SourceKind::Jsx, PackageType::Module),
+        )
+        .with_options(parse_options())
+        .parse();
+        assert!(!ret.fatal_error, "{:?}", ret.diagnostics);
+        scan_program(&ret.program, src)
+            .findings
+            .into_iter()
+            .map(|f| (f.class, f.severity, f.api, f.origin.kind))
+            .collect()
+    }
+
+    #[test]
+    fn dangerously_set_inner_html_with_props_or_request_data() {
+        let found = scan_jsx(
+            "export function Label({ label }) { return <span dangerouslySetInnerHTML={{ __html: label }} />; }",
+        );
+        assert_eq!(
+            found,
+            vec![(
+                VulnClass::Xss,
+                Severity::Medium,
+                "dangerouslySetInnerHTML".to_owned(),
+                "props"
+            )]
+        );
+        // array elements of tainted props, through a markdown renderer
+        let mapped = scan_jsx(
+            "function Chat({ messages }) { return <div>{messages.map((m) => <p dangerouslySetInnerHTML={{ __html: renderMarkdown(m.text) }} />)}</div>; }",
+        );
+        assert_eq!(mapped.len(), 1, "{mapped:?}");
+        assert!(scan_jsx("function A({ x }) { return <p dangerouslySetInnerHTML={{ __html: '<b>static</b>' }} title={x} />; }").is_empty());
+    }
+
+    #[test]
+    fn a_tainted_argument_list_is_argument_injection() {
+        let found = one(
+            "io.on('connection', (s) => { s.on('install', (url) => { spawn('git', ['clone', url, dir]); }); });",
+        );
+        assert_eq!(
+            found,
+            vec![(
+                VulnClass::CommandInjection,
+                Severity::Medium,
+                "child_process.spawn".to_owned(),
+                "socket"
+            )]
         );
     }
 

@@ -35,6 +35,7 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ("browser", include_str!("../../../../packs/browser.yaml")),
     ("archive", include_str!("../../../../packs/archive.yaml")),
     ("auth", include_str!("../../../../packs/auth.yaml")),
+    ("react", include_str!("../../../../packs/react.yaml")),
 ];
 
 /// One pack file, as written.
@@ -84,9 +85,23 @@ pub struct Pack {
     pub module_pass: Vec<String>,
     #[serde(default)]
     pub auth: AuthSpec,
+    #[serde(default)]
+    pub jsx: JsxSpec,
     /// Fields of a procedure's options that are client input (`params: input` sources).
     #[serde(default)]
     pub input_fields: Vec<String>,
+}
+
+/// JSX: props that take raw HTML, and how component props count as input.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsxSpec {
+    #[serde(default)]
+    pub html_props: Vec<String>,
+    #[serde(default)]
+    pub html_value_keys: Vec<String>,
+    #[serde(default)]
+    pub props_kind: Option<String>,
 }
 
 /// How authentication shows in code.
@@ -144,6 +159,17 @@ pub struct SinkSpec {
     pub confined_by: Vec<String>,
     #[serde(default)]
     pub escalate: Option<Escalate>,
+    /// Weaker matches checked when `args` find nothing: `spawn('git', ['clone', url])`.
+    #[serde(default)]
+    pub also: Vec<AlsoSpec>,
+}
+
+/// A secondary argument rule with its own severity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlsoSpec {
+    pub args: Vec<String>,
+    pub severity: SeverityName,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -273,6 +299,8 @@ pub struct Propagation {
     #[serde(default)]
     pub build_methods: Vec<String>,
     #[serde(default)]
+    pub iteration_methods: Vec<String>,
+    #[serde(default)]
     pub pass_globals: Vec<String>,
 }
 
@@ -383,6 +411,8 @@ pub struct Sink {
     pub confined_by: Vec<String>,
     /// (option, severity, rules)
     pub escalate: Option<(String, Severity, Vec<ArgRule>)>,
+    /// (severity, rules) tried when `args` match nothing.
+    pub also: Vec<(Severity, Vec<ArgRule>)>,
 }
 
 /// Every pack merged.
@@ -415,6 +445,10 @@ pub struct Model {
     pub result_sources: Vec<ResultSource>,
     pub pass_methods: Vec<String>,
     pub build_methods: Vec<String>,
+    pub iteration_methods: Vec<String>,
+    pub jsx_html_props: Vec<String>,
+    pub jsx_html_value_keys: Vec<String>,
+    pub props_kind: Option<String>,
     pub pass_globals: Vec<String>,
     pub clearing: Vec<String>,
     pub validators: Vec<String>,
@@ -484,6 +518,16 @@ impl Model {
                 args,
                 confined_by: spec.confined_by.clone(),
                 escalate,
+                also: spec
+                    .also
+                    .iter()
+                    .map(|a| {
+                        (
+                            a.severity.severity(),
+                            a.args.iter().filter_map(|r| ArgRule::parse(r)).collect(),
+                        )
+                    })
+                    .collect(),
             };
             if let Some(module) = &spec.module {
                 for export in &spec.exports {
@@ -523,6 +567,13 @@ impl Model {
         self.result_sources.extend(pack.result_sources);
         self.pass_methods.extend(pack.propagation.pass_methods);
         self.build_methods.extend(pack.propagation.build_methods);
+        self.iteration_methods
+            .extend(pack.propagation.iteration_methods);
+        self.jsx_html_props.extend(pack.jsx.html_props);
+        self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
+        if pack.jsx.props_kind.is_some() {
+            self.props_kind = pack.jsx.props_kind;
+        }
         self.pass_globals.extend(pack.propagation.pass_globals);
         self.clearing.extend(pack.sanitizers.calls);
         self.validators.extend(pack.sanitizers.validators);

@@ -26,7 +26,7 @@ const CLASSES: &[&str] = &[
 ];
 
 /// Sparse-checkout patterns: sources and the package files that decide module types.
-const SPARSE: &[&str] = &[
+pub(crate) const SPARSE: &[&str] = &[
     "*.js",
     "*.jsx",
     "*.ts",
@@ -272,7 +272,7 @@ fn family(class: &str) -> &str {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<()> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<()> {
     let status = Command::new("git")
         .arg("-C")
         .arg(dir)

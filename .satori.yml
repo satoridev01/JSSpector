@@ -1,0 +1,18 @@
+settings:
+  name: "JSSpector: full-corpus run"
+  description: "Builds jsspector from this checkout, fetches every repository in CORPUS at its pinned commit (shallow and sparse: JavaScript/TypeScript sources and package files only; nothing in them is ever run), and scans each one. Fails when the scanner crashes or panics on any file. The output has a per-repository table and the HIGH/CRITICAL findings, which may be undisclosed vulnerabilities: always run it private."
+  image: rust
+  cpu: 8192
+  memory: 16384
+  timeout: 7200
+  example: satori run ./ --playbook .satori.yml --visibility private -d CORPUS="owner/name@commit owner/other@commit" --report --output
+
+install:
+  - cargo build --release --locked -p jsspector
+  - cargo build --locked -p xtask
+
+corpus:
+  assertReturnCode: 0
+  assertStdoutNotContains: "panicked at"
+  run:
+    - cargo xtask corpus --repos "${{CORPUS}}" --dir /tmp/corpus --out /tmp/corpus-reports --show high --threads 8 --jobs 8

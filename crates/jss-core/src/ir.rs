@@ -202,6 +202,10 @@ pub fn resolve_reference(
     file: &str,
     reference: &str,
 ) -> Option<FunctionId> {
+    // A handler written in another file (a route a helper registers inline).
+    if let Some(found) = elsewhere(reference, modules) {
+        return Some(found);
+    }
     let module = modules.get(file)?;
     let local: BTreeSet<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
     let imports: BTreeMap<&str, &Import> = module

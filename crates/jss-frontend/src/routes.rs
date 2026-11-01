@@ -22,6 +22,10 @@ pub struct Route {
     pub file: String,
     pub line: u32,
     pub handler: String,
+    /// What the IR resolves the handler by: the handler, or a function written in another file
+    /// (`<at>:file#name`, a route a helper registers inline).
+    #[serde(skip)]
+    pub handler_ref: String,
     pub auth: Auth,
     /// `http`, `socket`, `ipc`, `graphql`, `trpc`, `queue`, ...
     pub kind: String,
@@ -44,13 +48,15 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
     let mut entries: Vec<(Auth, String, jss_core::ir::FunctionId)> = routes
         .iter()
         .filter_map(|route| {
-            jss_core::ir::resolve_reference(&by_file, &route.file, &route.handler).map(|target| {
-                (
-                    route.auth,
-                    format!("{} {}", route.method, route.path),
-                    target,
-                )
-            })
+            jss_core::ir::resolve_reference(&by_file, &route.file, &route.handler_ref).map(
+                |target| {
+                    (
+                        route.auth,
+                        format!("{} {}", route.method, route.path),
+                        target,
+                    )
+                },
+            )
         })
         .collect();
     entries.sort();
@@ -152,7 +158,13 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                     path: full,
                     file: file.to_string(),
                     line: entry.line,
-                    handler: entry.handler.clone(),
+                    // `<at>:src/api/admin.js#POST /x` reads as the function's name.
+                    handler: entry
+                        .handler
+                        .strip_prefix(jss_core::ir::ELSEWHERE)
+                        .and_then(|r| r.split_once('#'))
+                        .map_or_else(|| entry.handler.clone(), |(_, name)| name.to_owned()),
+                    handler_ref: entry.handler.clone(),
                     auth: entry.auth.max(mount_auth),
                     kind: if entry.kind == "default-export" || entry.kind == "file-route" {
                         "http".to_owned()

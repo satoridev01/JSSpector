@@ -572,6 +572,9 @@ pub struct RouteTemplate {
     pub method: Result<String, usize>,
     pub path: Vec<PathPart>,
     pub auth: Auth,
+    /// The handler written inline in the template's function (`mstream.post('/x', (req, res)
+    /// => ...)`), by the name its walk gave it in the defining file.
+    pub handler: Option<String>,
 }
 
 /// A piece of a route path a helper builds: literal text, or one of its parameters.
@@ -4741,6 +4744,20 @@ impl Walker<'_> {
                 if assign.operator.is_assign() {
                     self.type_assignment(&assign.left, &assign.right, env);
                 }
+                // `mstream = express()` on a `let mstream;` declared earlier: a router, for the
+                // routes registered on it here and in the helpers it is handed to.
+                if assign.operator.is_assign()
+                    && let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left
+                {
+                    let factory = match chain_root(&assign.right) {
+                        Expression::CallExpression(c) => callee_name(&c.callee),
+                        Expression::NewExpression(n) => callee_name(&n.callee),
+                        _ => None,
+                    };
+                    if factory.as_deref().is_some_and(is_router_factory) {
+                        self.routers.insert(id.name.as_str().to_owned());
+                    }
+                }
                 self.assign_target(&assign.left, taint.clone(), env);
                 taint
             }
@@ -8816,13 +8833,42 @@ impl Walker<'_> {
         // router-like variable (not `Options.get(module, option)`).
         let router_receiver =
             receiver_param.is_some() || object.as_deref().is_some_and(|o| self.is_router(o));
+        // `export function setup(mstream) { mstream.post('/api/x', h) }`: a literal path on a
+        // parameter not named like a router is still the caller's router's route.
+        let param_router = receiver_param.is_some()
+            && !object.as_deref().is_some_and(|o| self.is_router(o))
+            && call
+                .arguments
+                .last()
+                .and_then(Argument::as_expression)
+                .is_some_and(|e| {
+                    matches!(
+                        e.get_inner_expression(),
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    )
+                });
         if role == Role::Route
-            && depends_on_params
+            && (depends_on_params || param_router)
             && router_receiver
             && env.function != "<anonymous>"
             && env.function != "<module>"
             && let Some(parts) = parts
         {
+            let inline_handler = call
+                .arguments
+                .last()
+                .and_then(Argument::as_expression)
+                .filter(|e| {
+                    matches!(
+                        e.get_inner_expression(),
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    )
+                })
+                .and(first)
+                .and_then(|first| self.resolve_text(first, env))
+                .map(|path| {
+                    self.inline_route_name(&method, &path, object.as_deref(), call.span.start)
+                });
             let template = RouteTemplate {
                 receiver_file: None,
                 receiver: match receiver_param {
@@ -8834,6 +8880,8 @@ impl Walker<'_> {
                     None => Ok(method.clone()),
                 },
                 path: parts,
+                // `(req, res) => ...` written here: the name `call` gave it.
+                handler: inline_handler,
                 auth,
             };
             let list = self
@@ -9283,6 +9331,12 @@ impl Walker<'_> {
                     method,
                     path,
                     auth: template.auth.max(auth),
+                    handler: template.handler.as_ref().map(|h| match defining_file {
+                        Some(file) if !h.starts_with(ELSEWHERE) => {
+                            format!("{ELSEWHERE}{file}#{h}")
+                        }
+                        _ => h.clone(),
+                    }),
                 };
                 let list = self
                     .route_templates
@@ -9314,12 +9368,20 @@ impl Walker<'_> {
             receiver_file,
             method: method.to_ascii_uppercase(),
             path: text,
-            handler: call
-                .arguments
-                .last()
-                .and_then(Argument::as_expression)
-                .and_then(callee_name)
-                .unwrap_or_else(|| format!("{name}()")),
+            // The handler written in the template's function (in its file), else the one this
+            // call passes.
+            handler: match (&template.handler, defining_file) {
+                (Some(h), Some(file)) if !h.starts_with(ELSEWHERE) => {
+                    format!("{ELSEWHERE}{file}#{h}")
+                }
+                (Some(h), _) => h.clone(),
+                (None, _) => call
+                    .arguments
+                    .last()
+                    .and_then(Argument::as_expression)
+                    .and_then(callee_name)
+                    .unwrap_or_else(|| format!("{name}()")),
+            },
             span: call.span,
             auth: template.auth.max(auth),
             kind: "http",

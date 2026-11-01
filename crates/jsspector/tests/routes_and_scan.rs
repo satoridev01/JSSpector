@@ -1650,3 +1650,53 @@ fn client_callbacks_are_linked_to_their_entries() {
         );
     }
 }
+
+/// A helper that registers literal routes on the router it is handed, whatever the parameter
+/// is called (`setup(mstream)`), called through a namespace import on an app assigned after
+/// its declaration: the routes are the caller's, and the findings in their inline handlers
+/// are linked to them.
+#[test]
+fn routes_registered_on_a_handed_router_are_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/api/admin.js",
+        "import fs from 'fs';\nexport function setup(mstream) {\n  \
+         mstream.post('/api/v1/admin/file', (req, res) => { res.send(fs.readFileSync(req.body.path)); });\n}\n",
+    );
+    write(
+        root,
+        "src/server.js",
+        "import express from 'express';\nimport * as adminApi from './api/admin.js';\nlet mstream;\n\
+         export function serveIt() {\n  mstream = express();\n  adminApi.setup(mstream);\n}\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let listed: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap(),
+                r["handler"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(
+        listed
+            .iter()
+            .any(|r| r == "POST /api/v1/admin/file POST /api/v1/admin/file"),
+        "{listed:?}"
+    );
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let entries: Vec<&str> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["entry"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(entries, vec!["POST /api/v1/admin/file"]);
+}

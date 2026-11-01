@@ -7,11 +7,11 @@
 ## Quick start
 
 ```sh
-cargo install --git https://github.com/satoridev01/JSSpector --locked jsspector
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/satoridev01/JSSpector/releases/latest/download/jsspector-installer.sh | sh
 jsspector scan path/to/repo
 ```
 
-Releases are built with [dist](https://github.com/axodotdev/cargo-dist) for macOS and Linux (x86_64 and arm64) when a version tag is pushed: archives and a shell installer on GitHub Releases, and a Homebrew formula (`brew install satoridev01/tap/jsspector`) once the first release is out.
+The installer puts the binary for your platform in `~/.cargo/bin`. Releases are built with [dist](https://github.com/axodotdev/cargo-dist) for macOS and Linux (x86_64 and arm64) when a version tag is pushed: the archives, their checksums and the installer are on [GitHub Releases](https://github.com/satoridev01/JSSpector/releases). From source: `cargo install --git https://github.com/satoridev01/JSSpector --locked jsspector`.
 
 ```
   routes/files.js

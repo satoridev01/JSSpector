@@ -201,6 +201,12 @@ pub const RETURNS: &str = "<return>";
 /// throw ... }`). After a call returns, the argument is clean.
 pub const VALIDATES: &str = "<validates>";
 
+/// The `api` of a summary that says "the function returns true only when this parameter is
+/// safe for the classes in `at_sink.escaped`": a predicate by what it does
+/// (`const identity = (v) => typeof v === 'string' && /^[\w.-]+$/.test(v)`), used as a guard
+/// by its callers (`if (!identity(id)) throw`).
+pub const PREDICATE: &str = "<predicate>";
+
 /// The `api` of a summary that says "the function returns an instance of this class"
 /// ([`Summary::instance_of`]), whole or as one field of a returned object (`out_field`):
 /// factories (`return new PgClient(cfg)`), singleton accessors (`return Registry.instance`) and
@@ -2033,8 +2039,10 @@ impl Walker<'_> {
                 // Inside the consequent, the test held; inside the alternate, it failed.
                 let mut held = Vec::new();
                 guards::facts(&s.test, true, &mut held);
+                self.predicate_facts(&s.test, true, &mut held);
                 let mut failed = Vec::new();
                 guards::facts(&s.test, false, &mut failed);
+                self.predicate_facts(&s.test, false, &mut failed);
                 let before = env.save();
                 env.learn(held);
                 self.branch(&s.consequent, env);
@@ -3363,6 +3371,11 @@ impl Walker<'_> {
             {
                 self.record_instances(vec![class], f.span, &env, None);
             }
+            if let [Statement::ReturnStatement(r)] = body.statements.as_slice()
+                && let Some(argument) = &r.argument
+            {
+                self.record_predicate(argument, &env);
+            }
             self.leave();
         }
         self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
@@ -3704,9 +3717,15 @@ impl Walker<'_> {
                 ArrowFunctionBody::FunctionBody(body) => {
                     self.statements(&body.statements, &mut env);
                     self.record_validated(&body.statements, params.span, &env);
+                    if let [Statement::ReturnStatement(r)] = body.statements.as_slice()
+                        && let Some(argument) = &r.argument
+                    {
+                        self.record_predicate(argument, &env);
+                    }
                 }
                 other => {
                     if let Some(expr) = other.as_expression() {
+                        self.record_predicate(expr, &env);
                         let taint = self.expr(expr, &mut env);
                         self.fn_returns = union(self.fn_returns.take(), taint.clone());
                         self.record_returned(expr, taint, &env);
@@ -3743,6 +3762,104 @@ impl Walker<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// Summary pass: a function that returns a check of its parameters (`typeof v ===
+    /// 'string' && /^[\w.-]+$/.test(v)`): true, each parameter the check cleans is safe for
+    /// those classes.
+    fn record_predicate(&mut self, returned: &Expression<'_>, env: &Env) {
+        if !self.summarize || env.function == "<anonymous>" || env.function == "<module>" {
+            return;
+        }
+        let mut held = Vec::new();
+        guards::facts(returned, true, &mut held);
+        for (key, fact) in held {
+            let guards::Fact::Clean(classes) = fact else {
+                continue;
+            };
+            let Some(index) = env.params.iter().position(|p| !p.is_empty() && *p == key) else {
+                continue;
+            };
+            let list = self.summaries.entry(env.function.clone()).or_default();
+            if list.iter().any(|s| s.api == PREDICATE && s.param == index) {
+                continue;
+            }
+            let span = returned.span();
+            let mut at_sink = Origin::source("param", span);
+            at_sink.escaped = classes;
+            list.push(Summary {
+                param: index,
+                class: VulnClass::CodeInjection,
+                severity: Severity::Low,
+                api: PREDICATE.to_owned(),
+                arg: span,
+                call: span,
+                steps: Vec::new(),
+                at_sink,
+                ext: None,
+                field: None,
+                out_field: None,
+                defined_in: None,
+                start: false,
+                rest: false,
+                instance_of: None,
+            });
+        }
+    }
+
+    /// The facts a test establishes through calls to predicates by what they do (see
+    /// [`PREDICATE`]): `!identity(id)` failed, so `id` is clean.
+    fn predicate_facts(
+        &self,
+        test: &Expression<'_>,
+        truth: bool,
+        out: &mut Vec<(String, guards::Fact)>,
+    ) {
+        match test.get_inner_expression() {
+            Expression::UnaryExpression(u) if u.operator == UnaryOperator::LogicalNot => {
+                self.predicate_facts(&u.argument, !truth, out);
+            }
+            Expression::LogicalExpression(l)
+                if (l.operator == LogicalOperator::And && truth)
+                    || (l.operator == LogicalOperator::Or && !truth) =>
+            {
+                self.predicate_facts(&l.left, truth, out);
+                self.predicate_facts(&l.right, truth, out);
+            }
+            Expression::CallExpression(call) if truth => {
+                let Expression::Identifier(id) = call.callee.get_inner_expression() else {
+                    return;
+                };
+                let name = id.name.as_str();
+                let summaries: Vec<Summary> = match self.relative.get(name) {
+                    Some((spec, export)) => {
+                        let export = export.as_deref().unwrap_or("default");
+                        self.exported_function(spec, export)
+                            .and_then(|(file, local)| {
+                                self.external.get(&local).map(|list| {
+                                    list.iter()
+                                        .filter(|s| s.defined_in.as_deref() == Some(file.as_str()))
+                                        .cloned()
+                                        .collect()
+                                })
+                            })
+                            .unwrap_or_default()
+                    }
+                    None => self.summaries.get(name).cloned().unwrap_or_default(),
+                };
+                for s in summaries.iter().filter(|s| s.api == PREDICATE) {
+                    if let Some(key) = call
+                        .arguments
+                        .get(s.param)
+                        .and_then(Argument::as_expression)
+                        .and_then(guards::path_key)
+                    {
+                        out.push((key, guards::Fact::Clean(s.at_sink.escaped)));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -9278,10 +9395,9 @@ impl Walker<'_> {
         call_span: Span,
         env: &Env,
     ) {
-        for summary in summaries
-            .iter()
-            .filter(|s| s.api != RETURNS && s.api != VALIDATES && s.api != INSTANCE)
-        {
+        for summary in summaries.iter().filter(|s| {
+            s.api != RETURNS && s.api != VALIDATES && s.api != INSTANCE && s.api != PREDICATE
+        }) {
             let whole = argument_taint(taints, summary.param, summary.rest);
             let origin = match (&summary.field, arguments) {
                 (Some(field), Some(arguments)) => {
@@ -9857,6 +9973,28 @@ mod tests {
             found.iter().any(|f| f.0 == VulnClass::NosqlInjection),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn predicates_by_what_they_do_guard_their_callers() {
+        let helpers = "const identity = (value) => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(value);\n\
+                       function okName(n) { return /^[a-z]+$/.test(n); }\n";
+        for quiet in [
+            "app.get('/s', (req, res) => { const id = req.query.id; if (!identity(id)) throw new Error('bad'); fs.readFileSync(path.join(DIR, id)); });",
+            "app.get('/s', (req, res) => { if (!okName(req.query.n)) return res.end(); exec('run ' + req.query.n); });",
+        ] {
+            assert!(one(&format!("{helpers}{quiet}")).is_empty(), "{quiet}");
+        }
+        // A check that does not exit, or a predicate whose pattern admits a separator, cleans
+        // nothing.
+        let found = one(&format!(
+            "{helpers}app.get('/s', (req, res) => {{ const id = req.query.id; if (!identity(id)) log('bad'); fs.readFileSync(path.join(DIR, id)); }});"
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        let found = one(
+            "const loose = (v) => /^[\\w/.-]+$/.test(v);\napp.get('/s', (req, res) => { const id = req.query.id; if (!loose(id)) throw new Error('bad'); fs.readFileSync(path.join(DIR, id)); });",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[test]

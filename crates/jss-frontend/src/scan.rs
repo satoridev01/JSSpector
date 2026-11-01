@@ -713,10 +713,9 @@ fn analyze(
                 name: name.clone(),
                 ..ir::Function::default()
             });
-        for summary in list
-            .iter()
-            .filter(|s| s.api != taint::VALIDATES && s.api != taint::INSTANCE)
-        {
+        for summary in list.iter().filter(|s| {
+            s.api != taint::VALIDATES && s.api != taint::INSTANCE && s.api != taint::PREDICATE
+        }) {
             let to = if summary.api == taint::RETURNS {
                 ir::FlowTarget::Return
             } else {

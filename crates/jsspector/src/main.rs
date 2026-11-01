@@ -59,8 +59,11 @@ struct ScanArgs {
     #[arg(long, value_name = "CLASSES", value_delimiter = ',', value_parser = parse_include)]
     include: Vec<Include>,
     /// Report only findings at or above this severity: critical, high, medium or low.
-    #[arg(long, value_name = "SEVERITY", default_value = "low", value_parser = parse_severity)]
+    #[arg(long, value_name = "SEVERITY", default_value = "high", value_parser = parse_severity)]
     min_severity: Severity,
+    /// Print the full JSON report instead of the readable list.
+    #[arg(long)]
+    json: bool,
 }
 
 fn parse_severity(value: &str) -> Result<Severity, String> {
@@ -199,14 +202,51 @@ fn scan(args: &ScanArgs) -> ExitCode {
     }
     jss_frontend::finalize(&mut output.findings);
     let mut out = BufWriter::new(io::stdout().lock());
-    let written = serde_json::to_writer_pretty(&mut out, &output)
-        .map_err(io::Error::from)
-        .and_then(|()| writeln!(out))
-        .and_then(|()| out.flush());
+    let written = if args.json {
+        serde_json::to_writer_pretty(&mut out, &output)
+            .map_err(io::Error::from)
+            .and_then(|()| writeln!(out))
+    } else {
+        write_text(&mut out, &output)
+    }
+    .and_then(|()| out.flush());
     if let Err(err) = written {
         return fail(EXIT_ENGINE, format!("cannot write the report: {err}"));
     }
     ExitCode::SUCCESS
+}
+
+/// The readable list: one block per finding, then a one-line summary.
+fn write_text(out: &mut impl Write, output: &ScanOutput) -> io::Result<()> {
+    for f in &output.findings {
+        let severity = serde_json::to_value(f.severity)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_uppercase))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "{severity} {}  {}:{}",
+            f.class.name(),
+            f.file,
+            f.source.line
+        )?;
+        writeln!(out, "  source  {} ({})", f.source.expr, f.source.kind)?;
+        let sink_file = f.sink.file.as_deref().unwrap_or(&f.file);
+        writeln!(
+            out,
+            "  sink    {}:{}  {}({})",
+            sink_file, f.sink.line, f.sink.api, f.sink.arg
+        )?;
+        writeln!(out, "  in      {}", f.function)?;
+        writeln!(out)?;
+    }
+    writeln!(
+        out,
+        "{} finding(s), {} file(s) scanned, {} skipped",
+        output.findings.len(),
+        output.files_scanned,
+        output.skipped.len()
+    )
 }
 
 fn parse(args: &ParseArgs) -> ExitCode {

@@ -71,6 +71,8 @@ struct Context<'a> {
     exports: BTreeMap<String, BTreeMap<String, String>>,
     /// Request props that hold no objects, per directory of a scanned file.
     scalar: &'a BTreeMap<String, Vec<String>>,
+    /// The round's summary names by last segment.
+    external_names: BTreeMap<String, Vec<String>>,
 }
 
 impl ParsePool {
@@ -106,6 +108,7 @@ impl ParsePool {
                 constants,
                 exports,
                 scalar: &scalar,
+                external_names: taint::index_names(external),
             };
             self.install(|| {
                 files
@@ -122,8 +125,9 @@ impl ParsePool {
         // Each round lets a summary cross one more file: a route, its controller, a service,
         // a helper. Stop when nothing new is learned (at most `CROSS_FILE_HOPS` rounds).
         let mut external = Summaries::new();
-        let mut known_templates = 0;
-        let mut known_constants = 0;
+        // What the last round ran on: summaries, templates, constants, exports and re-exports
+        // (counted). A round on the same inputs would give the same reports.
+        let mut known = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut reports = run(
             &external,
             BTreeMap::new(),
@@ -154,17 +158,20 @@ impl ParsePool {
                 .filter(|r| !r.module.exports.is_empty())
                 .map(|r| (r.rel_path.clone(), r.module.exports.clone()))
                 .collect();
-            let merged = merge(reports);
-            let grew = count(&merged) > count(&external)
-                || template_count > known_templates
-                || constant_count > known_constants;
-            known_templates = template_count;
-            known_constants = constant_count;
-            external = merged;
-            reports = run(&external, reexports, templates, constants, exports);
-            if !grew {
+            let merged = merge(&reports);
+            let now = (
+                count(&merged),
+                template_count,
+                constant_count,
+                exports.values().map(BTreeMap::len).sum(),
+                reexports.values().map(BTreeSet::len).sum(),
+            );
+            if now == known {
                 break;
             }
+            known = now;
+            external = merged;
+            reports = run(&external, reexports, templates, constants, exports);
         }
         reports
     }
@@ -276,11 +283,14 @@ fn count(summaries: &Summaries) -> usize {
 
 /// Merges per-file summaries. A name defined in several files keeps every definition: callers
 /// link to the one their import resolves to.
-fn merge(reports: Vec<ScanReport>) -> Summaries {
+fn merge(reports: &[ScanReport]) -> Summaries {
     let mut merged = Summaries::new();
     for report in reports {
-        for (name, list) in report.summaries {
-            merged.entry(name).or_default().extend(list);
+        for (name, list) in &report.summaries {
+            merged
+                .entry(name.clone())
+                .or_default()
+                .extend(list.iter().cloned());
         }
     }
     merged
@@ -436,6 +446,7 @@ fn analyze(
             .scalar
             .get(parent_dir(&file.rel_path))
             .map_or(&[], Vec::as_slice),
+        external_names: &context.external_names,
     };
     let result = taint::scan_file_program(program, &linking, external);
     let index = LineIndex::new(text);

@@ -30,19 +30,30 @@ pub enum Fact {
     Scalar,
 }
 
+/// Longest access path a key is built for: no guard or pack name has more segments, and a
+/// longer chain (`x.a.a.a...`) would cost its length squared at every level.
+const MAX_KEY_SEGMENTS: usize = 32;
+
 /// The access path of an identifier or a chain of static members: `req.query.id`.
 pub fn path_key(expr: &Expression<'_>) -> Option<String> {
+    path_key_within(expr, MAX_KEY_SEGMENTS)
+}
+
+fn path_key_within(expr: &Expression<'_>, budget: usize) -> Option<String> {
+    let budget = budget.checked_sub(1)?;
     match expr.get_inner_expression() {
         Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
         Expression::StaticMemberExpression(m) => Some(format!(
             "{}.{}",
-            path_key(&m.object)?,
+            path_key_within(&m.object, budget)?,
             m.property.name.as_str()
         )),
         Expression::ComputedMemberExpression(m) => match m.expression.get_inner_expression() {
-            Expression::StringLiteral(lit) => {
-                Some(format!("{}.{}", path_key(&m.object)?, lit.value.as_str()?))
-            }
+            Expression::StringLiteral(lit) => Some(format!(
+                "{}.{}",
+                path_key_within(&m.object, budget)?,
+                lit.value.as_str()?
+            )),
             _ => None,
         },
         Expression::ChainExpression(chain) => {
@@ -52,7 +63,7 @@ pub fn path_key(expr: &Expression<'_>) -> Option<String> {
                 .and_then(|m| match m {
                     oxc_ast::ast::MemberExpression::StaticMemberExpression(s) => Some(format!(
                         "{}.{}",
-                        path_key(&s.object)?,
+                        path_key_within(&s.object, budget)?,
                         s.property.name.as_str()
                     )),
                     _ => None,

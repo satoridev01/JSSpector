@@ -67,6 +67,11 @@ fn class_bit(class: VulnClass) -> u8 {
 /// The `param` of a return summary whose value is client data, whatever the arguments.
 const RETURNS_SOURCE: usize = usize::MAX;
 
+/// Most route templates kept per function, and most parts in a template's path: route
+/// helpers have a handful; more is a generator, or recursion.
+const MAX_TEMPLATES: usize = 64;
+const MAX_TEMPLATE_PARTS: usize = 32;
+
 /// The `api` of a summary that says "the function returns this parameter" (not a sink).
 pub const RETURNS: &str = "<return>";
 
@@ -161,6 +166,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
     let templates = Templates::new();
     let constants = BTreeMap::new();
     let exports = BTreeMap::new();
+    let names = BTreeMap::new();
     let linking = Linking {
         file: "",
         files: &files,
@@ -170,6 +176,7 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
         constants: &constants,
         exports: &exports,
         scalar_props: &[],
+        external_names: &names,
     };
     scan_file_program(program, &linking, external)
 }
@@ -193,6 +200,19 @@ pub struct Linking<'a> {
     /// Request props that hold only strings and arrays in this file's package (`query` with
     /// Express 5).
     pub scalar_props: &'a [String],
+    /// The repository's summary names by their last segment (`find` -> `UsersService.find`,
+    /// `find`): built once per round, so a lookup never scans every summary.
+    pub external_names: &'a BTreeMap<String, Vec<String>>,
+}
+
+/// [`Linking::external_names`] of a summary map.
+pub fn index_names(summaries: &Summaries) -> BTreeMap<String, Vec<String>> {
+    let mut index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in summaries.keys() {
+        let last = name.rsplit('.').next().unwrap_or(name);
+        index.entry(last.to_owned()).or_default().push(name.clone());
+    }
+    index
 }
 
 impl Linking<'_> {
@@ -228,6 +248,7 @@ pub fn scan_file_program(
         pending_auth: Auth::NoneDetected,
         pending_request_kind: std::cell::Cell::new(None),
         pending_server_fields: std::cell::Cell::new(None),
+        resolved: std::cell::RefCell::new(BTreeMap::new()),
         router_auth: BTreeMap::new(),
         inline_names: BTreeMap::new(),
         routers: BTreeSet::new(),
@@ -406,7 +427,9 @@ struct Env {
     /// This function's parameter names, in order.
     params: Vec<String>,
     /// Arrays of object literals (route tables): name -> rows of field -> text.
-    tables: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    /// Shared: a table never changes once declared, and every function entered copies the
+    /// environment.
+    tables: std::rc::Rc<BTreeMap<String, Vec<BTreeMap<String, String>>>>,
     /// The row a table loop variable stands for in this walk: `r` -> fields.
     rows: BTreeMap<String, BTreeMap<String, String>>,
     /// Variables bound to an object literal: the taint of each field.
@@ -570,7 +593,7 @@ impl Env {
             fields: BTreeMap::new(),
             auth: Auth::NoneDetected,
             params: Vec::new(),
-            tables: BTreeMap::new(),
+            tables: std::rc::Rc::new(BTreeMap::new()),
             rows: BTreeMap::new(),
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
@@ -691,6 +714,8 @@ struct Walker<'e> {
     pending_request_kind: std::cell::Cell<Option<&'static str>>,
     /// The `server_fields` of the client source the next callback is registered for.
     pending_server_fields: std::cell::Cell<Option<&'static [String]>>,
+    /// Import specifiers resolved so far (resolving tries many candidate paths).
+    resolved: std::cell::RefCell<BTreeMap<String, Option<String>>>,
     /// Routers with authentication middleware applied to every later route: `router.use(auth)`.
     /// Middleware added with `use(...)` on each router (by [`router_key`]): the path prefix it
     /// guards (`""` for all) and the authentication it requires, in registration order.
@@ -962,10 +987,16 @@ fn literal_path(expr: &Expression<'_>) -> Option<String> {
 
 /// The name a middleware argument goes by: `requireLogin`, `auth.required`, `passport.authenticate('jwt')`.
 fn callee_name(expr: &Expression<'_>) -> Option<String> {
+    callee_name_within(expr, 32)
+}
+
+/// [`callee_name`], for at most `budget` segments (a longer chain has no useful name).
+fn callee_name_within(expr: &Expression<'_>, budget: usize) -> Option<String> {
+    let budget = budget.checked_sub(1)?;
     match expr.get_inner_expression() {
         Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
         Expression::CallExpression(call) => {
-            let inner = callee_name(&call.callee)?;
+            let inner = callee_name_within(&call.callee, budget)?;
             // `passport.authenticate('jwt')`, `requireRole('admin')`: the arguments count too.
             let args: Vec<String> = call
                 .arguments
@@ -978,7 +1009,7 @@ fn callee_name(expr: &Expression<'_>) -> Option<String> {
             Some(format!("{inner} {}", args.join(" ")))
         }
         other => other.as_member_expression().and_then(|m| {
-            let object = callee_name(m.object()).unwrap_or_default();
+            let object = callee_name_within(m.object(), budget).unwrap_or_default();
             let property = m
                 .static_property_name()
                 .and_then(|p| p.as_str().map(str::to_owned))?;
@@ -1182,7 +1213,9 @@ impl Walker<'_> {
                 env.branch -= 1;
                 // `for (const r of routes) router[r.method](r.path, r.handler)`: one record-only
                 // walk per known row.
+                // Not inside another row walk: nested table loops would multiply the walks.
                 if !self.summarize
+                    && !self.record_only
                     && let Expression::Identifier(table) = s.right.get_inner_expression()
                     && let Some(rows) = env.tables.get(table.name.as_str()).cloned()
                     && let ForStatementLeft::VariableDeclaration(d) = &s.left
@@ -1523,7 +1556,7 @@ impl Walker<'_> {
             {
                 let rows = table_rows(array);
                 if !rows.is_empty() {
-                    env.tables.insert(name.clone(), rows);
+                    std::rc::Rc::make_mut(&mut env.tables).insert(name.clone(), rows);
                 }
             }
             // `const user = verifyToken(token)`, `const session = await getServerSession()`,
@@ -3483,6 +3516,8 @@ impl Walker<'_> {
                 object: Some(table),
                 method,
             } = &callee
+                && !self.summarize
+                && !self.record_only
                 && has(&m().iteration_methods, method)
                 && let Some(rows) = env.tables.get(table).cloned()
                 && let Some(callback) = call.arguments.first().and_then(Argument::as_expression)
@@ -3845,10 +3880,16 @@ impl Walker<'_> {
             }
             let name = target.names.first()?.clone();
             let suffix = format!(".{name}");
+            let last = name.rsplit('.').next().unwrap_or(&name);
             let mut matching = self
-                .external
-                .iter()
-                .filter(|(k, list)| k.ends_with(&suffix) && list.iter().any(&defined_there));
+                .linking
+                .external_names
+                .get(last)
+                .into_iter()
+                .flatten()
+                .filter(|k| k.ends_with(&suffix))
+                .filter_map(|k| self.external.get(k).map(|list| (k, list)))
+                .filter(|(_, list)| list.iter().any(&defined_there));
             match (matching.next(), matching.next()) {
                 (Some((k, list)), None) => Some((
                     k.clone(),
@@ -4352,8 +4393,12 @@ impl Walker<'_> {
         // another file instantiates its routes (or, called with this function's own parameters,
         // makes this function a template too).
         if let Some((name, templates)) = self.templates_for(callee) {
-            for template in templates {
-                self.instantiate(&name, &template, call, auth, env);
+            // A helper calling itself (`add(p + '/x')` inside `add`) would derive its templates
+            // from its own, without end.
+            if name != env.function {
+                for template in templates {
+                    self.instantiate(&name, &template, call, auth, env);
+                }
             }
             return;
         }
@@ -4610,16 +4655,20 @@ impl Walker<'_> {
         if self.exported_function(spec, method).is_some() {
             return true;
         }
-        let suffix = format!(".{method}");
-        self.external.iter().any(|(name, list)| {
-            (name == method || name.ends_with(&suffix))
-                && list.iter().any(|s| {
+        self.linking
+            .external_names
+            .get(method)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| self.external.get(name))
+            .any(|list| {
+                list.iter().any(|s| {
                     s.defined_in
                         .as_deref()
                         .or(s.ext.as_ref().map(|e| e.file.as_str()))
                         .is_some_and(|file| self.names_file(spec, file))
                 })
-        })
+            })
     }
 
     /// Whether `expr` is an upload object of the request: `req.file`, `req.files[0]`,
@@ -4811,6 +4860,11 @@ impl Walker<'_> {
                 }),
             },
         };
+        // Bounded: a path of at most `MAX_TEMPLATE_PARTS` parts, at most `MAX_TEMPLATES` templates
+        // per function.
+        if path.len() > MAX_TEMPLATE_PARTS {
+            return;
+        }
         let open = path.iter().any(|p| matches!(p, PathPart::Param(_))) || method.is_err();
         if open {
             if env.function != "<anonymous>" && env.function != "<module>" {
@@ -4824,7 +4878,7 @@ impl Walker<'_> {
                     .route_templates
                     .entry(env.function.clone())
                     .or_default();
-                if !list.contains(&derived) {
+                if list.len() < MAX_TEMPLATES && !list.contains(&derived) {
                     list.push(derived);
                 }
             }
@@ -5005,7 +5059,13 @@ impl Walker<'_> {
         if self.linking.files.is_empty() {
             return spec_names_file(spec, file);
         }
-        match self.linking.resolve(spec) {
+        let resolved = self
+            .resolved
+            .borrow_mut()
+            .entry(spec.to_owned())
+            .or_insert_with(|| self.linking.resolve(spec))
+            .clone();
+        match resolved {
             Some(resolved) => {
                 resolved == file
                     || self

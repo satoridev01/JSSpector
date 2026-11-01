@@ -118,10 +118,13 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
     }
 
     let mut routes = BTreeSet::new();
+    let mut memo = BTreeMap::new();
     for (file, report) in &by_file {
         for entry in &report.module.entries {
             let prefixes = match &entry.receiver {
-                Some(receiver) => prefixes(&parents, &(file.to_string(), receiver.clone()), 0),
+                Some(receiver) => {
+                    prefixes(&parents, &(file.to_string(), receiver.clone()), &mut memo)
+                }
                 None => vec![(String::new(), Auth::NoneDetected)],
             };
             let path = match entry.kind.as_str() {
@@ -203,19 +206,55 @@ fn product(report: &ScanReport, exported: &str) -> String {
 fn prefixes(
     parents: &BTreeMap<RouterId, Vec<(RouterId, String, Auth)>>,
     router: &RouterId,
-    depth: usize,
+    memo: &mut BTreeMap<RouterId, Vec<(String, Auth)>>,
 ) -> Vec<(String, Auth)> {
-    match parents.get(router) {
-        Some(edges) if depth < 8 => edges
-            .iter()
-            .flat_map(|(parent, prefix, auth)| {
-                prefixes(parents, parent, depth + 1)
-                    .into_iter()
-                    .map(move |(above, above_auth)| (join(&above, prefix), above_auth.max(*auth)))
-            })
-            .collect(),
-        _ => vec![(String::new(), Auth::NoneDetected)],
+    let mut path = Vec::new();
+    prefixes_from(parents, router, &mut path, memo)
+}
+
+/// The prefixes a router is reachable under: every chain of mounts above it, each with the
+/// strongest authentication on the way. A router mounted into itself (directly or through
+/// others) is a root on the second visit, and at most `MAX_PREFIXES` prefixes are kept.
+fn prefixes_from(
+    parents: &BTreeMap<RouterId, Vec<(RouterId, String, Auth)>>,
+    router: &RouterId,
+    path: &mut Vec<RouterId>,
+    memo: &mut BTreeMap<RouterId, Vec<(String, Auth)>>,
+) -> Vec<(String, Auth)> {
+    const MAX_PREFIXES: usize = 64;
+    if let Some(known) = memo.get(router) {
+        return known.clone();
     }
+    let root = || vec![(String::new(), Auth::NoneDetected)];
+    let Some(edges) = parents.get(router) else {
+        return root();
+    };
+    if path.contains(router) || path.len() >= 8 {
+        return root();
+    }
+    path.push(router.clone());
+    let mut found: Vec<(String, Auth)> = Vec::new();
+    for (parent, prefix, auth) in edges {
+        if parent == router {
+            // `router.use('/p', router)`: no prefix comes from mounting a router into itself.
+            continue;
+        }
+        for (above, above_auth) in prefixes_from(parents, parent, path, memo) {
+            let entry = (join(&above, prefix), above_auth.max(*auth));
+            if !found.contains(&entry) && found.len() < MAX_PREFIXES {
+                found.push(entry);
+            }
+        }
+    }
+    path.pop();
+    if found.is_empty() {
+        found = root();
+    }
+    // Only a complete result is reusable (one computed inside a cycle may miss its prefixes).
+    if path.is_empty() {
+        memo.insert(router.clone(), found.clone());
+    }
+    found
 }
 
 /// Joins URL path parts with exactly one `/` between them.

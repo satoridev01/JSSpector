@@ -47,18 +47,25 @@ struct TsConfig {
 impl Workspace {
     /// Reads every `package.json` under `root`.
     pub fn load(root: &Path) -> Self {
-        let mut packages = BTreeMap::new();
+        let mut packages: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
         let mut tsconfigs = BTreeMap::new();
+        // Sorted, so the result never depends on the file system's directory order.
         let walker = ignore::WalkBuilder::new(root)
             .standard_filters(false)
             .hidden(true)
             .filter_entry(|e| e.file_name() != "node_modules" && e.file_name() != ".git")
+            .sort_by_file_path(|a, b| a.cmp(b))
             .build();
         for entry in walker.flatten() {
             let name = entry.file_name().to_string_lossy();
             if name == "tsconfig.json" || name == "jsconfig.json" {
                 if let Some((dir, config)) = read_tsconfig(root, entry.path()) {
-                    tsconfigs.entry(dir).or_insert(config);
+                    // tsconfig.json wins over jsconfig.json in the same directory.
+                    if name == "tsconfig.json" {
+                        tsconfigs.insert(dir, config);
+                    } else {
+                        tsconfigs.entry(dir).or_insert(config);
+                    }
                 }
                 continue;
             }
@@ -88,7 +95,16 @@ impl Workspace {
                     entries.push(value.trim_start_matches("./").to_owned());
                 }
             }
-            packages.insert(name.to_owned(), (dir, entries));
+            // A name declared twice (fixtures, examples): the shallowest directory, then the
+            // first by name, whatever order the walk found them in.
+            let depth = |d: &str| d.matches('/').count() + usize::from(!d.is_empty());
+            match packages.get(name) {
+                Some((existing, _))
+                    if (depth(existing), existing.as_str()) <= (depth(&dir), dir.as_str()) => {}
+                _ => {
+                    packages.insert(name.to_owned(), (dir, entries));
+                }
+            }
         }
         Self {
             packages,

@@ -55,6 +55,9 @@ pub struct Origin {
     pub object: bool,
 }
 
+/// The `param` of a return summary whose value is client data, whatever the arguments.
+const RETURNS_SOURCE: usize = usize::MAX;
+
 /// The `api` of a summary that says "the function returns this parameter" (not a sink).
 pub const RETURNS: &str = "<return>";
 
@@ -1517,11 +1520,10 @@ impl Walker<'_> {
             }
             Role::Route | Role::Plain => {
                 let model = m();
-                let conventional = first.is_some_and(|n| has(&model.request_names, n))
-                    && (names.len() >= 2 || role == Role::Route);
+                // `(req, res)` handlers, and helpers that take the request (`getDir(req)`).
+                let conventional = first.is_some_and(|n| has(&model.request_names, n));
                 if let Some(first) = first {
-                    if has(&model.context_names, first) && (role == Role::Route || names.len() <= 2)
-                    {
+                    if has(&model.context_names, first) && role == Role::Route {
                         // Koa: the context is the request too.
                         env.requests.insert(first.to_owned(), "http");
                     } else if role == Role::Route
@@ -1571,10 +1573,11 @@ impl Walker<'_> {
     /// Summary pass: a function that returns (a value derived from) its parameter.
     fn record_return(&mut self, taint: Option<Origin>, span: Span, env: &Env) {
         let Some(origin) = taint else { return };
-        let Some(param) = origin.param else { return };
         if !self.summarize || env.function == "<anonymous>" || env.function == "<module>" {
             return;
         }
+        // `function getDir(req) { return req.query.dir }`: returns client data itself.
+        let param = origin.param.unwrap_or(RETURNS_SOURCE);
         let field = self.field_of.get(&origin.span.start).cloned();
         let list = self.summaries.entry(env.function.clone()).or_default();
         if list
@@ -1650,23 +1653,12 @@ impl Walker<'_> {
 
     fn expr_inner(&mut self, expr: &Expression<'_>, env: &mut Env) -> Option<Origin> {
         match expr {
-            Expression::Identifier(id) => env
-                .vars
-                .get(id.name.as_str())
-                .cloned()
-                // A request object passed along as a value (`getId(req)`) carries its data.
-                .or_else(|| {
-                    env.requests
-                        .get(id.name.as_str())
-                        .filter(|kind| **kind != CONTEXT)
-                        .map(|kind| Origin::source(kind, id.span))
-                })
-                .map(|mut o| {
-                    if env.scalars.contains(id.name.as_str()) {
-                        o.object = false;
-                    }
-                    o
-                }),
+            Expression::Identifier(id) => env.vars.get(id.name.as_str()).cloned().map(|mut o| {
+                if env.scalars.contains(id.name.as_str()) {
+                    o.object = false;
+                }
+                o
+            }),
             Expression::StaticMemberExpression(_)
             | Expression::ComputedMemberExpression(_)
             | Expression::PrivateFieldExpression(_) => self.member(expr, env),
@@ -2905,6 +2897,11 @@ impl Walker<'_> {
                 .iter()
                 .filter(|s| s.api == RETURNS)
                 .filter_map(|s| {
+                    if s.param == RETURNS_SOURCE {
+                        let mut origin = Origin::source(s.at_sink.kind, call.span);
+                        origin.object = s.at_sink.object;
+                        return Some(origin);
+                    }
                     let whole = taints.get(s.param).cloned().flatten();
                     match &s.field {
                         Some(field) => {
@@ -3710,6 +3707,9 @@ impl Walker<'_> {
                     }
                 };
             let Some(origin) = origin else { continue };
+            if has(&sink.ignore_kinds, origin.kind) {
+                continue;
+            }
             // The CLI is the user's own machine: never above low.
             let severity = m().cap(origin.kind, severity);
             let Some(arg) = arguments.get(index) else {

@@ -42,6 +42,7 @@ sinks:
     class: path-traversal
     severity: high
     args: ["any:0"]
+    ignore_kinds: [dom, props]
   - module: fs
     exports: [rename, renameSync, copyFile, copyFileSync, cp, cpSync, copy, copySync, move, moveSync, symlink, symlinkSync]
     class: path-traversal

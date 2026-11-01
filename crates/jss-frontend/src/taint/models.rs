@@ -170,6 +170,9 @@ pub struct SinkSpec {
     /// Weaker matches checked when `args` find nothing: `spawn('git', ['clone', url])`.
     #[serde(default)]
     pub also: Vec<AlsoSpec>,
+    /// Source kinds this sink does not apply to: a browser page's URL is no SSRF.
+    #[serde(default)]
+    pub ignore_kinds: Vec<String>,
 }
 
 /// A secondary argument rule with its own severity.
@@ -421,6 +424,7 @@ pub struct Sink {
     pub escalate: Option<(String, Severity, Vec<ArgRule>)>,
     /// (severity, rules) tried when `args` match nothing.
     pub also: Vec<(Severity, Vec<ArgRule>)>,
+    pub ignore_kinds: Vec<String>,
 }
 
 /// Every pack merged.
@@ -537,6 +541,7 @@ impl Model {
                         )
                     })
                     .collect(),
+                ignore_kinds: spec.ignore_kinds.clone(),
             };
             if let Some(module) = &spec.module {
                 for export in &spec.exports {

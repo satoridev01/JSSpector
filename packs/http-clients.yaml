@@ -13,6 +13,6 @@ modules:
   ky: http-client
   phin: http-client
 sinks:
-  - {module: http-client, exports: ["", get, post, put, patch, delete, head, request, stream], class: ssrf, severity: high, args: ["url:0"]}
-  - {global: [fetch], class: ssrf, severity: high, args: ["url:0"]}
+  - {module: http-client, exports: ["", get, post, put, patch, delete, head, request, stream], class: ssrf, severity: high, args: ["url:0"], ignore_kinds: [dom, props, ext-message, postmessage]}
+  - {global: [fetch], class: ssrf, severity: high, args: ["url:0"], ignore_kinds: [dom, props, ext-message, postmessage]}
 url_option_keys: [url, uri, host, hostname, baseURL]

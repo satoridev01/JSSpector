@@ -330,6 +330,17 @@ pub struct Sanitizers {
     /// Statements that throw unless their first argument has a type: `check(x, String)`.
     #[serde(default)]
     pub type_assertions: Vec<String>,
+    /// Words that make a predicate (`isX`, `hasX`, `validateX`) a validator: true means safe.
+    #[serde(default)]
+    pub validator_words: Vec<String>,
+    /// Words that make a predicate a rejecter: true means bad (`isPathTraversal`).
+    #[serde(default)]
+    pub rejecter_words: Vec<String>,
+    /// Methods that, false for a marker, clean their receiver: `p.includes('..')`.
+    #[serde(default)]
+    pub receiver_rejecters: Vec<String>,
+    #[serde(default)]
+    pub rejected_markers: Vec<String>,
     /// Calls that escape for one class only: `class: [calls]`.
     #[serde(default)]
     pub escapers: BTreeMap<String, Vec<String>>,
@@ -467,6 +478,10 @@ pub struct Model {
     pub validators: Vec<String>,
     pub receiver_validators: Vec<String>,
     pub type_assertions: Vec<String>,
+    pub validator_words: Vec<String>,
+    pub rejecter_words: Vec<String>,
+    pub receiver_rejecters: Vec<String>,
+    pub rejected_markers: Vec<String>,
     pub escapers: BTreeMap<String, Vec<String>>,
     pub html_props: Vec<String>,
     pub sql_keywords: Vec<String>,
@@ -597,6 +612,12 @@ impl Model {
         self.receiver_validators
             .extend(pack.sanitizers.receiver_validators);
         self.type_assertions.extend(pack.sanitizers.type_assertions);
+        self.validator_words.extend(pack.sanitizers.validator_words);
+        self.rejecter_words.extend(pack.sanitizers.rejecter_words);
+        self.receiver_rejecters
+            .extend(pack.sanitizers.receiver_rejecters);
+        self.rejected_markers
+            .extend(pack.sanitizers.rejected_markers);
         for (class, calls) in pack.sanitizers.escapers {
             self.escapers.entry(class).or_default().extend(calls);
         }

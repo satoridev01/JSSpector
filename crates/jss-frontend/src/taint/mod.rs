@@ -2000,7 +2000,16 @@ impl Walker<'_> {
                         env,
                     );
                 }
-                None
+                // `new URL(input)` keeps the input.
+                match &callee {
+                    Callee::Global(name) if has(&m().pass_globals, name) => taints
+                        .iter()
+                        .flatten()
+                        .next()
+                        .cloned()
+                        .map(|o| o.step(new.span.start, format!("through new {name}()"))),
+                    _ => None,
+                }
             }
             Expression::ChainExpression(chain) => {
                 use oxc_ast::ast::ChainElement;
@@ -2834,7 +2843,10 @@ impl Walker<'_> {
             Callee::Global(name) => self.summaries.get(name).map(|s| (name.clone(), s.clone())),
             Callee::Method { method, .. } if !method.is_empty() => {
                 let suffix = format!(".{method}");
-                let mut matching = self.summaries.iter().filter(|(k, _)| k.ends_with(&suffix));
+                let mut matching = self
+                    .summaries
+                    .iter()
+                    .filter(|(k, _)| k.ends_with(&suffix) || *k == method);
                 match (matching.next(), matching.next()) {
                     (Some((k, s)), None) => Some((k.clone(), s.clone())),
                     _ => None,
@@ -4292,6 +4304,19 @@ mod tests {
         assert_eq!(found[0].0, VulnClass::Ssrf);
         // a constant field stays clean
         assert!(one("class E { constructor() { this.url = 'https://api.example.com'; } run() { return axios.get(this.url); } }").is_empty());
+    }
+
+    #[test]
+    fn rejecting_and_named_validators_clean_values() {
+        // Flowise's fix: a predicate that is true for bad input, then an exit
+        let fixed = "app.get('/f', (req, res) => { const id = req.query.id; if (isPathTraversal(id)) { throw new Error('bad'); } fs.createReadStream(path.join(base, id)); });";
+        assert!(one(fixed).is_empty());
+        let vulnerable = "app.get('/f', (req, res) => { const id = req.query.id; fs.createReadStream(path.join(base, id)); });";
+        assert_eq!(one(vulnerable).len(), 1);
+        assert!(one("app.get('/f', (req, res) => { const p = req.query.p; if (p.includes('..')) return res.end(); fs.readFileSync(p); });").is_empty());
+        assert!(one("app.get('/f', (req, res) => { const u = req.query.u; if (!isValidUUID(u)) return; exec('x ' + u); });").is_empty());
+        // `isInvalid` is a rejecter, not a validator
+        assert_eq!(one("app.get('/f', (req, res) => { const u = req.query.u; if (!isInvalidName(u)) return; exec('x ' + u); });").len(), 1);
     }
 
     #[test]

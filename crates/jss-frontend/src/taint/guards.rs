@@ -88,6 +88,8 @@ pub fn facts(test: &Expression<'_>, truth: bool, out: &mut Vec<(String, Fact)>) 
             _ => {}
         },
         Expression::CallExpression(call) if truth => validator_call(call, out),
+        // `if (isPathTraversal(x)) throw ...`: a check that is true for bad input, false here.
+        Expression::CallExpression(call) => rejecter_call(call, out),
         Expression::BinaryExpression(b) => {
             let equal = matches!(
                 b.operator,
@@ -143,8 +145,18 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
     let qualified = callee
         .as_member_expression()
         .and_then(|m| Some(format!("{}.{name}", path_key(m.object())?)));
-    let validates_args =
-        has(validators, &name) || qualified.as_deref().is_some_and(|q| has(validators, q));
+    let lower = name.to_ascii_lowercase();
+    let validates_args = has(validators, &name)
+        || qualified.as_deref().is_some_and(|q| has(validators, q))
+        || (is_predicate(&lower)
+            && model()
+                .validator_words
+                .iter()
+                .any(|w| lower.contains(w.as_str()))
+            && !model()
+                .rejecter_words
+                .iter()
+                .any(|w| lower.contains(w.as_str())));
     if validates_args {
         for argument in &call.arguments {
             if let Some(key) = argument.as_expression().and_then(path_key) {
@@ -154,6 +166,56 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
     }
     // Checks on the value itself: `p.startsWith(base)`, `v.match(/^\d+$/)`.
     if has(&model().receiver_validators, &name)
+        && let Some(member) = callee.as_member_expression()
+        && let Some(key) = path_key(member.object())
+    {
+        out.push((key, Fact::Clean));
+    }
+}
+
+/// `isX`, `hasX`, `canX`, `checkX`...: a name that reads as a yes/no question.
+fn is_predicate(lower: &str) -> bool {
+    [
+        "is", "has", "can", "check", "validate", "verify", "ensure", "assert",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p))
+}
+
+/// A rejecting check that returned false: `isPathTraversal(x)`, `x.includes('..')`.
+fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String, Fact)>) {
+    let callee = call.callee.get_inner_expression();
+    let name = match callee {
+        Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+        other => other
+            .as_member_expression()
+            .and_then(|m| m.static_property_name())
+            .and_then(|n| n.as_str().map(str::to_owned)),
+    };
+    let Some(name) = name else { return };
+    let lower = name.to_ascii_lowercase();
+    if is_predicate(&lower)
+        && model()
+            .rejecter_words
+            .iter()
+            .any(|w| lower.contains(w.as_str()))
+    {
+        for argument in &call.arguments {
+            if let Some(key) = argument.as_expression().and_then(path_key) {
+                out.push((key, Fact::Clean));
+            }
+        }
+        return;
+    }
+    // `p.includes('..')` (or another marker) was false: the receiver has no traversal.
+    if has(&model().receiver_rejecters, &name)
+        && let Some(Argument::StringLiteral(marker)) = call.arguments.first()
+        && marker.value.as_str().is_some_and(|m| {
+            model()
+                .rejected_markers
+                .iter()
+                .any(|r| m.contains(r.as_str()))
+        })
         && let Some(member) = callee.as_member_expression()
         && let Some(key) = path_key(member.object())
     {

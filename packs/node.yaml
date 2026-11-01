@@ -54,7 +54,8 @@ propagation:
   pass_methods: [trim, trimStart, trimEnd, toLowerCase, toUpperCase, toLocaleLowerCase, toLocaleUpperCase, replace,
     replaceAll, slice, substring, substr, split, join, concat, toString, padStart, padEnd, normalize, at, valueOf, repeat]
   build_methods: [concat, join, format]
-  pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, util.format]
+  pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, util.format, URL, encodeURI,
+    encodeURL, normalizeUrl, url.parse, url.resolve, querystring.parse]
 sanitizers:
   calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN]
   # Used as a guard (`if (!isValid(x)) return;`), these clear their argument on the passing path.
@@ -62,6 +63,12 @@ sanitizers:
     isInt, isNumeric, isEmail, isURL, isMongoId, isValidObjectId, isSafeMapKey, isFinite, isInteger, includes, has,
     test, isPathInside, isWithin, isSubPath]
   receiver_validators: [startsWith, match]
+  # Predicates (isX, hasX, validateX...) named like these are validators (true = safe)...
+  validator_words: [valid, safe, allowed, whitelisted, allowlisted, permitted, inside, within, uuid, numeric, alphanumeric]
+  # ...or rejecters (true = bad), which clean their argument when they returned false.
+  rejecter_words: [traversal, malicious, unsafe, invalid, dangerous, forbidden, blocked, blacklisted, denylisted, private, internal, outside]
+  receiver_rejecters: [includes, match, test]
+  rejected_markers: ["..", "\\0", "%2e"]
   escapers:
     sql-injection: [escape, escapeId, format, mysql.escape, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
     xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss]

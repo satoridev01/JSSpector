@@ -1,0 +1,10 @@
+# How authentication shows in code: route middleware and checks inside handlers.
+name: auth
+auth:
+  # Middleware names (or callee names of middleware factories) containing one of these.
+  middleware: [auth, login, logged, token, jwt, session, passport, protect, ensure, requireuser, verify, guard, signedin, permission, acl, rbac]
+  admin: [admin, superuser, staff, owner, root, sysadmin]
+  # `if (!req.user) return ...`: request fields whose absence ends the request.
+  request_fields: [user, session, auth, account, isAuthenticated]
+  # NestJS-style decorators on a class or method.
+  decorators: [UseGuards, Auth, Roles, Authorized, Protected]

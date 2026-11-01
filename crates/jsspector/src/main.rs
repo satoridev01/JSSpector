@@ -331,7 +331,10 @@ fn write_text(
             writeln!(
                 out,
                 "          {}in {}, auth: {}{}",
-                st.dim, f.function, f.auth, st.reset
+                st.dim,
+                f.function,
+                f.auth.name(),
+                st.reset
             )?;
             writeln!(out)?;
             let sink_code = source_line(root, file, f.sink.line);

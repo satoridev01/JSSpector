@@ -15,12 +15,12 @@ pub mod models;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use jss_core::{Severity, VulnClass};
+use jss_core::{Auth, Severity, VulnClass};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, ArrowFunctionBody, AssignmentTarget, BindingPattern,
     CallExpression, Class, ClassElement, Declaration, ExportDefaultDeclarationKind, Expression,
     ForStatementInit, ForStatementLeft, FormalParameters, Function, ModuleDeclaration,
-    ObjectPropertyKind, Program, PropertyKey, Statement, VariableDeclaration,
+    ObjectPropertyKind, Program, PropertyKey, Statement, UnaryOperator, VariableDeclaration,
 };
 use oxc_ast::ast::{BinaryOperator, SimpleAssignmentTarget};
 use oxc_span::{GetSpan, Span};
@@ -93,6 +93,8 @@ pub struct RawFinding {
     pub origin: Origin,
     /// The sink is in another file (reached through a repo-wide summary).
     pub ext: Option<ExtSink>,
+    /// Authentication recognized on the way (set when the finding is recorded).
+    pub auth: Auth,
 }
 
 /// A sink in another file, already resolved to a location.
@@ -129,6 +131,8 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
     let mut walker = Walker {
         external,
         field_of: BTreeMap::new(),
+        pending_auth: Auth::NoneDetected,
+        router_auth: BTreeMap::new(),
         modules: BTreeMap::new(),
         relative: BTreeMap::new(),
         result: ScanResult::default(),
@@ -194,6 +198,8 @@ struct Env {
     sockets: BTreeSet<String>,
     /// Names whose `.input` field is client data (tRPC procedure options).
     inputs: BTreeMap<String, &'static str>,
+    /// Authentication recognized for this function's entry point.
+    auth: Auth,
     /// Variables bound to an object literal: the taint of each field.
     fields: BTreeMap<String, BTreeMap<String, Origin>>,
     /// Access paths a guard validated: no longer tainted.
@@ -231,6 +237,7 @@ impl Env {
             sockets: BTreeSet::new(),
             inputs: BTreeMap::new(),
             fields: BTreeMap::new(),
+            auth: Auth::NoneDetected,
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
             branch: 0,
@@ -245,6 +252,7 @@ impl Env {
             sockets: self.sockets.clone(),
             inputs: self.inputs.clone(),
             fields: self.fields.clone(),
+            auth: self.auth,
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
             branch: 0,
@@ -324,6 +332,10 @@ struct Walker<'e> {
     external: &'e Summaries,
     /// Summary pass: the field each destructured parameter source stands for, by span start.
     field_of: BTreeMap<u32, String>,
+    /// Authentication for the next function entered (route middleware, guard decorators).
+    pending_auth: Auth,
+    /// Routers with authentication middleware applied to every later route: `router.use(auth)`.
+    router_auth: BTreeMap<String, Auth>,
     modules: BTreeMap<String, Imported>,
     /// Local names bound to relative modules: name -> (specifier, export or None).
     relative: BTreeMap<String, (String, Option<String>)>,
@@ -363,6 +375,33 @@ fn spec_names_file(spec: &str, file: &str) -> bool {
     let stem = parts.next().unwrap_or("").split('.').next().unwrap_or("");
     let dir = parts.next().unwrap_or("");
     !last.is_empty() && (last == stem || (stem == "index" && last == dir))
+}
+
+/// The name a middleware argument goes by: `requireLogin`, `auth.required`, `passport.authenticate('jwt')`.
+fn callee_name(expr: &Expression<'_>) -> Option<String> {
+    match expr.get_inner_expression() {
+        Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+        Expression::CallExpression(call) => {
+            let inner = callee_name(&call.callee)?;
+            // `passport.authenticate('jwt')`, `requireRole('admin')`: the arguments count too.
+            let args: Vec<String> = call
+                .arguments
+                .iter()
+                .filter_map(|a| match a {
+                    Argument::StringLiteral(l) => l.value.as_str().map(str::to_owned),
+                    _ => None,
+                })
+                .collect();
+            Some(format!("{inner} {}", args.join(" ")))
+        }
+        other => other.as_member_expression().and_then(|m| {
+            let object = callee_name(m.object()).unwrap_or_default();
+            let property = m
+                .static_property_name()
+                .and_then(|p| p.as_str().map(str::to_owned))?;
+            Some(format!("{object}.{property}"))
+        }),
+    }
 }
 
 /// `require('x')` → `x`.
@@ -461,6 +500,10 @@ impl Walker<'_> {
                 env.learn(held);
                 self.branch(&s.consequent, env);
                 let consequent_exits = guards::exits(&s.consequent);
+                // `if (!req.user) return res.status(401)...`: past here, the caller is logged in.
+                if consequent_exits && self.requires_login(&s.test, env) {
+                    env.auth = env.auth.max(Auth::User);
+                }
                 if consequent_exits {
                     // Taint added in an exiting branch never reaches what follows.
                     (env.vars, env.clean, env.scalars) = saved;
@@ -838,6 +881,19 @@ impl Walker<'_> {
 
     fn class(&mut self, class: &Class<'_>, env: &mut Env) {
         let class_name = class.id.as_ref().map(|id| id.name.as_str().to_owned());
+        // `@UseGuards(AuthGuard)` on the class or a method: every request passes the guard.
+        let guarded = |decorators: &[oxc_ast::ast::Decorator<'_>]| {
+            decorators
+                .iter()
+                .filter_map(|d| {
+                    let name = callee_name(&d.expression)?;
+                    let head = name.split([' ', '(', '.']).next().unwrap_or("").to_owned();
+                    has(&m().auth_decorators, &head)
+                        .then(|| m().auth_of(&name).unwrap_or(Auth::User))
+                })
+                .max()
+        };
+        let class_auth = guarded(&class.decorators).unwrap_or_default();
         for element in &class.body.body {
             match element {
                 ClassElement::MethodDefinition(method) => {
@@ -845,6 +901,8 @@ impl Walker<'_> {
                         Some(class) => format!("{class}.{key}"),
                         None => key,
                     });
+                    self.pending_auth =
+                        class_auth.max(guarded(&method.decorators).unwrap_or_default());
                     self.function(&method.value, env, name, Role::Plain);
                 }
                 ClassElement::PropertyDefinition(property) => {
@@ -884,6 +942,7 @@ impl Walker<'_> {
     ) -> Env {
         let name = name.unwrap_or_else(|| "<anonymous>".to_owned());
         let mut env = parent.closure(name);
+        env.auth = env.auth.max(std::mem::take(&mut self.pending_auth));
         let names: Vec<Option<&str>> = params
             .items
             .iter()
@@ -1393,6 +1452,7 @@ impl Walker<'_> {
                                     function: env.function.clone(),
                                     origin,
                                     ext: None,
+                                    auth: Auth::NoneDetected,
                                 },
                                 env,
                             );
@@ -1418,6 +1478,7 @@ impl Walker<'_> {
                                 function: env.function.clone(),
                                 origin: origin.clone(),
                                 ext: None,
+                                auth: Auth::NoneDetected,
                             },
                             env,
                         );
@@ -1571,6 +1632,30 @@ impl Walker<'_> {
         self.expr(member.object(), env)
     }
 
+    /// `!req.user`, `!req.session.userId`, `!req.isAuthenticated()`: a test that is true when no
+    /// one is logged in.
+    fn requires_login(&self, test: &Expression<'_>, env: &Env) -> bool {
+        let Expression::UnaryExpression(u) = test.get_inner_expression() else {
+            if let Expression::LogicalExpression(l) = test.get_inner_expression() {
+                return self.requires_login(&l.left, env) || self.requires_login(&l.right, env);
+            }
+            return false;
+        };
+        if u.operator != UnaryOperator::LogicalNot {
+            return false;
+        }
+        let target = match u.argument.get_inner_expression() {
+            Expression::CallExpression(call) => &call.callee,
+            other => other,
+        };
+        let Some(key) = guards::path_key(target) else {
+            return false;
+        };
+        let mut parts = key.split('.');
+        let root = parts.next().unwrap_or("");
+        env.requests.contains_key(root) && parts.any(|p| has(&m().auth_request_fields, p))
+    }
+
     /// The source kind when `expr` is a request object: a request parameter, or `ctx.request`.
     fn request_kind(&self, expr: &Expression<'_>, env: &Env) -> Option<&'static str> {
         match expr {
@@ -1709,6 +1794,46 @@ impl Walker<'_> {
             _ => None,
         };
         let last = call.arguments.len().saturating_sub(1);
+        // Authentication middleware: `app.get(path, requireLogin, handler)`, an earlier
+        // `router.use(auth)`, or `router.use(auth)` itself.
+        let receiver_name = match &callee {
+            Callee::Method {
+                object: Some(o), ..
+            } => Some(o.clone()),
+            _ => None,
+        };
+        let middleware_auth = call
+            .arguments
+            .iter()
+            .take(last)
+            .filter_map(|a| a.as_expression().and_then(callee_name))
+            .filter_map(|name| m().auth_of(&name))
+            .max()
+            .unwrap_or_default();
+        let route_auth = receiver_name
+            .as_deref()
+            .and_then(|r| self.router_auth.get(r).copied())
+            .unwrap_or_default()
+            .max(middleware_auth);
+        if let Callee::Method {
+            object: Some(object),
+            method,
+        } = &callee
+            && has(&m().route_methods, method)
+            && role != Role::Route
+        {
+            // `router.use(auth)`: a router-wide middleware.
+            let used = call
+                .arguments
+                .iter()
+                .filter_map(|a| a.as_expression().and_then(callee_name))
+                .filter_map(|name| m().auth_of(&name))
+                .max();
+            if let Some(level) = used {
+                let entry = self.router_auth.entry(object.clone()).or_default();
+                *entry = (*entry).max(level);
+            }
+        }
         let mut taints = Vec::with_capacity(call.arguments.len());
         for (index, argument) in call.arguments.iter().enumerate() {
             let arg_role = match shape {
@@ -1723,6 +1848,9 @@ impl Walker<'_> {
                         .map(Expression::get_inner_expression),
                     Some(Expression::ObjectExpression(_))
                 );
+            if arg_role == Role::Route {
+                self.pending_auth = route_auth;
+            }
             let taint = match (argument.as_expression(), &route_name) {
                 // Walked below, once, as callbacks.
                 _ if callbacks_object => None,
@@ -2182,6 +2310,7 @@ impl Walker<'_> {
                     function: env.function.clone(),
                     origin,
                     ext: summary.ext.clone(),
+                    auth: Auth::NoneDetected,
                 },
                 env,
             );
@@ -2190,6 +2319,15 @@ impl Walker<'_> {
 
     /// Records a finding, or in the summary pass, a summary of a parameter that reaches a sink.
     fn emit(&mut self, mut finding: RawFinding, env: &Env) {
+        finding.auth = finding.auth.max(env.auth);
+        // Reachable by admins only: one level lower.
+        if finding.auth == Auth::Admin {
+            finding.severity = match finding.severity {
+                Severity::Critical => Severity::High,
+                Severity::High => Severity::Medium,
+                Severity::Medium | Severity::Low => Severity::Low,
+            };
+        }
         // The CLI is the user's own machine: never above low.
         finding.severity = m().cap(finding.origin.kind, finding.severity);
         match (self.summarize, finding.origin.param) {
@@ -2354,6 +2492,7 @@ impl Walker<'_> {
                     function: env.function.clone(),
                     origin,
                     ext: None,
+                    auth: Auth::NoneDetected,
                 },
                 env,
             );
@@ -2733,6 +2872,51 @@ mod tests {
         assert_eq!(one("app.get('/x', (req, res) => { const meta = { name: req.query.name, dir: '/srv' }; fs.readFileSync(path.join(meta.dir, meta.name)); });").len(), 1);
         // a field written later
         assert_eq!(one("app.get('/x', (req, res) => { const o = { dir: '/srv' }; o.dir = req.query.d; fs.readFileSync(o.dir); });").len(), 1);
+    }
+
+    fn auth_of(src: &str) -> Vec<(Auth, Severity)> {
+        let src = format!("{HEAD}{src}");
+        let allocator = Allocator::default();
+        let ret = Parser::new(
+            &allocator,
+            &src,
+            source_type(SourceKind::Js, PackageType::CommonJs),
+        )
+        .with_options(parse_options())
+        .parse();
+        scan_program(&ret.program, &src)
+            .findings
+            .into_iter()
+            .map(|f| (f.auth, f.severity))
+            .collect()
+    }
+
+    #[test]
+    fn authentication_is_recognized_and_admin_only_lowers_severity() {
+        assert_eq!(
+            auth_of("app.get('/p', (req, res) => { exec('ping ' + req.query.h); });"),
+            vec![(Auth::NoneDetected, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of("app.get('/p', requireLogin, (req, res) => { exec('ping ' + req.query.h); });"),
+            vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "router.use(passport.authenticate('jwt'));\nrouter.get('/p', (req, res) => { exec('ping ' + req.query.h); });"
+            ),
+            vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of("app.post('/p', isAdmin, (req, res) => { exec('ping ' + req.body.h); });"),
+            vec![(Auth::Admin, Severity::High)]
+        );
+        assert_eq!(
+            auth_of(
+                "app.get('/p', (req, res) => { if (!req.user) { return res.sendStatus(401); } exec('ping ' + req.query.h); });"
+            ),
+            vec![(Auth::User, Severity::Critical)]
+        );
     }
 
     #[test]

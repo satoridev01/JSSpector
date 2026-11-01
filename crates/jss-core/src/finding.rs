@@ -44,6 +44,29 @@ pub enum Severity {
     Low,
 }
 
+/// Authentication found on the path to a sink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Auth {
+    /// No middleware or check was recognized (it may still exist, e.g. app-wide).
+    #[default]
+    NoneDetected,
+    /// A login check (middleware, guard, or `if (!req.user) return`).
+    User,
+    /// An admin or role check.
+    Admin,
+}
+
+impl Auth {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NoneDetected => "none-detected",
+            Self::User => "user",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 /// Where a finding's tainted value came from.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct SourceLoc {
@@ -85,8 +108,8 @@ pub struct Finding {
     pub severity: Severity,
     /// Always `heuristic` in v0.
     pub confidence: &'static str,
-    /// Always `unknown` in v0: entry points and middleware are not modeled yet.
-    pub auth: &'static str,
+    /// Authentication recognized on the path from the entry point.
+    pub auth: Auth,
     /// Nearest enclosing named function, or `<anonymous>`.
     pub function: String,
     pub source: SourceLoc,

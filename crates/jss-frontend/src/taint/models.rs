@@ -34,6 +34,7 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ("electron", include_str!("../../../../packs/electron.yaml")),
     ("browser", include_str!("../../../../packs/browser.yaml")),
     ("archive", include_str!("../../../../packs/archive.yaml")),
+    ("auth", include_str!("../../../../packs/auth.yaml")),
 ];
 
 /// One pack file, as written.
@@ -81,9 +82,25 @@ pub struct Pack {
     /// `family.export` calls whose result carries their arguments' taint.
     #[serde(default)]
     pub module_pass: Vec<String>,
+    #[serde(default)]
+    pub auth: AuthSpec,
     /// Fields of a procedure's options that are client input (`params: input` sources).
     #[serde(default)]
     pub input_fields: Vec<String>,
+}
+
+/// How authentication shows in code.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSpec {
+    #[serde(default)]
+    pub middleware: Vec<String>,
+    #[serde(default)]
+    pub admin: Vec<String>,
+    #[serde(default)]
+    pub request_fields: Vec<String>,
+    #[serde(default)]
+    pub decorators: Vec<String>,
 }
 
 /// A member read whose value is client data.
@@ -398,6 +415,10 @@ pub struct Model {
     pub url_option_keys: Vec<String>,
     pub module_pass: Vec<String>,
     pub input_fields: Vec<String>,
+    pub auth_middleware: Vec<String>,
+    pub auth_admin: Vec<String>,
+    pub auth_request_fields: Vec<String>,
+    pub auth_decorators: Vec<String>,
     pub route_method_keys: Vec<String>,
     pub route_path_keys: Vec<String>,
     /// Packs that failed to load, with the reason.
@@ -501,6 +522,10 @@ impl Model {
         self.module_namespaces.extend(pack.module_namespaces);
         self.url_option_keys.extend(pack.url_option_keys);
         self.module_pass.extend(pack.module_pass);
+        self.auth_middleware.extend(pack.auth.middleware);
+        self.auth_admin.extend(pack.auth.admin);
+        self.auth_request_fields.extend(pack.auth.request_fields);
+        self.auth_decorators.extend(pack.auth.decorators);
         self.input_fields.extend(pack.input_fields);
         self.route_method_keys.extend(pack.routes.method_keys);
         self.route_path_keys.extend(pack.routes.path_keys);
@@ -539,6 +564,22 @@ impl Model {
                 boundary(before) && boundary(after)
             })
         })
+    }
+
+    /// The authentication a middleware or guard name implies, if any.
+    pub fn auth_of(&self, name: &str) -> Option<jss_core::Auth> {
+        let lower = name.to_ascii_lowercase();
+        if self.auth_admin.iter().any(|a| lower.contains(a.as_str())) {
+            Some(jss_core::Auth::Admin)
+        } else if self
+            .auth_middleware
+            .iter()
+            .any(|a| lower.contains(a.as_str()))
+        {
+            Some(jss_core::Auth::User)
+        } else {
+            None
+        }
     }
 
     /// Caps `severity` by the source kind's cap (a lower severity sorts later).

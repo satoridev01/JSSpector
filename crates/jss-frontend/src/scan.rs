@@ -277,7 +277,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
         class: raw.class,
         severity: raw.severity,
         confidence: "heuristic",
-        auth: "unknown",
+        auth: raw.auth,
         function: raw.function.clone(),
         source: SourceLoc {
             kind: raw.origin.kind,

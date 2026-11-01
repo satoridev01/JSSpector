@@ -1227,3 +1227,82 @@ fn nosql_sinks_need_a_mongodb_project() {
     // No manifest at all: nothing is held back.
     assert_eq!(count(None, false), 1);
 }
+
+/// An ES5 class in another file: its constructor's fields reach a sink in a prototype method.
+#[test]
+fn es5_classes_link_across_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/RestWrite.js",
+        "const { exec } = require('child_process');\n\
+         function RestWrite(config, data) { this.config = config; this.data = data; }\n\
+         RestWrite.prototype.execute = function () { return exec('ls ' + this.data.cmd); };\n\
+         module.exports = RestWrite;\n",
+    );
+    write(
+        root,
+        "src/rest.js",
+        "const RestWrite = require('./RestWrite');\n\
+         app.post('/x', (req, res) => new RestWrite(CONFIG, req.body).execute());\n\
+         app.post('/y', (req, res) => new RestWrite(CONFIG, { cmd: 'ls' }).execute());\n",
+    );
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = scan["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["class"], "command-injection");
+    assert_eq!(findings[0]["entry"], "POST /x");
+}
+
+/// CommonJS namespaces (`module.exports = { users: require('./users') }`) and whole-module
+/// re-exports (`module.exports = require('./impl')`) link calls through them.
+#[test]
+fn commonjs_namespaces_and_reexports_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/app.js",
+        "const api = require('./api');\nconst idx = require('./idx');\n\
+         app.post('/x/:type', (req, res) => api.users.gen(req, req.params));\n\
+         app.post('/csv', (req, res) => api.users.gen(req, { type: 'csv' }));\n\
+         app.get('/run', (req, res) => idx.run(req.query.x));\n",
+    );
+    write(
+        root,
+        "src/api/index.js",
+        "module.exports = { users: require('./users') };\n",
+    );
+    write(
+        root,
+        "src/api/users.js",
+        "exports.gen = async (c, { type }) => require('child_process').fork('./x-' + type + '.js');\n",
+    );
+    write(root, "src/idx.js", "module.exports = require('./impl');\n");
+    write(
+        root,
+        "src/impl.js",
+        "const { exec } = require('child_process');\nexports.run = (v) => exec('ls ' + v);\n",
+    );
+    let scan = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = scan["findings"].as_array().unwrap();
+    let got: Vec<(String, String)> = findings
+        .iter()
+        .map(|f| {
+            (
+                f["class"].as_str().unwrap().to_owned(),
+                f["entry"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        got.contains(&("path-traversal".to_owned(), "POST /x/{type}".to_owned())),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("command-injection".to_owned(), "GET /run".to_owned())),
+        "{got:?}"
+    );
+    assert!(!got.iter().any(|(_, e)| e == "POST /csv"), "{got:?}");
+}

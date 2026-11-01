@@ -90,6 +90,10 @@ fn unnamed_fields(fields: &BTreeMap<String, Origin>) -> Option<Origin> {
     )
 }
 
+/// How an export table names a namespace export: `users` -> `<namespace>:src/api/users.js`
+/// (`exports.users = require('./users')`, `export * as users from './users'`).
+pub const NAMESPACE: &str = "<namespace>:";
+
 /// Most extra parameters an [`Origin`] remembers.
 const MAX_ALSO: usize = 4;
 
@@ -367,6 +371,7 @@ pub fn scan_file_program(
         fn_returns: None,
         callback_returns: None,
         closure_writes: Vec::new(),
+        pending_param_props: None,
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -945,6 +950,10 @@ struct Walker<'e> {
     callback_returns: Option<Origin>,
     /// What the function walked last wrote to its parent's names: (name, field, taint).
     closure_writes: Vec<(String, Option<String>, Origin)>,
+    /// TypeScript parameter properties of the constructor about to be entered
+    /// (`constructor(private readonly cfg: Config)`): (class, parameter names), stored as
+    /// instance fields at entry.
+    pending_param_props: Option<(String, Vec<String>)>,
     /// The file is a service worker (`self.addEventListener('fetch', ...)`): a `request` there is
     /// the page's own request, not a server's (kept across passes).
     service_worker: bool,
@@ -1177,6 +1186,45 @@ fn capture_mask(expr: &Expression<'_>) -> u8 {
     }
 }
 
+/// `function RestWrite(config, data) { this.data = data; }`: a PascalCase function that sets
+/// fields of `this` is an ES5 class's constructor.
+fn is_es5_constructor(name: &str, f: &Function<'_>) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+        && f.body.as_ref().is_some_and(|body| {
+            body.statements.iter().any(|statement| {
+                let Statement::ExpressionStatement(e) = statement else {
+                    return false;
+                };
+                let Expression::AssignmentExpression(assign) = e.expression.get_inner_expression()
+                else {
+                    return false;
+                };
+                assign
+                    .left
+                    .as_simple_assignment_target()
+                    .and_then(SimpleAssignmentTarget::as_member_expression)
+                    .is_some_and(|m| matches!(m.object(), Expression::ThisExpression(_)))
+            })
+        })
+}
+
+/// `C.prototype.run` -> (`C`, Some(`run`)); `C.prototype` -> (`C`, None).
+fn prototype_owner(
+    member: &oxc_ast::ast::MemberExpression<'_>,
+) -> Option<(String, Option<String>)> {
+    let key = guards::member_key(member)?;
+    let mut parts = key.split('.');
+    let class = parts.next()?;
+    if !class.chars().next().is_some_and(char::is_uppercase) || parts.next()? != "prototype" {
+        return None;
+    }
+    let method = parts.next().map(str::to_owned);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((class.to_owned(), method))
+}
+
 /// A regular expression: `/a(.*)/` or `new RegExp(...)`.
 fn is_regex(expr: &Expression<'_>) -> bool {
     match expr.get_inner_expression() {
@@ -1240,6 +1288,39 @@ fn closure_writes(inner: &Env, parent: &Env) -> Vec<(String, Option<String>, Ori
     }
     writes.truncate(32);
     writes
+}
+
+/// What a function returns when called with `arguments`, by its return summaries.
+fn summary_returns(
+    name: &str,
+    summaries: &[Summary],
+    arguments: &[Option<Origin>],
+    span: Span,
+) -> Option<Origin> {
+    let mut returned = None;
+    for s in summaries.iter().filter(|s| s.api == RETURNS) {
+        let origin = if s.param == RETURNS_SOURCE {
+            let mut origin = Origin::source(s.at_sink.kind, span);
+            origin.object = s.at_sink.object;
+            origin.upload = s.at_sink.upload;
+            Some(origin)
+        } else {
+            argument_taint(arguments, s.param, s.rest)
+        };
+        let at = &s.at_sink;
+        returned = union(
+            returned,
+            origin.map(|mut o| {
+                o.built |= at.built;
+                o.sqlish |= at.sqlish;
+                o.prefix &= at.prefix;
+                o.object &= at.object;
+                o.escaped |= at.escaped;
+                o.step(span.start, format!("returned by `{name}()`"))
+            }),
+        );
+    }
+    returned
 }
 
 /// Merges a tuple's position taints into the positions seen so far.
@@ -1578,7 +1659,13 @@ impl Walker<'_> {
                 if let Some(name) = &name {
                     env.locals.insert(name.clone());
                 }
-                self.function(f, env, name, Role::Plain);
+                match name.as_deref().filter(|n| is_es5_constructor(n, f)) {
+                    Some(class) => {
+                        let class = class.to_owned();
+                        self.es5_constructor(f, env, &class);
+                    }
+                    None => self.function(f, env, name, Role::Plain),
+                }
             }
             Statement::ClassDeclaration(c) => self.class(c, env),
             Statement::BlockStatement(b) => self.statements(&b.body, env),
@@ -1849,7 +1936,16 @@ impl Walker<'_> {
                     .as_str()
                     .and_then(|s| self.linking.resolve(s))
                 {
-                    self.facts.reexports.push(target);
+                    match &export.exported {
+                        // `export * as users from './users'`: a namespace.
+                        Some(name) => {
+                            self.facts.exports.insert(
+                                name.name().as_str().to_owned(),
+                                format!("{NAMESPACE}{target}"),
+                            );
+                        }
+                        None => self.facts.reexports.push(target),
+                    }
                 }
             }
             ModuleDeclaration::ExportFromDeclaration(export) => {
@@ -2674,10 +2770,38 @@ impl Walker<'_> {
                             }
                         }
                     }
+                    // `constructor(private readonly cfg: Config) {}`: `this.cfg = cfg`.
+                    if method.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+                        && let Some(class) = &class_name
+                    {
+                        let props: Vec<String> = method
+                            .value
+                            .params
+                            .items
+                            .iter()
+                            .filter(|p| p.accessibility.is_some() || p.readonly || p.r#override)
+                            .filter_map(|p| match &p.pattern {
+                                BindingPattern::BindingIdentifier(id) => {
+                                    Some(id.name.as_str().to_owned())
+                                }
+                                BindingPattern::AssignmentPattern(a) => match &a.left {
+                                    BindingPattern::BindingIdentifier(id) => {
+                                        Some(id.name.as_str().to_owned())
+                                    }
+                                    _ => None,
+                                },
+                                _ => None,
+                            })
+                            .collect();
+                        if !props.is_empty() {
+                            self.pending_param_props = Some((class.clone(), props));
+                        }
+                    }
                     let saved_class =
                         std::mem::replace(&mut self.current_class, class_name.clone());
                     self.function(&method.value, env, name, Role::Plain);
                     self.current_class = saved_class;
+                    self.pending_param_props = None;
                 }
                 ClassElement::PropertyDefinition(property) => {
                     if let Some(value) = &property.value {
@@ -2860,6 +2984,15 @@ impl Walker<'_> {
                 let mut origin = Origin::source("param", span);
                 origin.param = Some(params.items.len());
                 self.bind_pattern(&rest.rest.argument, Some(origin), None, &mut env);
+            }
+        }
+        // `constructor(private readonly cfg: Config)`: the instance field holds the parameter.
+        if let Some((class, props)) = self.pending_param_props.take() {
+            let fields = self.class_fields.entry(class).or_default();
+            for name in props {
+                if let Some(origin) = env.vars.get(&name) {
+                    fields.insert(name, origin.clone());
+                }
             }
         }
         // A callback of an array, promise or string method: its parameters are the receiver's
@@ -3410,24 +3543,85 @@ impl Walker<'_> {
                     {
                         chain_local = property.clone();
                     }
+                    // `module.exports = require('./impl')`: a re-export; `exports.users =
+                    // require('./users')`: a namespace.
+                    if let Some(file) =
+                        require_spec(&assign.right).and_then(|spec| self.linking.resolve(&spec))
+                    {
+                        match export.as_deref() {
+                            Some("default") => self.facts.reexports.push(file),
+                            Some(name) => {
+                                self.facts
+                                    .exports
+                                    .insert(name.to_owned(), format!("{NAMESPACE}{file}"));
+                            }
+                            None => {}
+                        }
+                    }
                     let local = local.or_else(|| chain_local.clone());
                     if let (Some(export), Some(local)) = (export, local) {
                         self.facts.exports.insert(export, local);
                     }
-                    // `module.exports = { list, create }`
+                    // `module.exports = { list, create, users: require('./users') }`
                     if key == "module.exports"
                         && let Expression::ObjectExpression(object) =
                             assign.right.get_inner_expression()
                     {
                         for property in &object.properties {
-                            if let ObjectPropertyKind::ObjectProperty(p) = property
-                                && let (Some(k), Expression::Identifier(v)) =
-                                    (prop_name(&p.key), p.value.get_inner_expression())
-                            {
-                                self.facts.exports.insert(k, v.name.as_str().to_owned());
+                            let ObjectPropertyKind::ObjectProperty(p) = property else {
+                                continue;
+                            };
+                            let Some(k) = prop_name(&p.key) else {
+                                continue;
+                            };
+                            match p.value.get_inner_expression() {
+                                Expression::Identifier(v) => {
+                                    self.facts.exports.insert(k, v.name.as_str().to_owned());
+                                }
+                                value => {
+                                    if let Some(file) = require_spec(value)
+                                        .and_then(|spec| self.linking.resolve(&spec))
+                                    {
+                                        self.facts.exports.insert(k, format!("{NAMESPACE}{file}"));
+                                    }
+                                }
                             }
                         }
                     }
+                }
+                // `C.prototype.run = function () {}` and `C.prototype = { run() {} }`: methods
+                // of the ES5 class `C`, walked as `C.run` with `this` an instance of `C`.
+                if let Some(class) = assign
+                    .left
+                    .as_simple_assignment_target()
+                    .and_then(SimpleAssignmentTarget::as_member_expression)
+                    .and_then(prototype_owner)
+                {
+                    let saved_class = self.current_class.replace(class.0.clone());
+                    match (&class.1, assign.right.get_inner_expression()) {
+                        (Some(method), right) => {
+                            let name = Some(format!("{}.{method}", class.0));
+                            if !self.maybe_function(right, env, name, Role::Plain) {
+                                self.expr(right, env);
+                            }
+                        }
+                        (None, Expression::ObjectExpression(object)) => {
+                            for property in &object.properties {
+                                let ObjectPropertyKind::ObjectProperty(p) = property else {
+                                    continue;
+                                };
+                                let name = prop_name(&p.key).map(|k| format!("{}.{k}", class.0));
+                                if !self.maybe_function(&p.value, env, name, Role::Plain) {
+                                    self.expr(&p.value, env);
+                                }
+                            }
+                        }
+                        (None, right) => {
+                            self.expr(right, env);
+                        }
+                    }
+                    self.current_class = saved_class;
+                    return None;
                 }
                 let saved_receiver = match chain_local {
                     Some(local) => {
@@ -5067,21 +5261,30 @@ impl Walker<'_> {
                     names: vec![export.to_owned()],
                 }
             }),
-            // `require('./shell').run(x)`: that module's `run`.
+            // `require('./shell').run(x)`: that module's `run`; `api.users.gen(x)`: the `gen` of
+            // the module `api` exports as its `users` namespace.
             Callee::Method {
                 object: None,
                 method,
-            } if !method.is_empty() => call
-                .callee
-                .get_inner_expression()
-                .as_member_expression()
-                .and_then(|m| require_spec(m.object()))
-                .filter(|spec| self.linking.is_own(spec))
-                .map(|spec| Target {
-                    exact: self.exported_function(&spec, method),
-                    names: vec![method.clone()],
-                    spec,
-                }),
+            } if !method.is_empty() => {
+                let member = call.callee.get_inner_expression().as_member_expression();
+                match member.and_then(|m| require_spec(m.object())) {
+                    Some(spec) if self.linking.is_own(&spec) => Some(Target {
+                        exact: self.exported_function(&spec, method),
+                        names: vec![method.clone()],
+                        spec,
+                    }),
+                    Some(_) => None,
+                    None => member
+                        .and_then(|m| self.namespace_file(m.object()))
+                        .and_then(|file| self.exported_function_in(&file, method))
+                        .map(|exact| Target {
+                            spec: String::new(),
+                            names: vec![method.clone()],
+                            exact: Some(exact),
+                        }),
+                }
+            }
             // `shell.run()` on `const shell = new ShellService()`: the imported class's method.
             Callee::Method {
                 object: Some(object),
@@ -5310,6 +5513,10 @@ impl Walker<'_> {
             }
         }
 
+        // `run.call(null, x)`, `run.apply(null, [x])`, `setImmediate(run, x)`.
+        if let Some(returned) = self.indirect_call(call, &taints, env) {
+            return returned;
+        }
         // Result taint. A verification's result (`jwt.verify(token)`) is trusted, whatever the
         // callee's return summary says.
         let callee_text = callee_name(&call.callee).unwrap_or_default();
@@ -5982,30 +6189,55 @@ impl Walker<'_> {
             })
             .collect();
         self.apply_summaries(&name, &summaries, &arguments, None, span, env);
-        let mut returned = None;
-        for s in summaries.iter().filter(|s| s.api == RETURNS) {
-            let origin = if s.param == RETURNS_SOURCE {
-                let mut origin = Origin::source(s.at_sink.kind, span);
-                origin.object = s.at_sink.object;
-                origin.upload = s.at_sink.upload;
-                Some(origin)
-            } else {
-                argument_taint(&arguments, s.param, s.rest)
-            };
-            let at = &s.at_sink;
-            returned = union(
-                returned,
-                origin.map(|mut o| {
-                    o.built |= at.built;
-                    o.sqlish |= at.sqlish;
-                    o.prefix &= at.prefix;
-                    o.object &= at.object;
-                    o.escaped |= at.escaped;
-                    o.step(span.start, format!("returned by `{name}()`"))
-                }),
-            );
-        }
-        returned
+        summary_returns(&name, &summaries, &arguments, span)
+    }
+
+    /// `run.call(null, x)`, `run.apply(null, [x])`, `setImmediate(run, x)`: calls of a
+    /// function referenced by name, with the arguments it really receives. Applies its
+    /// summaries and returns what it returns (`None` when this is no such call).
+    fn indirect_call(
+        &mut self,
+        call: &CallExpression<'_>,
+        taints: &[Option<Origin>],
+        env: &Env,
+    ) -> Option<Option<Origin>> {
+        let callee = call.callee.get_inner_expression();
+        let (target, forwarded): (&Expression<'_>, Vec<Option<Origin>>) = match callee
+            .as_member_expression()
+            .and_then(|m| {
+                m.static_property_name()
+                    .and_then(|n| n.as_str())
+                    .map(|n| (m, n))
+            }) {
+            Some((member, "call")) => (member.object(), taints.iter().skip(1).cloned().collect()),
+            Some((member, "apply")) => {
+                let forwarded = match call
+                    .arguments
+                    .get(1)
+                    .and_then(Argument::as_expression)
+                    .map(Expression::get_inner_expression)
+                {
+                    Some(Expression::ArrayExpression(array)) => self.array_positions(array, env),
+                    _ => {
+                        let all = taints.get(1).cloned().flatten();
+                        (0..8).map(|_| all.clone()).collect()
+                    }
+                };
+                (member.object(), forwarded)
+            }
+            _ => {
+                let name = guards::path_key(callee)?;
+                let spec = m().forwarders.iter().find(|f| has(&f.functions, &name))?;
+                let target = call
+                    .arguments
+                    .get(spec.callback)
+                    .and_then(Argument::as_expression)?;
+                (target, taints.iter().skip(spec.from).cloned().collect())
+            }
+        };
+        let (name, summaries) = self.referenced_summaries(target)?;
+        self.apply_summaries(&name, &summaries, &forwarded, None, call.span, env);
+        Some(summary_returns(&name, &summaries, &forwarded, call.span))
     }
 
     /// The summaries of a function referenced by name (`save`, `this.save`, `helpers.save`):
@@ -6037,6 +6269,49 @@ impl Walker<'_> {
             .iter()
             .find(|(k, _)| **k == referenced || k.ends_with(&suffix))
             .map(|(k, list)| (k.clone(), list.clone()))
+    }
+
+    /// Walks `function C(x) { this.x = x; }` as the constructor of the ES5 class `C`: its
+    /// parameters' flows into instance fields are summarized under `C.constructor`, which
+    /// `new C(..)` applies.
+    fn es5_constructor(&mut self, f: &Function<'_>, env: &Env, class: &str) {
+        if self.summarize {
+            for param in &f.params.items {
+                self.ctor_params.insert(param.span.start, class.to_owned());
+                if let BindingPattern::ObjectPattern(object) = &param.pattern {
+                    for property in &object.properties {
+                        self.ctor_params
+                            .insert(property.span.start, class.to_owned());
+                    }
+                }
+            }
+        }
+        let saved_class = self.current_class.replace(class.to_owned());
+        self.function(f, env, Some(format!("{class}.constructor")), Role::Plain);
+        self.current_class = saved_class;
+    }
+
+    /// The file a namespace of an imported module names: `api.users` with `api` from
+    /// `require('./api')`, whose `users` is `require('./users')` or `export * as users`.
+    fn namespace_file(&self, expr: &Expression<'_>) -> Option<String> {
+        let Expression::StaticMemberExpression(member) = expr.get_inner_expression() else {
+            return None;
+        };
+        let Expression::Identifier(root) = member.object.get_inner_expression() else {
+            return None;
+        };
+        let (spec, export) = self.relative.get(root.name.as_str())?;
+        let file = self.linking.resolve(spec)?;
+        // `import { users } from './api'` then `users.gen()` is handled as a plain import.
+        if export.as_deref().is_some_and(|e| e != "default") {
+            return None;
+        }
+        let local = self
+            .linking
+            .exports
+            .get(&file)?
+            .get(member.property.name.as_str())?;
+        local.strip_prefix(NAMESPACE).map(str::to_owned)
     }
 
     /// A router's own path prefix (`""` without one).
@@ -7087,6 +7362,12 @@ impl Walker<'_> {
     /// recorded export).
     fn exported_function(&self, spec: &str, export: &str) -> Option<(String, String)> {
         let file = self.linking.resolve(spec)?;
+        self.exported_function_in(&file, export)
+    }
+
+    /// [`Self::exported_function`] of a resolved file.
+    fn exported_function_in(&self, file: &str, export: &str) -> Option<(String, String)> {
+        let file = file.to_owned();
         let table = |f: &str| self.linking.exports.get(f);
         let reexported: Vec<&String> = self
             .linking
@@ -7536,6 +7817,24 @@ mod tests {
             &allocator,
             src,
             source_type(SourceKind::Js, PackageType::CommonJs),
+        )
+        .with_options(parse_options())
+        .parse();
+        assert!(!ret.fatal_error, "{:?}", ret.diagnostics);
+        scan_program(&ret.program, src)
+            .findings
+            .into_iter()
+            .map(|f| (f.class, f.severity, f.api, f.origin.kind))
+            .collect()
+    }
+
+    /// [`scan`] of TypeScript.
+    fn scan_ts(src: &str) -> Vec<(VulnClass, Severity, String, &'static str)> {
+        let allocator = Allocator::default();
+        let ret = Parser::new(
+            &allocator,
+            src,
+            source_type(SourceKind::Ts, PackageType::CommonJs),
         )
         .with_options(parse_options())
         .parse();
@@ -8076,6 +8375,87 @@ mod tests {
              app.post('/u', (req, res) => { const uploads = collectFiles(req); uploads.map((f) => fs.remove(f.path)); });"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn typescript_parameter_properties_are_fields() {
+        let head = "const { exec } = require('child_process');\n";
+        let class =
+            "class I { constructor(private readonly cfg: any) {} run() { exec(this.cfg.cmd); } }\n";
+        let found = scan_ts(&format!(
+            "{head}{class}app.post('/x', (req, res) => new I(req.body).run());"
+        ));
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::CommandInjection),
+            "{found:?}"
+        );
+        assert!(
+            scan_ts(&format!(
+                "{head}{class}app.post('/x', (req, res) => new I({{ cmd: 'ls' }}).run());"
+            ))
+            .is_empty()
+        );
+        // Without a modifier, the parameter is no field.
+        assert!(scan_ts(&format!(
+            "{head}class J {{ constructor(cfg: any) {{}} run() {{ exec((this as any).cfg.cmd); }} }}\n\
+             app.post('/x', (req, res) => new J(req.body).run());"
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn es5_constructors_and_prototype_methods_are_classes() {
+        let found = one(
+            "function C(x) { this.x = x; }\nC.prototype.run = function () { exec('ls ' + this.x); };\n\
+             app.get('/x', (req, res) => new C(req.query.a).run());",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::CommandInjection),
+            "{found:?}"
+        );
+        let found = one(
+            "function D(x) { this.x = x; }\nD.prototype = { run() { exec('ls ' + this.x); } };\n\
+             app.get('/x', (req, res) => new D(req.query.a).run());",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::CommandInjection),
+            "{found:?}"
+        );
+        // Converted on the way in; a lowercase helper is no class.
+        assert!(one(
+            "function Point(x) { this.x = Number(x); }\nPoint.prototype.s = function () { exec('ls ' + this.x); };\n\
+             app.get('/x', (req, res) => new Point(req.query.a).s());"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn call_apply_and_forwarders_reach_the_function() {
+        use VulnClass::*;
+        let run = "function run(v) { exec('ls ' + v); }\n";
+        for call in [
+            "run.call(null, req.query.x)",
+            "run.apply(null, [req.query.x])",
+            "setImmediate(run, req.query.x)",
+            "setTimeout(run, 10, req.query.x)",
+        ] {
+            let found = one(&format!("{run}app.get('/x', (req, res) => {call});"));
+            assert!(
+                found.iter().any(|f| f.0 == CommandInjection),
+                "{call}: {found:?}"
+            );
+        }
+        // Only the receiver (`this`) is tainted; a constant; the delay.
+        for call in [
+            "run.call(req.query.x)",
+            "run.call(null, 'ls')",
+            "setTimeout(run, req.query.ms)",
+        ] {
+            assert!(
+                one(&format!("{run}app.get('/x', (req, res) => {call});")).is_empty(),
+                "{call}"
+            );
+        }
     }
 
     #[test]

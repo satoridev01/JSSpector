@@ -456,6 +456,22 @@ pub struct Propagation {
     /// `p.then((v) => ...)`, `s.replace(re, (m, g1) => ...)`.
     #[serde(default)]
     pub callbacks: BTreeMap<String, CallbackSpec>,
+    /// Functions that call a function argument with the arguments after it:
+    /// `setImmediate(fn, a)`, `setTimeout(fn, ms, a)`.
+    #[serde(default)]
+    pub forwarders: Vec<ForwarderSpec>,
+}
+
+/// A function that forwards arguments to a callback (see [`Propagation::forwarders`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwarderSpec {
+    /// The forwarding functions, by name (`setImmediate`, `process.nextTick`).
+    pub functions: Vec<String>,
+    /// The argument that is the callback.
+    pub callback: usize,
+    /// The first forwarded argument.
+    pub from: usize,
 }
 
 /// How a method calls its callback (see [`Propagation::callbacks`]).
@@ -673,6 +689,7 @@ pub struct Model {
     pub key_globals: Vec<String>,
     pub object_module_pass: Vec<String>,
     pub callbacks: BTreeMap<String, CallbackSpec>,
+    pub forwarders: Vec<ForwarderSpec>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
     pub props_kind: Option<String>,
@@ -840,6 +857,7 @@ impl Model {
         self.object_module_pass
             .extend(pack.propagation.object_module_pass);
         self.callbacks.extend(pack.propagation.callbacks);
+        self.forwarders.extend(pack.propagation.forwarders);
         self.jsx_html_props.extend(pack.jsx.html_props);
         self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
         if pack.jsx.props_kind.is_some() {

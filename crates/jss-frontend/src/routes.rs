@@ -208,6 +208,11 @@ fn locate_export(
     let report = by_file.get(file)?;
     let reexports = &report.module.reexports;
     match report.module.exports.get(name) {
+        // `exports.users = require('./users')`: that module's router.
+        Some(local) if local.starts_with(crate::taint::NAMESPACE) && depth < 8 => {
+            let target = local.trim_start_matches(crate::taint::NAMESPACE);
+            locate_export(by_file, target, "default", depth + 1)
+        }
         // Defined here, unless this file only re-exports it from another one.
         Some(local) => {
             if depth < 8 {

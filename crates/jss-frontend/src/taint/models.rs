@@ -330,6 +330,10 @@ pub struct Sanitizers {
     /// Statements that throw unless their first argument has a type: `check(x, String)`.
     #[serde(default)]
     pub type_assertions: Vec<String>,
+    /// Callee names (last segment, lower case) starting with these return trusted data:
+    /// `jwt.verify(token)`, `verifySig(cookie)`.
+    #[serde(default)]
+    pub result_cleaning_prefixes: Vec<String>,
     /// Words that make a predicate (`isX`, `hasX`, `validateX`) a validator: true means safe.
     #[serde(default)]
     pub validator_words: Vec<String>,
@@ -479,6 +483,7 @@ pub struct Model {
     pub receiver_validators: Vec<String>,
     pub type_assertions: Vec<String>,
     pub validator_words: Vec<String>,
+    pub result_cleaning_prefixes: Vec<String>,
     pub rejecter_words: Vec<String>,
     pub receiver_rejecters: Vec<String>,
     pub rejected_markers: Vec<String>,
@@ -613,6 +618,8 @@ impl Model {
             .extend(pack.sanitizers.receiver_validators);
         self.type_assertions.extend(pack.sanitizers.type_assertions);
         self.validator_words.extend(pack.sanitizers.validator_words);
+        self.result_cleaning_prefixes
+            .extend(pack.sanitizers.result_cleaning_prefixes);
         self.rejecter_words.extend(pack.sanitizers.rejecter_words);
         self.receiver_rejecters
             .extend(pack.sanitizers.receiver_rejecters);

@@ -560,6 +560,22 @@ fn table_rows(array: &oxc_ast::ast::ArrayExpression<'_>) -> Vec<BTreeMap<String,
     rows
 }
 
+/// The pack sink a finding's `api` names: `fetch`, `http-client.get`, `.query`, `db.query`.
+fn sink_for_api(api: &str) -> Option<&'static models::Sink> {
+    let model = m();
+    if let Some((family, export)) = api.split_once('.')
+        && let Some(sink) = model.module_sink(family, export)
+    {
+        return Some(sink);
+    }
+    let last = api.rsplit('.').next().unwrap_or(api);
+    model
+        .global_sink(api)
+        .or_else(|| model.module_sink(api, ""))
+        .or_else(|| model.method_sink(api))
+        .or_else(|| model.method_sink(last))
+}
+
 /// A route path written as a literal, or built from literals: `urljoin(base, 'api/x')`,
 /// `prefix + '/x'`, `` `${base}/x` `` (unknown parts are dropped).
 fn literal_path(expr: &Expression<'_>) -> Option<String> {
@@ -2979,7 +2995,21 @@ impl Walker<'_> {
             }
         }
 
-        // Result taint.
+        // Result taint. A verification's result (`jwt.verify(token)`) is trusted, whatever the
+        // callee's return summary says.
+        let callee_text = callee_name(&call.callee).unwrap_or_default();
+        let last_segment = callee_text
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if m()
+            .result_cleaning_prefixes
+            .iter()
+            .any(|p| last_segment.starts_with(p.as_str()))
+        {
+            return None;
+        }
         if returned.is_some() {
             return returned;
         }
@@ -3497,6 +3527,14 @@ impl Walker<'_> {
                 continue;
             }
             if summary.class == VulnClass::Xss && !built {
+                continue;
+            }
+            // Route params and headers are strings: no NoSQL operator objects.
+            if summary.class == VulnClass::NosqlInjection && !origin.object {
+                continue;
+            }
+            // The sink ignores this kind of source (a browser URL is no SSRF).
+            if sink_for_api(&summary.api).is_some_and(|s| has(&s.ignore_kinds, origin.kind)) {
                 continue;
             }
             let mut origin = origin.step(call_span.start, format!("passed to `{name}()`"));

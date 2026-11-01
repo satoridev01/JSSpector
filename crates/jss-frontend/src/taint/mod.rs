@@ -55,6 +55,9 @@ pub struct Origin {
     pub object: bool,
 }
 
+/// The `api` of a summary that says "the function returns this parameter" (not a sink).
+const RETURNS: &str = "<return>";
+
 /// The request-kind marker for a context object whose request data is under `.req`.
 const CONTEXT: &str = "context";
 
@@ -699,7 +702,8 @@ impl Walker<'_> {
             }
             Statement::ReturnStatement(s) => {
                 if let Some(argument) = &s.argument {
-                    self.expr(argument, env);
+                    let taint = self.expr(argument, env);
+                    self.record_return(taint, argument.span(), env);
                 }
             }
             Statement::ThrowStatement(s) => {
@@ -1474,11 +1478,41 @@ impl Walker<'_> {
             ArrowFunctionBody::FunctionBody(body) => self.statements(&body.statements, &mut env),
             other => {
                 if let Some(expr) = other.as_expression() {
-                    self.expr(expr, &mut env);
+                    let taint = self.expr(expr, &mut env);
+                    self.record_return(taint, expr.span(), &env);
                 }
             }
         }
         self.leave();
+    }
+
+    /// Summary pass: a function that returns (a value derived from) its parameter.
+    fn record_return(&mut self, taint: Option<Origin>, span: Span, env: &Env) {
+        let Some(origin) = taint else { return };
+        let Some(param) = origin.param else { return };
+        if !self.summarize || env.function == "<anonymous>" || env.function == "<module>" {
+            return;
+        }
+        let field = self.field_of.get(&origin.span.start).cloned();
+        let list = self.summaries.entry(env.function.clone()).or_default();
+        if list
+            .iter()
+            .any(|s| s.api == RETURNS && s.param == param && s.field == field)
+        {
+            return;
+        }
+        list.push(Summary {
+            param,
+            class: VulnClass::CodeInjection,
+            severity: Severity::Low,
+            api: RETURNS.to_owned(),
+            arg: span,
+            call: span,
+            steps: origin.steps.clone(),
+            at_sink: origin,
+            ext: None,
+            field,
+        });
     }
 
     /// Walks a function-valued expression, if it is one. Returns whether it was.
@@ -1534,12 +1568,23 @@ impl Walker<'_> {
 
     fn expr_inner(&mut self, expr: &Expression<'_>, env: &mut Env) -> Option<Origin> {
         match expr {
-            Expression::Identifier(id) => env.vars.get(id.name.as_str()).cloned().map(|mut o| {
-                if env.scalars.contains(id.name.as_str()) {
-                    o.object = false;
-                }
-                o
-            }),
+            Expression::Identifier(id) => env
+                .vars
+                .get(id.name.as_str())
+                .cloned()
+                // A request object passed along as a value (`getId(req)`) carries its data.
+                .or_else(|| {
+                    env.requests
+                        .get(id.name.as_str())
+                        .filter(|kind| **kind != CONTEXT)
+                        .map(|kind| Origin::source(kind, id.span))
+                })
+                .map(|mut o| {
+                    if env.scalars.contains(id.name.as_str()) {
+                        o.object = false;
+                    }
+                    o
+                }),
             Expression::StaticMemberExpression(_)
             | Expression::ComputedMemberExpression(_)
             | Expression::PrivateFieldExpression(_) => self.member(expr, env),
@@ -2688,6 +2733,23 @@ impl Walker<'_> {
                 _ => None,
             }
         });
+        // What the helper returns: the taint of the arguments its return summaries name.
+        let returned = helper.as_ref().and_then(|(name, summaries)| {
+            summaries
+                .iter()
+                .filter(|s| s.api == RETURNS)
+                .filter_map(|s| {
+                    let whole = taints.get(s.param).cloned().flatten();
+                    match &s.field {
+                        Some(field) => {
+                            self.field_taint(call.arguments.get(s.param), field, env, whole)
+                        }
+                        None => whole,
+                    }
+                })
+                .fold(None, |acc, o| union(acc, Some(o)))
+                .map(|o| o.step(call.span.start, format!("returned by `{name}()`")))
+        });
         if let Some((name, summaries)) = helper {
             self.apply_summaries(
                 &name,
@@ -2743,6 +2805,9 @@ impl Walker<'_> {
         }
 
         // Result taint.
+        if returned.is_some() {
+            return returned;
+        }
         let any_arg = || taints.iter().flatten().next().cloned();
         match &callee {
             Callee::Method { method, .. } => {
@@ -3200,7 +3265,7 @@ impl Walker<'_> {
         call_span: Span,
         env: &Env,
     ) {
-        for summary in summaries {
+        for summary in summaries.iter().filter(|s| s.api != RETURNS) {
             let whole = taints.get(summary.param).cloned().flatten();
             let origin = match (&summary.field, arguments) {
                 (Some(field), Some(arguments)) => {
@@ -3980,6 +4045,41 @@ mod tests {
         );
         assert_eq!(worker.len(), 1, "{worker:?}");
         assert_eq!(worker[0].3, "queue");
+    }
+
+    #[test]
+    fn return_values_carry_parameter_taint() {
+        let helper = "function clean(v) { return v.trim(); }\nfunction getDir(req) { return req.query.dir; }\n";
+        assert_eq!(
+            one(&format!(
+                "{helper}app.get('/a', (req, res) => {{ exec('ls ' + clean(req.query.d)); }});"
+            ))
+            .len(),
+            1
+        );
+        assert_eq!(
+            one(&format!(
+                "{helper}app.get('/a', (req, res) => {{ exec('ls ' + getDir(req)); }});"
+            ))
+            .len(),
+            1
+        );
+        // a helper that returns a constant does not
+        assert!(one("function fixed(v) { return 'x'; }\napp.get('/a', (req, res) => { exec('ls ' + fixed(req.query.d)); });").is_empty());
+        // arrow helpers with expression bodies
+        assert_eq!(one("const wrap = (v) => `\"${v}\"`;\napp.get('/a', (req, res) => { exec('ls ' + wrap(req.query.d)); });").len(), 1);
+    }
+
+    #[test]
+    fn deep_set_helpers_with_tainted_paths() {
+        let found = scan(
+            "const _ = require('lodash');\napp.post('/s', (req, res) => { _.set(settings, req.body.path, req.body.value); });",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, VulnClass::PrototypePollution);
+        assert!(scan("const _ = require('lodash');\napp.post('/s', (req, res) => { _.set(settings, 'theme', req.body.value); });").is_empty());
+        // Map.set is not a deep write
+        assert!(scan("app.post('/s', (req, res) => { cache.set(req.body.k, 1); });").is_empty());
     }
 
     #[test]

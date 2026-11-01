@@ -1,0 +1,21 @@
+# Deep property writes: a tainted key path reaches Object.prototype.
+name: prototype-pollution
+modules:
+  lodash: lodash
+  lodash-es: lodash
+  lodash.set: lodash-set
+  lodash.merge: lodash-merge
+  lodash.defaultsdeep: lodash-merge
+  object-path: deep-set
+  dot-prop: deep-set
+  set-value: deep-set
+  dset: deep-set
+  deep-set: deep-set
+  deepmerge: lodash-merge
+  merge-deep: lodash-merge
+sinks:
+  - {module: lodash, exports: [set, setWith, update, updateWith, zipObjectDeep], class: prototype-pollution, severity: high, args: ["any:1"]}
+  - {module: lodash-set, exports: [""], class: prototype-pollution, severity: high, args: ["any:1"]}
+  - {module: deep-set, exports: ["", set, setProperty, dset], class: prototype-pollution, severity: high, args: ["any:1"]}
+  - {module: lodash, exports: [merge, mergeWith, defaultsDeep], class: prototype-pollution, severity: medium, args: ["object:1"]}
+  - {module: lodash-merge, exports: ["", all], class: prototype-pollution, severity: medium, args: ["object:1", "object:0"]}

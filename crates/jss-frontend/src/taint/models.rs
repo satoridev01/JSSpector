@@ -37,6 +37,10 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ("auth", include_str!("../../../../packs/auth.yaml")),
     ("react", include_str!("../../../../packs/react.yaml")),
     ("dom", include_str!("../../../../packs/dom.yaml")),
+    (
+        "prototype-pollution",
+        include_str!("../../../../packs/prototype-pollution.yaml"),
+    ),
 ];
 
 /// One pack file, as written.

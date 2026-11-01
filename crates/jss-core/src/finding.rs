@@ -112,6 +112,10 @@ pub struct Finding {
     pub auth: Auth,
     /// Nearest enclosing named function, or `<anonymous>`.
     pub function: String,
+    /// The entry point that reaches this function (`GET /api/files`), when the inventory finds
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
     pub source: SourceLoc,
     pub trace: Vec<TraceStep>,
     /// Line-independent identity: `class|file|function|sink api|source expr|ordinal`.

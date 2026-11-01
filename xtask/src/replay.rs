@@ -47,6 +47,8 @@ pub struct Options {
     pub limit: Option<usize>,
     pub repo: Option<String>,
     pub out: Option<PathBuf>,
+    /// The scanner to run (default: `target/release/jsspector`).
+    pub binary: Option<PathBuf>,
 }
 
 struct Pair {
@@ -56,6 +58,8 @@ struct Pair {
     vulnerable: String,
     fix: String,
     sink_file: String,
+    /// The advisory's sink line at the vulnerable commit, when it gives one.
+    sink_line: Option<u64>,
 }
 
 pub fn run(options: &Options) -> Result<()> {
@@ -65,7 +69,10 @@ pub fn run(options: &Options) -> Result<()> {
     )?;
     let pairs = pairs(&seed, options);
     eprintln!("replay: {} pairs in covered classes", pairs.len());
-    let binary = options.root.join("target/release/jsspector");
+    let binary = options
+        .binary
+        .clone()
+        .unwrap_or_else(|| options.root.join("target/release/jsspector"));
     if !binary.exists() {
         bail!("build the scanner first: cargo build --release -p jsspector");
     }
@@ -162,11 +169,18 @@ fn pairs(seed: &Value, options: &Options) -> Vec<Pair> {
             if !matches!(verdict, "verified" | "corrected") || !CLASSES.contains(&class.as_str()) {
                 continue;
             }
-            let sink_file = get(&candidate, "sink_location")
-                .as_str()
-                .and_then(|s| s.split([':', ' ']).next())
-                .unwrap_or("")
-                .to_owned();
+            let location = get(&candidate, "sink_location").as_str().unwrap_or("");
+            let sink_file = location.split([':', ' ']).next().unwrap_or("").to_owned();
+            // `path/file.ts:892 — ...`
+            let sink_line = location
+                .strip_prefix(sink_file.as_str())
+                .and_then(|rest| rest.strip_prefix(':'))
+                .map(|rest| {
+                    rest.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|digits| digits.parse().ok());
             let id = get(&candidate, "cve")
                 .as_str()
                 .filter(|c| !c.is_empty())
@@ -186,6 +200,7 @@ fn pairs(seed: &Value, options: &Options) -> Vec<Pair> {
                     .unwrap_or("")
                     .to_owned(),
                 sink_file,
+                sink_line,
             });
         }
     }
@@ -196,27 +211,57 @@ fn pairs(seed: &Value, options: &Options) -> Vec<Pair> {
 }
 
 /// (detected at the vulnerable commit, absent at the fix).
+/// (detected at the vulnerable commit, cleared at the fix). Detected: a finding of the
+/// advisory's class family with its sink in the advisory's file (the nearest to the advisory's
+/// line when it gives one). Cleared: none of those findings' line-independent keys remain at the
+/// fix (other findings in the same file do not count against it).
 fn score(pair: &Pair, cache: &Path, binary: &Path) -> Result<(bool, bool)> {
     let dir = cache.join(pair.repo.replace('/', "__"));
-    let vulnerable = matching(&scan_at(&dir, &pair.repo, &pair.vulnerable, binary)?, pair);
-    if !vulnerable {
+    let keys = matching(&scan_at(&dir, &pair.repo, &pair.vulnerable, binary)?, pair);
+    if keys.is_empty() {
         return Ok((false, false));
     }
-    let fixed = matching(&scan_at(&dir, &pair.repo, &pair.fix, binary)?, pair);
-    Ok((true, !fixed))
+    let fixed = scan_at(&dir, &pair.repo, &pair.fix, binary)?;
+    let remaining = get(&fixed, "findings").as_array().is_some_and(|findings| {
+        findings.iter().any(|f| {
+            get(f, "key")
+                .as_str()
+                .is_some_and(|k| keys.iter().any(|key| key == k))
+        })
+    });
+    Ok((true, !remaining))
 }
 
-fn matching(report: &Value, pair: &Pair) -> bool {
-    get(report, "findings").as_array().is_some_and(|findings| {
-        findings.iter().any(|f| {
-            let file = get(get(f, "sink"), "file")
-                .as_str()
-                .or_else(|| get(f, "file").as_str())
-                .unwrap_or("");
-            family(get(f, "class").as_str().unwrap_or("")) == family(&pair.class)
-                && file == pair.sink_file
+/// The keys of the findings that match the advisory.
+fn matching(report: &Value, pair: &Pair) -> Vec<String> {
+    let candidates: Vec<(u64, String)> = get(report, "findings")
+        .as_array()
+        .map(|findings| {
+            findings
+                .iter()
+                .filter(|f| {
+                    let file = get(get(f, "sink"), "file")
+                        .as_str()
+                        .or_else(|| get(f, "file").as_str())
+                        .unwrap_or("");
+                    family(get(f, "class").as_str().unwrap_or("")) == family(&pair.class)
+                        && file == pair.sink_file
+                })
+                .map(|f| {
+                    let line = get(get(f, "sink"), "line").as_u64().unwrap_or(0);
+                    let distance = pair.sink_line.map_or(0, |at| line.abs_diff(at));
+                    (distance, get(f, "key").as_str().unwrap_or("").to_owned())
+                })
+                .collect()
         })
-    })
+        .unwrap_or_default();
+    // The nearest to the advisory's line (within a window); otherwise every match in the file.
+    let nearest = candidates.iter().map(|(d, _)| *d).min().unwrap_or(0);
+    candidates
+        .into_iter()
+        .filter(|(d, _)| nearest > 40 || *d == nearest)
+        .map(|(_, key)| key)
+        .collect()
 }
 
 /// Classes scored as one: command and code injection are both code execution.

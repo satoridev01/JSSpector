@@ -413,3 +413,37 @@ fn nest_prefixes_from_imported_enums_through_tsconfig_paths_and_controller_auth_
         "{list:?}"
     );
 }
+
+#[test]
+fn findings_get_their_entry_point_and_the_route_auth_from_mounts_in_other_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "app.js",
+        "const express = require('express');\nconst admin = require('./admin');\nconst app = express();\n\
+         app.use('/admin', requireAdmin, admin);\nmodule.exports = app;\n",
+    );
+    write(
+        root,
+        "admin.js",
+        "const router = require('express').Router();\nconst { exec } = require('child_process');\n\
+         const ping = (req, res) => exec('ping -c 1 ' + req.query.host);\n\
+         router.get('/ping', ping);\nmodule.exports = router;\n",
+    );
+    let report = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0]["entry"], "GET /admin/ping");
+    assert_eq!(findings[0]["auth"], "admin");
+    // Admin-only: critical command injection reported one level lower.
+    assert_eq!(findings[0]["severity"], "high");
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    assert_eq!(routes[0]["auth"], "admin");
+}

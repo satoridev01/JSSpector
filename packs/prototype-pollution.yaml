@@ -13,9 +13,12 @@ modules:
   deep-set: deep-set
   deepmerge: lodash-merge
   merge-deep: lodash-merge
+# Current lodash (>= 4.17.17), set-value (>= 4), dot-prop (>= 5.1.1) and object-path (>= 0.11.5)
+# refuse __proto__/constructor/prototype path segments: a tainted path is only exploitable with an
+# old version, which the scanner cannot see without the lockfile. Medium until it can.
 sinks:
-  - {module: lodash, exports: [set, setWith, update, updateWith, zipObjectDeep], class: prototype-pollution, severity: high, args: ["any:1"]}
-  - {module: lodash-set, exports: [""], class: prototype-pollution, severity: high, args: ["any:1"]}
-  - {module: deep-set, exports: ["", set, setProperty, dset], class: prototype-pollution, severity: high, args: ["any:1"]}
+  - {module: lodash, exports: [set, setWith, update, updateWith, zipObjectDeep], class: prototype-pollution, severity: medium, args: ["any:1"]}
+  - {module: lodash-set, exports: [""], class: prototype-pollution, severity: medium, args: ["any:1"]}
+  - {module: deep-set, exports: ["", set, setProperty, dset], class: prototype-pollution, severity: medium, args: ["any:1"]}
   - {module: lodash, exports: [merge, mergeWith, defaultsDeep], class: prototype-pollution, severity: medium, args: ["object:1"]}
   - {module: lodash-merge, exports: ["", all], class: prototype-pollution, severity: medium, args: ["object:1", "object:0"]}

@@ -24,5 +24,5 @@ pub use process::{
     FileReport, FileStatus, ParsePool, PoolError, STACK_BASE, STACK_PER_BRACKET_BYTE,
     STACK_PER_BYTE, WORKER_STACK_BYTES, parser_stack_bound,
 };
-pub use routes::{Route, inventory};
+pub use routes::{Route, attach_entries, inventory};
 pub use scan::{ScanReport, ScanStatus, finalize};

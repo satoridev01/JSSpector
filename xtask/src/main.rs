@@ -32,6 +32,9 @@ enum Task {
         /// Write the JSON report here instead of stdout.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// The scanner binary [default: target/release/jsspector].
+        #[arg(long)]
+        binary: Option<std::path::PathBuf>,
     },
 }
 
@@ -43,6 +46,7 @@ fn main() -> Result<()> {
             limit,
             repo,
             out,
+            binary,
         } => {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -59,6 +63,7 @@ fn main() -> Result<()> {
                 limit,
                 repo,
                 out,
+                binary,
             })
         }
     }

@@ -204,7 +204,8 @@ fn scan(args: &ScanArgs) -> ExitCode {
         Err(err) => return fail(EXIT_USAGE, err),
     };
     let selection = discovery.selection(include_set(&args.include));
-    let reports = pool.scan(&discovery.files, selection);
+    let mut reports = pool.scan(&discovery.files, selection);
+    jss_frontend::attach_entries(&mut reports);
     let mut output = ScanOutput {
         root: args.path.to_string_lossy().into_owned(),
         files_scanned: 0,
@@ -361,9 +362,14 @@ fn write_text(
                 f.source.kind,
                 describe(f.class)
             )?;
+            let via = f
+                .entry
+                .as_deref()
+                .map(|e| format!(" via {e}"))
+                .unwrap_or_default();
             writeln!(
                 out,
-                "          {}in {}, auth: {}{}",
+                "          {}in {}{via}, auth: {}{}",
                 st.dim,
                 f.function,
                 f.auth.name(),

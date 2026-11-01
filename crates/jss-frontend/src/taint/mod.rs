@@ -324,6 +324,8 @@ pub struct MountFact {
     /// The mounted router: a local name, or a file when mounted as `require('./x')`.
     pub target: Option<String>,
     pub target_file: Option<String>,
+    /// Authentication middleware on the mount (`app.use('/admin', requireAdmin, router)`).
+    pub auth: Auth,
 }
 
 /// A named function's parameter that reaches a sink in its body.
@@ -3636,6 +3638,7 @@ impl Walker<'_> {
                         prefix: path,
                         target,
                         target_file,
+                        auth,
                     });
                     return;
                 }
@@ -4874,6 +4877,14 @@ mod tests {
         assert_eq!(one("app.post('/s', (req, res) => { const id = req.body.id.replace(/\\.\\.\\//g, ''); fs.writeFileSync(path.join(dir, id), x); });").len(), 1);
         // not global: only the first bad character goes
         assert_eq!(one("app.post('/s', (req, res) => { const id = req.body.id.replace(/[^a-z]/, ''); fs.writeFileSync(path.join(dir, id), x); });").len(), 1);
+    }
+
+    #[test]
+    fn library_deep_sets_are_medium() {
+        let found = scan(
+            "const _ = require('lodash');\napp.post('/s', (req, res) => { _.set(settings, req.body.path, 1); });",
+        );
+        assert_eq!(found[0].1, Severity::Medium);
     }
 
     #[test]

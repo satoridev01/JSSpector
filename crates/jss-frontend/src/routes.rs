@@ -29,6 +29,47 @@ pub struct Route {
     pub inputs: Vec<String>,
 }
 
+/// Links findings to the entry points that reach them: each route's handler is resolved to a
+/// function through the IR, the call graph is followed from the handlers, and every finding in a
+/// reached function gets the route (`entry`) and, when stronger, the route's authentication (an
+/// admin-only route lowers the severity one level).
+pub fn attach_entries(reports: &mut [ScanReport]) {
+    let routes = inventory(reports);
+    let modules: Vec<jss_core::ir::Module> = reports.iter().map(|r| r.module.clone()).collect();
+    let by_file: BTreeMap<&str, &jss_core::ir::Module> =
+        modules.iter().map(|m| (m.file.as_str(), m)).collect();
+    let graph = jss_core::ir::link(&modules);
+    let mut roots = Vec::new();
+    let mut labels = Vec::new();
+    for route in &routes {
+        if let Some(target) = jss_core::ir::resolve_reference(&by_file, &route.file, &route.handler)
+        {
+            roots.push(target);
+            labels.push((format!("{} {}", route.method, route.path), route.auth));
+        }
+    }
+    let reached = jss_core::ir::reachable(&graph, &roots);
+    for report in reports.iter_mut() {
+        for finding in &mut report.findings {
+            let id = (finding.file.clone(), finding.function.clone());
+            let Some((label, auth)) = reached.get(&id).and_then(|index| labels.get(*index)) else {
+                continue;
+            };
+            finding.entry = Some(label.clone());
+            if *auth > finding.auth {
+                if *auth == Auth::Admin && finding.auth != Auth::Admin {
+                    finding.severity = match finding.severity {
+                        jss_core::Severity::Critical => jss_core::Severity::High,
+                        jss_core::Severity::High => jss_core::Severity::Medium,
+                        _ => jss_core::Severity::Low,
+                    };
+                }
+                finding.auth = *auth;
+            }
+        }
+    }
+}
+
 /// A router: a variable in a file.
 type RouterId = (String, String);
 
@@ -41,7 +82,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
         .collect();
 
     // Mount edges: child router -> (parent router, prefix).
-    let mut parents: BTreeMap<RouterId, Vec<(RouterId, String)>> = BTreeMap::new();
+    let mut parents: BTreeMap<RouterId, Vec<(RouterId, String, Auth)>> = BTreeMap::new();
     for (file, report) in &by_file {
         for mount in &report.module.mounts {
             let Some(parent) = &mount.receiver else {
@@ -53,10 +94,11 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                 (None, None) => None,
             };
             if let Some(child) = child {
-                parents
-                    .entry(child)
-                    .or_default()
-                    .push(((file.to_string(), parent.clone()), mount.prefix.clone()));
+                parents.entry(child).or_default().push((
+                    (file.to_string(), parent.clone()),
+                    mount.prefix.clone(),
+                    mount.auth,
+                ));
             }
         }
     }
@@ -66,7 +108,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
         for entry in &report.module.entries {
             let prefixes = match &entry.receiver {
                 Some(receiver) => prefixes(&parents, &(file.to_string(), receiver.clone()), 0),
-                None => vec![String::new()],
+                None => vec![(String::new(), Auth::NoneDetected)],
             };
             let path = match entry.kind.as_str() {
                 "file-route" | "default-export" => match file_route_path(file) {
@@ -75,7 +117,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                 },
                 _ => entry.path.clone(),
             };
-            for prefix in prefixes {
+            for (prefix, mount_auth) in prefixes {
                 let full = if entry.kind == "http" || entry.kind == "file-route" {
                     openapi_path(&join(&prefix, &path))
                 } else {
@@ -87,7 +129,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                     file: file.to_string(),
                     line: entry.line,
                     handler: entry.handler.clone(),
-                    auth: entry.auth,
+                    auth: entry.auth.max(mount_auth),
                     kind: if entry.kind == "default-export" || entry.kind == "file-route" {
                         "http".to_owned()
                     } else {
@@ -143,21 +185,22 @@ fn product(report: &ScanReport, exported: &str) -> String {
 }
 
 /// Every prefix a router is reachable under (`""` for a root).
+/// Every (prefix, mount authentication) a router is reachable under (`""` for a root).
 fn prefixes(
-    parents: &BTreeMap<RouterId, Vec<(RouterId, String)>>,
+    parents: &BTreeMap<RouterId, Vec<(RouterId, String, Auth)>>,
     router: &RouterId,
     depth: usize,
-) -> Vec<String> {
+) -> Vec<(String, Auth)> {
     match parents.get(router) {
         Some(edges) if depth < 8 => edges
             .iter()
-            .flat_map(|(parent, prefix)| {
+            .flat_map(|(parent, prefix, auth)| {
                 prefixes(parents, parent, depth + 1)
                     .into_iter()
-                    .map(move |above| join(&above, prefix))
+                    .map(move |(above, above_auth)| (join(&above, prefix), above_auth.max(*auth)))
             })
             .collect(),
-        _ => vec![String::new()],
+        _ => vec![(String::new(), Auth::NoneDetected)],
     }
 }
 

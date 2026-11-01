@@ -471,6 +471,7 @@ fn analyze(
                 prefix: mount.prefix,
                 target: mount.target,
                 target_file: mount.target_file,
+                auth: mount.auth,
             })
             .collect(),
     };
@@ -547,6 +548,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
         confidence: "heuristic",
         auth: raw.auth,
         function: raw.function.clone(),
+        entry: None,
         source: SourceLoc {
             kind: raw.origin.kind,
             expr: source_expr,

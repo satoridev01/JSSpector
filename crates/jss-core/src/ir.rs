@@ -117,6 +117,8 @@ pub struct Mount {
     pub prefix: String,
     pub target: Option<String>,
     pub target_file: Option<String>,
+    /// Authentication middleware applied at the mount.
+    pub auth: Auth,
 }
 
 /// A function, by module and name.
@@ -172,6 +174,46 @@ pub fn link(modules: &[Module]) -> CallGraph {
     graph
 }
 
+/// The function `reference` (as written in `file`: `list`, `ctrl.list`, `Users.find`) names,
+/// in that module or, through its imports, another.
+pub fn resolve_reference(
+    modules: &BTreeMap<&str, &Module>,
+    file: &str,
+    reference: &str,
+) -> Option<FunctionId> {
+    let module = modules.get(file)?;
+    let local: BTreeSet<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+    let imports: BTreeMap<&str, &Import> = module
+        .imports
+        .iter()
+        .map(|i| (i.local.as_str(), i))
+        .collect();
+    resolve_call(reference, &local, &imports, modules, file)
+}
+
+/// Every function reachable from `roots` through the call graph (roots included).
+pub fn reachable(graph: &CallGraph, roots: &[FunctionId]) -> BTreeMap<FunctionId, usize> {
+    let mut seen: BTreeMap<FunctionId, usize> = BTreeMap::new();
+    let mut stack: Vec<(FunctionId, usize)> = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        stack.push((root.clone(), index));
+    }
+    while let Some((id, root)) = stack.pop() {
+        if seen.contains_key(&id) || seen.len() > 200_000 {
+            continue;
+        }
+        seen.insert(id.clone(), root);
+        if let Some(callees) = graph.edges.get(&format!("{}#{}", id.0, id.1)) {
+            for callee in callees {
+                if let Some((file, name)) = callee.split_once('#') {
+                    stack.push(((file.to_owned(), name.to_owned()), root));
+                }
+            }
+        }
+    }
+    seen
+}
+
 fn resolve_call(
     callee: &str,
     local: &BTreeSet<&str>,
@@ -179,8 +221,24 @@ fn resolve_call(
     by_file: &BTreeMap<&str, &Module>,
     file: &str,
 ) -> Option<FunctionId> {
+    resolve_in(callee, local, imports, by_file, file, 0)
+}
+
+/// Resolves `callee` in one module, following imports, export names, namespace re-exports
+/// (`import * as watch from './watch'; export { watch }`) and barrels (`export * from`).
+fn resolve_in(
+    callee: &str,
+    local: &BTreeSet<&str>,
+    imports: &BTreeMap<&str, &Import>,
+    by_file: &BTreeMap<&str, &Module>,
+    file: &str,
+    depth: usize,
+) -> Option<FunctionId> {
     if local.contains(callee) {
         return Some((file.to_owned(), callee.to_owned()));
+    }
+    if depth > 6 {
+        return None;
     }
     let (head, rest) = match callee.split_once('.') {
         Some((head, rest)) => (head, Some(rest)),
@@ -189,42 +247,84 @@ fn resolve_call(
     let import = imports.get(head)?;
     let target_file = import.resolved.as_deref()?;
     let target = by_file.get(target_file)?;
+    let exported = |name: &str| {
+        target
+            .exports
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    };
     // `import { find } ...; find()`, `import svc ...; svc.find()`, `import { Users } ...; Users.find()`.
     let candidates: Vec<String> = match (import.export.as_deref(), rest) {
-        (Some(export), None) => vec![
-            target
-                .exports
-                .get(export)
-                .cloned()
-                .unwrap_or_else(|| export.to_owned()),
-        ],
+        (Some(export), None) => vec![exported(export)],
         (Some(export), Some(method)) => vec![
             format!("{export}.{method}"),
-            format!(
-                "{}.{method}",
-                target
-                    .exports
-                    .get(export)
-                    .cloned()
-                    .unwrap_or_else(|| export.to_owned())
-            ),
+            format!("{}.{method}", exported(export)),
         ],
         (None, Some(method)) => {
             let mut names = vec![method.to_owned()];
             if let Some(default) = target.exports.get("default") {
                 names.push(format!("{default}.{method}"));
             }
-            if let Some(exported) = target.exports.get(method) {
-                names.push(exported.clone());
+            if let Some(name) = target.exports.get(method) {
+                names.push(name.clone());
             }
             names
         }
         (None, None) => target.exports.get("default").cloned().into_iter().collect(),
     };
-    candidates
-        .into_iter()
-        .find(|name| target.functions.iter().any(|f| f.name == *name))
-        .map(|name| (target_file.to_owned(), name))
+    if let Some(name) = candidates
+        .iter()
+        .find(|name| target.functions.iter().any(|f| f.name == **name))
+    {
+        return Some((target_file.to_owned(), name.clone()));
+    }
+    // Not defined there: follow what the target itself imports or re-exports.
+    let target_local: BTreeSet<&str> = target.functions.iter().map(|f| f.name.as_str()).collect();
+    let target_imports: BTreeMap<&str, &Import> = target
+        .imports
+        .iter()
+        .map(|i| (i.local.as_str(), i))
+        .collect();
+    let follow = match (import.export.as_deref(), rest) {
+        (Some(export), None) => Some(exported(export)),
+        (Some(export), Some(more)) => Some(format!("{}.{more}", exported(export))),
+        (None, Some(more)) => {
+            let (segment, remaining) = match more.split_once('.') {
+                Some((segment, remaining)) => (segment, Some(remaining)),
+                None => (more, None),
+            };
+            Some(match remaining {
+                Some(remaining) => format!("{}.{remaining}", exported(segment)),
+                None => exported(segment),
+            })
+        }
+        (None, None) => None,
+    };
+    if let Some(next) = &follow
+        && let Some(found) = resolve_in(
+            next,
+            &target_local,
+            &target_imports,
+            by_file,
+            target_file,
+            depth + 1,
+        )
+    {
+        return Some(found);
+    }
+    // Barrels: `export * from './x'`.
+    let wanted = follow.or_else(|| candidates.first().cloned())?;
+    target.reexports.iter().find_map(|barrel| {
+        let module = by_file.get(barrel.as_str())?;
+        let names: BTreeSet<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+        let imports: BTreeMap<&str, &Import> = module
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i))
+            .collect();
+        resolve_in(&wanted, &names, &imports, by_file, barrel, depth + 1)
+    })
 }
 
 #[cfg(test)]
@@ -274,5 +374,43 @@ mod tests {
         assert!(callees.contains("routes.js#helper"));
         assert_eq!(graph.cross_module, 1);
         assert_eq!(graph.unresolved, 1);
+    }
+
+    #[test]
+    fn references_follow_namespace_re_exports() {
+        let app = Module {
+            file: "app.js".to_owned(),
+            imports: vec![Import {
+                local: "api".to_owned(),
+                specifier: "./api".to_owned(),
+                export: None,
+                resolved: Some("api/index.js".to_owned()),
+            }],
+            ..Module::default()
+        };
+        let index = Module {
+            file: "api/index.js".to_owned(),
+            imports: vec![Import {
+                local: "watch".to_owned(),
+                specifier: "./api.watch".to_owned(),
+                export: None,
+                resolved: Some("api/api.watch.js".to_owned()),
+            }],
+            exports: BTreeMap::from([("watch".to_owned(), "watch".to_owned())]),
+            ..Module::default()
+        };
+        let watch = Module {
+            file: "api/api.watch.js".to_owned(),
+            exports: BTreeMap::from([("readFile".to_owned(), "readFile".to_owned())]),
+            functions: vec![function("readFile", &[])],
+            ..Module::default()
+        };
+        let modules = [app, index, watch];
+        let by_file: BTreeMap<&str, &Module> =
+            modules.iter().map(|m| (m.file.as_str(), m)).collect();
+        assert_eq!(
+            resolve_reference(&by_file, "app.js", "api.watch.readFile"),
+            Some(("api/api.watch.js".to_owned(), "readFile".to_owned()))
+        );
     }
 }

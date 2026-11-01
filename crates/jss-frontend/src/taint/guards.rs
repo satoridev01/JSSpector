@@ -464,10 +464,13 @@ fn predicate_word(lower: &str) -> Option<&'static str> {
     {
         return None;
     }
+    // Right after the prefix (`isValidName`), or a long word anywhere in the rest
+    // (`isRegularContainedFile`, `isPathInside`): short words such as `valid` or `safe` only
+    // count first.
     model()
         .validator_words
         .iter()
-        .find(|w| rest.starts_with(w.as_str()))
+        .find(|w| rest.starts_with(w.as_str()) || (w.len() >= 6 && rest.contains(w.as_str())))
         .map(String::as_str)
 }
 
@@ -615,22 +618,35 @@ pub fn exits(statement: &Statement<'_>) -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CharSet {
     ascii: u128,
+    /// Some non-ASCII character that is punctuation, a symbol or a full-width form (`／`, `．`,
+    /// `∕`), or any non-ASCII character we cannot place.
     other: bool,
+    /// Some non-ASCII letter (an accented Latin letter, a CJK ideograph): never a path
+    /// separator or a dot.
+    letters: bool,
+}
+
+/// Non-ASCII blocks of punctuation, symbols and look-alike forms: Latin-1 punctuation, general
+/// punctuation through miscellaneous symbols, CJK punctuation, and half- and full-width forms.
+fn punctuation_block(code: u32) -> bool {
+    matches!(code, 0x80..=0xBF | 0x2000..=0x2BFF | 0x3000..=0x303F | 0xFE00..=0xFFFF)
+        || code > 0xFFFF
 }
 
 impl CharSet {
     fn add(&mut self, c: char) {
         match u32::from(c) {
             n @ 0..=127 => self.ascii |= 1u128 << n,
-            _ => self.other = true,
+            n if punctuation_block(n) => self.other = true,
+            _ => self.letters = true,
         }
     }
 
     fn add_range(&mut self, from: char, to: char) {
-        for code in u32::from(from)..=u32::from(to) {
+        for code in u32::from(from)..=u32::from(to).min(0x11_0000) {
             match char::from_u32(code) {
-                Some(c) if code < 128 => self.add(c),
-                _ => self.other = true,
+                Some(c) => self.add(c),
+                None => self.other = true,
             }
         }
     }
@@ -750,6 +766,7 @@ fn sequence(body: &str) -> Option<CharSet> {
                 let class = class_body(&inner)?;
                 set.ascii |= class.ascii;
                 set.other |= class.other;
+                set.letters |= class.letters;
             }
             '.' => return None,
             '(' => {
@@ -842,6 +859,11 @@ fn class_body(inner: &str) -> Option<CharSet> {
         if c == '\\' {
             let next = chars.next()?;
             match next {
+                // `\u4e00`: that character.
+                'u' if chars.clone().take(4).all(|h| h.is_ascii_hexdigit()) => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    items.push(Some(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?));
+                }
                 'w' | 'd' | 's' | 'W' | 'D' | 'S' | 'p' | 'P' | 'x' | 'u' => {
                     escape(next, &mut set)?;
                     items.push(None);
@@ -875,10 +897,10 @@ fn class_body(inner: &str) -> Option<CharSet> {
 /// The classes a value made only of `set`'s characters is safe for.
 pub fn mask(set: &CharSet) -> u8 {
     let mut classes = ALL;
-    if set.other || set.any(";|&$`(){}<>\\\n\r\t \"'!*?~#") {
+    if set.other || set.letters || set.any(";|&$`(){}<>\\\n\r\t \"'!*?~#") {
         classes &= !(class_bit(VulnClass::CommandInjection) | class_bit(VulnClass::CodeInjection));
     }
-    if set.other || set.any("'\"`\\ \t\n\r;()/*#=") {
+    if set.other || set.letters || set.any("'\"`\\ \t\n\r;()/*#=") {
         classes &= !class_bit(VulnClass::SqlInjection);
     }
     if set.any("<>\"'`") {
@@ -888,8 +910,8 @@ pub fn mask(set: &CharSet) -> u8 {
     if set.other || set.any("/\\") {
         classes &= !class_bit(VulnClass::PathTraversal);
     }
-    // A host needs letters or dots; digits alone are no URL start.
-    if set.has_letters() || set.any(".:/@\\") {
+    // A host needs letters or dots; digits alone are no URL start (an IDN host letters too).
+    if set.has_letters() || set.letters || set.other || set.any(".:/@\\") {
         classes &= !class_bit(VulnClass::Ssrf);
     }
     // `__proto__`, `constructor`, `prototype` are made of letters.

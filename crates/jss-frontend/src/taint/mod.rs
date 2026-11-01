@@ -60,7 +60,7 @@ pub struct Origin {
     /// Summary pass only: other parameters the value also carries, as (index, span start of
     /// their origin, for its field, whether that parameter's data can be at the start of the
     /// value), at most [`MAX_ALSO`]: `exec(b + a)` carries both, `a` after `b`.
-    pub also: Vec<(usize, u32, bool)>,
+    pub also: Vec<(usize, u32, bool, u8)>,
     /// Upload objects (`req.files`, wherever they went): the fields the server chose (`path`,
     /// `filename`, `destination`) are not the attacker's.
     pub upload: bool,
@@ -69,6 +69,10 @@ pub struct Origin {
     /// The response of a request to this value's URL (`await fetch(url)`): the attacker's only
     /// where they chose the URL's start.
     pub response: bool,
+    /// Classes the primary parameter was escaped for on its own path before this value was
+    /// merged with others (on top of `escaped`, which holds for the whole value). Each entry of
+    /// `also` keeps its own the same way.
+    pub primary_escaped: u8,
 }
 
 /// The key under which a tracked object keeps what its fields of unknown name may hold
@@ -99,6 +103,14 @@ fn unnamed_fields(fields: &BTreeMap<String, Origin>) -> Option<Origin> {
 /// (`exports.users = require('./users')`, `export * as users from './users'`).
 pub const NAMESPACE: &str = "<namespace>:";
 
+/// The classes percent-encoded text is safe for: no markup, quote, separator or shell character
+/// survives encoding.
+const ENCODED: u8 = class_bit(VulnClass::Xss)
+    | class_bit(VulnClass::SqlInjection)
+    | class_bit(VulnClass::CommandInjection)
+    | class_bit(VulnClass::CodeInjection)
+    | class_bit(VulnClass::PathTraversal);
+
 /// Most extra parameters an [`Origin`] remembers.
 const MAX_ALSO: usize = 4;
 
@@ -106,15 +118,24 @@ impl Origin {
     /// Every parameter this value carries, with the span start that names its field and
     /// whether its data can be at the start of the value: its own, then the others it was
     /// merged with (never at the start once the whole value is not).
-    fn contributors(&self) -> Vec<(usize, u32, bool)> {
-        let mut all: Vec<(usize, u32, bool)> = self
+    /// ... and the classes each one was escaped for on its way in (`cwd = sanitized(url)`
+    /// merged with an unchecked `cwd` parameter: the first is safe, the second is not).
+    fn contributors(&self) -> Vec<(usize, u32, bool, u8)> {
+        let mut all: Vec<(usize, u32, bool, u8)> = self
             .param
-            .map(|p| (p, self.span.start, self.prefix))
+            .map(|p| {
+                (
+                    p,
+                    self.span.start,
+                    self.prefix,
+                    self.primary_escaped | self.escaped,
+                )
+            })
             .into_iter()
             .collect();
-        for &(param, at, prefix) in &self.also {
-            if !all.iter().any(|&(p, a, _)| (p, a) == (param, at)) {
-                all.push((param, at, prefix && self.prefix));
+        for &(param, at, prefix, escaped) in &self.also {
+            if !all.iter().any(|&(p, a, _, _)| (p, a) == (param, at)) {
+                all.push((param, at, prefix && self.prefix, escaped | self.escaped));
             }
         }
         all
@@ -123,19 +144,25 @@ impl Origin {
     /// Remembers `other`'s parameters as carried by this value too.
     fn absorb(&mut self, other: &Origin) {
         let own = self.param.map(|p| (p, self.span.start));
-        for (param, at, prefix) in other.contributors() {
+        // What the own parameter was escaped for so far, before the merge's value-level `and`.
+        self.primary_escaped |= self.escaped;
+        for (param, at, prefix, escaped) in other.contributors() {
             if own == Some((param, at)) {
+                // The same parameter on two paths: escaped only where both escaped it.
+                self.primary_escaped &= escaped;
                 continue;
             }
             if let Some(entry) = self
                 .also
                 .iter_mut()
-                .find(|(p, a, _)| (*p, *a) == (param, at))
+                .find(|(p, a, _, _)| (*p, *a) == (param, at))
             {
-                // Seen on two paths: at the start if either put it there.
+                // Seen on two paths: at the start if either put it there, escaped only if both
+                // escaped it.
                 entry.2 |= prefix;
+                entry.3 &= escaped;
             } else if self.also.len() < MAX_ALSO {
-                self.also.push((param, at, prefix));
+                self.also.push((param, at, prefix, escaped));
             }
         }
     }
@@ -154,7 +181,7 @@ fn url_rule(class: VulnClass, api: &str) -> bool {
 }
 
 /// The bit of `class` in [`Origin::escaped`].
-fn class_bit(class: VulnClass) -> u8 {
+const fn class_bit(class: VulnClass) -> u8 {
     1 << (class as u8)
 }
 
@@ -210,6 +237,7 @@ impl Origin {
             upload: false,
             dash_free: false,
             response: false,
+            primary_escaped: 0,
         }
     }
 
@@ -412,6 +440,7 @@ pub fn scan_file_program(
         emit_field: None,
         field_slots: BTreeMap::new(),
         field_reads: BTreeMap::new(),
+        call_fields: BTreeMap::new(),
         regexes: BTreeMap::new(),
         service_worker: false,
         modules: BTreeMap::new(),
@@ -651,6 +680,12 @@ struct Env {
     node_tags: BTreeMap<String, String>,
     /// Argument arrays that already hold `"--"`: what is pushed after it is positional.
     options_ended: BTreeSet<String>,
+    /// Variables bound to an object whose text form is percent-encoded (`const u = new
+    /// URLSearchParams(q)`): what is stored in it (`u.set(k, v)`) is encoded in that text too.
+    encoded: BTreeSet<String>,
+    /// Results of a lookup by equality in a list the server holds (`const doc =
+    /// docs.find((d) => d.filename === name)`): result -> the value looked up (`name`).
+    found_by: BTreeMap<String, String>,
     /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
     /// bindings, inner functions): writes to any other name are writes to its parent's.
     locals: BTreeSet<String>,
@@ -848,6 +883,8 @@ impl Env {
             nodes: BTreeSet::new(),
             node_tags: BTreeMap::new(),
             options_ended: BTreeSet::new(),
+            encoded: BTreeSet::new(),
+            found_by: BTreeMap::new(),
             locals: BTreeSet::new(),
             branch: 0,
             function,
@@ -879,6 +916,8 @@ impl Env {
             nodes: self.nodes.clone(),
             node_tags: self.node_tags.clone(),
             options_ended: self.options_ended.clone(),
+            encoded: self.encoded.clone(),
+            found_by: self.found_by.clone(),
             locals: BTreeSet::new(),
             branch: 0,
             function,
@@ -1030,6 +1069,9 @@ struct Walker<'e> {
     /// Classes and interfaces declared in this file (and ES5 constructors with prototype
     /// methods): `new C()` of one of them is an instance worth typing.
     declared_classes: BTreeSet<String>,
+    /// The fields each call that returns an object literal gave this walk: (call span) ->
+    /// field -> taint (a field it does not list is clean).
+    call_fields: BTreeMap<(u32, u32), BTreeMap<String, Origin>>,
     /// The first read of each field of a parameter while summarizing: (parameter position,
     /// field) -> that read's position, which every later read of it shares.
     field_reads: BTreeMap<(u32, String), u32>,
@@ -1330,6 +1372,7 @@ fn response_of_value(mut o: Origin, s: &Summary) -> Origin {
         o.sqlish = false;
         o.prefix = true;
         o.escaped = 0;
+        o.primary_escaped = 0;
         o.response = true;
     }
     o
@@ -1347,6 +1390,82 @@ fn callee_label(callee: &Callee) -> String {
             Some(object) => format!("{object}.{method}"),
             None => method.clone(),
         },
+    }
+}
+
+/// The access path a lookup by equality checks, when the list it searches is not the
+/// attacker's: `docs.find((d) => d.filename === name)` and `docs.some(...)` give `name`.
+fn lookup_value(call: &CallExpression<'_>, env: &Env) -> Option<String> {
+    let member = call.callee.get_inner_expression().as_member_expression()?;
+    let method = member.static_property_name()?.as_str()?;
+    if !has(&m().lookup_methods, method) {
+        return None;
+    }
+    // A list of the server's: not a value the attacker sent.
+    let list = guards::path_key(member.object())?;
+    let root = list.split('.').next().unwrap_or(&list);
+    if env.vars.contains_key(root) || env.requests.contains_key(root) {
+        return None;
+    }
+    let Expression::ArrowFunctionExpression(arrow) = call
+        .arguments
+        .first()
+        .and_then(Argument::as_expression)?
+        .get_inner_expression()
+    else {
+        return None;
+    };
+    let item = match &arrow.params.items.first()?.pattern {
+        BindingPattern::BindingIdentifier(id) => id.name.as_str(),
+        _ => return None,
+    };
+    let body = match &arrow.body {
+        ArrowFunctionBody::FunctionBody(body) => match body.statements.as_slice() {
+            [Statement::ReturnStatement(r)] => r.argument.as_ref()?,
+            _ => return None,
+        },
+        other => other.as_expression()?,
+    };
+    let Expression::BinaryExpression(test) = body.get_inner_expression() else {
+        return None;
+    };
+    if !matches!(
+        test.operator,
+        BinaryOperator::StrictEquality | BinaryOperator::Equality
+    ) {
+        return None;
+    }
+    let of_item = |e: &Expression<'_>| {
+        guards::path_key(e).is_some_and(|k| k == item || k.starts_with(&format!("{item}.")))
+    };
+    let value = match (of_item(&test.left), of_item(&test.right)) {
+        (true, false) => &test.right,
+        (false, true) => &test.left,
+        _ => return None,
+    };
+    guards::path_key(value)
+}
+
+/// The object literal a return gives, also behind a condition whose other outcome is no value
+/// (`dir ? { url, path } : null`, `ok && { url }`).
+fn returned_object<'a, 'b>(expr: &'b Expression<'a>) -> Option<&'b ObjectExpression<'a>> {
+    let nothing = |e: &Expression<'_>| match e.get_inner_expression() {
+        Expression::NullLiteral(_) | Expression::BooleanLiteral(_) => true,
+        Expression::Identifier(id) => id.name == "undefined",
+        _ => false,
+    };
+    match expr.get_inner_expression() {
+        Expression::ObjectExpression(object) => Some(object),
+        Expression::ConditionalExpression(c) if nothing(&c.alternate) => {
+            returned_object(&c.consequent)
+        }
+        Expression::ConditionalExpression(c) if nothing(&c.consequent) => {
+            returned_object(&c.alternate)
+        }
+        Expression::LogicalExpression(l) if l.operator == LogicalOperator::And => {
+            returned_object(&l.right)
+        }
+        _ => None,
     }
 }
 
@@ -1370,6 +1489,37 @@ fn doubles_quotes(arguments: &[Argument<'_>]) -> bool {
             Some(Argument::StringLiteral(quote)) => quote.value.as_str() == Some("'"),
             _ => false,
         }
+}
+
+/// `s.replace(/[&<>"']/g, (c) => ESC[c])` or `s.replace(/[<>]/g, lookup)`: a global regex that
+/// is one character class holding both `<` and `>`, replaced by what a function or a table
+/// gives, never by a literal that brings markup back.
+fn escapes_markup(arguments: &[Argument<'_>]) -> bool {
+    let Some(Argument::RegExpLiteral(regex)) = arguments.first() else {
+        return false;
+    };
+    if !regex.regex.flags.contains(oxc_ast::ast::RegExpFlags::G) {
+        return false;
+    }
+    let pattern = regex.regex.pattern.text.as_str();
+    let Some(inner) = pattern.strip_prefix('[').and_then(|p| p.strip_suffix(']')) else {
+        return false;
+    };
+    if inner.starts_with('^') || !inner.contains('<') || !inner.contains('>') {
+        return false;
+    }
+    match arguments.get(1).and_then(Argument::as_expression) {
+        Some(Expression::StringLiteral(with)) => {
+            with.value.as_str().is_some_and(|w| !w.contains(['<', '>']))
+        }
+        Some(
+            Expression::ArrowFunctionExpression(_)
+            | Expression::FunctionExpression(_)
+            | Expression::Identifier(_)
+            | Expression::StaticMemberExpression(_),
+        ) => true,
+        _ => false,
+    }
 }
 
 /// The class a `: C` type annotation names (a PascalCase type reference).
@@ -1907,6 +2057,21 @@ impl Walker<'_> {
                     (true, _) => {}
                     (false, true) => env.restore(then_path),
                     (false, false) => env.join_with(&then_path),
+                }
+                // `if (!doc) return` after `const doc = docs.find((d) => d.name === name)`, or
+                // `if (!docs.some((d) => d.name === name)) return`: `name` is the server's.
+                if consequent_exits
+                    && let Expression::UnaryExpression(u) = s.test.get_inner_expression()
+                    && u.operator == UnaryOperator::LogicalNot
+                {
+                    let value = match u.argument.get_inner_expression() {
+                        Expression::Identifier(id) => env.found_by.get(id.name.as_str()).cloned(),
+                        Expression::CallExpression(c) => lookup_value(c, env),
+                        _ => None,
+                    };
+                    if let Some(value) = value {
+                        env.learn(vec![(value, guards::Fact::Clean(guards::ALL))]);
+                    }
                 }
             }
             Statement::ReturnStatement(s) => {
@@ -2596,6 +2761,18 @@ impl Walker<'_> {
                 } else {
                     env.plain.remove(name);
                 }
+                // `const u = new URLSearchParams(q)`: its text form is percent-encoded.
+                let encoded = match init.get_inner_expression() {
+                    Expression::NewExpression(n) => {
+                        callee_name(&n.callee).is_some_and(|c| has(&m().encoding_constructors, &c))
+                    }
+                    _ => false,
+                };
+                if encoded {
+                    env.encoded.insert(name.clone());
+                } else {
+                    env.encoded.remove(name);
+                }
                 // `const iframe = document.createElement('iframe')`: a node, not markup.
                 let node = match init.get_inner_expression() {
                     Expression::CallExpression(c) => guards::path_key(&c.callee)
@@ -2606,6 +2783,24 @@ impl Walker<'_> {
                     env.nodes.insert(name.clone());
                 } else {
                     env.nodes.remove(name);
+                }
+                // `const doc = docs.find((d) => d.filename === name)`: found, `name` is the
+                // server's.
+                let looked_up = match init.get_inner_expression() {
+                    Expression::AwaitExpression(a) => match a.argument.get_inner_expression() {
+                        Expression::CallExpression(c) => lookup_value(c, env),
+                        _ => None,
+                    },
+                    Expression::CallExpression(c) => lookup_value(c, env),
+                    _ => None,
+                };
+                match looked_up {
+                    Some(value) => {
+                        env.found_by.insert(name.clone(), value);
+                    }
+                    None => {
+                        env.found_by.remove(name);
+                    }
                 }
                 // `const args = ['--json', '--']`: pushes after it are positional.
                 let ended = matches!(
@@ -2839,6 +3034,7 @@ impl Walker<'_> {
                                 upload: false,
                                 dash_free: false,
                                 response: false,
+                                primary_escaped: 0,
                             })
                         }
                         (Some(_), _) => None,
@@ -3284,6 +3480,7 @@ impl Walker<'_> {
                     upload: false,
                     dash_free: false,
                     response: false,
+                    primary_escaped: 0,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -3328,6 +3525,7 @@ impl Walker<'_> {
                     upload: false,
                     dash_free: false,
                     response: false,
+                    primary_escaped: 0,
                 };
                 self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
             }
@@ -3428,6 +3626,7 @@ impl Walker<'_> {
                         upload: false,
                         dash_free: false,
                         response: false,
+                        primary_escaped: 0,
                     };
                     self.bind_pattern(&param.pattern, Some(origin), None, &mut env);
                 }
@@ -3607,18 +3806,20 @@ impl Walker<'_> {
         }
         // `function getDir(req) { return req.query.dir }`: returns client data itself. A value
         // built from several parameters returns each of them.
-        let contributors: Vec<(usize, u32, bool)> = match origin.param {
+        let contributors: Vec<(usize, u32, bool, u8)> = match origin.param {
             Some(_) => origin.contributors(),
-            None => std::iter::once((RETURNS_SOURCE, origin.span.start, origin.prefix))
-                .chain(
-                    origin
-                        .also
-                        .iter()
-                        .map(|&(p, a, prefix)| (p, a, prefix && origin.prefix)),
-                )
-                .collect(),
+            None => std::iter::once((
+                RETURNS_SOURCE,
+                origin.span.start,
+                origin.prefix,
+                origin.escaped,
+            ))
+            .chain(origin.also.iter().map(|&(p, a, prefix, escaped)| {
+                (p, a, prefix && origin.prefix, escaped | origin.escaped)
+            }))
+            .collect(),
         };
-        for (param, at, prefix) in contributors {
+        for (param, at, prefix, escaped) in contributors {
             let field = self.field_of.get(&at).cloned();
             let list = self.summaries.entry(env.function.clone()).or_default();
             if list.iter().any(|s| {
@@ -3636,6 +3837,7 @@ impl Walker<'_> {
                 steps: origin.steps.clone(),
                 at_sink: Origin {
                     prefix,
+                    escaped,
                     ..origin.clone()
                 },
                 ext: None,
@@ -3657,7 +3859,7 @@ impl Walker<'_> {
         if !self.summarize {
             return;
         }
-        if let Expression::ObjectExpression(object) = argument.get_inner_expression()
+        if let Some(object) = returned_object(argument)
             && object
                 .properties
                 .iter()
@@ -4015,6 +4217,17 @@ impl Walker<'_> {
         } else {
             Role::Plain
         };
+        // `const Card = memo((props) => ...)`, `forwardRef(...)`, `observer(...)`: the wrapped
+        // function is the component `Card`.
+        if let (Some(name), Expression::CallExpression(call)) = (&name, expr.get_inner_expression())
+            && callee_name(&call.callee).is_some_and(|c| has(&m().component_wrappers, &c))
+            && let Some(wrapped) = call.arguments.first().and_then(Argument::as_expression)
+        {
+            for argument in call.arguments.iter().skip(1) {
+                self.argument(argument, env, Role::Plain);
+            }
+            return self.expr_named(wrapped, env, Some(name.clone()));
+        }
         if self.maybe_function(expr, env, name, role) {
             return None;
         }
@@ -4587,14 +4800,17 @@ impl Walker<'_> {
                         env,
                     );
                 }
-                // `new URL(input)` keeps the input.
+                // `new URL(input)` keeps the input; `new URLSearchParams(q)` too, though its
+                // text form is percent-encoded (what `.get()` reads back is not).
                 match &callee {
-                    Callee::Global(name) if has(&m().pass_globals, name) => taints
-                        .iter()
-                        .flatten()
-                        .next()
-                        .cloned()
-                        .map(|o| o.step(new.span.start, format!("through new {name}()"))),
+                    Callee::Global(name) if has(&m().pass_globals, name) => {
+                        taints.iter().flatten().next().cloned().map(|mut o| {
+                            if has(&m().encoding_constructors, name) {
+                                o.escaped |= ENCODED;
+                            }
+                            o.step(new.span.start, format!("through new {name}()"))
+                        })
+                    }
                     _ => None,
                 }
             }
@@ -4777,6 +4993,7 @@ impl Walker<'_> {
                 built: false,
                 sqlish: false,
                 escaped: 0,
+                primary_escaped: 0,
                 response: true,
                 ..origin
             }
@@ -5372,6 +5589,7 @@ impl Walker<'_> {
                     .is_some_and(|p| has(&m().upload_objects, p)),
                 dash_free: false,
                 response: false,
+                primary_escaped: 0,
             });
         }
         // `this.url` in a class method: what another method stored there.
@@ -6150,6 +6368,16 @@ impl Walker<'_> {
                 });
                 value = union(value, taint);
             }
+            // `u.set(k, v)` on a `new URLSearchParams()`: percent-encoded in its text form.
+            if target_name
+                .as_ref()
+                .is_some_and(|n| env.encoded.contains(n))
+            {
+                value = value.map(|mut o| {
+                    o.escaped |= ENCODED;
+                    o
+                });
+            }
             if let (true, Some(name)) = (ended, target_name) {
                 env.options_ended.insert(name);
             }
@@ -6646,6 +6874,20 @@ impl Walker<'_> {
             }
             whole
         });
+        // `remoteImagePlace(tab)` returning `{ note, workspace, data }`: a helper whose return
+        // summaries are all per field returns an object literal, whose other fields are clean.
+        let fields_only = helper.as_ref().is_some_and(|(_, summaries)| {
+            summaries
+                .iter()
+                .filter(|s| s.api == RETURNS)
+                .all(|s| s.out_field.is_some())
+        });
+        if fields_only && !returned_fields.is_empty() {
+            self.call_fields
+                .insert((call.span.start, call.span.end), returned_fields.clone());
+        } else {
+            self.call_fields.remove(&(call.span.start, call.span.end));
+        }
         self.last_returned_fields = (!returned_fields.is_empty()).then_some(returned_fields);
         // `isValidRequest(req, fileName)`: past the call, what it validates is clean.
         if let Some((_, summaries)) = &helper {
@@ -6729,6 +6971,7 @@ impl Walker<'_> {
                             upload: false,
                             dash_free: false,
                             response: false,
+                            primary_escaped: 0,
                         })
                     })
                     .collect();
@@ -6829,6 +7072,7 @@ impl Walker<'_> {
                         upload: false,
                         dash_free: false,
                         response: false,
+                        primary_escaped: 0,
                     });
                 }
                 // Pack result sources: `zip.getEntries()`.
@@ -6840,6 +7084,14 @@ impl Walker<'_> {
                     return any_arg().map(|mut o| {
                         o.object = false;
                         o.step(call.span.start, format!("validated by .{method}()"))
+                    });
+                }
+                // `String(v).replace(/[&<>"']/g, (c) => ESC[c])`: every markup character
+                // replaced by what a function or table gives (an entity): an HTML escaper.
+                if has(&m().strip_methods, method) && escapes_markup(&call.arguments) {
+                    return receiver.map(|mut o| {
+                        o.escaped |= class_bit(VulnClass::Xss);
+                        o.step(call.span.start, "markup characters replaced".to_owned())
                     });
                 }
                 // `v.replace(/'/g, "''")`: quotes doubled, safe inside a quoted SQL string.
@@ -6914,6 +7166,19 @@ impl Walker<'_> {
                             if regex.regex.pattern.text.as_str().starts_with('^')
                                 && with.value.as_str().is_some_and(guards::fixed_origin)
                     );
+                // `new URLSearchParams(location.search).get('next')`: a value of the receiver,
+                // never of the argument (`ALLOWED.get(req.query.k)` stays clean).
+                if has(&m().receiver_reads, method) {
+                    return receiver.map(|mut o| {
+                        o.prefix = true;
+                        o.built = false;
+                        // A value read back is decoded: whatever encoding the receiver's text
+                        // form had does not apply to it.
+                        o.escaped = 0;
+                        o.primary_escaped = 0;
+                        o.step(call.span.start, format!("read by .{method}()"))
+                    });
+                }
                 if has(&m().pass_methods, method) {
                     let built = has(&m().build_methods, method);
                     let taint = union(receiver, any_arg()).map(|mut o| {
@@ -7254,6 +7519,23 @@ impl Walker<'_> {
                     .cloned()
                     .or_else(|| unnamed_fields(fields)),
                 None => whole,
+            },
+            // `remoteImageResponse(src, remoteImagePlace(tab))`: that field of what the inner
+            // call returned.
+            Expression::CallExpression(c) => {
+                match self.call_fields.get(&(c.span.start, c.span.end)) {
+                    Some(fields) => fields.get(field).cloned(),
+                    None => whole,
+                }
+            }
+            Expression::AwaitExpression(a) => match a.argument.get_inner_expression() {
+                Expression::CallExpression(c) => {
+                    match self.call_fields.get(&(c.span.start, c.span.end)) {
+                        Some(fields) => fields.get(field).cloned(),
+                        None => whole,
+                    }
+                }
+                _ => whole,
             },
             _ => whole,
         }
@@ -9118,9 +9400,13 @@ impl Walker<'_> {
         if self.summarize {
             // One summary per parameter the value carries (`exec(b + a)`: both).
             let url_sink = finding.start || url_rule(finding.class, &finding.api);
-            for (param, at, prefix) in finding.origin.contributors() {
+            for (param, at, prefix, escaped) in finding.origin.contributors() {
                 // A parameter after the start of a URL does not choose where it goes.
                 if url_sink && !prefix {
+                    continue;
+                }
+                // Escaped for this class on its own way in, before it met the rest.
+                if escaped & class_bit(finding.class) != 0 {
                     continue;
                 }
                 // Reached through an instance field set from a constructor parameter; else the
@@ -9569,6 +9855,29 @@ mod tests {
         );
         assert!(
             found.iter().any(|f| f.0 == VulnClass::NosqlInjection),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_escaped_on_its_own_path_stays_escaped_once_merged() {
+        // great_cto: `cwd` is replaced by a path checked to be inside the home directory, which
+        // comes from `url`; merged with the unchecked `cwd` parameter, only `cwd` reaches the
+        // read.
+        let helpers = "function inside(x) { const r = path.resolve(x); return isInsideDir(HOME, r) ? r : null; }\n\
+                       function dispatch(url, cwd) { const p = url.searchParams.get('project'); if (p) { const w = inside(p); if (w) { cwd = w; } } fs.readFileSync(path.join(cwd, 'x.json')); }\n";
+        assert!(
+            one(&format!(
+                "{helpers}app.get('/b', (req, res) => {{ dispatch(new URL(req.url, BASE), process.cwd()); }});"
+            ))
+            .is_empty()
+        );
+        let found = one(&format!(
+            "{helpers}app.get('/b', (req, res) => {{ dispatch(new URL(req.url, BASE), req.query.dir); }});"
+        ));
+        assert_eq!(
+            found.iter().map(|f| f.0).collect::<Vec<_>>(),
+            vec![VulnClass::PathTraversal],
             "{found:?}"
         );
     }
@@ -10729,6 +11038,29 @@ mod tests {
         assert!(one("app.get('/a', (req, res) => { if (!isValidId(req.query.id)) return res.end(); exec('run ' + req.query.id); });").is_empty());
         // comparison with a constant
         assert!(one("app.get('/a', (req, res) => { const m = req.query.m; if (m !== 'fast' && m !== 'slow') return; exec('run ' + m); });").is_empty());
+        // career-ops: a containment predicate named with its word inside the name, and a
+        // lookup by equality in the server's own list.
+        assert!(one("app.get('/a', (req, res) => { const abs = path.resolve(DIR, req.query.f); if (!isRegularContainedFile(abs, DIR)) { return res.end(); } fs.openSync(abs, 'r'); });").is_empty());
+        assert!(one("app.get('/a', (req, res) => { const f = req.query.f; const doc = docs.find((d) => d.filename === f); if (!doc) { return res.end(); } fs.openSync(path.resolve(DIR, f), 'r'); });").is_empty());
+        assert!(one("app.get('/a', (req, res) => { const f = req.query.f; if (!docs.some((d) => f === d.filename)) return res.end(); fs.openSync(path.resolve(DIR, f), 'r'); });").is_empty());
+        // ... but a list the attacker sent proves nothing.
+        assert_eq!(one("app.get('/a', (req, res) => { const f = req.query.f; const doc = req.body.docs.find((d) => d.filename === f); if (!doc) { return res.end(); } fs.openSync(path.resolve(DIR, f), 'r'); });").len(), 1);
+        // mirotalksfu: js-xss's filterXSS escapes HTML.
+        assert!(scan("const qs = new URLSearchParams(window.location.search); el.innerHTML = filterXSS(qs.get('message'));").is_empty());
+        // qq-bridge: a strip that keeps word characters and CJK ideographs (`\u4e00-\u9fff`).
+        assert!(one("app.get('/r', (req, res) => { const name = String(req.query.role).replace(/[^\\w\\u4e00-\\u9fff-]/g, ''); fs.readFileSync(path.join(DIR, name + '.md')); });").is_empty());
+        // ... but full-width forms (`／`, `．`) are kept unread.
+        assert_eq!(one("app.get('/r', (req, res) => { const name = String(req.query.role).replace(/[^\\w\\uff0e\\uff0f-]/g, ''); fs.readFileSync(path.join(DIR, name)); });").len(), 1);
+        // tubehaus: a URLSearchParams in text is percent-encoded; a value read out of it is not.
+        assert!(scan("const sp = new URLSearchParams(location.search); const u = new URLSearchParams({ q: sp.get('q') }); el.innerHTML = '<a href=\"?' + u + '\">x</a>';").is_empty());
+        assert_eq!(scan("const sp = new URLSearchParams(location.search); el.innerHTML = '<b>' + sp.get('q') + '</b>';").len(), 1);
+        // tubehaus: an escaper by what it does, whatever its name.
+        assert!(scan("const ESC = { '<': '&lt;', '>': '&gt;' }; const esc = (v) => String(v).replace(/[&<>\"']/g, (c) => ESC[c]); el.innerHTML = '<b>' + esc(location.hash) + '</b>';").is_empty());
+        assert_eq!(
+            scan("el.innerHTML = '<b>' + String(location.hash).replace(/[<>]/g, '<i>') + '</b>';")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -10852,6 +11184,14 @@ mod tests {
             "function Pdf(props) { const { href } = props.node.attrs; return <embed src={href} />; }",
         );
         assert_eq!(found.len(), 1, "{found:?}");
+        // Components wrapped in `memo`, `forwardRef` or `observer` take props too.
+        for wrapped in [
+            "const L = memo(({ url }) => <a href={url}>x</a>);",
+            "const L = React.forwardRef(({ url }, ref) => <a ref={ref} href={url}>x</a>);",
+            "const L = observer(function Link({ url }) { return <a href={url}>x</a>; });",
+        ] {
+            assert_eq!(scan_jsx(wrapped).len(), 1, "{wrapped}");
+        }
         // A fixed start, an image, a component, a checked URL: none.
         for quiet in [
             "function L({ id }) { return <a href={'/u/' + id}>x</a>; }",
@@ -10943,6 +11283,19 @@ mod tests {
         );
         // `stream.write` is not `document.write`
         assert!(scan("stream.write(location.hash);").is_empty());
+        // Values read out of the page's query: `URLSearchParams`, `url.searchParams.get()`.
+        assert_eq!(
+            scan("const p = new URLSearchParams(location.search); location.href = p.get('next');")
+                .len(),
+            1
+        );
+        assert_eq!(
+            scan("const u = new URL(location.href); el.innerHTML = '<b>' + u.searchParams.get('q') + '</b>';")
+                .len(),
+            1
+        );
+        // A read keyed by attacker data out of a fixed table is the table's.
+        assert!(scan("const ALLOWED = new Map([['a', '/a']]); location.href = ALLOWED.get(location.hash.slice(1)) || '/';").is_empty());
     }
 
     #[test]
@@ -11047,6 +11400,26 @@ mod tests {
                 "child_process.spawn".to_owned(),
                 "http"
             )]
+        );
+        // An object returned behind a condition keeps its fields apart too; so does an object a
+        // call returns straight into another call (hibi's image cache).
+        let helpers = "function locate(src, place) { const name = createHash('sha256').update(String(src)).digest('hex'); return place ? { url: src, path: path.join(place.data, name) } : null; }\n\
+                       function keep(image) { fs.readFileSync(image.path); }\n\
+                       function respond(src, place) { const image = locate(src, place); if (image) { keep(image); } }\n\
+                       const placeOf = (tab) => ({ note: lookup(tab), data: DATA });\n";
+        assert!(
+            one(&format!(
+                "{helpers}app.get('/i', (req, res) => {{ respond(req.query.src, placeOf(req.query.tab)); }});"
+            ))
+            .is_empty()
+        );
+        let found = one(&format!(
+            "{helpers}app.get('/i', (req, res) => {{ respond('x', {{ data: req.query.dir }}); }});"
+        ));
+        assert_eq!(
+            found.iter().map(|f| f.0).collect::<Vec<_>>(),
+            vec![VulnClass::PathTraversal],
+            "{found:?}"
         );
     }
 

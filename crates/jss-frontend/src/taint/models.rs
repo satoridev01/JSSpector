@@ -164,6 +164,10 @@ pub struct JsxSpec {
     pub html_value_keys: Vec<String>,
     #[serde(default)]
     pub props_kind: Option<String>,
+    /// Calls that wrap a component and return it (`memo`, `forwardRef`, `observer`): the
+    /// function they wrap is the component the const names.
+    #[serde(default)]
+    pub component_wrappers: Vec<String>,
 }
 
 /// How authentication shows in code.
@@ -454,6 +458,11 @@ pub struct ResultSource {
 pub struct Propagation {
     #[serde(default)]
     pub pass_methods: Vec<String>,
+    /// Methods that read a value out of their receiver, never out of their arguments
+    /// (`params.get('next')` on a URLSearchParams, Headers, FormData or Map): what the
+    /// receiver holds, all of it the attacker's when the receiver is.
+    #[serde(default)]
+    pub receiver_reads: Vec<String>,
     #[serde(default)]
     pub build_methods: Vec<String>,
     #[serde(default)]
@@ -622,6 +631,14 @@ pub struct Sanitizers {
     /// Methods that, true, validate their receiver: `p.startsWith(base)`.
     #[serde(default)]
     pub receiver_validators: Vec<String>,
+    /// Objects whose text form is percent-encoded (`${new URLSearchParams(q)}`): no markup,
+    /// quote, separator or shell character survives in it.
+    #[serde(default)]
+    pub encoding_constructors: Vec<String>,
+    /// Lookups of a value in a list the server holds, by equality
+    /// (`docs.find((d) => d.filename === name)`): found, the value is one of the server's.
+    #[serde(default)]
+    pub lookup_methods: Vec<String>,
     /// Statements that throw unless their first argument has a type: `check(x, String)`.
     #[serde(default)]
     pub type_assertions: Vec<String>,
@@ -854,6 +871,7 @@ pub struct Model {
     pub client_sources: Vec<ClientSource>,
     pub result_sources: Vec<ResultSource>,
     pub pass_methods: Vec<String>,
+    pub receiver_reads: Vec<String>,
     pub build_methods: Vec<String>,
     pub iteration_methods: Vec<String>,
     pub strip_methods: Vec<String>,
@@ -882,12 +900,15 @@ pub struct Model {
     pub instances: BTreeMap<String, InstanceSpec>,
     pub jsx_html_props: Vec<String>,
     pub jsx_html_value_keys: Vec<String>,
+    pub component_wrappers: Vec<String>,
     pub props_kind: Option<String>,
     pub pass_globals: Vec<String>,
     pub object_globals: Vec<String>,
     pub clearing: Vec<String>,
     pub validators: Vec<String>,
     pub receiver_validators: Vec<String>,
+    pub lookup_methods: Vec<String>,
+    pub encoding_constructors: Vec<String>,
     pub type_assertions: Vec<String>,
     pub object_patterns: Vec<String>,
     pub scoped_sanitizers: BTreeMap<String, Vec<String>>,
@@ -1039,6 +1060,7 @@ impl Model {
         self.client_sources.extend(pack.client_sources);
         self.result_sources.extend(pack.result_sources);
         self.pass_methods.extend(pack.propagation.pass_methods);
+        self.receiver_reads.extend(pack.propagation.receiver_reads);
         self.build_methods.extend(pack.propagation.build_methods);
         self.iteration_methods
             .extend(pack.propagation.iteration_methods);
@@ -1087,6 +1109,7 @@ impl Model {
             self.service_worker.kind = worker.kind;
         }
         self.jsx_html_props.extend(pack.jsx.html_props);
+        self.component_wrappers.extend(pack.jsx.component_wrappers);
         self.jsx_html_value_keys.extend(pack.jsx.html_value_keys);
         if pack.jsx.props_kind.is_some() {
             self.props_kind = pack.jsx.props_kind;
@@ -1116,6 +1139,9 @@ impl Model {
         self.validators.extend(pack.sanitizers.validators);
         self.receiver_validators
             .extend(pack.sanitizers.receiver_validators);
+        self.lookup_methods.extend(pack.sanitizers.lookup_methods);
+        self.encoding_constructors
+            .extend(pack.sanitizers.encoding_constructors);
         self.type_assertions.extend(pack.sanitizers.type_assertions);
         self.object_patterns.extend(pack.sanitizers.object_patterns);
         for (class, names) in pack.sanitizers.scoped {

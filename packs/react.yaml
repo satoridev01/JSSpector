@@ -5,6 +5,8 @@ jsx:
   html_value_keys: [__html]
   # Component props (functions named in PascalCase) carry stored or user data.
   props_kind: props
+  # `const Card = memo((props) => ...)`: the wrapped function is the component.
+  component_wrappers: [memo, React.memo, forwardRef, React.forwardRef, observer]
 severity_caps:
   props: medium
 propagation:

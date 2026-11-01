@@ -125,12 +125,15 @@ propagation:
   object_module_pass: [lodash.clone, lodash.cloneDeep, lodash.omit, lodash.pick, lodash.get, lodash.castArray,
     lodash.toArray, lodash.flatten, lodash.head, lodash.last, deepcopy, klona, clone]
 sanitizers:
-  calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN]
+  # A hash digest (hex or base64) never holds `..`, a quote or markup.
+  calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN, digest]
   # Used as a guard (`if (!isValid(x)) return;`), these clear their argument on the passing path.
   validators: [isUUID, isUuid, uuidValidate, validate, isValid, isValidId, isSafe, isSafeName, isAlphanumeric,
     isInt, isNumeric, isEmail, isURL, isMongoId, isValidObjectId, isSafeMapKey, isFinite, isInteger, includes, has,
     test, isPathInside, isWithin, isSubPath]
   receiver_validators: [startsWith, match]
+  # `docs.find((d) => d.name === name)` found something: `name` is one the server holds.
+  lookup_methods: [find, findLast, some]
   # A signature check returns trusted claims: jwt.verify, verifySig, verifyToken.
   result_cleaning_prefixes: [verify, unsign]
   # ...trusted even when the function is in the repository: it checks a signature.
@@ -156,7 +159,7 @@ sanitizers:
     none: [isURL, isEmail, url, email]
   escapers:
     sql-injection: [escape, escapeId, mysql.escape, mysql.format, SqlString.format, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
-    xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss]
+    xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss, filterXSS]
     command-injection: [quote, shellescape, shellEscape, escapeShellArg]
 member_sources:
   - {object: process, property: argv, kind: cli}

@@ -18,3 +18,11 @@ node_factories: [document.createElement, document.createElementNS, document.crea
 sinks:
   - {methods: [insertAdjacentHTML], class: xss, severity: high, args: ["any:1"]}
   - {methods: [html, append, prepend, after, before, replaceWith, writeln], class: xss, severity: high, args: ["html:0"]}
+propagation:
+  # `new URLSearchParams(location.search)` keeps what it parses; `params.get('next')` (also on
+  # Headers, FormData and Map) reads a value of its receiver, never of its argument.
+  pass_globals: [URLSearchParams]
+  receiver_reads: [get, getAll]
+sanitizers:
+  # `${new URLSearchParams(q)}` is percent-encoded text.
+  encoding_constructors: [URLSearchParams]

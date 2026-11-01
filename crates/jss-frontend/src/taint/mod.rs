@@ -3539,8 +3539,13 @@ impl Walker<'_> {
             .as_ref()
             .is_some_and(|p| p.iter().any(|part| matches!(part, PathPart::Param(_))))
             || method_param.is_some();
+        // A template must register on a router: a parameter (checked when instantiated) or a
+        // router-like variable (not `Options.get(module, option)`).
+        let router_receiver =
+            receiver_param.is_some() || object.as_deref().is_some_and(|o| self.is_router(o));
         if role == Role::Route
             && depends_on_params
+            && router_receiver
             && env.function != "<anonymous>"
             && env.function != "<module>"
             && let Some(parts) = parts
@@ -3575,14 +3580,7 @@ impl Walker<'_> {
         let object = &object;
         let method = &method;
         // Only registrations on a router or app: not `$http.get('/x', config)` in a client.
-        let is_router = object.as_deref().is_some_and(|o| {
-            self.routers.contains(o) || {
-                let lower = o.to_ascii_lowercase();
-                m().router_names
-                    .iter()
-                    .any(|n| lower == *n || lower.ends_with(n.as_str()))
-            }
-        });
+        let is_router = object.as_deref().is_some_and(|o| self.is_router(o));
         let handler_like = call
             .arguments
             .last()
@@ -3652,6 +3650,13 @@ impl Walker<'_> {
                     kind: "http",
                 });
             }
+            // An event or channel name (`socket.on('join', ...)`), not any text.
+            Role::Client(_, _)
+                if !matches!(
+                    call.arguments.first(),
+                    Some(Argument::StringLiteral(name))
+                        if name.value.as_str().is_some_and(|n| !n.is_empty() && !n.contains(char::is_whitespace))
+                ) => {}
             Role::Client(kind, _) => self.facts.routes.push(RouteFact {
                 receiver: object.clone(),
                 method: kind.to_ascii_uppercase(),
@@ -3706,6 +3711,16 @@ impl Walker<'_> {
                         .is_some_and(|e| self.names_file(spec, &e.file))
                 })
         })
+    }
+
+    /// A router or app variable: from a factory, or named like one.
+    fn is_router(&self, name: &str) -> bool {
+        self.routers.contains(name) || {
+            let lower = name.to_ascii_lowercase();
+            m().router_names
+                .iter()
+                .any(|n| lower == *n || lower.ends_with(n.as_str()))
+        }
     }
 
     /// The route templates a callee has: this file's, or (through an import) another file's.
@@ -3830,6 +3845,12 @@ impl Walker<'_> {
             })
             .collect();
         let Ok(method) = method else { return };
+        // Registered on a variable of the caller that is not a router: not a route.
+        if let Ok(Some(receiver)) = &receiver
+            && !self.is_router(receiver)
+        {
+            return;
+        }
         self.facts.routes.push(RouteFact {
             receiver: receiver.ok().flatten(),
             method: method.to_ascii_uppercase(),

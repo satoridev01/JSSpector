@@ -3757,6 +3757,10 @@ impl Walker<'_> {
                                 }
                                 other => other.as_member_expression().and_then(guards::member_key),
                             })
+                    // A local `let location` is not the page's `location`.
+                    && !env
+                        .locals
+                        .contains(target.split('.').next().unwrap_or(&target))
                     && let Some(sink) = m().assign_sink(&target)
                 {
                     let url_rule = sink.args.iter().any(|r| matches!(r, ArgRule::UrlPrefix(_)));
@@ -8985,6 +8989,30 @@ mod tests {
             "{head}function go(s: Svc, v: string) {{ s.run(v); }}\napp.get('/x', (req, res) => go(make(), req.query.x));"
         ));
         assert!(found.iter().any(|f| f.0 == CommandInjection), "{found:?}");
+    }
+
+    #[test]
+    fn n8n_node_parameters_and_webhooks() {
+        use Severity::*;
+        use VulnClass::*;
+        let found = scan(
+            "class N { async execute() { const p = this.getNodeParameter('pagination', 0); const r = {};\n  \
+             p.parameters.forEach((x) => { r[x.type][x.name] = x.value; }); } }",
+        );
+        assert!(found.iter().any(|f| f.0 == PrototypePollution), "{found:?}");
+        let found = scan(
+            "class W { async webhook() { const files = this.getBodyData().files;\n  \
+             for (const k of Object.keys(files)) await this.nodeHelpers.copyBinaryFile(files[k].filepath, 'x'); } }",
+        );
+        assert!(
+            found.contains(&(PathTraversal, High, ".copyBinaryFile".to_owned(), "http"))
+                || found.iter().any(|f| f.0 == PathTraversal && f.1 == High),
+            "{found:?}"
+        );
+        // A local `location`; a whole statement; a number.
+        assert!(scan("class L { execute() { let location = this.getNodeParameter('loc', 0); location = location.trim(); } }").is_empty());
+        assert!(scan("class Q { async execute() { const q = this.getNodeParameter('query', 0); await conn.query(q); } }").is_empty());
+        assert!(scan("const { exec } = require('child_process');\nclass E { execute() { exec('ls ' + parseInt(this.getNodeParameter('n', 0), 10)); } }").is_empty());
     }
 
     #[test]

@@ -51,6 +51,10 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ),
     ("mcp", include_str!("../../../../packs/mcp.yaml")),
     (
+        "n8n-nodes",
+        include_str!("../../../../packs/n8n-nodes.yaml"),
+    ),
+    (
         "multipart",
         include_str!("../../../../packs/multipart.yaml"),
     ),

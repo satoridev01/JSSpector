@@ -744,6 +744,10 @@ struct Env {
     /// Variables naming the same file as another (`const resolved = path.resolve(file)`):
     /// variable -> that one. Confining one confines the other (paths only).
     same_file: BTreeMap<String, String>,
+    /// Paths built by joining a segment onto a base (`const full = path.join(base, seg)`):
+    /// name -> (the base's access paths, the segment). When the joined path is confined to the
+    /// base, the segment does not climb, so joining it onto any base stays confined.
+    joined: BTreeMap<String, (Vec<String>, String)>,
     /// Relative paths (`const rel = path.relative(base, file)`): rel -> (the base's access
     /// paths, `file`). `rel.startsWith('..')` false puts `file` inside the base.
     relative_of: BTreeMap<String, (Vec<String>, String)>,
@@ -993,6 +997,14 @@ impl Env {
             {
                 more.push((file.clone(), guards::Fact::Clean(path_bit)));
             }
+            // `full = path.join(base, seg)` confined to `base`: `seg` does not climb, so joining
+            // it onto any base stays confined. Only when the base is not the attacker's.
+            if classes & path_bit != 0
+                && let Some((bases, seg)) = self.joined.get(&key)
+                && !bases.iter().any(|b| self.attacker_data(b))
+            {
+                more.push((seg.clone(), guards::Fact::Clean(path_bit)));
+            }
             // `HOSTS.has(url.hostname)` on `url = new URL(x)`, the host equal to a value the
             // server holds: the URL goes there. Not a prefix, a pattern or a denylist
             // (`url.origin.startsWith(API)`, `isBlockedHost(h)`), which other hosts pass.
@@ -1109,6 +1121,7 @@ impl Env {
             node_tags: BTreeMap::new(),
             derived: BTreeMap::new(),
             same_file: BTreeMap::new(),
+            joined: BTreeMap::new(),
             relative_of: BTreeMap::new(),
             host_alias: BTreeMap::new(),
             url_parsed: BTreeMap::new(),
@@ -1151,6 +1164,7 @@ impl Env {
             node_tags: self.node_tags.clone(),
             derived: self.derived.clone(),
             same_file: self.same_file.clone(),
+            joined: self.joined.clone(),
             relative_of: self.relative_of.clone(),
             host_alias: self.host_alias.clone(),
             url_parsed: self.url_parsed.clone(),
@@ -1179,6 +1193,8 @@ impl Env {
         // What was built from the value `name` had before this write is not built from it now.
         self.derived.retain(|_, from| from != name);
         self.same_file.retain(|_, file| file != name);
+        self.joined
+            .retain(|_, (bases, seg)| seg != name && !bases.iter().any(|b| b == name));
         self.relative_of
             .retain(|_, (bases, file)| file != name && !bases.iter().any(|b| b == name));
         self.host_alias
@@ -4018,6 +4034,15 @@ impl Walker<'_> {
                     }
                     _ => {
                         env.relative_of.remove(name);
+                    }
+                }
+                // `const full = path.join(base, seg)`: a segment joined onto a base.
+                match self.joined_base_segment(init) {
+                    Some((bases, seg)) if seg != *name => {
+                        env.joined.insert(name.clone(), (bases, seg));
+                    }
+                    _ => {
+                        env.joined.remove(name);
                     }
                 }
                 // `const resolved = path.resolve(file)`: the same file as `file`.
@@ -7200,6 +7225,7 @@ impl Walker<'_> {
                 // `file = other`: no longer built from what it was.
                 env.derived.remove(id.name.as_str());
                 env.same_file.remove(id.name.as_str());
+                env.joined.remove(id.name.as_str());
                 env.relative_of.remove(id.name.as_str());
             }
             // `({ file } = req.body)`, `[a, b] = list`: each name gets the value (as a whole), and
@@ -7216,6 +7242,7 @@ impl Walker<'_> {
                     env.bind(&name, taint);
                     env.derived.remove(&name);
                     env.same_file.remove(&name);
+                    env.joined.remove(&name);
                     env.relative_of.remove(&name);
                 }
             }
@@ -11625,6 +11652,44 @@ impl Walker<'_> {
 
     /// The variable a call names the same file as: `path.resolve(file)`, `path.normalize(file)`
     /// (a pack's `same_file` calls, with that one argument).
+    /// `path.join(base, seg)` / `path.resolve(base, seg)` (and `join(base, 'mid', seg)` with
+    /// literal middle parts): the base's access paths and the single joined segment, when exactly
+    /// one argument is a path the rest is not. The segment is the last argument.
+    fn joined_base_segment(&self, expr: &Expression<'_>) -> Option<(Vec<String>, String)> {
+        let Expression::CallExpression(c) = expr.get_inner_expression() else {
+            return None;
+        };
+        let Callee::Module {
+            family,
+            export: Some(export),
+        } = self.callee(&c.callee)
+        else {
+            return None;
+        };
+        let qualified = format!("{family}.{export}");
+        if !(has(&m().root_joins, &qualified) || has(&m().same_file_calls, &qualified))
+            || c.arguments.len() < 2
+        {
+            return None;
+        }
+        let args: Vec<&Expression<'_>> = c
+            .arguments
+            .iter()
+            .map(|a| a.as_expression())
+            .collect::<Option<_>>()?;
+        let (base, rest) = args.split_first()?;
+        let bases = guards::relative_base_keys(base);
+        if bases.is_empty() {
+            return None;
+        }
+        // Every middle argument must be a constant; the last is the segment.
+        let (segment, middle) = rest.split_last()?;
+        if !middle.iter().all(|e| literal_path(e).is_some()) {
+            return None;
+        }
+        guards::path_key(segment).map(|seg| (bases, seg))
+    }
+
     fn same_file_of(&self, expr: &Expression<'_>) -> Option<String> {
         let Expression::CallExpression(c) = expr.get_inner_expression() else {
             return None;
@@ -12965,6 +13030,25 @@ mod tests {
         // Judged by its body, not by its name: inside the base the attacker chose.
         assert!(one(&format!("{helpers}app.get('/c', (req, res) => {{ const f = path.join(ROOT, req.query.n); if (!isWithin(ROOT, f)) {{ return res.end(); }} res.send(fs.readFileSync(f)); }});")).is_empty());
         assert_eq!(one(&format!("{helpers}app.get('/d', (req, res) => {{ const f = path.join(ROOT, req.query.n); if (!isWithin(req.query.base, f)) {{ return res.end(); }} res.send(fs.readFileSync(f)); }});")).len(), 1);
+    }
+
+    #[test]
+    fn a_segment_confined_under_one_base_is_confined_under_another() {
+        // mStream getVPathInfo: the check is on `resolve(join(base, rel))`, but the function
+        // returns `rel`, which the caller re-joins with a (DB-derived) base. `rel` cannot climb.
+        let vpath = "const ROOT = '/srv/lib';\n\
+            function vinfo(url) { const rel = path.relative('x', path.normalize(url)); const full = path.join(ROOT, rel); const r = path.resolve(full); if (r !== ROOT && !r.startsWith(ROOT + path.sep)) throw new Error('escape'); return { rel }; }\n";
+        assert!(
+            one(&format!("{vpath}app.get('/a', (req, res) => {{ const info = vinfo(req.query.f); res.send(fs.readFileSync(path.join('/other/base', info.rel))); }});")).is_empty(),
+            "a segment proven not to climb should confine a re-join"
+        );
+        // In place: `full = join(base, seg)` confined, then `seg` re-joined elsewhere.
+        assert!(one("const B = '/srv/b';\napp.get('/x', (req, res) => { const seg = req.query.s; const full = path.join(B, seg); const r = path.resolve(full); if (!r.startsWith(B + path.sep)) return res.end(); res.send(fs.readFileSync(path.join('/zzz', seg))); });").is_empty());
+        // But a base the attacker chose confines nothing: the segment stays tainted.
+        assert_eq!(
+            one("app.get('/y', (req, res) => { const base = req.query.b; const seg = req.query.s; const full = path.join(base, seg); const r = path.resolve(full); if (!r.startsWith(base + path.sep)) return res.end(); res.send(fs.readFileSync(path.join('/zzz', seg))); });").len(),
+            1
+        );
     }
 
     #[test]

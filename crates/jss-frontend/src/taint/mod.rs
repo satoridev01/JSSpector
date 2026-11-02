@@ -9471,11 +9471,20 @@ impl Walker<'_> {
             return (Role::Route, Shape::Callback);
         }
         // `server.middlewares.use((req, res, next) => ...)`: a dev server's handlers.
-        if let Some(registration) = model
-            .middleware_registrations
-            .iter()
-            .find(|r| has(&r.methods, method) && via.as_deref().is_some_and(|v| has(&r.via, v)))
-        {
+        // By the receiver's name only an inline `(req, res, ...)` handler: a Redux store's
+        // `middlewares.push(thunk)` is no server.
+        let inline_handler = arguments.iter().any(|a| {
+            match a.as_expression().map(Expression::get_inner_expression) {
+                Some(Expression::ArrowFunctionExpression(f)) => f.params.items.len() >= 2,
+                Some(Expression::FunctionExpression(f)) => f.params.items.len() >= 2,
+                _ => false,
+            }
+        });
+        if let Some(registration) = model.middleware_registrations.iter().find(|r| {
+            has(&r.methods, method)
+                && (via.as_deref().is_some_and(|v| has(&r.via, v))
+                    || (inline_handler && object.is_some_and(|o| has(&r.objects, o))))
+        }) {
             self.pending_request_kind
                 .set(Some(registration.kind.as_str()));
             return (Role::Route, Shape::Callback);
@@ -12914,6 +12923,23 @@ mod tests {
     }
 
     #[test]
+    fn dev_server_middleware_is_rated_like_any_server() {
+        // module-federation's Modern.js plugin: Rsbuild's `dev.setupMiddlewares`.
+        let rsbuild = one(
+            "export const plugin = () => ({ dev: { setupMiddlewares: [(middlewares) => middlewares.unshift((req, res, next) => { fs.createReadStream(path.join(process.cwd(), 'dist' + req.url)).pipe(res); })] } });",
+        );
+        assert_eq!(rsbuild.len(), 1, "{rsbuild:?}");
+        assert_eq!((rsbuild[0].1, rsbuild[0].3), (Severity::High, "dev-server"));
+        let vite = one(
+            "export default { plugins: [{ configureServer(server) { server.middlewares.use((req, res) => { res.end(fs.readFileSync(path.join('public', req.url))); }); } }] };",
+        );
+        assert_eq!(vite.len(), 1, "{vite:?}");
+        assert_eq!((vite[0].1, vite[0].3), (Severity::High, "dev-server"));
+        // A Redux store's middleware list is no server.
+        assert!(one("const middlewares = [];\nmiddlewares.push((store) => (next) => (action) => next(action));").is_empty());
+    }
+
+    #[test]
     fn the_left_side_of_and_is_the_value_only_when_falsy() {
         // webbrain's dev server: `m && ROOTS[m[1]]` is a base the server holds (or `null`).
         let server = "const http = require('http');\nconst ROOTS = { a: '/srv/a' };\n";
@@ -14325,7 +14351,7 @@ mod tests {
     }
 
     #[test]
-    fn dev_server_middleware_is_capped_and_mcp_tool_arguments_are_sources() {
+    fn dev_server_middleware_and_mcp_tool_arguments_are_sources() {
         let dev = one(
             "export default { plugins: [{ configureServer(server) { server.middlewares.use((req, res, next) => { res.end(fs.readFileSync(path.join(root, req.url))); }); } }] };",
         );
@@ -14333,7 +14359,7 @@ mod tests {
             dev,
             vec![(
                 VulnClass::PathTraversal,
-                Severity::Medium,
+                Severity::High,
                 "fs.readFileSync".to_owned(),
                 "dev-server"
             )]

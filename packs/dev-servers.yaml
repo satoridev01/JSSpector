@@ -1,8 +1,10 @@
-# Development servers: middleware registered on Vite / webpack-dev-server / connect instances.
-# Their handlers see real requests, but only while developing: medium at most.
+# Development servers: middleware registered on Vite / webpack-dev-server / Rsbuild / connect
+# instances. Their handlers see real requests from any page the developer opens (and, bound to
+# every interface, from the network): rated like any server's.
 name: dev-servers
 routes:
-  # `server.middlewares.use((req, res, next) => ...)` in a Vite plugin's configureServer.
-  middleware_registrations: [{via: [middlewares], methods: [use], kind: dev-server}]
-severity_caps:
-  dev-server: medium
+  middleware_registrations:
+    # `server.middlewares.use((req, res, next) => ...)` in a Vite plugin's configureServer.
+    - {via: [middlewares], methods: [use], kind: dev-server}
+    # Rsbuild / Modern.js `dev.setupMiddlewares: [(middlewares) => middlewares.unshift(fn)]`.
+    - {objects: [middlewares], methods: [unshift, push], kind: dev-server}

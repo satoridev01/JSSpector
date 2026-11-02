@@ -412,7 +412,13 @@ pub struct RouteSpec {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareRegistration {
+    /// The receiver is `X.<via>` for one of these (`server.middlewares.use(..)`).
+    #[serde(default)]
     pub via: Vec<String>,
+    /// Or the receiver is named one of these (`middlewares.unshift(..)` in Rsbuild's
+    /// `dev.setupMiddlewares`).
+    #[serde(default)]
+    pub objects: Vec<String>,
     pub methods: Vec<String>,
     pub kind: String,
 }

@@ -12,3 +12,11 @@ auth:
   setup: [session, cookieSession, expressSession, passport.initialize, passport.session]
   # `return res.status(403).send(..)` in an inline `(req, res, next)` middleware: a guard.
   denial_methods: [status, sendStatus, writeHead]
+  # What that check must read to guard anything, as whole words (or phrases) of names and
+  # strings (`x-api-key` is `x`, `api`, `key`; `apiKey` too): a credential or an identity.
+  # `req.get('origin')`, `req.protocol` and `req.method` do not.
+  credentials: [authorization, authorized, authenticated, token, tokens, apikey, secret, secrets,
+    password, passwd, bearer, credential, credentials, signature, cookie, cookies, session,
+    sessions, user, users, account, auth, login, logged, signedin, jwt, role, roles, permission,
+    permissions, acl, principal, userid, uid, api-key, access-key]
+  not_credentials: [user-agent]

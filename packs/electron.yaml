@@ -2,6 +2,9 @@
 name: electron
 client_sources:
   - {object: ipcMain, methods: [on, handle, once, handleOnce], params: after-first, kind: ipc}
+# What the app's own renderer sends takes a compromised renderer first: hardening.
+severity_caps:
+  ipc: low
 sinks:
   - {methods: [openExternal], class: command-injection, severity: high, args: ["url:0"]}
   # Opening the file a path names: a path confined to a directory is safe.

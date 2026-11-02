@@ -420,6 +420,17 @@ pub fn scan_file_program(
     linking: &Linking<'_>,
     external: &Summaries,
 ) -> ScanResult {
+    guards::set_analyzed([]);
+    let result = scan_file_program_inner(program, linking, external);
+    guards::set_analyzed([]);
+    result
+}
+
+fn scan_file_program_inner(
+    program: &Program<'_>,
+    linking: &Linking<'_>,
+    external: &Summaries,
+) -> ScanResult {
     let mut walker = Walker {
         external,
         linking,
@@ -481,6 +492,7 @@ pub fn scan_file_program(
     // `MAX_SUMMARY_PASSES`.
     let mut learned = usize::MAX;
     for pass in 0..MAX_SUMMARY_PASSES {
+        guards::set_analyzed(walker.predicate_names());
         walker.modules.clear();
         // Middleware applies to the routes registered after it, in program order: never carry
         // a later `use(auth)` into an earlier route through a previous pass.
@@ -502,6 +514,7 @@ pub fn scan_file_program(
         learned = now;
     }
     walker.summarize = false;
+    guards::set_analyzed(walker.predicate_names());
     walker.modules.clear();
     walker.router_auth.clear();
     walker.router_prefixes.clear();
@@ -750,6 +763,9 @@ struct Env {
     /// For a function a declaration names inside another function (`function send() {}`,
     /// `const send = () => {}`): that function ([`Summary::scope`]).
     def_scope: Option<u32>,
+    /// Summary pass: where this function's own parameters' values start (not an enclosing
+    /// function's, which a closure sees too).
+    own_params: BTreeSet<u32>,
     /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
     /// bindings, inner functions): writes to any other name are writes to its parent's.
     locals: BTreeSet<String>,
@@ -894,8 +910,29 @@ impl Env {
                 .any(|origin| origin.param.is_none())
     }
 
+    /// The parameters' values among a base's access paths, merged: a summary's base that the
+    /// caller passes (`readInside(base, file)`).
+    fn param_base(&self, bases: &[String]) -> Option<Origin> {
+        bases
+            .iter()
+            .filter_map(|base| {
+                let root = base.split('.').next().unwrap_or(base);
+                [base.as_str(), root]
+                    .into_iter()
+                    .find_map(|k| self.vars.get(k))
+                    .filter(|origin| {
+                        origin.param.is_some() && self.own_params.contains(&origin.span.start)
+                    })
+                    .cloned()
+            })
+            .fold(None, |merged, origin| union(merged, Some(origin)))
+    }
+
     /// Records what a guard established.
     fn learn(&mut self, facts: Vec<(String, guards::Fact)>) {
+        // Values confined to a base that is a parameter: as much the attacker's as the base the
+        // caller passes, for what the base confines.
+        let mut rebased: Vec<(String, Origin, u8)> = Vec::new();
         let mut facts: Vec<(String, guards::Fact)> = facts
             .into_iter()
             .filter_map(|(key, fact)| match fact {
@@ -906,10 +943,11 @@ impl Env {
                     if bases.iter().any(|b| self.attacker_data(b)) {
                         return None;
                     }
-                    Some((
-                        file.clone(),
-                        guards::Fact::Clean(class_bit(VulnClass::PathTraversal)),
-                    ))
+                    let path_bit = class_bit(VulnClass::PathTraversal);
+                    if let Some(base) = self.param_base(bases) {
+                        rebased.push((file.clone(), base, path_bit));
+                    }
+                    Some((file.clone(), guards::Fact::Clean(path_bit)))
                 }
                 // A base the attacker chose confines nothing.
                 guards::Fact::Contained(_, bases)
@@ -917,7 +955,12 @@ impl Env {
                 {
                     None
                 }
-                guards::Fact::Contained(classes, _) => Some((key, guards::Fact::Clean(classes))),
+                guards::Fact::Contained(classes, bases) => {
+                    if let Some(base) = self.param_base(&bases) {
+                        rebased.push((key.clone(), base, classes));
+                    }
+                    Some((key, guards::Fact::Clean(classes)))
+                }
                 other => Some((key, other)),
             })
             .collect();
@@ -931,8 +974,10 @@ impl Env {
                 break;
             };
             next += 1;
-            let guards::Fact::Clean(classes) = fact else {
-                continue;
+            let (classes, exact) = match fact {
+                guards::Fact::Clean(classes) => (classes, false),
+                guards::Fact::Allowed => (guards::ALL, true),
+                _ => continue,
             };
             let mut more: Vec<(String, guards::Fact)> = self
                 .derived
@@ -945,28 +990,44 @@ impl Env {
             {
                 more.push((file.clone(), guards::Fact::Clean(path_bit)));
             }
-            // `HOSTS.has(url.hostname)` on `url = new URL(x)`: the URL goes to an allowed host.
+            // `HOSTS.has(url.hostname)` on `url = new URL(x)`, the host equal to a value the
+            // server holds: the URL goes there. Not a prefix, a pattern or a denylist
+            // (`url.origin.startsWith(API)`, `isBlockedHost(h)`), which other hosts pass.
             let ssrf_bit = class_bit(VulnClass::Ssrf);
-            if classes & ssrf_bit != 0 {
+            if exact {
                 // `host = url.hostname; HOSTS.has(host)`: a check of that URL's host.
                 if let Some(field) = self.host_alias.get(&key) {
-                    more.push((field.clone(), guards::Fact::Clean(ssrf_bit)));
+                    more.push((field.clone(), guards::Fact::Allowed));
                 }
-                // `url = new URL(s)` going to an allowed host: so does `s`, parsed the same way.
-                if let Some(from) = self.url_parsed.get(&key) {
-                    more.push((from.clone(), guards::Fact::Clean(ssrf_bit)));
+                if let Some((object, field)) = key.rsplit_once('.')
+                    && has(&m().url_host_fields, field)
+                    && self
+                        .local_instances
+                        .get(object)
+                        .or_else(|| self.instances.get(object))
+                        .is_some_and(|class| has(&m().url_classes, class))
+                {
+                    more.push((object.to_owned(), guards::Fact::Clean(ssrf_bit)));
+                    // `url = new URL(s)`: `s`, parsed the same way, goes there too.
+                    if let Some(from) = self.url_parsed.get(object) {
+                        more.push((from.clone(), guards::Fact::Clean(ssrf_bit)));
+                    }
                 }
             }
-            if classes & ssrf_bit != 0
-                && let Some((object, field)) = key.rsplit_once('.')
-                && has(&m().url_host_fields, field)
-                && self
-                    .local_instances
-                    .get(object)
-                    .or_else(|| self.instances.get(object))
-                    .is_some_and(|class| has(&m().url_classes, class))
+            // What a value confined to a parameter base says about others (`file` past a check
+            // of `resolved = path.resolve(file)`) holds as far as that base does.
+            if let Some(base) = rebased
+                .iter()
+                .find(|(k, _, _)| *k == key)
+                .map(|(_, base, _)| base.clone())
             {
-                more.push((object.to_owned(), guards::Fact::Clean(ssrf_bit)));
+                for (other, fact) in &more {
+                    if let guards::Fact::Clean(classes) = fact
+                        && !rebased.iter().any(|(k, _, _)| k == other)
+                    {
+                        rebased.push((other.clone(), base.clone(), *classes));
+                    }
+                }
             }
             for fact in more {
                 if !facts.contains(&fact) {
@@ -976,8 +1037,8 @@ impl Env {
         }
         for (key, fact) in facts {
             match fact {
-                guards::Fact::Clean(_) if self.is_request_object(&key) => {}
-                guards::Fact::Clean(guards::ALL) => {
+                guards::Fact::Clean(_) | guards::Fact::Allowed if self.is_request_object(&key) => {}
+                guards::Fact::Clean(guards::ALL) | guards::Fact::Allowed => {
                     self.vars.remove(&key);
                     self.clean.insert(key);
                 }
@@ -1002,6 +1063,19 @@ impl Env {
                     }
                 }
                 guards::Fact::Contained(..) => {}
+            }
+        }
+        for (key, mut base, classes) in rebased {
+            // The base's parameter stands for what the base confines only.
+            base.escaped = guards::ALL & !classes;
+            base.primary_escaped = base.escaped;
+            self.clean.remove(&key);
+            let merged = match self.vars.remove(&key) {
+                Some(own) => union(Some(own), Some(base)),
+                None => Some(base),
+            };
+            if let Some(merged) = merged {
+                self.vars.insert(key, merged);
             }
         }
     }
@@ -1039,6 +1113,7 @@ impl Env {
             encoded: BTreeSet::new(),
             found_by: BTreeMap::new(),
             def_scope: None,
+            own_params: BTreeSet::new(),
             locals: BTreeSet::new(),
             branch: 0,
             owner: function.clone(),
@@ -1079,6 +1154,7 @@ impl Env {
             encoded: self.encoded.clone(),
             found_by: self.found_by.clone(),
             def_scope: self.def_scope,
+            own_params: BTreeSet::new(),
             locals: BTreeSet::new(),
             branch: 0,
             owner: if function == "<anonymous>" {
@@ -1185,9 +1261,9 @@ struct Walker<'e> {
     /// Import specifiers resolved so far (resolving tries many candidate paths).
     resolved: std::cell::RefCell<BTreeMap<String, Option<String>>>,
     /// Routers with authentication middleware applied to every later route: `router.use(auth)`.
-    /// Middleware added with `use(...)` on each router (by [`router_key`]): the path prefix it
-    /// guards (`""` for all) and the authentication it requires, in registration order.
-    router_auth: BTreeMap<String, Vec<(String, Auth)>>,
+    /// Middleware added with `use(...)` (or a verb) on each router (by [`router_key`]), in
+    /// registration order.
+    router_auth: BTreeMap<String, Vec<RouterGuard>>,
     /// Names given to inline route handlers (`GET /items`), with the registration that took
     /// each: kept across passes so every pass names a handler the same way.
     inline_names: BTreeMap<String, u32>,
@@ -1714,6 +1790,32 @@ fn handler_like(call: &CallExpression<'_>) -> bool {
         })
 }
 
+/// Middleware guarding the routes registered after it on a router.
+#[derive(Debug, Clone)]
+struct RouterGuard {
+    /// The path prefix it guards (`""` for all); the one path it guards when `exact`.
+    prefix: String,
+    /// Registered with a verb (`app.get('/admin/{*path}', guard)`): routes of that method only.
+    method: Option<String>,
+    /// A verb's path without a wildcard (`app.all('/admin', guard)`): that path only.
+    exact: bool,
+    auth: Auth,
+}
+
+impl RouterGuard {
+    /// Whether it runs for a route of `method` at `path` (`None`: unknown).
+    fn guards(&self, method: Option<&str>, path: Option<&str>) -> bool {
+        if self.method.is_some() && self.method.as_deref() != method {
+            return false;
+        }
+        if self.exact {
+            let prefix = self.prefix.trim_end_matches('/');
+            return path.is_some_and(|p| p.trim_end_matches('/') == prefix);
+        }
+        covers(&self.prefix, path)
+    }
+}
+
 /// One of `names` (a receiver's name, class or chain) contains one of `needles` (lower case).
 fn any_contains<'n>(mut names: impl Iterator<Item = &'n str>, needles: &[String]) -> bool {
     names.any(|name| {
@@ -1767,9 +1869,12 @@ fn names_in(expr: &Expression<'_>, out: &mut Vec<String>) {
 }
 
 /// The authentication an inline middleware enforces before `next()`: an `if` that answers 401
-/// or 403 and returns. Admin when the check names an admin word (`req.user.admin !== true`) or
-/// compares a value of the request with one of the server (`req.header('Authorization') !==
-/// SECRET`, a shared secret); a user otherwise (`!req.session.user`).
+/// or 403 and returns, on a credential or an identity of the request. Admin when the check
+/// names an admin word (`req.user.admin !== true`) or compares a credential of the request with
+/// a value of the server (`req.header('Authorization') !== SECRET`, a shared secret); a user
+/// otherwise (`!req.session.user`). Nothing when a request can get past it: a `next()` before
+/// it (`if (req.method === 'GET') return next()`) or in its answer, or a check that holds only
+/// with another condition (`req.user && !req.user.admin` lets anonymous requests through).
 fn inline_guard_auth(expr: &Expression<'_>) -> Option<Auth> {
     let (params, statements) = match expr.get_inner_expression() {
         Expression::ArrowFunctionExpression(f) => match &f.body {
@@ -1779,7 +1884,8 @@ fn inline_guard_auth(expr: &Expression<'_>) -> Option<Auth> {
         Expression::FunctionExpression(f) => (&f.params, &f.body.as_ref()?.statements),
         _ => return None,
     };
-    if params.items.len() < 3 {
+    // `(err, req, res, next)` handles errors: it guards nothing.
+    if params.items.len() != 3 {
         return None;
     }
     let request = params
@@ -1788,8 +1894,19 @@ fn inline_guard_auth(expr: &Expression<'_>) -> Option<Auth> {
         .pattern
         .get_identifier_name()?
         .to_string();
-    // `const authorization = req.header('Authorization')`: read from the request.
+    let next = params
+        .items
+        .get(2)
+        .and_then(|p| p.pattern.get_identifier_name())
+        .map(|n| n.to_string());
+    let calls_next = |statement: &Statement<'_>| {
+        next.as_deref()
+            .is_some_and(|next| statement_calls(statement, next))
+    };
+    // `const authorization = req.header('Authorization')`: read from the request; a credential
+    // when its name or what it reads says so.
     let mut from_request: BTreeSet<String> = BTreeSet::from([request]);
+    let mut credentials: BTreeSet<String> = BTreeSet::new();
     let mut level: Option<Auth> = None;
     for statement in statements {
         match statement {
@@ -1804,41 +1921,79 @@ fn inline_guard_auth(expr: &Expression<'_>) -> Option<Auth> {
                     names_in(init, &mut names);
                     if names.iter().any(|n| from_request.contains(n)) {
                         from_request.insert(name.to_string());
+                        let mut words = names.clone();
+                        words.push(name.to_string());
+                        literals_in(init, &mut words);
+                        if words.iter().any(|w| credential_word(w)) {
+                            credentials.insert(name.to_string());
+                        }
                     }
                 }
             }
             Statement::IfStatement(i)
                 if guards::exits(&i.consequent) && answers_denied(&i.consequent) =>
             {
+                // `res.status(401); return next()`: it answers and goes on anyway.
+                if calls_next(&i.consequent) {
+                    return None;
+                }
+                // `req.user && !req.user.admin`, `req.path.startsWith('/admin') && ...`: denied
+                // only when the other condition holds too.
+                if matches!(i.test.get_inner_expression(),
+                    Expression::LogicalExpression(l) if l.operator == LogicalOperator::And)
+                {
+                    continue;
+                }
                 let mut names = Vec::new();
                 names_in(&i.test, &mut names);
                 if !names.iter().any(|n| from_request.contains(n)) {
+                    continue;
+                }
+                // `req.get('origin') !== ALLOWED_ORIGIN`, `req.protocol !== 'https'`: no
+                // credential, no identity.
+                let mut words = names.clone();
+                literals_in(&i.test, &mut words);
+                if !words
+                    .iter()
+                    .any(|w| credentials.contains(w) || credential_word(w))
+                {
                     continue;
                 }
                 let admin = names.iter().any(|n| {
                     let lower = n.to_ascii_lowercase();
                     m().auth_admin.iter().any(|a| lower.contains(a.as_str()))
                 });
-                let this = if admin || compares_to_server(&i.test, &from_request) {
+                let this = if admin || compares_to_server(&i.test, &from_request, &credentials) {
                     Auth::Admin
                 } else {
                     Auth::User
                 };
                 level = level.max(Some(this));
             }
+            // `if (req.method === 'GET') return next()` before the check: not every request
+            // meets it.
+            other if level.is_none() && calls_next(other) => return None,
             _ => {}
         }
     }
     level
 }
 
-/// `x !== SECRET` with `x` read from the request and `SECRET` not: a shared secret.
-fn compares_to_server(test: &Expression<'_>, from_request: &BTreeSet<String>) -> bool {
+/// `x !== SECRET` with `x` a credential read from the request (`req.header('Authorization')`)
+/// and `SECRET` not read from it: a shared secret.
+fn compares_to_server(
+    test: &Expression<'_>,
+    from_request: &BTreeSet<String>,
+    credentials: &BTreeSet<String>,
+) -> bool {
     match test.get_inner_expression() {
         Expression::LogicalExpression(l) => {
-            compares_to_server(&l.left, from_request) || compares_to_server(&l.right, from_request)
+            compares_to_server(&l.left, from_request, credentials)
+                || compares_to_server(&l.right, from_request, credentials)
         }
-        Expression::UnaryExpression(u) => compares_to_server(&u.argument, from_request),
+        Expression::UnaryExpression(u) => {
+            compares_to_server(&u.argument, from_request, credentials)
+        }
         Expression::BinaryExpression(b)
             if matches!(
                 b.operator,
@@ -1850,14 +2005,207 @@ fn compares_to_server(test: &Expression<'_>, from_request: &BTreeSet<String>) ->
                 names_in(e, &mut names);
                 names.iter().any(|n| from_request.contains(n))
             };
+            // The request's side names a credential: `authorization`, `req.get('x-api-key')`.
+            let credential = |e: &Expression<'_>| {
+                let mut words = Vec::new();
+                names_in(e, &mut words);
+                literals_in(e, &mut words);
+                words
+                    .iter()
+                    .any(|w| credentials.contains(w) || credential_word(w))
+            };
             let server = |e: &Expression<'_>| {
                 matches!(e.get_inner_expression(), Expression::Identifier(_))
                     || e.get_inner_expression().as_member_expression().is_some()
             };
-            (reads(&b.left) && !reads(&b.right) && server(&b.right))
-                || (reads(&b.right) && !reads(&b.left) && server(&b.left))
+            (reads(&b.left) && credential(&b.left) && !reads(&b.right) && server(&b.right))
+                || (reads(&b.right) && credential(&b.right) && !reads(&b.left) && server(&b.left))
         }
         _ => false,
+    }
+}
+
+/// A name or string that names a credential or an identity (`authorization`, `x-api-key`,
+/// `req.session`, `isAuthenticated`), word by word per the auth pack: `user-agent` and
+/// `author` do not.
+fn credential_word(text: &str) -> bool {
+    let words = split_words(text);
+    let model = m();
+    // A pack phrase (`api-key`, one word or more) starting at word `i`.
+    let at = |phrase: &String, i: usize| {
+        let phrase = split_words(phrase);
+        !phrase.is_empty() && words.get(i..i + phrase.len()) == Some(&phrase[..])
+    };
+    (0..words.len()).any(|i| {
+        !model.auth_not_credentials.iter().any(|p| at(p, i))
+            && model
+                .auth_credentials
+                .iter()
+                .chain(&model.auth_admin)
+                .any(|p| at(p, i))
+    })
+}
+
+/// The lower-case words of a name or string: `x-api-key`, `apiKey` and `API_KEY` are `api`,
+/// `key`.
+fn split_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_lower = false;
+    for c in text.chars() {
+        if !c.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            previous_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && previous_lower && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        previous_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+        current.push(c.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// The string literals an expression reads (`req.get('Authorization')`, `h['x-api-key']`).
+fn literals_in(expr: &Expression<'_>, out: &mut Vec<String>) {
+    fn walk(expr: &Expression<'_>, out: &mut Vec<String>, depth: usize) {
+        if depth > 32 {
+            return;
+        }
+        let deeper = |e: &Expression<'_>, out: &mut Vec<String>| walk(e, out, depth + 1);
+        match expr.get_inner_expression() {
+            Expression::StringLiteral(s) => {
+                if let Some(text) = s.value.as_str() {
+                    out.push(text.to_owned());
+                }
+            }
+            Expression::BinaryExpression(b) => {
+                deeper(&b.left, out);
+                deeper(&b.right, out);
+            }
+            Expression::LogicalExpression(l) => {
+                deeper(&l.left, out);
+                deeper(&l.right, out);
+            }
+            Expression::UnaryExpression(u) => deeper(&u.argument, out),
+            Expression::CallExpression(c) => {
+                deeper(&c.callee, out);
+                for a in &c.arguments {
+                    if let Some(e) = a.as_expression() {
+                        deeper(e, out);
+                    }
+                }
+            }
+            Expression::ComputedMemberExpression(m) => {
+                deeper(&m.expression, out);
+                deeper(&m.object, out);
+            }
+            other => {
+                if let Some(member) = other.as_member_expression() {
+                    deeper(member.object(), out);
+                }
+            }
+        }
+    }
+    walk(expr, out, 0);
+}
+
+/// Whether a statement calls `name` (not in a nested function): `return next()`. Too deep to
+/// tell counts as a call.
+fn statement_calls(statement: &Statement<'_>, name: &str) -> bool {
+    fn expr(e: &Expression<'_>, name: &str, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        let deeper = |e: &Expression<'_>| expr(e, name, depth + 1);
+        let arg = |a: &Argument<'_>| a.as_expression().is_some_and(|e| expr(e, name, depth + 1));
+        match e.get_inner_expression() {
+            Expression::CallExpression(c) => {
+                matches!(c.callee.get_inner_expression(),
+                    Expression::Identifier(id) if id.name.as_str() == name)
+                    || deeper(&c.callee)
+                    || c.arguments.iter().any(arg)
+            }
+            Expression::SequenceExpression(seq) => seq.expressions.iter().any(deeper),
+            Expression::LogicalExpression(l) => deeper(&l.left) || deeper(&l.right),
+            Expression::BinaryExpression(b) => deeper(&b.left) || deeper(&b.right),
+            Expression::ConditionalExpression(c) => {
+                deeper(&c.test) || deeper(&c.consequent) || deeper(&c.alternate)
+            }
+            Expression::AssignmentExpression(a) => deeper(&a.right),
+            Expression::UnaryExpression(u) => deeper(&u.argument),
+            Expression::AwaitExpression(a) => deeper(&a.argument),
+            Expression::NewExpression(n) => deeper(&n.callee) || n.arguments.iter().any(arg),
+            Expression::ArrayExpression(a) => a
+                .elements
+                .iter()
+                .any(|e| e.as_expression().is_some_and(|e| expr(e, name, depth + 1))),
+            Expression::TemplateLiteral(t) => t.expressions.iter().any(deeper),
+            other => other
+                .as_member_expression()
+                .is_some_and(|m| deeper(m.object())),
+        }
+    }
+    fn stmt(s: &Statement<'_>, name: &str, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        let deeper = |s: &Statement<'_>| stmt(s, name, depth + 1);
+        let body = |b: &[Statement<'_>]| b.iter().any(|s| stmt(s, name, depth + 1));
+        let e = |x: &Expression<'_>| expr(x, name, depth + 1);
+        match s {
+            Statement::ExpressionStatement(x) => e(&x.expression),
+            Statement::ReturnStatement(r) => r.argument.as_ref().is_some_and(e),
+            Statement::ThrowStatement(t) => e(&t.argument),
+            Statement::BlockStatement(b) => body(&b.body),
+            Statement::IfStatement(i) => {
+                e(&i.test) || deeper(&i.consequent) || i.alternate.as_ref().is_some_and(deeper)
+            }
+            Statement::VariableDeclaration(d) => d
+                .declarations
+                .iter()
+                .any(|d| d.init.as_ref().is_some_and(e)),
+            Statement::TryStatement(t) => {
+                body(&t.block.body)
+                    || t.handler.as_ref().is_some_and(|h| body(&h.body.body))
+                    || t.finalizer.as_ref().is_some_and(|f| body(&f.body))
+            }
+            Statement::SwitchStatement(sw) => {
+                e(&sw.discriminant) || sw.cases.iter().any(|c| body(&c.consequent))
+            }
+            Statement::ForStatement(f) => deeper(&f.body),
+            Statement::ForInStatement(f) => deeper(&f.body),
+            Statement::ForOfStatement(f) => deeper(&f.body),
+            Statement::WhileStatement(w) => e(&w.test) || deeper(&w.body),
+            Statement::DoWhileStatement(d) => e(&d.test) || deeper(&d.body),
+            Statement::LabeledStatement(l) => deeper(&l.body),
+            _ => false,
+        }
+    }
+    stmt(statement, name, 0)
+}
+
+/// A mount path written as something other than a string the walker reads: a regex, a list,
+/// a configured value (`config.panelPath`, `ADMIN_PREFIX`).
+fn looks_like_path(expr: &Expression<'_>) -> bool {
+    match expr.get_inner_expression() {
+        Expression::RegExpLiteral(_)
+        | Expression::ArrayExpression(_)
+        | Expression::StringLiteral(_)
+        | Expression::TemplateLiteral(_)
+        | Expression::BinaryExpression(_) => true,
+        other => guards::path_key(other).is_some_and(|key| {
+            let last = key.rsplit('.').next().unwrap_or(&key).to_ascii_lowercase();
+            m().mount_path_words
+                .iter()
+                .any(|w| last.contains(w.as_str()))
+        }),
     }
 }
 
@@ -1918,6 +2266,38 @@ fn string_receivers(expr: &Expression<'_>) -> Vec<(String, guards::Fact)> {
         current = member.object().get_inner_expression();
     }
     out
+}
+
+/// Whether evaluating `expr` calls something (`remember && rememberEmail(res, email)`), whose
+/// summary may prove a fact about its arguments; not counting nested functions.
+fn has_call(expr: &Expression<'_>) -> bool {
+    fn walk(expr: &Expression<'_>, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        let deeper = |e: &Expression<'_>| walk(e, depth + 1);
+        match expr.get_inner_expression() {
+            Expression::CallExpression(_) | Expression::ChainExpression(_) => true,
+            Expression::SequenceExpression(seq) => seq.expressions.iter().any(deeper),
+            Expression::LogicalExpression(l) => deeper(&l.left) || deeper(&l.right),
+            Expression::BinaryExpression(b) => deeper(&b.left) || deeper(&b.right),
+            Expression::ConditionalExpression(c) => {
+                deeper(&c.test) || deeper(&c.consequent) || deeper(&c.alternate)
+            }
+            Expression::UnaryExpression(u) => deeper(&u.argument),
+            Expression::AwaitExpression(a) => deeper(&a.argument),
+            Expression::AssignmentExpression(a) => deeper(&a.right),
+            Expression::ArrayExpression(a) => a
+                .elements
+                .iter()
+                .any(|e| e.as_expression().is_some_and(|e| walk(e, depth + 1))),
+            Expression::TemplateLiteral(t) => t.expressions.iter().any(deeper),
+            other => other
+                .as_member_expression()
+                .is_some_and(|m| deeper(m.object())),
+        }
+    }
+    walk(expr, 0)
 }
 
 /// Whether evaluating `expr` can assign a variable or field (`flag && (x = 'ls')`), not counting
@@ -2373,6 +2753,46 @@ fn note_url_parts(name: &str, init: &Expression<'_>, env: &mut Env) {
     }
 }
 
+/// The names a destructuring assignment writes: `({ file, dir: d } = body)`, `[a, ...b] = xs`.
+fn assignment_target_names(target: &AssignmentTarget<'_>, out: &mut Vec<String>) {
+    use oxc_ast::ast::{AssignmentTargetMaybeDefault as D, AssignmentTargetProperty as P};
+    fn maybe_default(target: &D<'_>, out: &mut Vec<String>) {
+        match target {
+            D::AssignmentTargetWithDefault(d) => assignment_target_names(&d.binding, out),
+            other => {
+                if let Some(target) = other.as_assignment_target() {
+                    assignment_target_names(target, out);
+                }
+            }
+        }
+    }
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => out.push(id.name.as_str().to_owned()),
+        AssignmentTarget::ObjectAssignmentTarget(o) => {
+            for property in &o.properties {
+                match property {
+                    P::AssignmentTargetPropertyIdentifier(i) => {
+                        out.push(i.binding.name.as_str().to_owned());
+                    }
+                    P::AssignmentTargetPropertyProperty(p) => maybe_default(&p.binding, out),
+                }
+            }
+            if let Some(rest) = &o.rest {
+                assignment_target_names(&rest.target, out);
+            }
+        }
+        AssignmentTarget::ArrayAssignmentTarget(a) => {
+            for element in a.elements.iter().flatten() {
+                maybe_default(element, out);
+            }
+            if let Some(rest) = &a.rest {
+                assignment_target_names(&rest.target, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// An arrow function or a function expression (in parentheses or under a cast too).
 fn is_function_value(expr: &Expression<'_>) -> bool {
     matches!(
@@ -2607,11 +3027,24 @@ impl Walker<'_> {
             Statement::ExpressionStatement(s) => {
                 self.expr(&s.expression, env);
                 // `email = email.trim()`, `name.toLowerCase();`: those receivers were strings.
+                // Not `name ||= email.trim()`, which runs only when `name` is falsy.
                 let value = match s.expression.get_inner_expression() {
-                    Expression::AssignmentExpression(a) => &a.right,
-                    other => other,
+                    Expression::AssignmentExpression(a)
+                        if matches!(
+                            a.operator,
+                            AssignmentOperator::LogicalOr
+                                | AssignmentOperator::LogicalAnd
+                                | AssignmentOperator::LogicalNullish
+                        ) =>
+                    {
+                        None
+                    }
+                    Expression::AssignmentExpression(a) => Some(&a.right),
+                    other => Some(other),
                 };
-                env.learn(string_receivers(value));
+                if let Some(value) = value {
+                    env.learn(string_receivers(value));
+                }
                 // `check(x, String)`, `assertSafe(x)`: past this line, the assertion held.
                 let mut asserted = Vec::new();
                 guards::assertion(statement, &mut asserted);
@@ -2732,10 +3165,15 @@ impl Walker<'_> {
                     env.clean.retain(|k| before.clean.contains(k));
                     env.scalars.retain(|k| before.scalars.contains(k));
                     env.partial.retain(|k, _| before.partial.contains_key(k));
+                    // Nor what it did to a value (`email.toLowerCase()` proved a string): each is
+                    // at the weaker of its states before and after the block.
                     for (name, origin) in &before.vars {
-                        env.vars
-                            .entry(name.clone())
-                            .or_insert_with(|| origin.clone());
+                        match env.vars.get_mut(name) {
+                            Some(current) => join(current, origin),
+                            None => {
+                                env.vars.insert(name.clone(), origin.clone());
+                            }
+                        }
                     }
                     self.statements(&handler.body.body, env);
                     let handler_exits = handler.body.body.last().is_some_and(guards::exits);
@@ -3716,6 +4154,14 @@ impl Walker<'_> {
             } else if let Some(name) = &name_hint {
                 env.fields.remove(name);
             }
+            // `const [base, rest] = film ? [filmDir, u.slice(n)] : [root, u]`: each name what its
+            // position holds, in either literal.
+            if let BindingPattern::ArrayPattern(array) = &declarator.id
+                && let Some(positions) = self.literal_positions(init, env)
+            {
+                self.bind_positions(array, &positions, env);
+                continue;
+            }
             // `const { body, query } = req`
             let request = match init.get_inner_expression() {
                 Expression::Identifier(id) => env.requests.get(id.name.as_str()).copied(),
@@ -3728,6 +4174,51 @@ impl Walker<'_> {
                 env,
             );
         }
+    }
+
+    /// The taint at each position of an array literal, or of either of two (`c ? [a, b] :
+    /// [d, e]`), without spreads; what the walk of the initializer recorded stays as it was.
+    fn literal_positions(
+        &mut self,
+        expr: &Expression<'_>,
+        env: &Env,
+    ) -> Option<Vec<Option<Origin>>> {
+        let elements = |this: &mut Self,
+                        array: &oxc_ast::ast::ArrayExpression<'_>|
+         -> Option<Vec<Option<Origin>>> {
+            let mut probe = env.clone();
+            let mut positions = Vec::new();
+            for element in &array.elements {
+                let expr = element.as_expression()?;
+                positions.push(this.expr(expr, &mut probe));
+            }
+            Some(positions)
+        };
+        let saved = std::mem::replace(&mut self.record_only, true);
+        let positions = match expr.get_inner_expression() {
+            Expression::ArrayExpression(array) => elements(self, array),
+            Expression::ConditionalExpression(c) => match (
+                c.consequent.get_inner_expression(),
+                c.alternate.get_inner_expression(),
+            ) {
+                (Expression::ArrayExpression(a), Expression::ArrayExpression(b)) => {
+                    match (elements(self, a), elements(self, b)) {
+                        (Some(a), Some(b)) => Some(
+                            (0..a.len().max(b.len()))
+                                .map(|i| {
+                                    union(a.get(i).cloned().flatten(), b.get(i).cloned().flatten())
+                                })
+                                .collect(),
+                        ),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        self.record_only = saved;
+        positions
     }
 
     /// Binds `const x = require(spec)` and `const { a, b: c } = require(spec)`.
@@ -4199,6 +4690,27 @@ impl Walker<'_> {
         }
     }
 
+    /// The functions known to check their arguments, by name: this file's with a predicate
+    /// summary, and our other files' imported here. Their calls are judged by those summaries,
+    /// not by their names (`isWithin(req.query.base, f)` confines `f` to the caller's base).
+    fn predicate_names(&self) -> Vec<String> {
+        let own = self
+            .summaries
+            .iter()
+            .filter(|(_, list)| list.iter().any(|s| s.api == PREDICATE))
+            .map(|(name, _)| name.clone());
+        let imported = self.relative.iter().filter_map(|(local, (spec, export))| {
+            let export = export.as_deref().unwrap_or("default");
+            let (file, name) = self.exported_function(spec, export)?;
+            self.external
+                .get(&name)?
+                .iter()
+                .any(|s| s.api == PREDICATE && s.defined_in.as_deref() == Some(file.as_str()))
+                .then(|| local.clone())
+        });
+        own.chain(imported).collect()
+    }
+
     /// This file's summaries of the function a call by `name` reaches: the closest function so
     /// named declared in a function the call is in, else the top-level ones. Same-named
     /// closures of different functions (`send` in one, `send` in another) stay apart.
@@ -4354,6 +4866,7 @@ impl Walker<'_> {
                         self.field_of.insert(property.span.start, key);
                         self.param_owner
                             .insert(property.span.start, (env.function.clone(), env.def_scope));
+                        env.own_params.insert(property.span.start);
                         let mut origin = Origin::source("param", property.span);
                         origin.param = Some(index);
                         self.bind_pattern(&property.value, Some(origin), None, &mut env);
@@ -4361,6 +4874,7 @@ impl Walker<'_> {
                     if let Some(rest) = &object.rest {
                         self.param_owner
                             .insert(param.span.start, (env.function.clone(), env.def_scope));
+                        env.own_params.insert(param.span.start);
                         let mut origin = Origin::source("param", param.span);
                         origin.param = Some(index);
                         self.bind_pattern(&rest.argument, Some(origin), None, &mut env);
@@ -4369,6 +4883,7 @@ impl Walker<'_> {
                 }
                 self.param_owner
                     .insert(param.span.start, (env.function.clone(), env.def_scope));
+                env.own_params.insert(param.span.start);
                 let origin = Origin {
                     kind: "param",
                     span: param.span,
@@ -4392,6 +4907,7 @@ impl Walker<'_> {
                 let span = rest.span;
                 self.param_owner
                     .insert(span.start, (env.function.clone(), env.def_scope));
+                env.own_params.insert(span.start);
                 self.rest_params.insert(span.start);
                 let mut origin = Origin::source("param", span);
                 origin.param = Some(params.items.len());
@@ -4622,6 +5138,8 @@ impl Walker<'_> {
         }
         let mut held = Vec::new();
         guards::facts(returned, true, &mut held);
+        // `return isInsideDir(ROOT, p)`: what the predicates it calls establish.
+        self.predicate_facts(returned, true, &mut held);
         // A parameter, or a local naming the same file as one (`const c = path.resolve(child)`):
         // its index, and whether it was reached through such a local.
         let param_of = |key: &str| -> Option<(usize, bool)> {
@@ -4637,6 +5155,7 @@ impl Walker<'_> {
         for (key, fact) in held {
             let (classes, bases) = match fact {
                 guards::Fact::Clean(classes) => (classes, Vec::new()),
+                guards::Fact::Allowed => (guards::ALL, Vec::new()),
                 // `c.startsWith(p + path.sep)`: inside a base that is a parameter (the caller's
                 // argument decides) or a constant of the function.
                 guards::Fact::Contained(classes, bases) => (classes, bases),
@@ -4767,7 +5286,12 @@ impl Walker<'_> {
                             None if literal_path(base).is_some() => {
                                 out.push((key, guards::Fact::Clean(classes)));
                             }
-                            None => {}
+                            // `isInsideDir(os.homedir(), p)`, `isInside(p, path.join(ROOT, d))`:
+                            // inside a base built from these, none of them the attacker's.
+                            None => out.push((
+                                key,
+                                guards::Fact::Contained(classes, guards::base_keys(base)),
+                            )),
                         },
                         Some(None) => {}
                     }
@@ -5394,9 +5918,10 @@ impl Walker<'_> {
             }
             Expression::LogicalExpression(logical) => {
                 let left = self.expr(&logical.left, env);
-                // `flag && (x = 'ls')`: the right side runs on one path only; what it assigns
-                // joins the path that skipped it.
-                let skipped = may_assign(&logical.right).then(|| env.save());
+                // `flag && (x = 'ls')`, `remember && rememberEmail(res, email)`: the right side
+                // runs on one path only; what it assigns or proves joins the path that skipped it.
+                let skipped =
+                    (may_assign(&logical.right) || has_call(&logical.right)).then(|| env.save());
                 let right = self.expr(&logical.right, env);
                 if let Some(skipped) = skipped {
                     env.join_with(&skipped);
@@ -5414,13 +5939,21 @@ impl Walker<'_> {
             }
             Expression::ConditionalExpression(c) => {
                 self.expr(&c.test, env);
-                // `ALLOWED.includes(x) ? x : 'id'`: what the test establishes holds in its branch.
+                // `ALLOWED.includes(x) ? x : 'id'`, `isInsideDir(home, p) ? p : null`: what the
+                // test establishes holds in its branch.
                 let mut held = Vec::new();
                 guards::facts(&c.test, true, &mut held);
+                self.predicate_facts(&c.test, true, &mut held);
                 let mut failed = Vec::new();
                 guards::facts(&c.test, false, &mut failed);
-                // `flag ? (x = 'ls') : 0`: each branch on its own path, joined after.
-                if may_assign(&c.consequent) || may_assign(&c.alternate) {
+                self.predicate_facts(&c.test, false, &mut failed);
+                // `flag ? (x = 'ls') : 0`, `flag ? check(x) : 0`: each branch on its own path,
+                // joined after.
+                if may_assign(&c.consequent)
+                    || may_assign(&c.alternate)
+                    || has_call(&c.consequent)
+                    || has_call(&c.alternate)
+                {
                     let before = env.save();
                     env.learn(held);
                     let a = self.expr(&c.consequent, env);
@@ -6560,6 +7093,23 @@ impl Walker<'_> {
                 env.same_file.remove(id.name.as_str());
                 env.relative_of.remove(id.name.as_str());
             }
+            // `({ file } = req.body)`, `[a, b] = list`: each name gets the value (as a whole), and
+            // what it was built from or checked against before is gone.
+            AssignmentTarget::ObjectAssignmentTarget(_)
+            | AssignmentTarget::ArrayAssignmentTarget(_) => {
+                let mut names = Vec::new();
+                assignment_target_names(target, &mut names);
+                for name in names {
+                    let taint = taint
+                        .clone()
+                        .map(|o| o.step(target.span().start, format!("assigned to `{name}`")));
+                    env.fields.remove(&name);
+                    env.bind(&name, taint);
+                    env.derived.remove(&name);
+                    env.same_file.remove(&name);
+                    env.relative_of.remove(&name);
+                }
+            }
             other => {
                 if let Some(member) = other
                     .as_simple_assignment_target()
@@ -7381,10 +7931,16 @@ impl Walker<'_> {
             .as_deref()
             .and_then(|r| self.router_auth.get(&router_key(r, env)))
             .map(|guards| {
+                let route_method = match &callee {
+                    Callee::Method { method, .. } if has(&m().route_verbs, method) => {
+                        Some(method.to_ascii_lowercase())
+                    }
+                    _ => None,
+                };
                 guards
                     .iter()
-                    .filter(|(prefix, _)| covers(prefix, route_path.as_deref()))
-                    .map(|(_, auth)| *auth)
+                    .filter(|g| g.guards(route_method.as_deref(), route_path.as_deref()))
+                    .map(|g| g.auth)
                     .max()
                     .unwrap_or_default()
             })
@@ -7408,7 +7964,11 @@ impl Walker<'_> {
             let middleware = arguments
                 .get(usize::from(prefix.is_some())..)
                 .unwrap_or(&[]);
-            if !middleware.iter().any(|e| self.mountable(e)) {
+            // Under a path it cannot read (`app.use(config.panelPath, guard)`, a regex, a list)
+            // or only on some runs (`if (TOKEN) app.use(guard)`): nothing it guards is known.
+            let unknown_scope = env.branch > 0
+                || (prefix.is_none() && arguments.first().is_some_and(|e| looks_like_path(e)));
+            if !unknown_scope && !middleware.iter().any(|e| self.mountable(e)) {
                 // `app.use((req, res, next) => { if (..) return res.status(403)..; next(); })`
                 let used = middleware
                     .iter()
@@ -7422,7 +7982,12 @@ impl Walker<'_> {
                     self.router_auth
                         .entry(router_key(object, env))
                         .or_default()
-                        .push((prefix.unwrap_or_default(), level));
+                        .push(RouterGuard {
+                            prefix: prefix.unwrap_or_default(),
+                            method: None,
+                            exact: false,
+                            auth: level,
+                        });
                 }
             }
         }
@@ -7435,6 +8000,7 @@ impl Walker<'_> {
             && !has(&m().mount_methods, method)
             && has(&m().route_methods, method)
             && call.arguments.len() == 2
+            && env.branch == 0
             && let Some(level) = call
                 .arguments
                 .last()
@@ -7446,17 +8012,24 @@ impl Walker<'_> {
                 .and_then(Argument::as_expression)
                 .and_then(|e| self.mount_path(e, env))
         {
-            // Up to the first wildcard: `/api/v1/admin/{*path}` guards `/api/v1/admin/...`.
-            let cut = ["{*", "*", "("]
-                .iter()
-                .filter_map(|w| prefix.find(w))
-                .min()
-                .unwrap_or(prefix.len());
-            let prefix = prefix.get(..cut).unwrap_or(&prefix).to_owned();
+            // Up to the first wildcard: `/api/v1/admin/{*path}` guards `/api/v1/admin/...`;
+            // without one, that path only. `all` is every method; a verb, its own.
+            let cut = ["{*", "*", "("].iter().filter_map(|w| prefix.find(w)).min();
+            let exact = cut.is_none();
+            let prefix = prefix
+                .get(..cut.unwrap_or(prefix.len()))
+                .unwrap_or(&prefix)
+                .to_owned();
+            let method = method.to_ascii_lowercase();
             self.router_auth
                 .entry(router_key(object, env))
                 .or_default()
-                .push((prefix, level));
+                .push(RouterGuard {
+                    prefix,
+                    method: (method != "all").then_some(method),
+                    exact,
+                    auth: level,
+                });
         }
         // Routes are kept from the final pass only (facts reset before it); templates from any.
         {
@@ -12148,6 +12721,116 @@ mod tests {
     }
 
     #[test]
+    fn middleware_that_lets_requests_through_guards_nothing() {
+        let route =
+            "app.get('/files', (req, res) => { res.send(fs.readFileSync(req.query.name)); });\n";
+        let high = |guard: &str| {
+            let found = one(&format!("const app = express();\n{guard}\n{route}"));
+            assert!(
+                !found.is_empty() && found.iter().all(|f| f.1 == Severity::High),
+                "{guard}: {found:?}"
+            );
+        };
+        // No credential: an origin, a protocol.
+        high(
+            "const ALLOWED = 'https://app.example.com';\napp.use((req, res, next) => { if (req.get('origin') !== ALLOWED) { return res.status(403).end(); } next(); });",
+        );
+        high(
+            "app.use((req, res, next) => { if (req.protocol !== HTTPS) { return res.sendStatus(403); } next(); });",
+        );
+        // A way past the check: `next()` before it or in its answer, a conjunction.
+        high(
+            "app.use((req, res, next) => { if (req.method === 'GET') { return next(); } if (req.get('x-api-key') !== API_KEY) { return res.sendStatus(401); } next(); });",
+        );
+        high(
+            "app.use((req, res, next) => { if (req.user && !req.user.isAdmin) { return res.sendStatus(403); } next(); });",
+        );
+        high(
+            "app.use((req, res, next) => { if (!req.session.user) { res.status(401); return next(); } next(); });",
+        );
+        // Only on some runs, or under a path it cannot read.
+        high(
+            "if (TOKEN) { app.use((req, res, next) => { if (req.get('authorization') !== TOKEN) { return res.sendStatus(401); } next(); }); }",
+        );
+        high(
+            "app.use(config.panelPath, (req, res, next) => { if (!req.session.admin) { return res.sendStatus(403); } next(); });",
+        );
+        // A verb's guard: its method and path only.
+        high(
+            "app.post('/files', (req, res, next) => { if (!req.session.admin) { return res.sendStatus(403); } next(); });",
+        );
+        high(
+            "app.all('/fil', (req, res, next) => { if (!req.session.admin) { return res.sendStatus(403); } next(); });",
+        );
+        // A shared secret in a credential header still guards (admin).
+        let secret = one(&format!(
+            "const app = express();\napp.use((req, res, next) => {{ const authorization = req.header('Authorization'); if (authorization !== SECRET) {{ return res.status(403).end(); }} next(); }});\n{route}"
+        ));
+        assert!(
+            !secret.is_empty() && secret.iter().all(|f| f.1 == Severity::Medium),
+            "{secret:?}"
+        );
+    }
+
+    #[test]
+    fn checks_that_other_values_pass_clean_nothing() {
+        let fetches = |check: &str| {
+            one(&format!("app.post('/p', async (req, res) => {{ const url = new URL(req.body.url); {check} res.send(await fetch(url.toString())); }});")).len()
+        };
+        // A prefix without the origin's `/`, a pattern, a denylist: other hosts pass.
+        assert_eq!(
+            fetches("if (!url.origin.startsWith(API_ORIGIN)) { return res.end(); }"),
+            1
+        );
+        assert_eq!(
+            fetches("if (!url.href.startsWith('https://api.example.com')) { return res.end(); }"),
+            1
+        );
+        assert_eq!(
+            fetches("if (!/^[a-z0-9.-]+$/i.test(url.hostname)) { return res.end(); }"),
+            1
+        );
+        assert_eq!(
+            fetches("if (isBlockedHost(url.hostname)) { return res.end(); }"),
+            1
+        );
+        // With it, the string checked goes to that host.
+        assert!(one("app.post('/q', async (req, res) => { const u = req.body.url; if (!u.startsWith('https://api.example.com/')) { return res.end(); } res.send(await fetch(u)); });").is_empty());
+        assert_eq!(one("app.post('/q', async (req, res) => { const u = req.body.url; if (!u.startsWith('https://api.example.com')) { return res.end(); } res.send(await fetch(u)); });").len(), 1);
+        // Facts that hold on one path only: a caught throw, `||=`, a short circuit.
+        let users = |body: &str| route(body).len();
+        assert_eq!(
+            users(
+                "const { email } = req.body; try { email.toLowerCase(); } catch (e) {} await User.findOne({ email });"
+            ),
+            1
+        );
+        assert_eq!(
+            users(
+                "const { email } = req.body; let name; name ||= email.trim(); await User.findOne({ email });"
+            ),
+            1
+        );
+        // `..` alone passes `startsWith('../')`; a relative check must use `'..'`.
+        let rel = "const ROOT = '/srv/up';\napp.delete('/d', (req, res) => { const dir = path.join(ROOT, req.query.dir); const rel = path.relative(ROOT, dir); if (rel.startsWith('../')) { return res.end(); } fs.rmSync(dir, { recursive: true }); });";
+        assert_eq!(one(rel).len(), 1);
+        // A destructuring write replaces what was checked.
+        assert_eq!(one("const ROOT = '/srv/up';\napp.post('/w', (req, res) => { let file = path.join(ROOT, req.query.f); const rel = path.relative(ROOT, file); ({ file } = req.body); if (rel.startsWith('..')) { return res.end(); } res.send(fs.readFileSync(file)); });").len(), 1);
+    }
+
+    #[test]
+    fn a_base_the_caller_passes_confines_as_much_as_it_is_the_callers() {
+        let helpers = "const ROOT = '/srv/data';\n\
+            function readInside(base, file) { const rel = path.relative(base, file); if (rel.startsWith('..')) { throw new Error('out'); } return fs.readFileSync(file); }\n\
+            function isWithin(base, p) { const r = path.resolve(p); return r.startsWith(path.resolve(base) + path.sep); }\n";
+        assert!(one(&format!("{helpers}app.get('/a', (req, res) => res.send(readInside(ROOT, path.join(ROOT, req.query.n))));")).is_empty());
+        assert_eq!(one(&format!("{helpers}app.get('/b', (req, res) => {{ const base = path.join(ROOT, req.query.ws); res.send(readInside(base, path.join(base, req.query.n))); }});")).len(), 1);
+        // Judged by its body, not by its name: inside the base the attacker chose.
+        assert!(one(&format!("{helpers}app.get('/c', (req, res) => {{ const f = path.join(ROOT, req.query.n); if (!isWithin(ROOT, f)) {{ return res.end(); }} res.send(fs.readFileSync(f)); }});")).is_empty());
+        assert_eq!(one(&format!("{helpers}app.get('/d', (req, res) => {{ const f = path.join(ROOT, req.query.n); if (!isWithin(req.query.base, f)) {{ return res.end(); }} res.send(fs.readFileSync(f)); }});")).len(), 1);
+    }
+
+    #[test]
     fn the_left_side_of_and_is_the_value_only_when_falsy() {
         // webbrain's dev server: `m && ROOTS[m[1]]` is a base the server holds (or `null`).
         let server = "const http = require('http');\nconst ROOTS = { a: '/srv/a' };\n";
@@ -12950,9 +13633,20 @@ mod tests {
             "chrome.runtime.onMessage.addListener((msg, sender, reply) => { $('#x').html(`<i>${msg.t}</i>`); });",
         );
         assert_eq!(ext.len(), 1, "{ext:?}");
+        // What the extension and the app send themselves is hardening (low); what other
+        // extensions and web pages send is not.
+        assert_eq!((ext[0].1, ext[0].3), (Severity::Low, "ext-internal"));
+        let external = scan(
+            "chrome.runtime.onMessageExternal.addListener((msg, sender, reply) => { $('#x').html(`<i>${msg.t}</i>`); });",
+        );
+        assert_eq!(external.len(), 1, "{external:?}");
+        assert_eq!(
+            (external[0].1, external[0].3),
+            (Severity::High, "ext-message")
+        );
         let ipc = scan("ipcMain.handle('open', (event, url) => { shell.openExternal(url); });");
         assert_eq!(ipc.len(), 1, "{ipc:?}");
-        assert_eq!(ipc[0].3, "ipc");
+        assert_eq!((ipc[0].1, ipc[0].3), (Severity::Low, "ipc"));
         // The IPC event object is not client data; a jQuery node append is not HTML.
         assert!(
             scan("ipcMain.on('x', (event) => { shell.openExternal(event.senderFrame.url); });")
@@ -13401,7 +14095,8 @@ mod tests {
 
     #[test]
     fn electron_sinks_and_bullmq_workers() {
-        assert_eq!(scan("ipcMain.handle('run', (event, code) => { win.webContents.executeJavaScript(code); });")[0].1, Severity::Critical);
+        // A critical sink, capped: what the app's own renderer sends is hardening.
+        assert_eq!(scan("ipcMain.handle('run', (event, code) => { win.webContents.executeJavaScript(code); });")[0].1, Severity::Low);
         assert_eq!(
             scan("ipcMain.on('open', (event, p) => shell.openPath(p));").len(),
             1

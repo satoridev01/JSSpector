@@ -18,6 +18,9 @@ routes:
   chain_methods: [route]
   # `router.route('POST', '/users', handler)` (parse-server's PromiseRouter and the like)
   verb_first_methods: [route]
+  # A mount path held in a variable named like one (`app.use(config.panelPath, guard)`): what is
+  # mounted there guards a path the walker cannot read, not every route.
+  mount_path_words: [path, prefix, url, route, base, mount, endpoint]
   verbs: [get, post, put, patch, delete, del, head, options, all]
   factories: [express, Router, express.Router, createServer, polka, connect]
   names: [app, router, server, api, routes, route, apirouter, application, express]
@@ -30,4 +33,4 @@ sinks:
   # A `root` option confines these (engine rule).
   # Never a browser's `chrome.downloads.download()`: browser-side sources do not reach Express.
   - {methods: [sendFile, download], class: path-traversal, severity: high, args: ["any:0"], confined_by: [root],
-     ignore_kinds: [dom, props, ext-message, postmessage]}
+     ignore_kinds: [dom, props, ext-message, ext-internal, postmessage]}

@@ -37,6 +37,32 @@ pub enum Fact {
     /// A relative path known not to climb (`rel.startsWith('..')` was false): the walker
     /// turns it into containment of what `rel` was computed from (`path.relative(base, file)`).
     NoUpward,
+    /// Equal to a value the server holds: a constant (`x === 'a'`) or a member of a set it
+    /// holds (`HOSTS.has(x)`). Clean for every class; for a URL's host, the URL goes there.
+    Allowed,
+}
+
+thread_local! {
+    /// Functions whose bodies proved a check (a predicate summary; this file's or our other
+    /// files'): what they check comes from those summaries, not from their names
+    /// (`isWithin(base, p)` confines `p` to the caller's `base`, not to anything).
+    static ANALYZED: std::cell::RefCell<std::collections::BTreeSet<String>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// The functions whose checks come from their summaries, for the file being walked.
+pub fn set_analyzed(names: impl IntoIterator<Item = String>) {
+    ANALYZED.with(|a| {
+        let mut a = a.borrow_mut();
+        a.clear();
+        a.extend(names);
+    });
+}
+
+/// Whether a call names an analyzed function directly (`isInside(f, base)`).
+fn analyzed_callee(call: &oxc_ast::ast::CallExpression<'_>) -> bool {
+    matches!(call.callee.get_inner_expression(), Expression::Identifier(id)
+        if ANALYZED.with(|a| a.borrow().contains(id.name.as_str())))
 }
 
 /// Longest access path a key is built for: no guard or pack name has more segments, and a
@@ -180,7 +206,7 @@ pub fn facts(test: &Expression<'_>, truth: bool, out: &mut Vec<(String, Fact)>) 
                     Expression::StringLiteral(_) | Expression::NumericLiteral(_)
                 ) && let Some(key) = path_key(a)
                 {
-                    out.push((key, Fact::Clean(ALL)));
+                    out.push((key, Fact::Allowed));
                 }
             }
         }
@@ -206,6 +232,7 @@ fn dedup(facts: &mut Vec<(String, Fact)>) {
 fn meet(a: &Fact, b: &Fact) -> Option<Fact> {
     match (a, b) {
         _ if a == b => Some(a.clone()),
+        (Fact::Allowed, other) | (other, Fact::Allowed) => meet(&Fact::Clean(ALL), other),
         (Fact::Clean(x), Fact::Clean(y)) => (x & y != 0).then_some(Fact::Clean(x & y)),
         (Fact::Clean(_), Fact::Scalar) | (Fact::Scalar, Fact::Clean(_)) => Some(Fact::Scalar),
         _ => None,
@@ -330,13 +357,16 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
         }
         return;
     }
-    let listed = has(&model.validators, &name)
-        || qualified
-            .as_deref()
-            .is_some_and(|q| has(&model.validators, q));
+    // A function of ours is judged by its body (its predicate summary), not its name.
+    let ours = analyzed_callee(call);
+    let listed = !ours
+        && (has(&model.validators, &name)
+            || qualified
+                .as_deref()
+                .is_some_and(|q| has(&model.validators, q)));
     // `isValidName(x)`, `isSafePath(x)`: a validator word right after the yes/no prefix, never
     // negated (`isNotAllowed`), and only for the first argument (`isValidPassword(user, pass)`).
-    let worded = !listed && predicate_word(&lower).is_some();
+    let worded = !ours && !listed && predicate_word(&lower).is_some();
     if listed || worded {
         let classes = if listed {
             named_mask(&name, qualified.as_deref())
@@ -349,6 +379,17 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
         } else {
             1
         };
+        // `HOSTS.has(x)` (a `Set` or `Map`), `['a', 'b'].includes(x)`: a member of what the
+        // server holds. Not `list.includes(x)` on a string (a substring).
+        let member = classes == ALL
+            && callee.as_member_expression().is_some_and(|m| {
+                has(&model.set_members, &name)
+                    || (has(&model.list_members, &name)
+                        && matches!(
+                            m.object().get_inner_expression(),
+                            Expression::ArrayExpression(_)
+                        ))
+            });
         for argument in call.arguments.iter().take(count) {
             let Some(key) = argument.as_expression().and_then(path_key) else {
                 continue;
@@ -356,6 +397,8 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
             if classes == 0 {
                 // A format check (`isEmail`): a string, nothing more.
                 out.push((key, Fact::Scalar));
+            } else if member {
+                out.push((key, Fact::Allowed));
             } else {
                 out.push((key, Fact::Clean(classes)));
             }
@@ -385,16 +428,18 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
                 .as_str()
                 .filter(|text| fixed_origin(text))
                 .map(|_| class_bit(VulnClass::Ssrf)),
-            // `resolved.startsWith(base + path.sep)`: contained in a base directory or origin,
-            // if the base is not the attacker's (checked where the fact is learned).
+            // `resolved.startsWith(base + path.sep)`: contained in a base directory, if the base
+            // is not the attacker's (checked where the fact is learned). Without a separator a
+            // sibling sharing the base's name passes too (`/srv/data` is a prefix of
+            // `/srv/data-old/x`): accepted for paths, where the base's own name limits it. An
+            // origin must end with its `/` (`https://api.example.com` is a prefix of
+            // `https://api.example.com.evil.net/`).
             Some(base) => {
-                out.push((
-                    key,
-                    Fact::Contained(
-                        class_bit(VulnClass::PathTraversal) | class_bit(VulnClass::Ssrf),
-                        base_keys(base),
-                    ),
-                ));
+                let mut classes = class_bit(VulnClass::PathTraversal);
+                if separator_end(base) == Some('/') {
+                    classes |= class_bit(VulnClass::Ssrf);
+                }
+                out.push((key, Fact::Contained(classes, base_keys(base))));
                 return;
             }
             None => None,
@@ -405,9 +450,36 @@ fn validator_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String
     }
 }
 
+/// How a base expression ends, when it ends with a path separator: `'/'` for `` `${base}/` ``
+/// and `base + '/'`, `'\\'` for a backslash, `'s'` for `base + path.sep` (either).
+fn separator_end(expr: &Expression<'_>) -> Option<char> {
+    match expr.get_inner_expression() {
+        Expression::StringLiteral(s) => s
+            .value
+            .as_str()?
+            .chars()
+            .last()
+            .filter(|c| matches!(c, '/' | '\\')),
+        Expression::TemplateLiteral(t) => {
+            let last = t.quasis.last()?.value.cooked.as_ref()?.as_str()?;
+            match last.chars().last() {
+                Some(c @ ('/' | '\\')) => Some(c),
+                Some(_) => None,
+                None => t.expressions.last().and_then(separator_end),
+            }
+        }
+        Expression::BinaryExpression(b) if b.operator == BinaryOperator::Addition => {
+            separator_end(&b.right)
+        }
+        other => path_key(other)
+            .filter(|key| key == "sep" || key.ends_with(".sep"))
+            .map(|_| 's'),
+    }
+}
+
 /// The access paths a base expression is built from: `base` and `path.sep` in
 /// `` `${base}${path.sep}` `` or `base + path.sep`, `root` in `path.resolve(root)`.
-fn base_keys(expr: &Expression<'_>) -> Vec<String> {
+pub fn base_keys(expr: &Expression<'_>) -> Vec<String> {
     let mut keys = Vec::new();
     collect_base_keys(expr, &mut keys, 0);
     keys
@@ -428,6 +500,10 @@ fn collect_base_keys(expr: &Expression<'_>, keys: &mut Vec<String>, depth: usize
             collect_base_keys(&b.right, keys, depth + 1);
         }
         Expression::CallExpression(call) => {
+            // `req.query.base.trim()`: what the method runs on too; `os.homedir()`: `os`.
+            if let Some(member) = call.callee.get_inner_expression().as_member_expression() {
+                collect_base_keys(member.object(), keys, depth + 1);
+            }
             for argument in call.arguments.iter().filter_map(Argument::as_expression) {
                 collect_base_keys(argument, keys, depth + 1);
             }
@@ -442,11 +518,13 @@ fn collect_base_keys(expr: &Expression<'_>, keys: &mut Vec<String>, depth: usize
     }
 }
 
-/// `https://host/...` (or `https://host`): a scheme and a fixed host.
+/// `https://host/...`: a scheme and a fixed host, closed by its `/`.
 pub fn fixed_origin(text: &str) -> bool {
+    // Up to the `/` after the host: `https://api.example.com` is also the start of
+    // `https://api.example.com.evil.net/` and `https://api.example.com@evil.net/`.
     text.split_once("://").is_some_and(|(scheme, rest)| {
-        let host = rest.split('/').next().unwrap_or("");
-        !scheme.is_empty() && !host.is_empty() && !host.contains('@')
+        rest.split_once('/')
+            .is_some_and(|(host, _)| !scheme.is_empty() && !host.is_empty() && !host.contains('@'))
     })
 }
 
@@ -542,6 +620,7 @@ fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String,
         return;
     }
     if is_predicate(&lower)
+        && !analyzed_callee(call)
         && model()
             .rejecter_words
             .iter()
@@ -600,15 +679,14 @@ fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String,
         out.push((key, Fact::NoLeadingDash));
         return;
     }
-    // `p.includes('..')` (or another marker) was false: the receiver has no traversal.
+    // `p.includes('..')` was false: the receiver has no traversal. Exactly the marker: no
+    // `'../'` (which `..` alone passes), no `'\0'` (which `../` passes).
     if has(&model().receiver_rejecters, &name)
         && let Some(Argument::StringLiteral(marker)) = call.arguments.first()
-        && marker.value.as_str().is_some_and(|m| {
-            model()
-                .rejected_markers
-                .iter()
-                .any(|r| m.contains(r.as_str()))
-        })
+        && marker
+            .value
+            .as_str()
+            .is_some_and(|m| model().rejected_markers.iter().any(|r| m == r.as_str()))
         && let Some(member) = callee.as_member_expression()
         && let Some(key) = path_key(member.object())
     {
@@ -616,18 +694,10 @@ fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String,
     }
 }
 
-/// `'..'`, `'../'`, `` `..${sep}` ``: the first argument of an upward check.
+/// `'..'`: the first argument of an upward check. Not `'../'` or `` `..${sep}` ``, which
+/// `..` itself (the base's parent) passes.
 fn upward_marker(argument: Option<&Argument<'_>>) -> bool {
-    match argument {
-        Some(Argument::StringLiteral(s)) => s.value.as_str().is_some_and(|v| v.starts_with("..")),
-        Some(Argument::TemplateLiteral(t)) => t
-            .quasis
-            .first()
-            .and_then(|q| q.value.cooked.as_ref())
-            .and_then(|c| c.as_str())
-            .is_some_and(|v| v.starts_with("..")),
-        _ => false,
-    }
+    matches!(argument, Some(Argument::StringLiteral(s)) if s.value.as_str() == Some(".."))
 }
 
 /// `path.relative(base, file)` (a pack's `relative_calls`, also imported bare).
@@ -1134,7 +1204,8 @@ mod tests {
     #[test]
     fn origins_are_fixed_only_with_a_host() {
         assert!(fixed_origin("https://api.example.com/"));
-        assert!(fixed_origin("https://fxtwitter.com"));
+        assert!(fixed_origin("https://fxtwitter.com/"));
+        assert!(!fixed_origin("https://fxtwitter.com"));
         assert!(!fixed_origin("http"));
         assert!(!fixed_origin("https://"));
         assert!(!fixed_origin("uploads/"));

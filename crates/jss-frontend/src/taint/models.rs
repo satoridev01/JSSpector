@@ -194,6 +194,14 @@ pub struct AuthSpec {
     /// an inline middleware that answers 401/403 and returns guards what follows it.
     #[serde(default)]
     pub denial_methods: Vec<String>,
+    /// Words of a credential or an identity (lower case, letters and digits only): an inline
+    /// middleware's 401/403 check must read one to guard anything (`req.get('origin')` does
+    /// not).
+    #[serde(default)]
+    pub credentials: Vec<String>,
+    /// Phrases that only look like a credential (`user-agent`).
+    #[serde(default)]
+    pub not_credentials: Vec<String>,
 }
 
 /// An authentication level in a pack.
@@ -349,6 +357,10 @@ pub struct RouteSpec {
     /// Methods that take the HTTP method first: `router.route('POST', '/users', handler)`.
     #[serde(default)]
     pub verb_first_methods: Vec<String>,
+    /// Words in the name of a mount path held in a variable (`config.panelPath`): middleware
+    /// mounted under it guards a path the walker cannot read.
+    #[serde(default)]
+    pub mount_path_words: Vec<String>,
     /// HTTP method names (as `route('POST', ...)` takes them, any case).
     #[serde(default)]
     pub verbs: Vec<String>,
@@ -741,6 +753,13 @@ pub struct Sanitizers {
     pub assertion_prefixes: Vec<String>,
     #[serde(default)]
     pub rejected_markers: Vec<String>,
+    /// Methods of a set the server holds that, true, make their argument one of its members
+    /// (`HOSTS.has(x)`).
+    #[serde(default)]
+    pub set_members: Vec<String>,
+    /// The same, for a list written out (`['a', 'b'].includes(x)`; on a string, a substring).
+    #[serde(default)]
+    pub list_members: Vec<String>,
     /// Calls that escape for one class only: `class: [calls]`.
     #[serde(default)]
     pub escapers: BTreeMap<String, Vec<String>>,
@@ -1011,6 +1030,11 @@ pub struct Model {
     pub auth_middleware: Vec<String>,
     pub auth_admin: Vec<String>,
     pub auth_denial_methods: Vec<String>,
+    pub auth_credentials: Vec<String>,
+    pub auth_not_credentials: Vec<String>,
+    pub set_members: Vec<String>,
+    pub list_members: Vec<String>,
+    pub mount_path_words: Vec<String>,
     pub auth_request_fields: Vec<String>,
     pub auth_decorators: Vec<String>,
     pub auth_setup: Vec<String>,
@@ -1160,6 +1184,8 @@ impl Model {
         self.leading_dash_checks
             .extend(pack.sanitizers.leading_dash_checks);
         self.upward_checks.extend(pack.sanitizers.upward_checks);
+        self.set_members.extend(pack.sanitizers.set_members);
+        self.list_members.extend(pack.sanitizers.list_members);
         self.relative_calls.extend(pack.sanitizers.relative_calls);
         self.predicate_prefixes
             .extend(pack.sanitizers.predicate_prefixes);
@@ -1269,6 +1295,9 @@ impl Model {
         self.auth_middleware.extend(pack.auth.middleware);
         self.auth_admin.extend(pack.auth.admin);
         self.auth_denial_methods.extend(pack.auth.denial_methods);
+        self.auth_credentials.extend(pack.auth.credentials);
+        self.auth_not_credentials.extend(pack.auth.not_credentials);
+        self.mount_path_words.extend(pack.routes.mount_path_words);
         self.auth_request_fields.extend(pack.auth.request_fields);
         self.auth_setup
             .extend(pack.auth.setup.iter().map(|n| n.to_ascii_lowercase()));

@@ -163,6 +163,10 @@ sanitizers:
   negations: [not, un, invalid]
   assertion_prefixes: [assert, ensure]
   rejected_markers: ["..", "\\0", "%2e"]
+  # `HOSTS.has(x)` true: `x` is one of what the server holds (on a URL's host, the URL goes
+  # there); `['a', 'b'].includes(x)` too, for a list written out (a string's is a substring).
+  set_members: [has]
+  list_members: [includes]
   # Checks and clearing calls that are safe for some classes only (names, and words of names
   # matched as predicates). `none`: format checks that only prove a string.
   scoped:

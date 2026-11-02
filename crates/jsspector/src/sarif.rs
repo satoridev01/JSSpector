@@ -249,6 +249,7 @@ mod tests {
             auth: Auth::NoneDetected,
             function: "list".to_owned(),
             entry: Some("GET /items".to_owned()),
+            entry_at: None,
             source: SourceLoc {
                 kind: "http",
                 expr: "req.query.id".to_owned(),

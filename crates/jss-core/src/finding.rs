@@ -103,6 +103,13 @@ pub struct TraceStep {
     pub note: String,
 }
 
+/// Where an entry point is registered: the `app.post('/x', handler)` call.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct EntryLoc {
+    pub file: String,
+    pub line: u32,
+}
+
 /// One candidate: a tainted value reaching a sink.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Finding {
@@ -120,6 +127,9 @@ pub struct Finding {
     /// one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// Where `entry` is registered, when it is a route the inventory located.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_at: Option<EntryLoc>,
     pub source: SourceLoc,
     pub trace: Vec<TraceStep>,
     /// Line-independent identity: `class|file|function|sink api|source expr|ordinal`.

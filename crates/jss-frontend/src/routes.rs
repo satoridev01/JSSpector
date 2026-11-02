@@ -21,6 +21,9 @@ pub struct Route {
     pub path: String,
     pub file: String,
     pub line: u32,
+    /// For a route a helper registers: its own `router.get(...)` call (file, line).
+    #[serde(skip)]
+    pub at: Option<(String, u32)>,
     pub handler: String,
     /// What the IR resolves the handler by: the handler, or a function written in another file
     /// (`<at>:file#name`, a route a helper registers inline).
@@ -45,7 +48,7 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
     let graph = jss_core::ir::link(&modules);
     // Weakest authentication first: a function reached from a public route and from an admin
     // route is reachable without logging in.
-    let mut entries: Vec<(Auth, String, jss_core::ir::FunctionId)> = routes
+    let mut entries: Vec<(Auth, String, jss_core::ir::FunctionId, jss_core::EntryLoc)> = routes
         .iter()
         .filter_map(|route| {
             jss_core::ir::resolve_reference(&by_file, &route.file, &route.handler_ref).map(
@@ -54,6 +57,16 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
                         route.auth,
                         format!("{} {}", route.method, route.path),
                         target,
+                        match &route.at {
+                            Some((file, line)) => jss_core::EntryLoc {
+                                file: file.clone(),
+                                line: *line,
+                            },
+                            None => jss_core::EntryLoc {
+                                file: route.file.clone(),
+                                line: route.line,
+                            },
+                        },
                     )
                 },
             )
@@ -62,18 +75,19 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
     entries.sort();
     let roots: Vec<jss_core::ir::FunctionId> = entries
         .iter()
-        .map(|(_, _, target)| target.clone())
+        .map(|(_, _, target, _)| target.clone())
         .collect();
-    let labels: Vec<(String, Auth)> = entries
+    let labels: Vec<(String, Auth, jss_core::EntryLoc)> = entries
         .into_iter()
-        .map(|(auth, label, _)| (label, auth))
+        .map(|(auth, label, _, at)| (label, auth, at))
         .collect();
     let reached = jss_core::ir::reachable(&graph, &roots);
     let model = crate::taint::models::model();
     for report in reports.iter_mut() {
         for finding in &mut report.findings {
             let id = (finding.file.clone(), finding.function.clone());
-            let Some((label, auth)) = reached.get(&id).and_then(|index| labels.get(*index)) else {
+            let Some((label, auth, at)) = reached.get(&id).and_then(|index| labels.get(*index))
+            else {
                 // Browser-side data no route reaches: the page or the component it enters.
                 let kind: &str = finding.source.kind;
                 if model.page_kinds.iter().any(|k| k == kind) {
@@ -84,6 +98,7 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
                 continue;
             };
             finding.entry = Some(label.clone());
+            finding.entry_at = Some(at.clone());
             if *auth > finding.auth {
                 if *auth == Auth::Admin && finding.auth != Auth::Admin {
                     finding.severity = match finding.severity {
@@ -166,6 +181,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                     path: full,
                     file: file.to_string(),
                     line: entry.line,
+                    at: entry.at.clone(),
                     // `<at>:src/api/admin.js#POST /x` reads as the function's name.
                     handler: entry
                         .handler

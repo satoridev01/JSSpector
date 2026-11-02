@@ -1,7 +1,7 @@
 //! One rule per vulnerability class: what it means, how to fix it, and its metadata (CWE, SARIF
 //! security severity). Shared by `scan --format sarif` and `explain`.
 
-use jss_core::{Finding, Severity, VulnClass};
+use jss_core::{Auth, Finding, Severity, VulnClass};
 
 /// Every class, in rule-index order (the SARIF `ruleIndex`).
 pub const CLASSES: [VulnClass; 8] = [
@@ -95,7 +95,7 @@ pub fn parse_severity(value: &str) -> Result<Severity, String> {
 /// fs.readFile`.
 pub fn title(f: &Finding) -> String {
     let place = match &f.entry {
-        Some(entry) => entry.clone(),
+        Some(entry) => entry_label(entry),
         None if !f.function.starts_with('<') => format!("{}()", f.function),
         None => f.file.clone(),
     };
@@ -117,8 +117,20 @@ pub fn resource(f: &Finding) -> String {
     )
 }
 
-/// A finding in a few sentences: what flows where, from which entry point and with what
-/// authentication, where the source and sink are, and what the class lets an attacker do.
+/// An entry point for people. A route registered for every method (`app.all`, shown as `ALL`
+/// or `ANY`) is just its path: the method word reads as noise.
+pub fn entry_label(entry: &str) -> String {
+    for any in ["ALL ", "ANY "] {
+        if let Some(path) = entry.strip_prefix(any) {
+            return path.to_owned();
+        }
+    }
+    entry.to_owned()
+}
+
+/// A finding in two short paragraphs: what flows where, from which entry point and with what
+/// authentication; then what the class lets an attacker do. Where the lines are is in the
+/// excerpt, not here.
 pub fn description(f: &Finding) -> String {
     let mut text = format!(
         "Data from `{}` ({}) {}: `{}`.",
@@ -128,17 +140,17 @@ pub fn description(f: &Finding) -> String {
         f.sink.api
     );
     match &f.entry {
-        Some(entry) => text.push_str(&format!(" Reached from {entry}")),
-        None => text.push_str(&format!(" In {}", f.function)),
+        Some(entry) => {
+            text.push_str(&format!(" It is reachable from `{}`", entry_label(entry)));
+            text.push_str(match f.auth {
+                Auth::NoneDetected => " with no authentication check detected.",
+                Auth::User => " by any logged-in user.",
+                Auth::Admin => " by administrators only.",
+            });
+        }
+        None => text.push_str(&format!(" It is in `{}`.", f.function)),
     }
-    text.push_str(&format!(
-        " (authentication: {}). Source at {}:{}, sink at {}.",
-        f.auth.name(),
-        f.file,
-        f.source.line,
-        resource(f)
-    ));
-    text.push(' ');
+    text.push_str("\n\n");
     text.push_str(rule(f.class).summary);
     text
 }

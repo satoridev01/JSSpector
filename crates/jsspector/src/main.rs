@@ -2,6 +2,7 @@
 
 mod baseline;
 mod config;
+mod excerpt;
 mod explain;
 mod openapi;
 mod report;
@@ -219,17 +220,21 @@ struct ReportedFinding<'a> {
     finding: &'a Finding,
     resource: String,
     description: String,
+    /// The lines the value passes through, entry point to sink, as annotated Markdown code
+    /// blocks (one per file).
+    affected: String,
     remediation: String,
 }
 
 impl<'a> ReportedFinding<'a> {
-    fn new(finding: &'a Finding) -> Self {
+    fn new(finding: &'a Finding, sources: &mut text::Sources) -> Self {
         Self {
             title: rules::title(finding),
             cwe: format!("CWE-{}", rules::rule(finding.class).cwe),
             finding,
             resource: rules::resource(finding),
             description: rules::description(finding),
+            affected: excerpt::affected(finding, sources),
             remediation: rules::remediation(finding.class),
         }
     }
@@ -495,7 +500,10 @@ fn scan(args: &ScanArgs) -> ExitCode {
             let output = ScanOutput {
                 root: args.path.to_string_lossy().into_owned(),
                 files_scanned: analysis.files_scanned,
-                findings: findings.iter().map(ReportedFinding::new).collect(),
+                findings: findings
+                    .iter()
+                    .map(|f| ReportedFinding::new(f, &mut sources))
+                    .collect(),
                 baselined: baselined.len(),
                 ignored,
                 skipped: &analysis.skipped,

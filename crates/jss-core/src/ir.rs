@@ -122,6 +122,10 @@ pub struct Entry {
     pub path: String,
     pub handler: String,
     pub line: u32,
+    /// Where a helper's own `router.get(...)` call is, when the route is registered through
+    /// one (`line` is then the call to the helper): file and line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<(String, u32)>,
     pub auth: Auth,
     pub kind: String,
     pub inputs: Vec<(String, String)>,

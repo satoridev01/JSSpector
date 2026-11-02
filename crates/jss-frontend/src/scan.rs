@@ -756,6 +756,7 @@ fn analyze(
                 path: r.path.clone(),
                 handler: r.handler.clone(),
                 line: line(r.span.start),
+                at: r.at.clone(),
                 auth: r.auth,
                 kind: r.kind.to_owned(),
                 inputs: facts
@@ -853,6 +854,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
         auth: raw.auth,
         function: raw.function.clone(),
         entry: None,
+        entry_at: None,
         source: SourceLoc {
             kind: raw.origin.kind,
             expr: source_expr,

@@ -434,6 +434,7 @@ fn scan_file_program_inner(
     let mut walker = Walker {
         external,
         linking,
+        source: program.source_text,
         facts: FileFacts::default(),
         field_of: BTreeMap::new(),
         pending_auth: Auth::NoneDetected,
@@ -589,6 +590,8 @@ pub struct RouteFact {
     /// The function that handles it (walker name).
     pub handler: String,
     pub span: Span,
+    /// For a route a helper registers: the file and line of the helper's own call.
+    pub at: Option<(String, u32)>,
     pub auth: Auth,
     pub kind: &'static str,
 }
@@ -612,6 +615,8 @@ pub struct RouteTemplate {
     /// Else the parameter holding the handler (`router.get(name, middlewares, controller)`):
     /// each caller passes its own.
     pub handler_param: Option<usize>,
+    /// The file and line of the `router.get(...)` call the template was made from.
+    pub at: Option<(String, u32)>,
 }
 
 /// A piece of a route path a helper builds: literal text, or one of its parameters.
@@ -1269,6 +1274,8 @@ enum Shape {
 struct Walker<'e> {
     external: &'e Summaries,
     linking: &'e Linking<'e>,
+    /// The file's text, for the lines of route templates.
+    source: &'e str,
     /// Entry-point facts (kept from the final pass only).
     facts: FileFacts,
     /// Summary pass: the field each destructured parameter source stands for, by span start.
@@ -3502,6 +3509,7 @@ impl Walker<'_> {
                     // `export { handler as GET, handler as POST }` (NextAuth, tRPC adapters).
                     if has(&m().route_exports, &exported) {
                         self.facts.routes.push(RouteFact {
+                            at: None,
                             receiver: None,
                             receiver_file: None,
                             method: exported.clone(),
@@ -3525,6 +3533,7 @@ impl Walker<'_> {
                         && has(&m().route_exports, name)
                     {
                         self.facts.routes.push(RouteFact {
+                            at: None,
                             receiver: None,
                             receiver_file: None,
                             method: name.clone(),
@@ -3548,6 +3557,7 @@ impl Walker<'_> {
                             let name = id.name.as_str().to_owned();
                             if has(&m().route_exports, &name) {
                                 self.facts.routes.push(RouteFact {
+                                    at: None,
                                     receiver: None,
                                     receiver_file: None,
                                     method: name.clone(),
@@ -3597,6 +3607,7 @@ impl Walker<'_> {
                     // A default-exported `(req, res)` handler (Next.js `pages/api`).
                     if f.params.items.len() >= 2 {
                         self.facts.routes.push(RouteFact {
+                            at: None,
                             receiver: None,
                             receiver_file: None,
                             method: "ANY".to_owned(),
@@ -3658,6 +3669,7 @@ impl Walker<'_> {
                         };
                         if let Some(handler) = handler {
                             self.facts.routes.push(RouteFact {
+                                at: None,
                                 receiver: None,
                                 receiver_file: None,
                                 method: "ANY".to_owned(),
@@ -4585,6 +4597,7 @@ impl Walker<'_> {
                         .take(64)
                     {
                         self.facts.routes.push(RouteFact {
+                            at: None,
                         receiver: None,
                         receiver_file: None,
                         method: verb.to_ascii_uppercase(),
@@ -6491,6 +6504,7 @@ impl Walker<'_> {
                     let entry = format!("{} {tool_name}", spec.kind.to_ascii_uppercase());
                     if !self.summarize && !self.record_only {
                         self.facts.routes.push(RouteFact {
+                            at: None,
                             receiver: None,
                             receiver_file: None,
                             method: spec.kind.to_ascii_uppercase(),
@@ -6558,6 +6572,7 @@ impl Walker<'_> {
                                                 && let Some(field_key) = prop_name(&f.key)
                                             {
                                                 self.facts.routes.push(RouteFact {
+                                                    at: None,
                                                     receiver: None,
                                                     receiver_file: None,
                                                     method: name
@@ -6612,6 +6627,7 @@ impl Walker<'_> {
                                             .insert((c.span.start, c.span.end), entry.clone());
                                         if !self.summarize {
                                             self.facts.routes.push(RouteFact {
+                                                at: None,
                                                 receiver: None,
                                                 receiver_file: None,
                                                 method: verb,
@@ -6652,6 +6668,7 @@ impl Walker<'_> {
                         let name = format!("{} {event}", kind.to_ascii_uppercase());
                         if !self.summarize && !self.record_only {
                             self.facts.routes.push(RouteFact {
+                                at: None,
                                 receiver: None,
                                 receiver_file: None,
                                 method: kind.to_ascii_uppercase(),
@@ -7997,6 +8014,7 @@ impl Walker<'_> {
                     let name = self.inline_route_name("ANY", "*", None, call.span.start);
                     if !self.summarize && !self.record_only {
                         self.facts.routes.push(RouteFact {
+                            at: None,
                             receiver: None,
                             receiver_file: None,
                             method: "ANY".to_owned(),
@@ -8396,6 +8414,7 @@ impl Walker<'_> {
                         _ => None,
                     };
                     self.facts.routes.push(RouteFact {
+                        at: None,
                         receiver,
                         receiver_file: None,
                         method: if verb.is_empty() {
@@ -9731,6 +9750,14 @@ impl Walker<'_> {
         }
     }
 
+    /// The 1-based line of a byte offset of this file.
+    fn line_at(&self, offset: u32) -> u32 {
+        let bytes = self.source.as_bytes();
+        let before = bytes.get(..offset as usize).unwrap_or(bytes);
+        let newlines = before.iter().filter(|b| **b == b'\n').count();
+        u32::try_from(newlines + 1).unwrap_or(u32::MAX)
+    }
+
     /// The name of an inline route handler: `GET /items`, or, when another registration in
     /// this file already took that name, with its receiver (`GET / [settings]`).
     fn inline_route_name(
@@ -10636,6 +10663,7 @@ impl Walker<'_> {
                 continue;
             }
             self.facts.routes.push(RouteFact {
+                at: None,
                 receiver: registration.receiver.clone(),
                 receiver_file: None,
                 method: registration.method.to_ascii_uppercase(),
@@ -10813,6 +10841,7 @@ impl Walker<'_> {
                     })
                     .unwrap_or_else(|| format!("{} {event}", kind.to_ascii_uppercase()));
                 self.facts.routes.push(RouteFact {
+                    at: None,
                     receiver: object.clone(),
                     receiver_file: None,
                     method: kind.to_ascii_uppercase(),
@@ -10927,6 +10956,7 @@ impl Walker<'_> {
                 }),
                 handler_param,
                 auth,
+                at: Some((self.linking.file.to_owned(), self.line_at(call.span.start))),
             };
             let list = self
                 .route_templates
@@ -11013,6 +11043,7 @@ impl Walker<'_> {
                     return;
                 }
                 self.facts.routes.push(RouteFact {
+                    at: None,
                     receiver: object.clone(),
                     receiver_file: None,
                     method: method.to_ascii_uppercase(),
@@ -11451,6 +11482,7 @@ impl Walker<'_> {
                         }),
                     // Handed on by one of our parameters: our callers pass it.
                     handler_param: passed_handler.and_then(|e| param_of(Some(e))),
+                    at: template.at.clone(),
                 };
                 let list = self
                     .route_templates
@@ -11497,6 +11529,7 @@ impl Walker<'_> {
                     .unwrap_or_else(|| format!("{name}()")),
             },
             span: call.span,
+            at: template.at.clone(),
             auth: template.auth.max(auth),
             kind: "http",
         });

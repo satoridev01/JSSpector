@@ -136,12 +136,30 @@ fn scan_links_a_route_to_a_sink_two_files_away() {
     assert_eq!(findings[0]["resource"], "src/services/users.js:3");
     let description = findings[0]["description"].as_str().unwrap();
     assert!(
-        description.starts_with("Data from `req.query` (http) is concatenated into an SQL query: `db.query`. Reached from GET /api/v1/users/{id} (authentication: user)."),
+        description.starts_with("Data from `req.query` (http) is concatenated into an SQL query: `db.query`. It is reachable from `GET /api/v1/users/{id}` by any logged-in user.\n\n"),
         "{description}"
     );
+    // The excerpt: one bullet per file in flow order (the route, then the service it calls),
+    // each line annotated with its step; the sink with the two lines above it.
+    let affected = findings[0]["affected"].as_str().unwrap();
+    let routes = affected.find("- `src/routes/users.js`").expect(affected);
+    let service = affected.find("- `src/services/users.js`").expect(affected);
+    assert!(routes < service, "{affected}");
     assert!(
-        description.contains("sink at src/services/users.js:3"),
-        "{description}"
+        affected.contains("router.get('/users/:id', (req, res) => svc.find(req.query.name));"),
+        "{affected}"
+    );
+    assert!(
+        affected.contains("// [1] entry: GET /api/v1/users/{id}, logged-in users"),
+        "{affected}"
+    );
+    assert!(
+        affected.contains("exports.find = function find(name) {"),
+        "{affected}"
+    );
+    assert!(
+        affected.contains("// [") && affected.contains("] VULNERABLE: req.query reaches db.query"),
+        "{affected}"
     );
     assert!(
         findings[0]["remediation"]

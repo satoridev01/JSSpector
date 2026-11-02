@@ -439,6 +439,7 @@ mod tests {
             auth,
             function: "GET /x".to_owned(),
             entry: entry.map(str::to_owned),
+            entry_at: None,
             source: SourceLoc {
                 kind: "http",
                 expr: expr.to_owned(),

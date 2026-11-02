@@ -4704,6 +4704,46 @@ impl Walker<'_> {
         self.closure_writes = closure_writes(&env, parent);
     }
 
+    /// A server's options object (`devServer: { before: [...] }`): the handlers its middleware
+    /// keys list are entry points of `spec.kind`; the other options are walked as values.
+    fn middleware_options(
+        &mut self,
+        options: &ObjectExpression<'_>,
+        spec: &'static models::MiddlewareOption,
+        env: &mut Env,
+    ) {
+        for option in &options.properties {
+            match option {
+                ObjectPropertyKind::ObjectProperty(o) => {
+                    let key = prop_name(&o.key);
+                    match o.value.get_inner_expression() {
+                        Expression::ArrayExpression(list)
+                            if key.as_deref().is_some_and(|k| has(&spec.keys, k)) =>
+                        {
+                            for element in list
+                                .elements
+                                .iter()
+                                .filter_map(ArrayExpressionElement::as_expression)
+                            {
+                                self.pending_request_kind.set(Some(spec.kind.as_str()));
+                                if !self.maybe_function(element, env, None, Role::Route) {
+                                    self.pending_request_kind.set(None);
+                                    self.expr(element, env);
+                                }
+                            }
+                        }
+                        _ => {
+                            self.expr_named(&o.value, env, key);
+                        }
+                    }
+                }
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    self.expr(&spread.argument, env);
+                }
+            }
+        }
+    }
+
     /// Records the functions a function body declares by name (`function send() {}`, `const
     /// send = () => {}`) before walking it: a call above a declaration sees it too.
     fn declare_nested(&mut self, body: &[Statement<'_>], scope: u32) {
@@ -6459,6 +6499,16 @@ impl Walker<'_> {
                                     ),
                                 )
                             {
+                                continue;
+                            }
+                            // `devServer: { before: [(req, res, next) => ...] }`: middleware a
+                            // server runs, listed in its options.
+                            if let Some(spec) = name.as_deref().and_then(|key| {
+                                m().middleware_options.iter().find(|o| o.object == key)
+                            }) && let Expression::ObjectExpression(options) =
+                                p.value.get_inner_expression()
+                            {
+                                self.middleware_options(options, spec, env);
                                 continue;
                             }
                             // GraphQL: `{ Query: { user(parent, args) { ... } } }`
@@ -9473,13 +9523,21 @@ impl Walker<'_> {
         // `server.middlewares.use((req, res, next) => ...)`: a dev server's handlers.
         // By the receiver's name only an inline `(req, res, ...)` handler: a Redux store's
         // `middlewares.push(thunk)` is no server.
-        let inline_handler = arguments.iter().any(|a| {
-            match a.as_expression().map(Expression::get_inner_expression) {
-                Some(Expression::ArrowFunctionExpression(f)) => f.params.items.len() >= 2,
-                Some(Expression::FunctionExpression(f)) => f.params.items.len() >= 2,
-                _ => false,
-            }
+        let handler = |e: &Expression<'_>| match e.get_inner_expression() {
+            Expression::ArrowFunctionExpression(f) => f.params.items.len() >= 2,
+            Expression::FunctionExpression(f) => f.params.items.len() >= 2,
+            _ => false,
+        };
+        // webpack-dev-server: `middlewares.unshift({ name, path, middleware: (req, res) => ... })`.
+        let handler_object = arguments.iter().any(|a| {
+            matches!(a.as_expression().map(Expression::get_inner_expression),
+                Some(Expression::ObjectExpression(o)) if o.properties.iter().any(|p| matches!(p,
+                    ObjectPropertyKind::ObjectProperty(p) if handler(&p.value))))
         });
+        let inline_handler = handler_object
+            || arguments
+                .iter()
+                .any(|a| a.as_expression().is_some_and(handler));
         if let Some(registration) = model.middleware_registrations.iter().find(|r| {
             has(&r.methods, method)
                 && (via.as_deref().is_some_and(|v| has(&r.via, v))
@@ -9487,7 +9545,12 @@ impl Walker<'_> {
         }) {
             self.pending_request_kind
                 .set(Some(registration.kind.as_str()));
-            return (Role::Route, Shape::Callback);
+            let shape = if handler_object {
+                Shape::ObjectOfFunctions
+            } else {
+                Shape::Callback
+            };
+            return (Role::Route, shape);
         }
         if let Callee::Method { .. } = callee {
             if has(&model.route_object_methods, method)
@@ -12937,6 +13000,22 @@ mod tests {
         assert_eq!((vite[0].1, vite[0].3), (Severity::High, "dev-server"));
         // A Redux store's middleware list is no server.
         assert!(one("const middlewares = [];\nmiddlewares.push((store) => (next) => (action) => next(action));").is_empty());
+        // webpack-dev-server: `{ path, middleware }` objects.
+        let webpack = one(
+            "module.exports = { devServer: { setupMiddlewares: (middlewares, devServer) => { middlewares.unshift({ name: 'files', path: '/files', middleware: (req, res) => { res.end(fs.readFileSync(path.join('public', req.query.f))); } }); return middlewares; } } };",
+        );
+        assert_eq!(webpack.len(), 1, "{webpack:?}");
+        assert_eq!(webpack[0].3, "dev-server");
+        // Modern.js: `tools.devServer.before: [(req, res, next) => ...]`.
+        let before = one(
+            "export const plugin = () => ({ tools: { devServer: { before: [(req, res, next) => { fs.createReadStream(path.join('dist', req.url)).pipe(res); }], port: 8080 } } });",
+        );
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!((before[0].1, before[0].3), (Severity::High, "dev-server"));
+        // Other options are only values.
+        assert!(
+            one("export default { devServer: { before: [], headers: { a: 'b' } } };").is_empty()
+        );
     }
 
     #[test]

@@ -6,5 +6,9 @@ routes:
   middleware_registrations:
     # `server.middlewares.use((req, res, next) => ...)` in a Vite plugin's configureServer.
     - {via: [middlewares], methods: [use], kind: dev-server}
-    # Rsbuild / Modern.js `dev.setupMiddlewares: [(middlewares) => middlewares.unshift(fn)]`.
+    # Rsbuild / Modern.js `dev.setupMiddlewares: [(middlewares) => middlewares.unshift(fn)]`,
+    # webpack-dev-server `setupMiddlewares` (`middlewares.unshift({ path, middleware: fn })`).
     - {objects: [middlewares], methods: [unshift, push], kind: dev-server}
+  # Middleware listed in a dev server's options: Modern.js `tools.devServer.before: [fn]`.
+  middleware_options:
+    - {object: devServer, keys: [before, after], kind: dev-server}

@@ -397,6 +397,9 @@ pub struct RouteSpec {
     /// Handler registrations on a property of a server: `server.middlewares.use(handler)`.
     #[serde(default)]
     pub middleware_registrations: Vec<MiddlewareRegistration>,
+    /// Middleware listed in a server's options: `devServer: { before: [handler] }`.
+    #[serde(default)]
+    pub middleware_options: Vec<MiddlewareOption>,
     /// Methods of a promise: `api.get(url).then(...)` (or `await api.get(url)`) sends a request;
     /// a registration returns its router, never a promise.
     #[serde(default)]
@@ -406,6 +409,16 @@ pub struct RouteSpec {
     /// four parameters).
     #[serde(default)]
     pub callback_error_params: Vec<String>,
+}
+
+/// `{ <object>: { <key>: [handler, ...] } }`: `(req, res, next)` handlers listed in a server's
+/// options, whose requests are `kind`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareOption {
+    pub object: String,
+    pub keys: Vec<String>,
+    pub kind: String,
 }
 
 /// `X.<via>.<method>(handler)` registers `(req, res)` handlers whose requests are `kind`.
@@ -1079,6 +1092,7 @@ pub struct Model {
     pub controller_auth: BTreeMap<String, jss_core::Auth>,
     pub public_options: Vec<String>,
     pub middleware_registrations: Vec<MiddlewareRegistration>,
+    pub middleware_options: Vec<MiddlewareOption>,
     pub route_path_keys: Vec<String>,
     /// Packs that failed to load, with the reason.
     pub errors: Vec<String>,
@@ -1355,6 +1369,8 @@ impl Model {
         self.public_options.extend(pack.routes.public_options);
         self.middleware_registrations
             .extend(pack.routes.middleware_registrations);
+        self.middleware_options
+            .extend(pack.routes.middleware_options);
         self.route_path_keys.extend(pack.routes.path_keys);
     }
 

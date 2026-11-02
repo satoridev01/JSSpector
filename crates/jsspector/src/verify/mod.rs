@@ -7,6 +7,7 @@
 //! finding the planner cannot drive is reported `skipped` with the reason, never a false
 //! "clean".
 
+mod browser;
 mod payload;
 mod plan;
 mod sandbox;
@@ -57,22 +58,31 @@ pub enum Missing {
 }
 
 /// Verifies `findings` against the app rooted at `root`. Returns one verdict per finding, in the
-/// same order. Builds the image once and reuses it for every finding.
+/// same order. Builds at most one HTTP image and one browser image, reused across findings.
 pub fn run(
     root: &std::path::Path,
     findings: &[Finding],
     missing: Missing,
 ) -> Result<Vec<Verdict>, String> {
-    let plans: Vec<Result<plan::Probe, plan::Skip>> =
-        findings.iter().map(plan::Probe::from_finding).collect();
+    let plans: Vec<Result<plan::Plan, plan::Skip>> = findings.iter().map(plan::plan).collect();
 
-    // Nothing drivable, or no Docker: answer without building anything.
-    let any_drivable = plans.iter().any(Result::is_ok);
-    if !any_drivable {
+    let needs_http = plans.iter().any(|p| matches!(p, Ok(plan::Plan::Http(_))));
+    let needs_browser = plans
+        .iter()
+        .any(|p| matches!(p, Ok(plan::Plan::Browser(_))));
+
+    // Nothing drivable: answer without building anything.
+    if !needs_http && !needs_browser {
         return Ok(findings
             .iter()
             .zip(&plans)
-            .map(|(f, p)| verdict(f, skip_outcome(p)))
+            .map(|(f, p)| {
+                let reason = match p {
+                    Err(skip) => skip.0.clone(),
+                    Ok(_) => "not attempted".to_owned(),
+                };
+                verdict(f, Outcome::Skipped { reason })
+            })
             .collect());
     }
     if !sandbox::available() {
@@ -83,14 +93,20 @@ pub fn run(
             ),
             Missing::Skip => Ok(findings
                 .iter()
-                .map(|f| verdict(f, Outcome::Skipped {
-                    reason: "no Docker daemon reachable".to_owned(),
-                }))
+                .map(|f| {
+                    verdict(f, Outcome::Skipped {
+                        reason: "no Docker daemon reachable".to_owned(),
+                    })
+                })
                 .collect()),
         };
     }
 
-    let mut session = sandbox::Session::start(root)?;
+    // Build the sessions the plans need. A build failure for one phase skips only that phase's
+    // findings, with the failure as the reason.
+    let mut http = needs_http.then(|| sandbox::Session::start(root));
+    let mut browser = needs_browser.then(|| sandbox::BrowserSession::start(root));
+
     let verdicts = findings
         .iter()
         .zip(&plans)
@@ -99,12 +115,35 @@ pub fn run(
                 Err(skip) => Outcome::Skipped {
                     reason: skip.0.clone(),
                 },
-                Ok(probe) => session.exercise(probe),
+                Ok(plan::Plan::Http(probe)) => match http.as_mut() {
+                    Some(Ok(session)) => session.exercise(probe),
+                    Some(Err(err)) => Outcome::Skipped {
+                        reason: format!("the app could not be launched: {err}"),
+                    },
+                    None => Outcome::Skipped {
+                        reason: "not attempted".to_owned(),
+                    },
+                },
+                Ok(plan::Plan::Browser(probe)) => match browser.as_mut() {
+                    Some(Ok(session)) => session.exercise(probe),
+                    Some(Err(err)) => Outcome::Skipped {
+                        reason: format!("the browser phase could not start: {err}"),
+                    },
+                    None => Outcome::Skipped {
+                        reason: "not attempted".to_owned(),
+                    },
+                },
             };
             verdict(finding, outcome)
         })
         .collect();
-    session.teardown();
+
+    if let Some(Ok(session)) = http.as_mut() {
+        session.teardown();
+    }
+    if let Some(Ok(session)) = browser.as_mut() {
+        session.teardown();
+    }
     Ok(verdicts)
 }
 
@@ -114,18 +153,6 @@ fn verdict(finding: &Finding, outcome: Outcome) -> Verdict {
         entry: finding.entry.clone(),
         class: finding.class.name().to_owned(),
         outcome,
-    }
-}
-
-fn skip_outcome(plan: &Result<plan::Probe, plan::Skip>) -> Outcome {
-    match plan {
-        Err(skip) => Outcome::Skipped {
-            reason: skip.0.clone(),
-        },
-        // Reached only when nothing is drivable, so this arm is for completeness.
-        Ok(_) => Outcome::Skipped {
-            reason: "not attempted".to_owned(),
-        },
     }
 }
 

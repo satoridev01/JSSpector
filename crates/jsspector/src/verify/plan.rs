@@ -32,6 +32,130 @@ pub struct Probe {
     pub class: VulnClass,
 }
 
+/// What the sandbox should do with a finding: drive it as an HTTP request (the server-side
+/// phase) or load it in a headless browser (a DOM-source XSS or client-side redirect).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    Http(Probe),
+    Browser(BrowserProbe),
+}
+
+/// A finding whose attacker input is the page's own URL and whose sink runs in the browser: the
+/// file holding the vulnerable script (to find the page that loads it), where in the URL the
+/// value enters, and whether the sink writes HTML or navigates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserProbe {
+    pub file: String,
+    pub vector: UrlVector,
+    pub sink: BrowserSink,
+}
+
+/// Where in the page URL the attacker value is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlVector {
+    /// `location.search` (`?x=...`).
+    Search,
+    /// `location.hash` (`#...`).
+    Hash,
+    /// `location.href` / `new URL(location.href)` / `location` (anywhere in the URL).
+    Href,
+    /// `document.referrer` (the referring page's URL).
+    Referrer,
+}
+
+/// What the browser sink does with the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserSink {
+    /// Written as HTML (`innerHTML`, `insertAdjacentHTML`, `document.write`, jQuery `.html()`).
+    Html,
+    /// Used to navigate (`location =`, `location.href =`, `window.open`, `location.assign`).
+    Navigation,
+}
+
+/// The sandbox's decision for a finding: drive it, or skip it with a reason.
+pub fn plan(finding: &Finding) -> Result<Plan, Skip> {
+    // Server-side HTTP findings first.
+    match Probe::from_finding(finding) {
+        Ok(probe) => return Ok(Plan::Http(probe)),
+        Err(http_skip) => {
+            // Only fall through to the browser phase for a page-side (DOM) source; otherwise the
+            // HTTP skip reason is the right one.
+            if finding.source.kind != "dom" {
+                return Err(http_skip);
+            }
+        }
+    }
+    browser_probe(finding).map(Plan::Browser)
+}
+
+/// A DOM-source XSS or client-side redirect the browser phase can drive, or why not.
+fn browser_probe(finding: &Finding) -> Result<BrowserProbe, Skip> {
+    if finding.class != VulnClass::Xss {
+        return Err(Skip(format!(
+            "{} from a DOM source is not driven by verify v1 (DOM XSS and client-side redirects only)",
+            finding.class.name()
+        )));
+    }
+    let vector = url_vector(&finding.source.expr).ok_or_else(|| {
+        Skip(format!(
+            "the DOM source `{}` is not a URL input the browser phase can place a payload in",
+            finding.source.expr
+        ))
+    })?;
+    let sink = browser_sink(&finding.sink.api).ok_or_else(|| {
+        Skip(format!(
+            "the sink `{}` is not an HTML or navigation sink the browser phase recognizes",
+            finding.sink.api
+        ))
+    })?;
+    Ok(BrowserProbe {
+        file: finding
+            .sink
+            .file
+            .clone()
+            .unwrap_or_else(|| finding.file.clone()),
+        vector,
+        sink,
+    })
+}
+
+/// The URL part a DOM source reads from.
+fn url_vector(expr: &str) -> Option<UrlVector> {
+    if expr.contains("location.search") {
+        Some(UrlVector::Search)
+    } else if expr.contains("location.hash") {
+        Some(UrlVector::Hash)
+    } else if expr.contains("document.referrer") {
+        Some(UrlVector::Referrer)
+    } else if expr.contains("location.href") || expr.contains("location") || expr.contains("URL") {
+        Some(UrlVector::Href)
+    } else {
+        None
+    }
+}
+
+/// Classifies a browser sink as writing HTML or navigating.
+fn browser_sink(api: &str) -> Option<BrowserSink> {
+    let api = api.trim_end_matches(" =").trim();
+    let last = api.rsplit('.').next().unwrap_or(api);
+    const HTML: [&str; 6] = [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "write",
+        "writeln",
+        "html",
+    ];
+    const NAV: [&str; 5] = ["location", "href", "open", "assign", "replace"];
+    if HTML.contains(&last) {
+        Some(BrowserSink::Html)
+    } else if NAV.contains(&last) {
+        Some(BrowserSink::Navigation)
+    } else {
+        None
+    }
+}
+
 /// The HTTP method to send. `Any` (a catch-all route) is sent as GET, or POST when the payload
 /// is in the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +449,72 @@ mod tests {
             key: "k".to_owned(),
             fingerprint: "f".to_owned(),
         }
+    }
+
+    /// A DOM finding: a browser-side source and sink, in a static front-end file.
+    fn dom_finding(expr: &str, sink_api: &str, file: &str) -> Finding {
+        let mut f = finding(VulnClass::Xss, Auth::NoneDetected, None, expr);
+        f.source.kind = "dom";
+        f.file = file.to_owned();
+        f.sink.api = sink_api.to_owned();
+        f
+    }
+
+    #[test]
+    fn a_dom_search_into_inner_html_is_a_browser_html_probe() {
+        let plan = plan(&dom_finding(
+            "location.search",
+            ".innerHTML =",
+            "web/pages.js",
+        ))
+        .unwrap();
+        let Plan::Browser(probe) = plan else {
+            panic!("expected a browser probe, got {plan:?}");
+        };
+        assert_eq!(probe.vector, UrlVector::Search);
+        assert_eq!(probe.sink, BrowserSink::Html);
+        assert_eq!(probe.file, "web/pages.js");
+    }
+
+    #[test]
+    fn a_location_assignment_is_a_navigation_probe() {
+        let plan = plan(&dom_finding(
+            "location.search",
+            "window.location =",
+            "app.js",
+        ))
+        .unwrap();
+        let Plan::Browser(probe) = plan else {
+            panic!("expected a browser probe");
+        };
+        assert_eq!(probe.sink, BrowserSink::Navigation);
+    }
+
+    #[test]
+    fn dom_vectors_and_sinks_are_classified() {
+        assert_eq!(url_vector("location.hash.slice(1)"), Some(UrlVector::Hash));
+        assert_eq!(
+            url_vector("new URL(location.href).searchParams"),
+            Some(UrlVector::Href)
+        );
+        assert_eq!(url_vector("document.referrer"), Some(UrlVector::Referrer));
+        assert_eq!(url_vector("req.query.name"), None);
+        assert_eq!(browser_sink("el.innerHTML ="), Some(BrowserSink::Html));
+        assert_eq!(browser_sink("insertAdjacentHTML"), Some(BrowserSink::Html));
+        assert_eq!(
+            browser_sink("location.href ="),
+            Some(BrowserSink::Navigation)
+        );
+        assert_eq!(browser_sink("fs.readFile"), None);
+    }
+
+    #[test]
+    fn a_non_url_dom_source_is_skipped_with_a_reason() {
+        // A postMessage source is DOM but not a URL input: skipped, not driven.
+        let mut f = dom_finding("event.data.html", ".innerHTML =", "w.js");
+        f.source.kind = "dom";
+        let err = plan(&f).unwrap_err();
+        assert!(err.0.contains("not a URL input"), "{}", err.0);
     }
 
     #[test]

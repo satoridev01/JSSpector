@@ -221,12 +221,7 @@ impl Session {
     }
 
     fn exec(&self, container: &str, cmd: &[&str]) -> Result<Output, String> {
-        let mut args = vec!["exec", container];
-        args.extend_from_slice(cmd);
-        Command::new("docker")
-            .args(&args)
-            .output()
-            .map_err(|e| e.to_string())
+        exec_in(container, cmd)
     }
 
     fn container_running(&self, name: &str) -> bool {
@@ -236,15 +231,7 @@ impl Session {
     }
 
     fn tail_logs(&self, name: &str) -> String {
-        Command::new("docker")
-            .args(["logs", "--tail", "50", name])
-            .output()
-            .map(|o| {
-                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-                s.push_str(&String::from_utf8_lossy(&o.stderr));
-                s
-            })
-            .unwrap_or_default()
+        tail_logs(name)
     }
 
     /// Removes the app, the marker service, the network and the image. Safe to call twice.
@@ -280,11 +267,14 @@ fn build_image(
         .to_str()
         .ok_or_else(|| "the repository path is not valid UTF-8".to_owned())?;
     let dockerfile = dockerfile(canary, start_command, port);
+    build_from_dockerfile(&dockerfile, tag, context)
+}
+
+/// Runs `docker build` with the Dockerfile on stdin and the context directory given, returning a
+/// trimmed error log on failure.
+fn build_from_dockerfile(dockerfile: &str, tag: &str, context: &str) -> Result<(), String> {
     let mut child = Command::new("docker")
-        .args([
-            "build", "-t", tag, "-f", "-", // the Dockerfile comes on stdin
-            context,
-        ])
+        .args(["build", "-t", tag, "-f", "-", context])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -308,6 +298,29 @@ fn build_image(
         ));
     }
     Ok(())
+}
+
+/// `docker exec <container> <cmd...>`, capturing output.
+fn exec_in(container: &str, cmd: &[&str]) -> Result<Output, String> {
+    let mut args = vec!["exec", container];
+    args.extend_from_slice(cmd);
+    Command::new("docker")
+        .args(&args)
+        .output()
+        .map_err(|e| e.to_string())
+}
+
+/// The last 50 lines of a container's logs (stdout and stderr), for probing and diagnostics.
+fn tail_logs(name: &str) -> String {
+    Command::new("docker")
+        .args(["logs", "--tail", "50", name])
+        .output()
+        .map(|o| {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s
+        })
+        .unwrap_or_default()
 }
 
 /// The generated Dockerfile. `npm ci` when a lockfile is present (reproducible), else `npm
@@ -466,6 +479,337 @@ const http = require('http');
 http.createServer((req,res)=>{console.log('MARKER '+req.url);res.end('ok');}).listen(80,'0.0.0.0');
 "#;
 
+// ----- browser phase (DOM-source XSS and client-side redirects) ---------------------------------
+
+/// The browser-phase base image: Playwright's, which carries Node, Chromium and its system
+/// dependencies. Pinned.
+const BROWSER_IMAGE: &str = "mcr.microsoft.com/playwright:v1.49.1-jammy";
+
+/// A built browser-phase image, a private network, a marker service, a static file server for the
+/// repo, and a browser container — one per `--verify` run that has DOM findings.
+pub struct BrowserSession {
+    tag: String,
+    network: String,
+    app: String,
+    marker: String,
+    browser: String,
+    canary: Canary,
+    port: u16,
+    nonce: u32,
+    root: std::path::PathBuf,
+    torn_down: bool,
+}
+
+impl BrowserSession {
+    /// Builds the browser-phase image from `root` and starts the marker service, the static file
+    /// server and the browser, or returns why it could not.
+    pub fn start(root: &std::path::Path) -> Result<Self, String> {
+        let id = run_id();
+        let canary = Canary::new(format!("{id}{}", short_rand()));
+        let session = Self {
+            tag: format!("jsspector-verify-browser:{id}"),
+            network: format!("jss-verifyb-net-{id}"),
+            app: format!("jss-verifyb-app-{id}"),
+            marker: format!("jss-verifyb-marker-{id}"),
+            browser: format!("jss-verifyb-br-{id}"),
+            canary,
+            port: 3000,
+            nonce: 0,
+            root: root.to_path_buf(),
+            torn_down: false,
+        };
+        build_browser_image(root, &session.tag, session.port)?;
+        docker(&["network", "create", "--internal", &session.network])
+            .map_err(|e| format!("could not create the private network: {e}"))?;
+        if let Err(err) = session.boot() {
+            let mut session = session;
+            session.teardown();
+            return Err(err);
+        }
+        Ok(session)
+    }
+
+    fn boot(&self) -> Result<(), String> {
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &self.marker,
+            "--network",
+            &self.network,
+            "--network-alias",
+            "jss-marker",
+            "--entrypoint",
+            "node",
+            &self.tag,
+            "/jss-marker.js",
+        ])
+        .map_err(|e| format!("could not start the marker service: {e}"))?;
+        // The static file server for the repo, reachable as `jss-app`.
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &self.app,
+            "--network",
+            &self.network,
+            "--network-alias",
+            "jss-app",
+            "--entrypoint",
+            "node",
+            &self.tag,
+            "/jss-serve.js",
+            "/app",
+            &self.port.to_string(),
+        ])
+        .map_err(|e| format!("could not start the static server: {e}"))?;
+        // The browser container, kept alive so each page load is a quick `docker exec`.
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &self.browser,
+            "--network",
+            &self.network,
+            "--security-opt",
+            "no-new-privileges",
+            "--shm-size",
+            "512m",
+            "--memory",
+            "2g",
+            "--entrypoint",
+            "sleep",
+            &self.tag,
+            "infinity",
+        ])
+        .map_err(|e| format!("could not start the browser container: {e}"))?;
+        self.wait_until_serving()
+    }
+
+    fn wait_until_serving(&self) -> Result<(), String> {
+        for _ in 0..30 {
+            let probe = exec_in(
+                &self.app,
+                &[
+                    "node",
+                    "-e",
+                    &format!(
+                        "require('net').connect({{port:{},host:'127.0.0.1'}}).on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))",
+                        self.port
+                    ),
+                ],
+            );
+            if probe.map(|o| o.status.success()).unwrap_or(false) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Err("the static server did not start within 30s".to_owned())
+    }
+
+    /// Loads the app in the browser with the probe's canary and reports whether it executed.
+    pub fn exercise(&mut self, probe: &super::plan::BrowserProbe) -> Outcome {
+        self.nonce += 1;
+        let page = match self.find_page(&probe.file) {
+            Ok(page) => page,
+            Err(reason) => return Outcome::Skipped { reason },
+        };
+        let attempts = super::browser::browser_attempts(probe, &page, &self.canary, self.nonce);
+        let referrer = super::browser::via_referrer(probe)
+            .then(|| super::browser::referrer_payload(probe, &self.canary, self.nonce));
+        let tried = attempts.len();
+        for attempt in &attempts {
+            let url = format!("http://jss-app:{}{}", self.port, attempt.url);
+            let mut cmd = vec!["node".to_owned(), "/jss-browser.js".to_owned(), url.clone()];
+            if let Some((payload, _)) = &referrer {
+                cmd.push(payload.clone());
+            }
+            let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            let _ = exec_in(&self.browser, &args);
+            let hit = referrer
+                .as_ref()
+                .map_or(attempt.token.as_str(), |(_, t)| t.as_str());
+            if tail_logs(&self.marker).contains(hit) {
+                return Outcome::Verified {
+                    how: format!("browser load {}", attempt.url),
+                };
+            }
+        }
+        Outcome::NotReproduced { tried }
+    }
+
+    /// The served path of an HTML document that loads the vulnerable script with a plain
+    /// `<script src>` (so a static load reaches its code), or the script's own page when it is
+    /// itself HTML. An `Err` gives why the browser phase cannot render it directly — commonly an
+    /// ES module behind an SPA entry, which v1 does not drive.
+    fn find_page(&self, script: &str) -> Result<String, String> {
+        let script_path = std::path::Path::new(script);
+        if matches!(
+            script_path.extension().and_then(|e| e.to_str()),
+            Some("html" | "htm")
+        ) {
+            return Ok(format!("/{}", script.trim_start_matches('/')));
+        }
+        let base = script_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("`{script}` has no file name"))?;
+        let mut best: Option<(usize, String)> = None;
+        for html in html_files(&self.root) {
+            let Ok(text) = std::fs::read_to_string(&html) else {
+                continue;
+            };
+            if !html_loads_script(&text, base) {
+                continue;
+            }
+            let rel = html
+                .strip_prefix(&self.root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let same_dir = usize::from(html.parent() == self.root.join(script_path).parent());
+            if best.as_ref().is_none_or(|(s, _)| same_dir > *s) {
+                best = Some((same_dir, format!("/{}", rel.trim_start_matches('/'))));
+            }
+        }
+        best.map(|(_, page)| page).ok_or_else(|| {
+            format!(
+                "no HTML page loads `{base}` with a <script> tag (it may be bundled or an ES \
+                 module behind the app entry; verify v1 drives directly-loadable pages)"
+            )
+        })
+    }
+
+    pub fn teardown(&mut self) {
+        if self.torn_down {
+            return;
+        }
+        self.torn_down = true;
+        let _ = docker(&["rm", "-f", &self.app]);
+        let _ = docker(&["rm", "-f", &self.marker]);
+        let _ = docker(&["rm", "-f", &self.browser]);
+        let _ = docker(&["network", "rm", &self.network]);
+        let _ = docker(&["rmi", "-f", &self.tag]);
+    }
+}
+
+impl Drop for BrowserSession {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+/// Builds the browser-phase image: the repo copied in, plus the static server, marker and browser
+/// scripts. No `npm install` — the front end is served as it is in the repo.
+fn build_browser_image(root: &std::path::Path, tag: &str, _port: u16) -> Result<(), String> {
+    let context = root
+        .to_str()
+        .ok_or_else(|| "the repository path is not valid UTF-8".to_owned())?;
+    // The Playwright image ships the browsers but not the `playwright` npm package; install the
+    // matching version (browsers already present, so skip their download) into a fixed path and
+    // point NODE_PATH at it. This is the only step that needs the network.
+    let dockerfile = format!(
+        "FROM {BROWSER_IMAGE}\n\
+         WORKDIR /app\n\
+         COPY . /app\n\
+         RUN mkdir -p /opt/pw && cd /opt/pw && npm init -y >/dev/null 2>&1 && \
+             PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install playwright@1.49.1 --no-audit --no-fund\n\
+         RUN echo {} | base64 -d > /jss-serve.js\n\
+         RUN echo {} | base64 -d > /jss-marker.js\n\
+         RUN echo {} | base64 -d > /jss-browser.js\n\
+         ENV NODE_PATH=/opt/pw/node_modules\n",
+        base64(SERVE_JS.as_bytes()),
+        base64(MARKER_JS.as_bytes()),
+        base64(BROWSER_JS.as_bytes()),
+    );
+    build_from_dockerfile(&dockerfile, tag, context)
+}
+
+/// Whether an HTML document loads `base` with a `<script src>` tag (so a static load runs its
+/// code): an occurrence of the file name preceded, within the same tag, by both `<script` and
+/// `src`.
+fn html_loads_script(text: &str, base: &str) -> bool {
+    text.match_indices(base).any(|(idx, _)| {
+        let start = idx.saturating_sub(300);
+        let before = text.get(start..idx).unwrap_or("").to_ascii_lowercase();
+        // `<script` must be the nearest opening tag, and a `src` attribute between it and here.
+        match before.rfind("<script") {
+            Some(tag) => before.get(tag..).unwrap_or("").contains("src"),
+            None => false,
+        }
+    })
+}
+
+/// The list of `.html` files in a repo, skipping `node_modules` and dot-directories.
+fn html_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+        if depth > 12 || out.len() > 5000 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, out, depth + 1);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("html" | "htm")
+            ) {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out, 0);
+    out
+}
+
+/// A static file server for the repo, dependency-free (core `http`).
+const SERVE_JS: &str = r#"
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const root = path.resolve(process.argv[2] || '/app');
+const port = Number(process.argv[3] || 3000);
+const types = {'.html':'text/html','.htm':'text/html','.js':'text/javascript','.mjs':'text/javascript','.cjs':'text/javascript','.css':'text/css','.json':'application/json','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.webp':'image/webp','.ico':'image/x-icon','.map':'application/json','.woff2':'font/woff2','.woff':'font/woff','.ttf':'font/ttf'};
+http.createServer((req, res) => {
+  try {
+    let p = decodeURIComponent(req.url.split('?')[0].split('#')[0]);
+    let f = path.join(root, p);
+    if (!f.startsWith(root)) { res.writeHead(403); return res.end('x'); }
+    let st; try { st = fs.statSync(f); } catch (e) { res.writeHead(404); return res.end('x'); }
+    if (st.isDirectory()) { f = path.join(f, 'index.html'); try { st = fs.statSync(f); } catch (e) { res.writeHead(404); return res.end('x'); } }
+    res.writeHead(200, { 'Content-Type': types[path.extname(f).toLowerCase()] || 'application/octet-stream' });
+    fs.createReadStream(f).pipe(res);
+  } catch (e) { res.writeHead(500); res.end('x'); }
+}).listen(port, '0.0.0.0');
+"#;
+
+/// Loads a URL in headless Chromium and lets any canary run. A canary that executes calls the
+/// marker service; this script makes no assertion itself.
+const BROWSER_JS: &str = r#"
+const { chromium } = require('playwright');
+(async () => {
+  const url = process.argv[2];
+  const referer = process.argv[3];
+  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  const context = await browser.newContext(referer ? { extraHTTPHeaders: { Referer: referer } } : {});
+  const page = await context.newPage();
+  page.on('dialog', d => { try { d.dismiss(); } catch (e) {} });
+  page.on('pageerror', () => {});
+  try { await page.goto(url, { waitUntil: 'load', timeout: 8000 }); } catch (e) {}
+  try { await page.waitForTimeout(1200); } catch (e) {}
+  try { await browser.close(); } catch (e) {}
+  process.exit(0);
+})();
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +953,76 @@ http.createServer((req, res) => {
         assert!(
             matches!(forged, Outcome::Verified { .. }),
             "the SSRF should verify, got {forged:?}"
+        );
+    }
+
+    #[test]
+    fn html_loads_script_wants_a_script_tag_not_a_module_mention() {
+        assert!(html_loads_script(
+            r#"<script src="app.js"></script>"#,
+            "app.js"
+        ));
+        assert!(html_loads_script(
+            r#"<script type="module" src="/y/app.js?v=3"></script>"#,
+            "app.js"
+        ));
+        // A plain mention, or an import in inline JS, is not a <script src>.
+        assert!(!html_loads_script(r#"<a href="app.js">x</a>"#, "app.js"));
+        assert!(!html_loads_script(
+            r#"<script>import './app.js'</script>"#,
+            "app.js"
+        ));
+    }
+
+    /// Confirms a reflected DOM XSS in a headless browser and clears a page that escapes. Needs
+    /// Docker *and* `JSS_VERIFY_BROWSER_TEST=1` (the Playwright image is large), so it is off by
+    /// default; it skips cleanly otherwise.
+    #[test]
+    fn browser_phase_verifies_a_reflected_dom_xss() {
+        use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
+
+        if !available() || std::env::var_os("JSS_VERIFY_BROWSER_TEST").is_none() {
+            eprintln!("browser e2e: skipped (needs Docker + JSS_VERIFY_BROWSER_TEST=1)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><div id=out></div><script src=\"app.js\"></script>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app.js"),
+            "document.getElementById('out').innerHTML='<b>'+new URLSearchParams(location.search).get('q')+'</b>';",
+        )
+        .unwrap();
+        // A page that escapes its input (textContent): the canary must not run.
+        std::fs::write(
+            dir.path().join("safe.html"),
+            "<!doctype html><div id=o></div><script>document.getElementById('o').textContent=new URLSearchParams(location.search).get('q');</script>",
+        )
+        .unwrap();
+
+        let mut session = BrowserSession::start(dir.path()).expect("browser session should start");
+        let vulnerable = session.exercise(&BrowserProbe {
+            file: "app.js".to_owned(),
+            vector: UrlVector::Search,
+            sink: BrowserSink::Html,
+        });
+        let safe = session.exercise(&BrowserProbe {
+            file: "safe.html".to_owned(),
+            vector: UrlVector::Search,
+            sink: BrowserSink::Html,
+        });
+        session.teardown();
+
+        assert!(
+            matches!(vulnerable, Outcome::Verified { .. }),
+            "the reflected DOM XSS should verify, got {vulnerable:?}"
+        );
+        assert!(
+            matches!(safe, Outcome::NotReproduced { .. }),
+            "the escaping page should not reproduce, got {safe:?}"
         );
     }
 }

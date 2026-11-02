@@ -23,7 +23,9 @@ use oxc_ast::ast::{
     ObjectPropertyKind, Program, PropertyKey, Statement, UnaryOperator, VariableDeclaration,
     VariableDeclarationKind,
 };
-use oxc_ast::ast::{BinaryOperator, LogicalOperator, ObjectExpression, SimpleAssignmentTarget};
+use oxc_ast::ast::{
+    AssignmentOperator, BinaryOperator, LogicalOperator, ObjectExpression, SimpleAssignmentTarget,
+};
 use oxc_span::{GetSpan, Span};
 
 use models::{ArgRule, Model, has};
@@ -469,6 +471,9 @@ pub fn scan_file_program(
         depth: 0,
         summarize: true,
         summaries: BTreeMap::new(),
+        scope_stack: Vec::new(),
+        nested_fns: BTreeMap::new(),
+        declaring: false,
     };
     // Summary passes until a pass learns nothing new: each pass sees the previous one's
     // summaries, so a helper declared before the helper it calls gets its summary one pass
@@ -653,6 +658,10 @@ pub struct Summary {
     /// For a [`PREDICATE`] that checks containment (`c.startsWith(p + path.sep)`): the parameter
     /// holding the base; the check confines only when the caller's base is not the attacker's.
     pub base_param: Option<usize>,
+    /// The function a nested function is declared in (by the start of its parameter list;
+    /// `None` at the top level and for functions no declaration names): a call by name takes
+    /// the summaries of the closest declaration it can see, not of every function so named.
+    pub scope: Option<u32>,
 }
 
 /// A function of a table (`const _mounts = { admin: require('./admin') }`, `_mounts.main = fn`):
@@ -724,6 +733,10 @@ struct Env {
     /// Relative paths (`const rel = path.relative(base, file)`): rel -> (the base's access
     /// paths, `file`). `rel.startsWith('..')` false puts `file` inside the base.
     relative_of: BTreeMap<String, (Vec<String>, String)>,
+    /// Copies of a URL's host (`const host = url.hostname`): name -> that field's access path.
+    host_alias: BTreeMap<String, String>,
+    /// URLs parsed from a string alone (`const url = new URL(s)`): url -> `s`.
+    url_parsed: BTreeMap<String, String>,
     /// Those nodes' tags, when the factory named one (`document.createElement('a')`).
     node_tags: BTreeMap<String, String>,
     /// Argument arrays that already hold `"--"`: what is pushed after it is positional.
@@ -734,6 +747,9 @@ struct Env {
     /// Results of a lookup by equality in a list the server holds (`const doc =
     /// docs.find((d) => d.filename === name)`): result -> the value looked up (`name`).
     found_by: BTreeMap<String, String>,
+    /// For a function a declaration names inside another function (`function send() {}`,
+    /// `const send = () => {}`): that function ([`Summary::scope`]).
+    def_scope: Option<u32>,
     /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
     /// bindings, inner functions): writes to any other name are writes to its parent's.
     locals: BTreeSet<String>,
@@ -931,6 +947,16 @@ impl Env {
             }
             // `HOSTS.has(url.hostname)` on `url = new URL(x)`: the URL goes to an allowed host.
             let ssrf_bit = class_bit(VulnClass::Ssrf);
+            if classes & ssrf_bit != 0 {
+                // `host = url.hostname; HOSTS.has(host)`: a check of that URL's host.
+                if let Some(field) = self.host_alias.get(&key) {
+                    more.push((field.clone(), guards::Fact::Clean(ssrf_bit)));
+                }
+                // `url = new URL(s)` going to an allowed host: so does `s`, parsed the same way.
+                if let Some(from) = self.url_parsed.get(&key) {
+                    more.push((from.clone(), guards::Fact::Clean(ssrf_bit)));
+                }
+            }
             if classes & ssrf_bit != 0
                 && let Some((object, field)) = key.rsplit_once('.')
                 && has(&m().url_host_fields, field)
@@ -1007,9 +1033,12 @@ impl Env {
             derived: BTreeMap::new(),
             same_file: BTreeMap::new(),
             relative_of: BTreeMap::new(),
+            host_alias: BTreeMap::new(),
+            url_parsed: BTreeMap::new(),
             options_ended: BTreeSet::new(),
             encoded: BTreeSet::new(),
             found_by: BTreeMap::new(),
+            def_scope: None,
             locals: BTreeSet::new(),
             branch: 0,
             owner: function.clone(),
@@ -1044,9 +1073,12 @@ impl Env {
             derived: self.derived.clone(),
             same_file: self.same_file.clone(),
             relative_of: self.relative_of.clone(),
+            host_alias: self.host_alias.clone(),
+            url_parsed: self.url_parsed.clone(),
             options_ended: self.options_ended.clone(),
             encoded: self.encoded.clone(),
             found_by: self.found_by.clone(),
+            def_scope: self.def_scope,
             locals: BTreeSet::new(),
             branch: 0,
             owner: if function == "<anonymous>" {
@@ -1068,6 +1100,9 @@ impl Env {
         self.same_file.retain(|_, file| file != name);
         self.relative_of
             .retain(|_, (bases, file)| file != name && !bases.iter().any(|b| b == name));
+        self.host_alias
+            .retain(|_, field| field.split('.').next() != Some(name));
+        self.url_parsed.retain(|_, from| from != name);
         match taint {
             Some(origin) => {
                 self.vars.insert(name.to_owned(), origin);
@@ -1185,8 +1220,8 @@ struct Walker<'e> {
     ctor_params: BTreeMap<u32, String>,
     /// Summary pass: the function each parameter origin (by span start) belongs to, so a sink
     /// reached inside a callback or a nested function is summarized for the function whose
-    /// parameter it is.
-    param_owner: BTreeMap<u32, String>,
+    /// parameter it is, with the function that one is declared in ([`Summary::scope`]).
+    param_owner: BTreeMap<u32, (String, Option<u32>)>,
     /// Summary pass: span starts of rest parameters' origins (`...paths`): their summaries take
     /// every argument from their index on.
     rest_params: BTreeSet<u32>,
@@ -1257,6 +1292,12 @@ struct Walker<'e> {
     /// Summary pass: parameters of named functions are tainted, and findings become summaries.
     summarize: bool,
     summaries: BTreeMap<String, Vec<Summary>>,
+    /// The functions being walked, outermost first, each by the start of its parameter list.
+    scope_stack: Vec<u32>,
+    /// Functions declared inside another function: name -> the functions declaring one.
+    nested_fns: BTreeMap<String, BTreeSet<u32>>,
+    /// Set right before walking a function a declaration names in the current function.
+    declaring: bool,
 }
 
 fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
@@ -2297,6 +2338,49 @@ fn literal_path(expr: &Expression<'_>) -> Option<String> {
 }
 
 /// The name a middleware argument goes by: `requireLogin`, `auth.required`, `passport.authenticate('jwt')`.
+/// `name = url.hostname` (a copy of a URL's host) and `name = new URL(s)` (a URL parsed from
+/// `s` alone): what a check of the URL's host says about the names it came from.
+fn note_url_parts(name: &str, init: &Expression<'_>, env: &mut Env) {
+    env.host_alias.remove(name);
+    env.url_parsed.remove(name);
+    match init.get_inner_expression() {
+        Expression::StaticMemberExpression(member)
+            if has(&m().url_host_fields, member.property.name.as_str()) =>
+        {
+            if let Some(object) = guards::path_key(&member.object) {
+                env.host_alias.insert(
+                    name.to_owned(),
+                    format!("{object}.{}", member.property.name.as_str()),
+                );
+            }
+        }
+        Expression::NewExpression(n)
+            if n.arguments.len() == 1
+                && callee_name(&n.callee).is_some_and(|c| has(&m().url_classes, &c)) =>
+        {
+            if let Some(Expression::Identifier(from)) = n
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .map(Expression::get_inner_expression)
+                && from.name.as_str() != name
+            {
+                env.url_parsed
+                    .insert(name.to_owned(), from.name.as_str().to_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An arrow function or a function expression (in parentheses or under a cast too).
+fn is_function_value(expr: &Expression<'_>) -> bool {
+    matches!(
+        expr.get_inner_expression(),
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+    )
+}
+
 fn callee_name(expr: &Expression<'_>) -> Option<String> {
     callee_name_within(expr, 32)
 }
@@ -2552,7 +2636,14 @@ impl Walker<'_> {
                         let class = class.to_owned();
                         self.es5_constructor(f, env, &class);
                     }
-                    None => self.function(f, env, name, Role::Plain),
+                    None => {
+                        if let Some(name) = &name {
+                            self.declare_function(name, None);
+                        }
+                        self.declaring = name.is_some();
+                        self.function(f, env, name, Role::Plain);
+                        self.declaring = false;
+                    }
                 }
             }
             Statement::ClassDeclaration(c) => self.class(c, env),
@@ -3450,6 +3541,7 @@ impl Walker<'_> {
                         env.same_file.remove(name);
                     }
                 }
+                note_url_parts(name, init, env);
                 // `const iframe = document.createElement('iframe')`: a node, not markup.
                 if creates_node(init) {
                     env.nodes.insert(name.clone());
@@ -3515,7 +3607,13 @@ impl Walker<'_> {
             } else {
                 self.chain_receiver.take()
             };
+            // `const send = (m) => ...`: a function this one declares.
+            if let Some(name) = name_hint.as_deref().filter(|_| is_function_value(init)) {
+                self.declare_function(name, None);
+                self.declaring = true;
+            }
             let taint = self.expr_named(init, env, name_hint.clone());
+            self.declaring = false;
             self.chain_receiver = saved_receiver;
             // `const db = getDBClient(cfg)`, `const reg = await Registry.getInstance()`: an
             // instance of what the function returns, when nothing above typed it by name.
@@ -4045,6 +4143,7 @@ impl Walker<'_> {
         };
         let outer = self.fn_returns.take();
         let mut env = self.enter_function(&f.params, parent, name, role);
+        self.declare_nested(&body.statements, f.params.span.start);
         if self.enter() {
             self.statements(&body.statements, &mut env);
             self.record_validated(&body.statements, f.params.span, &env);
@@ -4059,8 +4158,62 @@ impl Walker<'_> {
             }
             self.leave();
         }
+        self.scope_stack.pop();
         self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
         self.closure_writes = closure_writes(&env, parent);
+    }
+
+    /// Records the functions a function body declares by name (`function send() {}`, `const
+    /// send = () => {}`) before walking it: a call above a declaration sees it too.
+    fn declare_nested(&mut self, body: &[Statement<'_>], scope: u32) {
+        for statement in body {
+            match statement {
+                Statement::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        self.declare_function(id.name.as_str(), Some(scope));
+                    }
+                }
+                Statement::VariableDeclaration(d) => {
+                    for declarator in &d.declarations {
+                        if let (BindingPattern::BindingIdentifier(id), Some(init)) =
+                            (&declarator.id, &declarator.init)
+                            && is_function_value(init)
+                        {
+                            self.declare_function(id.name.as_str(), Some(scope));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A function declaration named `name` in `scope` (the current function when `None`;
+    /// nothing at the top level, where every call sees it anyway).
+    fn declare_function(&mut self, name: &str, scope: Option<u32>) {
+        if let Some(scope) = scope.or_else(|| self.scope_stack.last().copied()) {
+            self.nested_fns
+                .entry(name.to_owned())
+                .or_default()
+                .insert(scope);
+        }
+    }
+
+    /// This file's summaries of the function a call by `name` reaches: the closest function so
+    /// named declared in a function the call is in, else the top-level ones. Same-named
+    /// closures of different functions (`send` in one, `send` in another) stay apart.
+    fn visible_summaries(&self, name: &str) -> Vec<Summary> {
+        let Some(list) = self.summaries.get(name) else {
+            return Vec::new();
+        };
+        let scope = self.nested_fns.get(name).and_then(|scopes| {
+            self.scope_stack
+                .iter()
+                .rev()
+                .find(|scope| scopes.contains(scope))
+                .copied()
+        });
+        list.iter().filter(|s| s.scope == scope).cloned().collect()
     }
 
     fn enter_function(
@@ -4071,7 +4224,18 @@ impl Walker<'_> {
         role: Role,
     ) -> Env {
         let name = name.unwrap_or_else(|| "<anonymous>".to_owned());
+        let declared = std::mem::take(&mut self.declaring);
         let mut env = parent.closure(name);
+        // A function a declaration names inside another is that function's: a call by its name
+        // sees it only from there (see `visible_summaries`).
+        env.def_scope = if declared {
+            self.scope_stack.last().copied()
+        } else if env.function == "<anonymous>" {
+            parent.def_scope
+        } else {
+            None
+        };
+        self.scope_stack.push(params.span.start);
         env.auth = env.auth.max(std::mem::take(&mut self.pending_auth));
         let names: Vec<Option<&str>> = params
             .items
@@ -4189,14 +4353,14 @@ impl Walker<'_> {
                         };
                         self.field_of.insert(property.span.start, key);
                         self.param_owner
-                            .insert(property.span.start, env.function.clone());
+                            .insert(property.span.start, (env.function.clone(), env.def_scope));
                         let mut origin = Origin::source("param", property.span);
                         origin.param = Some(index);
                         self.bind_pattern(&property.value, Some(origin), None, &mut env);
                     }
                     if let Some(rest) = &object.rest {
                         self.param_owner
-                            .insert(param.span.start, env.function.clone());
+                            .insert(param.span.start, (env.function.clone(), env.def_scope));
                         let mut origin = Origin::source("param", param.span);
                         origin.param = Some(index);
                         self.bind_pattern(&rest.argument, Some(origin), None, &mut env);
@@ -4204,7 +4368,7 @@ impl Walker<'_> {
                     continue;
                 }
                 self.param_owner
-                    .insert(param.span.start, env.function.clone());
+                    .insert(param.span.start, (env.function.clone(), env.def_scope));
                 let origin = Origin {
                     kind: "param",
                     span: param.span,
@@ -4226,7 +4390,8 @@ impl Walker<'_> {
             // `function run(cmd, ...args)`: every argument from the rest's index on.
             if let Some(rest) = &params.rest {
                 let span = rest.span;
-                self.param_owner.insert(span.start, env.function.clone());
+                self.param_owner
+                    .insert(span.start, (env.function.clone(), env.def_scope));
                 self.rest_params.insert(span.start);
                 let mut origin = Origin::source("param", span);
                 origin.param = Some(params.items.len());
@@ -4393,6 +4558,9 @@ impl Walker<'_> {
     ) {
         let outer = self.fn_returns.take();
         let mut env = self.enter_function(params, parent, name, role);
+        if let ArrowFunctionBody::FunctionBody(body) = body {
+            self.declare_nested(&body.statements, params.span.start);
+        }
         if self.enter() {
             match body {
                 ArrowFunctionBody::FunctionBody(body) => {
@@ -4413,6 +4581,7 @@ impl Walker<'_> {
             }
             self.leave();
         }
+        self.scope_stack.pop();
         self.callback_returns = std::mem::replace(&mut self.fn_returns, outer);
         self.closure_writes = closure_writes(&env, parent);
     }
@@ -4503,7 +4672,10 @@ impl Walker<'_> {
                 continue;
             }
             let list = self.summaries.entry(env.function.clone()).or_default();
-            if list.iter().any(|s| s.api == PREDICATE && s.param == index) {
+            if list
+                .iter()
+                .any(|s| s.api == PREDICATE && s.param == index && s.scope == env.def_scope)
+            {
                 continue;
             }
             let span = returned.span();
@@ -4526,6 +4698,7 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: None,
                 base_param,
+                scope: env.def_scope,
             });
         }
     }
@@ -4568,7 +4741,7 @@ impl Walker<'_> {
                             })
                             .unwrap_or_default()
                     }
-                    None => self.summaries.get(name).cloned().unwrap_or_default(),
+                    None => self.visible_summaries(name),
                 };
                 for s in summaries.iter().filter(|s| s.api == PREDICATE) {
                     let Some(key) = call
@@ -4620,10 +4793,10 @@ impl Walker<'_> {
             if !param.is_empty()
                 && env.scalars.contains(param)
                 && !env.clean.contains(param)
-                && !self
-                    .summaries
-                    .get(&env.function)
-                    .is_some_and(|list| list.iter().any(|s| s.api == SCALARS && s.param == index))
+                && !self.summaries.get(&env.function).is_some_and(|list| {
+                    list.iter()
+                        .any(|s| s.api == SCALARS && s.param == index && s.scope == env.def_scope)
+                })
             {
                 self.summaries
                     .entry(env.function.clone())
@@ -4645,6 +4818,7 @@ impl Walker<'_> {
                         rest: false,
                         instance_of: None,
                         base_param: None,
+                        scope: env.def_scope,
                     });
             }
             // The classes it validates the parameter for (`at_sink.escaped`).
@@ -4657,7 +4831,10 @@ impl Walker<'_> {
                 continue;
             }
             let list = self.summaries.entry(env.function.clone()).or_default();
-            if list.iter().any(|s| s.api == VALIDATES && s.param == index) {
+            if list
+                .iter()
+                .any(|s| s.api == VALIDATES && s.param == index && s.scope == env.def_scope)
+            {
                 continue;
             }
             let mut at_sink = Origin::source("param", span);
@@ -4679,6 +4856,7 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: None,
                 base_param: None,
+                scope: env.def_scope,
             });
         }
     }
@@ -4714,7 +4892,11 @@ impl Walker<'_> {
             let field = self.field_of.get(&at).cloned();
             let list = self.summaries.entry(env.function.clone()).or_default();
             if list.iter().any(|s| {
-                s.api == RETURNS && s.param == param && s.field == field && s.out_field == out_field
+                s.api == RETURNS
+                    && s.param == param
+                    && s.field == field
+                    && s.out_field == out_field
+                    && s.scope == env.def_scope
             }) {
                 continue;
             }
@@ -4741,6 +4923,7 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: None,
                 base_param: None,
+                scope: env.def_scope,
             });
         }
     }
@@ -4793,9 +4976,9 @@ impl Walker<'_> {
         }
         let list = self.summaries.entry(env.function.clone()).or_default();
         for class in classes {
-            let mut known = list
-                .iter()
-                .filter(|s| s.api == INSTANCE && s.out_field == out_field);
+            let mut known = list.iter().filter(|s| {
+                s.api == INSTANCE && s.out_field == out_field && s.scope == env.def_scope
+            });
             let count = known.clone().count();
             if count >= MAX_RETURNED_CLASSES
                 || known.any(|s| s.instance_of.as_ref() == Some(&class))
@@ -4819,6 +5002,7 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: Some(class),
                 base_param: None,
+                scope: env.def_scope,
             });
         }
     }
@@ -5221,6 +5405,11 @@ impl Walker<'_> {
                 if self.module_fallback(expr).is_some() {
                     return None;
                 }
+                // `match && table[match[1]]`: the left side is the value only when it is falsy
+                // (`null`, `''`, `0`, `false`), which carries nothing an attacker chose.
+                if logical.operator == LogicalOperator::And {
+                    return right;
+                }
                 union(left, right)
             }
             Expression::ConditionalExpression(c) => {
@@ -5284,6 +5473,11 @@ impl Walker<'_> {
             }
             Expression::UpdateExpression(_) => None,
             Expression::AssignmentExpression(assign) => {
+                if assign.operator == AssignmentOperator::Assign
+                    && let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left
+                {
+                    note_url_parts(id.name.as_str(), &assign.right, env);
+                }
                 let name = match (&assign.left, assign.right.get_inner_expression()) {
                     // `module.exports = function runCommand() {}`: its own name, as exported.
                     (_, Expression::FunctionExpression(f)) if f.id.is_some() => {
@@ -7753,7 +7947,10 @@ impl Walker<'_> {
         // Same-file helpers whose parameters reach a sink (never for a method of an imported
         // module: `users.find()` is the other file's `find`, not this file's).
         let helper = match &callee {
-            Callee::Global(name) => self.summaries.get(name).map(|s| (name.clone(), s.clone())),
+            Callee::Global(name) => {
+                let list = self.visible_summaries(name);
+                (!list.is_empty()).then(|| (name.clone(), list))
+            }
             Callee::Method {
                 object: Some(object),
                 ..
@@ -8870,23 +9067,37 @@ impl Walker<'_> {
     /// The module a `x || module` / `x ?? module` fallback stands for (`options.fs || fs`), whole
     /// modules only (not `opts.join || join`).
     fn module_fallback(&self, expr: &Expression<'_>) -> Option<Imported> {
-        let Expression::LogicalExpression(logical) = expr.get_inner_expression() else {
-            return None;
+        let module = |side: &Expression<'_>| match side.get_inner_expression() {
+            Expression::Identifier(id) => self
+                .modules
+                .get(id.name.as_str())
+                .filter(|imported| imported.export.is_none())
+                .cloned(),
+            other => require_spec(other)
+                .and_then(|spec| m().module_family(&spec))
+                .map(|family| Imported {
+                    family,
+                    export: None,
+                }),
         };
-        if logical.operator == LogicalOperator::And {
-            return None;
+        match expr.get_inner_expression() {
+            Expression::LogicalExpression(logical) if logical.operator != LogicalOperator::And => {
+                [&logical.right, &logical.left]
+                    .into_iter()
+                    .find_map(|side| match side.get_inner_expression() {
+                        Expression::Identifier(_) => module(side),
+                        _ => None,
+                    })
+            }
+            // `const mod = url.startsWith('https') ? https : http`: that module either way.
+            Expression::ConditionalExpression(c) => {
+                match (module(&c.consequent), module(&c.alternate)) {
+                    (Some(a), Some(b)) if a.family == b.family => Some(a),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
-        [&logical.right, &logical.left]
-            .into_iter()
-            .find_map(|side| {
-                let Expression::Identifier(id) = side.get_inner_expression() else {
-                    return None;
-                };
-                self.modules
-                    .get(id.name.as_str())
-                    .filter(|imported| imported.export.is_none())
-                    .cloned()
-            })
     }
 
     /// Walks an expression for what it records, discarding its taint.
@@ -10999,13 +11210,13 @@ impl Walker<'_> {
                 }
                 // Reached through an instance field set from a constructor parameter; else the
                 // function whose parameter it is (a sink inside a callback or a nested function).
-                let owner = match self.ctor_params.get(&at) {
-                    Some(class) => format!("{class}.constructor"),
+                let (owner, scope) = match self.ctor_params.get(&at) {
+                    Some(class) => (format!("{class}.constructor"), None),
                     None => self
                         .param_owner
                         .get(&at)
                         .cloned()
-                        .unwrap_or_else(|| env.function.clone()),
+                        .unwrap_or_else(|| (env.function.clone(), env.def_scope)),
                 };
                 let field = self.field_of.get(&at).cloned().or_else(|| {
                     self.emit_field
@@ -11019,6 +11230,7 @@ impl Walker<'_> {
                         && s.call == finding.call
                         && s.api == finding.api
                         && s.field == field
+                        && s.scope == scope
                 });
                 if !duplicate {
                     list.push(Summary {
@@ -11041,6 +11253,7 @@ impl Walker<'_> {
                         rest: self.rest_params.contains(&at),
                         instance_of: None,
                         base_param: None,
+                        scope,
                     });
                 }
             }
@@ -11886,6 +12099,10 @@ mod tests {
         let hosts = "const HOSTS = new Set(['api.example.com']);\n";
         assert!(one(&format!("{hosts}app.post('/p', async (req, res) => {{ const url = new URL(req.body.url); if (!HOSTS.has(url.hostname)) {{ return res.end(); }} res.send(await fetch(url.toString())); }});")).is_empty());
         assert_eq!(one(&format!("{hosts}app.post('/q', async (req, res) => {{ const url = new URL(req.body.url); if (!url.pathname.startsWith('/api')) {{ return res.end(); }} res.send(await fetch(url.toString())); }});")).len(), 1);
+        // bentopdf's dev proxy: the host copied first, the string the URL was parsed from sent.
+        assert!(one(&format!("{hosts}app.post('/r', async (req, res) => {{ const target = req.query.url; let host; try {{ const parsed = new URL(target); host = parsed.hostname; }} catch {{ return res.end(); }} if (!HOSTS.has(host)) {{ return res.end(); }} res.send(await fetch(target)); }});")).is_empty());
+        // The string replaced after the check is not what was checked.
+        assert_eq!(one(&format!("{hosts}app.post('/s', async (req, res) => {{ let target = req.query.url; const parsed = new URL(target); if (!HOSTS.has(parsed.hostname)) {{ return res.end(); }} target = req.query.other; res.send(await fetch(target)); }});")).len(), 1);
         // yuvomi: `{ where, params }` from either branch; only `params` holds the request.
         assert!(route("const ids = req.body.ids; const scope = ids ? { where: `id IN (${ids.map(() => '?').join(',')})`, params: [...ids] } : { where: 'id > 0', params: [] }; db.prepare(`DELETE FROM t WHERE ${scope.where}`).run(...scope.params);").is_empty());
         let found = route(
@@ -11895,6 +12112,48 @@ mod tests {
             found.iter().any(|f| f.0 == VulnClass::SqlInjection),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn calls_reach_the_closest_function_of_that_name() {
+        let top = "const app = express();\nfunction send(p) { return fs.readFileSync(p); }\n";
+        // A nested `send` (hoisted or not) shadows the top-level one.
+        assert!(one(&format!("{top}function shadowed(x) {{ const send = (m) => m.length; return send(x); }}\napp.get('/1', (req, res) => res.send(shadowed(req.query.f)));")).is_empty());
+        assert!(one(&format!("{top}function hoisted(x) {{ return send(x); function send(m) {{ return String(m).length; }} }}\napp.get('/2', (req, res) => res.send(hoisted(req.query.f)));")).is_empty());
+        assert_eq!(one(&format!("{top}function plain(x) {{ return send(x); }}\napp.get('/3', (req, res) => res.send(plain(req.query.f)));")).len(), 1);
+        // dsh-codex: two `follow` closures of different functions; each call reaches its own.
+        let follow = "const http = require('http');\nconst app = express();\n\
+            function a(url) { const follow = (u) => u.length; return follow(url); }\n\
+            function b(url) { const follow = (u) => http.get(u); return follow(url); }\n";
+        assert!(
+            one(&format!(
+                "{follow}app.post('/a', (req, res) => {{ a(req.body.url); res.end(); }});"
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            one(&format!(
+                "{follow}app.post('/b', (req, res) => {{ b(req.body.url); res.end(); }});"
+            ))
+            .len(),
+            1
+        );
+        // mStream's album art: the module a URL's scheme picks is that module either way.
+        let found = one(
+            "const http = require('http');\nconst https = require('https');\nconst app = express();\n\
+            function get(u) { const mod = u.startsWith('https') ? https : http; return mod.get(u, (res) => res.resume()); }\n\
+            app.post('/art', (req, res) => { get(req.body.url); res.end(); });\n",
+        );
+        assert!(found.iter().any(|f| f.0 == VulnClass::Ssrf), "{found:?}");
+    }
+
+    #[test]
+    fn the_left_side_of_and_is_the_value_only_when_falsy() {
+        // webbrain's dev server: `m && ROOTS[m[1]]` is a base the server holds (or `null`).
+        let server = "const http = require('http');\nconst ROOTS = { a: '/srv/a' };\n";
+        assert!(one(&format!("{server}http.createServer((req, res) => {{ const m = req.url.match(/^\\/(\\w+)\\/(.+)$/); const base = m && ROOTS[m[1]]; if (!base) {{ return res.end(); }} const file = path.resolve(base, m[2]); if (!file.startsWith(path.resolve(base) + path.sep)) {{ return res.end(); }} fs.createReadStream(file).pipe(res); }});")).is_empty());
+        // The right side is still the value.
+        assert_eq!(one(&format!("{server}http.createServer((req, res) => {{ const m = req.url.match(/^\\/(.+)$/); const file = m && m[1]; fs.createReadStream(file).pipe(res); }});")).len(), 1);
     }
 
     #[test]

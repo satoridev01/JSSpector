@@ -214,6 +214,7 @@ struct ScanOutput<'a> {
 #[derive(Serialize)]
 struct ReportedFinding<'a> {
     title: String,
+    cwe: String,
     #[serde(flatten)]
     finding: &'a Finding,
     resource: String,
@@ -225,6 +226,7 @@ impl<'a> ReportedFinding<'a> {
     fn new(finding: &'a Finding) -> Self {
         Self {
             title: rules::title(finding),
+            cwe: format!("CWE-{}", rules::rule(finding.class).cwe),
             finding,
             resource: rules::resource(finding),
             description: rules::description(finding),

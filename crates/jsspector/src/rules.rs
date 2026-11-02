@@ -118,7 +118,7 @@ pub fn resource(f: &Finding) -> String {
 }
 
 /// A finding in a few sentences: what flows where, from which entry point and with what
-/// authentication, the path the value takes, and what the class lets an attacker do.
+/// authentication, where the source and sink are, and what the class lets an attacker do.
 pub fn description(f: &Finding) -> String {
     let mut text = format!(
         "Data from `{}` ({}) {}: `{}`.",
@@ -138,26 +138,6 @@ pub fn description(f: &Finding) -> String {
         f.source.line,
         resource(f)
     ));
-    if !f.trace.is_empty() {
-        let steps: Vec<String> = f
-            .trace
-            .iter()
-            .take(8)
-            .map(|step| {
-                format!(
-                    "{} ({}:{})",
-                    step.note,
-                    step.file.as_deref().unwrap_or(&f.file),
-                    step.line
-                )
-            })
-            .collect();
-        text.push_str(&format!(" Path: {}", steps.join(" -> ")));
-        if f.trace.len() > 8 {
-            text.push_str(" -> ...");
-        }
-        text.push('.');
-    }
     text.push(' ');
     text.push_str(rule(f.class).summary);
     text

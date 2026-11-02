@@ -650,6 +650,9 @@ pub struct Summary {
     pub rest: bool,
     /// [`INSTANCE`] summaries only: the class the function returns an instance of.
     pub instance_of: Option<ClassRef>,
+    /// For a [`PREDICATE`] that checks containment (`c.startsWith(p + path.sep)`): the parameter
+    /// holding the base; the check confines only when the caller's base is not the attacker's.
+    pub base_param: Option<usize>,
 }
 
 /// A function of a table (`const _mounts = { admin: require('./admin') }`, `_mounts.main = fn`):
@@ -715,6 +718,9 @@ struct Env {
     /// (`const file = join(root, dir, name)`): variable -> that one. A later check that the
     /// variable is clean cleans what was built from it.
     derived: BTreeMap<String, String>,
+    /// Variables naming the same file as another (`const resolved = path.resolve(file)`):
+    /// variable -> that one. Confining one confines the other (paths only).
+    same_file: BTreeMap<String, String>,
     /// Those nodes' tags, when the factory named one (`document.createElement('a')`).
     node_tags: BTreeMap<String, String>,
     /// Argument arrays that already hold `"--"`: what is pushed after it is positional.
@@ -871,34 +877,50 @@ impl Env {
 
     /// Records what a guard established.
     fn learn(&mut self, facts: Vec<(String, guards::Fact)>) {
-        // `if (!/^\d+\.webp$/.test(name)) return` after `file = join(root, name)`: `file` was
-        // built from `name` alone, unchanged, so it is as clean.
-        let mut facts = facts;
-        let built: Vec<(String, guards::Fact)> = facts
-            .iter()
+        let mut facts: Vec<(String, guards::Fact)> = facts
+            .into_iter()
             .filter_map(|(key, fact)| match fact {
-                guards::Fact::Clean(classes) => Some((key, *classes)),
-                _ => None,
-            })
-            .flat_map(|(key, classes)| {
-                self.derived
-                    .iter()
-                    .filter(move |(_, from)| *from == key)
-                    .map(move |(built, _)| (built.clone(), guards::Fact::Clean(classes)))
-            })
-            .collect();
-        facts.extend(built);
-        for (key, fact) in facts {
-            let fact = match fact {
                 // A base the attacker chose confines nothing.
                 guards::Fact::Contained(_, bases)
                     if bases.iter().any(|b| self.attacker_data(b)) =>
                 {
-                    continue;
+                    None
                 }
-                guards::Fact::Contained(classes, _) => guards::Fact::Clean(classes),
-                other => other,
+                guards::Fact::Contained(classes, _) => Some((key, guards::Fact::Clean(classes))),
+                other => Some((key, other)),
+            })
+            .collect();
+        // What a clean value says about others: `file = join(root, name)` is as clean as `name`
+        // (built from it unchanged); `resolved = path.resolve(file)` inside the root puts `file`
+        // there too (the same file, for paths only).
+        let path_bit = class_bit(VulnClass::PathTraversal);
+        let mut next = 0;
+        while facts.len() < 256 {
+            let Some((key, fact)) = facts.get(next).cloned() else {
+                break;
             };
+            next += 1;
+            let guards::Fact::Clean(classes) = fact else {
+                continue;
+            };
+            let mut more: Vec<(String, guards::Fact)> = self
+                .derived
+                .iter()
+                .filter(|(_, from)| **from == key)
+                .map(|(built, _)| (built.clone(), guards::Fact::Clean(classes)))
+                .collect();
+            if classes & path_bit != 0
+                && let Some(file) = self.same_file.get(&key)
+            {
+                more.push((file.clone(), guards::Fact::Clean(path_bit)));
+            }
+            for fact in more {
+                if !facts.contains(&fact) {
+                    facts.push(fact);
+                }
+            }
+        }
+        for (key, fact) in facts {
             match fact {
                 guards::Fact::Clean(_) if self.is_request_object(&key) => {}
                 guards::Fact::Clean(guards::ALL) => {
@@ -953,6 +975,7 @@ impl Env {
             nodes: BTreeSet::new(),
             node_tags: BTreeMap::new(),
             derived: BTreeMap::new(),
+            same_file: BTreeMap::new(),
             options_ended: BTreeSet::new(),
             encoded: BTreeSet::new(),
             found_by: BTreeMap::new(),
@@ -988,6 +1011,7 @@ impl Env {
             nodes: self.nodes.clone(),
             node_tags: self.node_tags.clone(),
             derived: self.derived.clone(),
+            same_file: self.same_file.clone(),
             options_ended: self.options_ended.clone(),
             encoded: self.encoded.clone(),
             found_by: self.found_by.clone(),
@@ -1009,6 +1033,7 @@ impl Env {
         self.forget(name);
         // What was built from the value `name` had before this write is not built from it now.
         self.derived.retain(|_, from| from != name);
+        self.same_file.retain(|_, file| file != name);
         match taint {
             Some(origin) => {
                 self.vars.insert(name.to_owned(), origin);
@@ -1267,6 +1292,19 @@ fn literal_comparison(value: &Expression<'_>) -> bool {
             }
             ObjectPropertyKind::SpreadProperty(_) => false,
         })
+}
+
+/// The check a predicate returns: a body that is one `return`, maybe after declarations of
+/// values it compares (`const c = path.resolve(child); return c.startsWith(...)`).
+fn predicate_return<'b, 'a>(statements: &'b [Statement<'a>]) -> Option<&'b Expression<'a>> {
+    let (last, before) = statements.split_last()?;
+    let Statement::ReturnStatement(r) = last else {
+        return None;
+    };
+    before
+        .iter()
+        .all(|s| matches!(s, Statement::VariableDeclaration(_)))
+        .then_some(r.argument.as_ref()?)
 }
 
 /// Whether a function body has a `return` somewhere, with a value or not (not counting nested
@@ -3104,6 +3142,15 @@ impl Walker<'_> {
                         env.derived.remove(name);
                     }
                 }
+                // `const resolved = path.resolve(file)`: the same file as `file`.
+                match self.same_file_of(init) {
+                    Some(file) if file != *name => {
+                        env.same_file.insert(name.clone(), file);
+                    }
+                    _ => {
+                        env.same_file.remove(name);
+                    }
+                }
                 // `const iframe = document.createElement('iframe')`: a node, not markup.
                 if creates_node(init) {
                     env.nodes.insert(name.clone());
@@ -3689,9 +3736,7 @@ impl Walker<'_> {
             {
                 self.record_instances(vec![class], f.span, &env, None);
             }
-            if let [Statement::ReturnStatement(r)] = body.statements.as_slice()
-                && let Some(argument) = &r.argument
-            {
+            if let Some(argument) = predicate_return(&body.statements) {
                 self.record_predicate(argument, &env);
             }
             self.leave();
@@ -4035,9 +4080,7 @@ impl Walker<'_> {
                 ArrowFunctionBody::FunctionBody(body) => {
                     self.statements(&body.statements, &mut env);
                     self.record_validated(&body.statements, params.span, &env);
-                    if let [Statement::ReturnStatement(r)] = body.statements.as_slice()
-                        && let Some(argument) = &r.argument
-                    {
+                    if let Some(argument) = predicate_return(&body.statements) {
                         self.record_predicate(argument, &env);
                     }
                 }
@@ -4092,13 +4135,55 @@ impl Walker<'_> {
         }
         let mut held = Vec::new();
         guards::facts(returned, true, &mut held);
+        // A parameter, or a local naming the same file as one (`const c = path.resolve(child)`):
+        // its index, and whether it was reached through such a local.
+        let param_of = |key: &str| -> Option<(usize, bool)> {
+            let mut key = key.to_owned();
+            for hop in 0..8 {
+                if let Some(index) = env.params.iter().position(|p| !p.is_empty() && *p == key) {
+                    return Some((index, hop > 0));
+                }
+                key = env.same_file.get(&key)?.clone();
+            }
+            None
+        };
         for (key, fact) in held {
-            let guards::Fact::Clean(classes) = fact else {
+            let (classes, bases) = match fact {
+                guards::Fact::Clean(classes) => (classes, Vec::new()),
+                // `c.startsWith(p + path.sep)`: inside a base that is a parameter (the caller's
+                // argument decides) or a constant of the function.
+                guards::Fact::Contained(classes, bases) => (classes, bases),
+                _ => continue,
+            };
+            let Some((index, through_file)) = param_of(&key) else {
                 continue;
             };
-            let Some(index) = env.params.iter().position(|p| !p.is_empty() && *p == key) else {
+            // `p + path.sep`: one base is a parameter (or the same file as one); the others must
+            // be clean (a separator, a constant root).
+            let mut base_params = BTreeSet::new();
+            let mut tainted_base = false;
+            for base in &bases {
+                match param_of(base) {
+                    Some((base, _)) => {
+                        base_params.insert(base);
+                    }
+                    None if env.vars.contains_key(base) => tainted_base = true,
+                    None => {}
+                }
+            }
+            if tainted_base || base_params.len() > 1 {
                 continue;
+            }
+            let base_param = base_params.into_iter().next();
+            // The same file, not the same text: paths only.
+            let classes = if through_file {
+                classes & class_bit(VulnClass::PathTraversal)
+            } else {
+                classes
             };
+            if classes == 0 {
+                continue;
+            }
             let list = self.summaries.entry(env.function.clone()).or_default();
             if list.iter().any(|s| s.api == PREDICATE && s.param == index) {
                 continue;
@@ -4122,6 +4207,7 @@ impl Walker<'_> {
                 start: false,
                 rest: false,
                 instance_of: None,
+                base_param,
             });
         }
     }
@@ -4167,13 +4253,32 @@ impl Walker<'_> {
                     None => self.summaries.get(name).cloned().unwrap_or_default(),
                 };
                 for s in summaries.iter().filter(|s| s.api == PREDICATE) {
-                    if let Some(key) = call
+                    let Some(key) = call
                         .arguments
                         .get(s.param)
                         .and_then(Argument::as_expression)
                         .and_then(guards::path_key)
+                    else {
+                        continue;
+                    };
+                    let classes = s.at_sink.escaped;
+                    match s
+                        .base_param
+                        .map(|b| call.arguments.get(b).and_then(Argument::as_expression))
                     {
-                        out.push((key, guards::Fact::Clean(s.at_sink.escaped)));
+                        None => out.push((key, guards::Fact::Clean(classes))),
+                        // `isPathWithinParent(resolved, root)`: inside the caller's base, which
+                        // confines only if the attacker did not choose it.
+                        Some(Some(base)) => match guards::path_key(base) {
+                            Some(base) => {
+                                out.push((key, guards::Fact::Contained(classes, vec![base])));
+                            }
+                            None if literal_path(base).is_some() => {
+                                out.push((key, guards::Fact::Clean(classes)));
+                            }
+                            None => {}
+                        },
+                        Some(None) => {}
                     }
                 }
             }
@@ -4221,6 +4326,7 @@ impl Walker<'_> {
                         start: false,
                         rest: false,
                         instance_of: None,
+                        base_param: None,
                     });
             }
             // The classes it validates the parameter for (`at_sink.escaped`).
@@ -4254,6 +4360,7 @@ impl Walker<'_> {
                 start: false,
                 rest: false,
                 instance_of: None,
+                base_param: None,
             });
         }
     }
@@ -4315,6 +4422,7 @@ impl Walker<'_> {
                 start: origin.response,
                 rest: false,
                 instance_of: None,
+                base_param: None,
             });
         }
     }
@@ -4392,6 +4500,7 @@ impl Walker<'_> {
                 start: false,
                 rest: false,
                 instance_of: Some(class),
+                base_param: None,
             });
         }
     }
@@ -5936,6 +6045,7 @@ impl Walker<'_> {
                 env.bind(id.name.as_str(), taint);
                 // `file = other`: no longer built from what it was.
                 env.derived.remove(id.name.as_str());
+                env.same_file.remove(id.name.as_str());
             }
             other => {
                 if let Some(member) = other
@@ -10195,6 +10305,33 @@ impl Walker<'_> {
         }
     }
 
+    /// The variable a call names the same file as: `path.resolve(file)`, `path.normalize(file)`
+    /// (a pack's `same_file` calls, with that one argument).
+    fn same_file_of(&self, expr: &Expression<'_>) -> Option<String> {
+        let Expression::CallExpression(c) = expr.get_inner_expression() else {
+            return None;
+        };
+        let Callee::Module {
+            family,
+            export: Some(export),
+        } = self.callee(&c.callee)
+        else {
+            return None;
+        };
+        if !has(&m().same_file_calls, &format!("{family}.{export}")) || c.arguments.len() != 1 {
+            return None;
+        }
+        match c
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)?
+            .get_inner_expression()
+        {
+            Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+            _ => None,
+        }
+    }
+
     /// Joins the states of the `break` / `continue` jumps that land here (see [`Walker::jumps`]).
     fn land_jumps(&mut self, env: &mut Env) {
         for state in self.jumps.pop().unwrap_or_default() {
@@ -10506,6 +10643,7 @@ impl Walker<'_> {
                         start: finding.start || url_sink,
                         rest: self.rest_params.contains(&at),
                         instance_of: None,
+                        base_param: None,
                     });
                 }
             }
@@ -11326,6 +11464,20 @@ mod tests {
             "let video = null; video = '<video src=' + location.hash + '>'; $(media).append(video);",
         );
         assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn confining_a_resolved_path_confines_the_path_it_resolves() {
+        // compressing: `resolvedDestPath = path.resolve(destFilePath)` checked by a helper that
+        // compares resolved paths, then `destFilePath` written.
+        let head = "const path = require('path');\nconst fs = require('fs');\n\
+            function within(child, parent) { const c = path.resolve(child); const p = path.resolve(parent); return c === p || c.startsWith(p + path.sep); }\n\
+            const root = path.resolve('/srv/out');\n";
+        assert!(one(&format!("{head}app.post('/x', (req, res) => {{ const dest = path.join(root, req.body.name); const resolved = path.resolve(dest); if (!within(resolved, root)) {{ return res.end(); }} fs.writeFileSync(dest, 'x'); }});")).is_empty());
+        // Another path, unchecked, is still the attacker's.
+        assert_eq!(one(&format!("{head}app.post('/y', (req, res) => {{ const other = path.join(root, req.body.other); const dest = path.join(root, req.body.name); const resolved = path.resolve(dest); if (!within(resolved, root)) {{ return res.end(); }} fs.writeFileSync(other, 'x'); }});")).len(), 1);
+        // A base the attacker chose confines nothing.
+        assert_eq!(one(&format!("{head}app.post('/z', (req, res) => {{ const dest = path.join(root, req.body.name); const resolved = path.resolve(dest); if (!within(resolved, req.body.base)) {{ return res.end(); }} fs.writeFileSync(dest, 'x'); }});")).len(), 1);
     }
 
     #[test]

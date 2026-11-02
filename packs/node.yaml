@@ -114,6 +114,8 @@ propagation:
   entry_globals: [Object.entries]
   # The result starts with the first argument: `path.join(root, x)` (not `path.resolve`).
   root_joins: [path.join]
+  # The result names the same file as the one argument: confining one confines the other.
+  same_file_calls: [path.resolve, path.normalize]
   # `f.call(that, a)`, `f.apply(that, [a])`: `f(a)`.
   call_methods: [call]
   apply_methods: [apply]

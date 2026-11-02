@@ -116,6 +116,13 @@ propagation:
   root_joins: [path.join]
   # The result names the same file as the one argument: confining one confines the other.
   same_file_calls: [path.resolve, path.normalize]
+  # Only strings have these: past `email.toLowerCase()`, `email` was a string.
+  string_only_methods: [toLowerCase, toUpperCase, toLocaleLowerCase, toLocaleUpperCase, trim, trimStart, trimEnd,
+    normalize, padStart, padEnd, startsWith, endsWith, charAt, charCodeAt, codePointAt, localeCompare, repeat,
+    substring, substr, split, search, replace, replaceAll]
+  # `HOSTS.has(url.hostname)` on `url = new URL(x)`: the host is one of the allowed.
+  url_classes: [URL]
+  url_host_fields: [hostname, host, origin]
   # `f.call(that, a)`, `f.apply(that, [a])`: `f(a)`.
   call_methods: [call]
   apply_methods: [apply]
@@ -147,6 +154,9 @@ sanitizers:
   receiver_rejecters: [includes, match, test]
   # `if (p.startsWith('-')) throw`: no option smuggled in as an argument.
   leading_dash_checks: [startsWith]
+  # `if (rel.startsWith('..')) throw` with `rel = path.relative(base, file)`: `file` is inside.
+  upward_checks: [startsWith]
+  relative_calls: [path.relative]
   # Function names that read as yes/no questions (lower case prefixes), their negations, and
   # the prefixes of throwing assertions.
   predicate_prefixes: [is, has, can, check, validate, verify, ensure, assert]

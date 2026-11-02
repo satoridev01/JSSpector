@@ -553,6 +553,16 @@ pub struct Propagation {
     /// (`path.resolve(file)`): confining the result confines the argument.
     #[serde(default)]
     pub same_file_calls: Vec<String>,
+    /// Methods only strings have (`email.toLowerCase()`): past a call, the receiver was a
+    /// string (an object or array would have thrown), so no query operators.
+    #[serde(default)]
+    pub string_only_methods: Vec<String>,
+    /// URL classes (`new URL(x)`) and their fields that hold the host: an allowlist check of
+    /// `url.hostname` fixes where the URL goes.
+    #[serde(default)]
+    pub url_classes: Vec<String>,
+    #[serde(default)]
+    pub url_host_fields: Vec<String>,
     /// Function methods that call the function with the arguments after `this`
     /// (`f.call(that, a, b)`) ...
     #[serde(default)]
@@ -712,6 +722,14 @@ pub struct Sanitizers {
     /// injection after it).
     #[serde(default)]
     pub leading_dash_checks: Vec<String>,
+    /// Methods that, false for `..`, say a relative path does not climb:
+    /// `rel.startsWith('..')` with `rel = path.relative(base, file)` (`file` inside `base`).
+    #[serde(default)]
+    pub upward_checks: Vec<String>,
+    /// Module functions whose result is the second argument relative to the first
+    /// (`path.relative(base, file)`).
+    #[serde(default)]
+    pub relative_calls: Vec<String>,
     /// Name prefixes that make a function a yes/no question (`isSafe`, `checkPath`).
     #[serde(default)]
     pub predicate_prefixes: Vec<String>,
@@ -927,6 +945,11 @@ pub struct Model {
     pub entry_globals: Vec<String>,
     pub root_joins: Vec<String>,
     pub same_file_calls: Vec<String>,
+    pub string_only_methods: Vec<String>,
+    pub url_classes: Vec<String>,
+    pub url_host_fields: Vec<String>,
+    pub upward_checks: Vec<String>,
+    pub relative_calls: Vec<String>,
     pub call_methods: Vec<String>,
     pub apply_methods: Vec<String>,
     pub leading_dash_checks: Vec<String>,
@@ -1127,10 +1150,17 @@ impl Model {
         self.root_joins.extend(pack.propagation.root_joins);
         self.same_file_calls
             .extend(pack.propagation.same_file_calls);
+        self.string_only_methods
+            .extend(pack.propagation.string_only_methods);
+        self.url_classes.extend(pack.propagation.url_classes);
+        self.url_host_fields
+            .extend(pack.propagation.url_host_fields);
         self.call_methods.extend(pack.propagation.call_methods);
         self.apply_methods.extend(pack.propagation.apply_methods);
         self.leading_dash_checks
             .extend(pack.sanitizers.leading_dash_checks);
+        self.upward_checks.extend(pack.sanitizers.upward_checks);
+        self.relative_calls.extend(pack.sanitizers.relative_calls);
         self.predicate_prefixes
             .extend(pack.sanitizers.predicate_prefixes);
         self.negations.extend(pack.sanitizers.negations);

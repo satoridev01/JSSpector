@@ -34,6 +34,9 @@ pub enum Fact {
     Scalar,
     /// Known not to start with `-` (`if (p.startsWith('-')) throw`): no argument injection.
     NoLeadingDash,
+    /// A relative path known not to climb (`rel.startsWith('..')` was false): the walker
+    /// turns it into containment of what `rel` was computed from (`path.relative(base, file)`).
+    NoUpward,
 }
 
 /// Longest access path a key is built for: no guard or pack name has more segments, and a
@@ -553,6 +556,41 @@ fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String,
         }
         return;
     }
+    // `rel.startsWith('..')` was false: `rel` does not climb. Computed in place
+    // (`path.relative(base, file).startsWith('..')`): `file` is inside `base`.
+    if has(&model().upward_checks, &name)
+        && upward_marker(call.arguments.first())
+        && let Some(member) = callee.as_member_expression()
+    {
+        match member.object().get_inner_expression() {
+            Expression::CallExpression(relative) if is_relative_call(relative) => {
+                let bases = relative
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .map(relative_base_keys)
+                    .unwrap_or_default();
+                if let Some(target) = relative
+                    .arguments
+                    .get(1)
+                    .and_then(Argument::as_expression)
+                    .and_then(path_key)
+                    && !bases.is_empty()
+                {
+                    out.push((
+                        target,
+                        Fact::Contained(class_bit(VulnClass::PathTraversal), bases),
+                    ));
+                }
+            }
+            other => {
+                if let Some(key) = path_key(other) {
+                    out.push((key, Fact::NoUpward));
+                }
+            }
+        }
+        return;
+    }
     // `p.startsWith('-')` was false: no option can be smuggled in as an argument.
     if has(&model().leading_dash_checks, &name)
         && matches!(call.arguments.first(), Some(Argument::StringLiteral(dash)) if dash.value.as_str() == Some("-"))
@@ -575,6 +613,65 @@ fn rejecter_call(call: &oxc_ast::ast::CallExpression<'_>, out: &mut Vec<(String,
         && let Some(key) = path_key(member.object())
     {
         out.push((key, Fact::Clean(class_bit(VulnClass::PathTraversal))));
+    }
+}
+
+/// `'..'`, `'../'`, `` `..${sep}` ``: the first argument of an upward check.
+fn upward_marker(argument: Option<&Argument<'_>>) -> bool {
+    match argument {
+        Some(Argument::StringLiteral(s)) => s.value.as_str().is_some_and(|v| v.starts_with("..")),
+        Some(Argument::TemplateLiteral(t)) => t
+            .quasis
+            .first()
+            .and_then(|q| q.value.cooked.as_ref())
+            .and_then(|c| c.as_str())
+            .is_some_and(|v| v.starts_with("..")),
+        _ => false,
+    }
+}
+
+/// `path.relative(base, file)` (a pack's `relative_calls`, also imported bare).
+pub fn is_relative_call(call: &oxc_ast::ast::CallExpression<'_>) -> bool {
+    let Some((name, qualified)) = callee_names(call) else {
+        return false;
+    };
+    call.arguments.len() == 2
+        && model().relative_calls.iter().any(|r| {
+            qualified.as_deref() == Some(r.as_str()) || r.rsplit('.').next() == Some(name.as_str())
+        })
+}
+
+/// The access paths a base expression can be: `root`, either branch of
+/// `scene ? root : publicRoot`, the argument of `path.resolve(root)`. Empty when unknown.
+pub fn relative_base_keys(expr: &Expression<'_>) -> Vec<String> {
+    match expr.get_inner_expression() {
+        Expression::ConditionalExpression(c) => {
+            let (a, b) = (
+                relative_base_keys(&c.consequent),
+                relative_base_keys(&c.alternate),
+            );
+            if a.is_empty() || b.is_empty() {
+                Vec::new()
+            } else {
+                a.into_iter().chain(b).collect()
+            }
+        }
+        Expression::CallExpression(c) => {
+            // `path.join(root, 'still')`: a literal part is the code's.
+            let keys: Vec<Vec<String>> = c
+                .arguments
+                .iter()
+                .filter(|a| !matches!(a, Argument::StringLiteral(_) | Argument::NumericLiteral(_)))
+                .filter_map(Argument::as_expression)
+                .map(relative_base_keys)
+                .collect();
+            if keys.is_empty() || keys.iter().any(Vec::is_empty) {
+                Vec::new()
+            } else {
+                keys.concat()
+            }
+        }
+        other => path_key(other).into_iter().collect(),
     }
 }
 

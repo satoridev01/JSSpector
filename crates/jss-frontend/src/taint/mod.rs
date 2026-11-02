@@ -721,6 +721,9 @@ struct Env {
     /// Variables naming the same file as another (`const resolved = path.resolve(file)`):
     /// variable -> that one. Confining one confines the other (paths only).
     same_file: BTreeMap<String, String>,
+    /// Relative paths (`const rel = path.relative(base, file)`): rel -> (the base's access
+    /// paths, `file`). `rel.startsWith('..')` false puts `file` inside the base.
+    relative_of: BTreeMap<String, (Vec<String>, String)>,
     /// Those nodes' tags, when the factory named one (`document.createElement('a')`).
     node_tags: BTreeMap<String, String>,
     /// Argument arrays that already hold `"--"`: what is pushed after it is positional.
@@ -880,6 +883,18 @@ impl Env {
         let mut facts: Vec<(String, guards::Fact)> = facts
             .into_iter()
             .filter_map(|(key, fact)| match fact {
+                // `rel.startsWith('..')` was false, `rel = path.relative(base, file)`: `file`
+                // is inside the base.
+                guards::Fact::NoUpward => {
+                    let (bases, file) = self.relative_of.get(&key)?;
+                    if bases.iter().any(|b| self.attacker_data(b)) {
+                        return None;
+                    }
+                    Some((
+                        file.clone(),
+                        guards::Fact::Clean(class_bit(VulnClass::PathTraversal)),
+                    ))
+                }
                 // A base the attacker chose confines nothing.
                 guards::Fact::Contained(_, bases)
                     if bases.iter().any(|b| self.attacker_data(b)) =>
@@ -914,6 +929,19 @@ impl Env {
             {
                 more.push((file.clone(), guards::Fact::Clean(path_bit)));
             }
+            // `HOSTS.has(url.hostname)` on `url = new URL(x)`: the URL goes to an allowed host.
+            let ssrf_bit = class_bit(VulnClass::Ssrf);
+            if classes & ssrf_bit != 0
+                && let Some((object, field)) = key.rsplit_once('.')
+                && has(&m().url_host_fields, field)
+                && self
+                    .local_instances
+                    .get(object)
+                    .or_else(|| self.instances.get(object))
+                    .is_some_and(|class| has(&m().url_classes, class))
+            {
+                more.push((object.to_owned(), guards::Fact::Clean(ssrf_bit)));
+            }
             for fact in more {
                 if !facts.contains(&fact) {
                     facts.push(fact);
@@ -940,6 +968,8 @@ impl Env {
                     }
                     self.scalars.insert(key);
                 }
+                // Translated above when `key` is a relative path; nothing to keep otherwise.
+                guards::Fact::NoUpward => {}
                 guards::Fact::NoLeadingDash => {
                     if let Some(origin) = self.vars.get_mut(&key) {
                         origin.dash_free = true;
@@ -976,6 +1006,7 @@ impl Env {
             node_tags: BTreeMap::new(),
             derived: BTreeMap::new(),
             same_file: BTreeMap::new(),
+            relative_of: BTreeMap::new(),
             options_ended: BTreeSet::new(),
             encoded: BTreeSet::new(),
             found_by: BTreeMap::new(),
@@ -1012,6 +1043,7 @@ impl Env {
             node_tags: self.node_tags.clone(),
             derived: self.derived.clone(),
             same_file: self.same_file.clone(),
+            relative_of: self.relative_of.clone(),
             options_ended: self.options_ended.clone(),
             encoded: self.encoded.clone(),
             found_by: self.found_by.clone(),
@@ -1034,6 +1066,8 @@ impl Env {
         // What was built from the value `name` had before this write is not built from it now.
         self.derived.retain(|_, from| from != name);
         self.same_file.retain(|_, file| file != name);
+        self.relative_of
+            .retain(|_, (bases, file)| file != name && !bases.iter().any(|b| b == name));
         match taint {
             Some(origin) => {
                 self.vars.insert(name.to_owned(), origin);
@@ -1820,6 +1854,31 @@ fn answers_denied(statement: &Statement<'_>) -> bool {
     }
 }
 
+/// The receivers of methods only strings have along a call chain (`email.toLowerCase()`,
+/// `name.trim().split(',')`): past the call they were strings, never objects.
+fn string_receivers(expr: &Expression<'_>) -> Vec<(String, guards::Fact)> {
+    let mut out = Vec::new();
+    let mut current = expr.get_inner_expression();
+    for _ in 0..16 {
+        let Expression::CallExpression(call) = current else {
+            break;
+        };
+        let Some(member) = call.callee.get_inner_expression().as_member_expression() else {
+            break;
+        };
+        if member
+            .static_property_name()
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| has(&m().string_only_methods, n))
+            && let Some(key) = guards::path_key(member.object())
+        {
+            out.push((key, guards::Fact::Scalar));
+        }
+        current = member.object().get_inner_expression();
+    }
+    out
+}
+
 /// Whether evaluating `expr` can assign a variable or field (`flag && (x = 'ls')`), not counting
 /// nested functions.
 fn may_assign(expr: &Expression<'_>) -> bool {
@@ -2463,12 +2522,26 @@ impl Walker<'_> {
         match statement {
             Statement::ExpressionStatement(s) => {
                 self.expr(&s.expression, env);
+                // `email = email.trim()`, `name.toLowerCase();`: those receivers were strings.
+                let value = match s.expression.get_inner_expression() {
+                    Expression::AssignmentExpression(a) => &a.right,
+                    other => other,
+                };
+                env.learn(string_receivers(value));
                 // `check(x, String)`, `assertSafe(x)`: past this line, the assertion held.
                 let mut asserted = Vec::new();
                 guards::assertion(statement, &mut asserted);
                 env.learn(asserted);
             }
-            Statement::VariableDeclaration(d) => self.var_decl(d, env),
+            Statement::VariableDeclaration(d) => {
+                self.var_decl(d, env);
+                // `const emailLowerCase = email.toLowerCase()`: `email` was a string.
+                for declarator in &d.declarations {
+                    if let Some(init) = &declarator.init {
+                        env.learn(string_receivers(init));
+                    }
+                }
+            }
             Statement::FunctionDeclaration(f) => {
                 let name = f.id.as_ref().map(|id| id.name.as_str().to_owned());
                 if let Some(name) = &name {
@@ -3341,6 +3414,33 @@ impl Walker<'_> {
                         env.derived.remove(name);
                     }
                 }
+                // `const rel = path.relative(base, file)`.
+                match init.get_inner_expression() {
+                    Expression::CallExpression(c) if guards::is_relative_call(c) => {
+                        let bases = c
+                            .arguments
+                            .first()
+                            .and_then(Argument::as_expression)
+                            .map(guards::relative_base_keys)
+                            .unwrap_or_default();
+                        match c
+                            .arguments
+                            .get(1)
+                            .and_then(Argument::as_expression)
+                            .and_then(guards::path_key)
+                        {
+                            Some(file) if !bases.is_empty() => {
+                                env.relative_of.insert(name.clone(), (bases, file));
+                            }
+                            _ => {
+                                env.relative_of.remove(name);
+                            }
+                        }
+                    }
+                    _ => {
+                        env.relative_of.remove(name);
+                    }
+                }
                 // `const resolved = path.resolve(file)`: the same file as `file`.
                 match self.same_file_of(init) {
                     Some(file) if file != *name => {
@@ -3495,6 +3595,25 @@ impl Walker<'_> {
                 (&name_hint, init.get_inner_expression())
             {
                 let fields = self.literal_fields(object, env);
+                env.fields.insert(name.clone(), fields);
+            } else if let (Some(name), Expression::ConditionalExpression(c)) =
+                (&name_hint, init.get_inner_expression())
+                && let (Expression::ObjectExpression(a), Expression::ObjectExpression(b)) = (
+                    c.consequent.get_inner_expression(),
+                    c.alternate.get_inner_expression(),
+                )
+            {
+                // `const scope = ids ? { where: '..', params: [..ids] } : { where, params }`: each
+                // field what either literal gives it.
+                let mut fields = self.literal_fields(a, env);
+                for (field, origin) in self.literal_fields(b, env) {
+                    match fields.get_mut(&field) {
+                        Some(current) => join(current, &origin),
+                        None => {
+                            fields.insert(field, origin);
+                        }
+                    }
+                }
                 env.fields.insert(name.clone(), fields);
             } else if let Some(name) = &name_hint {
                 env.fields.remove(name);
@@ -6245,6 +6364,7 @@ impl Walker<'_> {
                 // `file = other`: no longer built from what it was.
                 env.derived.remove(id.name.as_str());
                 env.same_file.remove(id.name.as_str());
+                env.relative_of.remove(id.name.as_str());
             }
             other => {
                 if let Some(member) = other
@@ -11741,6 +11861,40 @@ mod tests {
             "let video = null; video = '<video src=' + location.hash + '>'; $(media).append(video);",
         );
         assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn a_relative_path_that_does_not_climb_confines_its_file() {
+        let head = "const { join, relative } = require('path');\nconst fs = require('fs');\nconst app = express();\nconst publicRoot = '/srv/public';\n";
+        // corosolto's dev tools, in place and through a variable.
+        assert!(one(&format!("{head}app.get('/a', (req, res) => {{ const file = join(publicRoot, req.query.p); if (!relative(publicRoot, file).startsWith('..')) {{ res.end(fs.readFileSync(file)); }} }});")).is_empty());
+        assert!(one(&format!("{head}app.get('/b', (req, res) => {{ const file = join(publicRoot, req.query.p); const rel = relative(publicRoot, file); if (rel.startsWith('..')) {{ return res.end(); }} res.end(fs.readFileSync(file)); }});")).is_empty());
+        // A base the attacker chose confines nothing.
+        assert_eq!(one(&format!("{head}app.get('/c', (req, res) => {{ const file = join(publicRoot, req.query.p); const rel = relative(req.query.base, file); if (rel.startsWith('..')) {{ return res.end(); }} res.end(fs.readFileSync(file)); }});")).len(), 1);
+    }
+
+    #[test]
+    fn string_methods_url_host_allowlists_and_branch_objects() {
+        // p5.js signup: `email.toLowerCase()` threw unless `email` was a string.
+        assert!(route("const { email } = req.body; const lower = email.toLowerCase(); await User.findOne({ email });").is_empty());
+        let found = route("const { email } = req.body; await User.findOne({ email });");
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::NosqlInjection),
+            "{found:?}"
+        );
+        // Steam_Buff: the host of a parsed URL checked against an allowlist.
+        let hosts = "const HOSTS = new Set(['api.example.com']);\n";
+        assert!(one(&format!("{hosts}app.post('/p', async (req, res) => {{ const url = new URL(req.body.url); if (!HOSTS.has(url.hostname)) {{ return res.end(); }} res.send(await fetch(url.toString())); }});")).is_empty());
+        assert_eq!(one(&format!("{hosts}app.post('/q', async (req, res) => {{ const url = new URL(req.body.url); if (!url.pathname.startsWith('/api')) {{ return res.end(); }} res.send(await fetch(url.toString())); }});")).len(), 1);
+        // yuvomi: `{ where, params }` from either branch; only `params` holds the request.
+        assert!(route("const ids = req.body.ids; const scope = ids ? { where: `id IN (${ids.map(() => '?').join(',')})`, params: [...ids] } : { where: 'id > 0', params: [] }; db.prepare(`DELETE FROM t WHERE ${scope.where}`).run(...scope.params);").is_empty());
+        let found = route(
+            "const scope = req.body.x ? { where: `id = ${req.body.id}`, params: [] } : { where: 'id = 1', params: [] }; db.prepare(`DELETE FROM t WHERE ${scope.where}`).run();",
+        );
+        assert!(
+            found.iter().any(|f| f.0 == VulnClass::SqlInjection),
+            "{found:?}"
+        );
     }
 
     #[test]

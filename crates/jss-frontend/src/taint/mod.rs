@@ -485,6 +485,7 @@ fn scan_file_program_inner(
         scope_stack: Vec::new(),
         nested_fns: BTreeMap::new(),
         declaring: false,
+        pending_archive: None,
     };
     // Summary passes until a pass learns nothing new: each pass sees the previous one's
     // summaries, so a helper declared before the helper it calls gets its summary one pass
@@ -766,6 +767,8 @@ struct Env {
     /// Summary pass: where this function's own parameters' values start (not an enclosing
     /// function's, which a closure sees too).
     own_params: BTreeSet<u32>,
+    /// Archives opened by a library that checks every entry's name (yauzl's `zipfile`).
+    validated_archives: BTreeSet<String>,
     /// Names this function declares (parameters, `var`/`let`/`const`, loop and catch
     /// bindings, inner functions): writes to any other name are writes to its parent's.
     locals: BTreeSet<String>,
@@ -1114,6 +1117,7 @@ impl Env {
             found_by: BTreeMap::new(),
             def_scope: None,
             own_params: BTreeSet::new(),
+            validated_archives: BTreeSet::new(),
             locals: BTreeSet::new(),
             branch: 0,
             owner: function.clone(),
@@ -1155,6 +1159,7 @@ impl Env {
             found_by: self.found_by.clone(),
             def_scope: self.def_scope,
             own_params: BTreeSet::new(),
+            validated_archives: self.validated_archives.clone(),
             locals: BTreeSet::new(),
             branch: 0,
             owner: if function == "<anonymous>" {
@@ -1374,6 +1379,9 @@ struct Walker<'e> {
     nested_fns: BTreeMap<String, BTreeSet<u32>>,
     /// Set right before walking a function a declaration names in the current function.
     declaring: bool,
+    /// Set while walking the arguments of a call that opens a checked archive: the index of
+    /// the callback parameter that receives it.
+    pending_archive: Option<usize>,
 }
 
 fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
@@ -2791,6 +2799,48 @@ fn assignment_target_names(target: &AssignmentTarget<'_>, out: &mut Vec<String>)
         }
         _ => {}
     }
+}
+
+/// For a call that opens an archive whose library checks every entry's name (yauzl's
+/// `open(path, { lazyEntries: true }, (err, zipfile) => ...)`), the callback parameter that
+/// receives it; not when the check is turned off (`decodeStrings: false`) or the options are
+/// not written out.
+fn checked_archive(callee: &Callee, arguments: &[Argument<'_>]) -> Option<usize> {
+    let Callee::Module {
+        family,
+        export: Some(export),
+    } = callee
+    else {
+        return None;
+    };
+    let spec = m()
+        .validated_archives
+        .iter()
+        .find(|v| v.module == *family && has(&v.exports, export))?;
+    let last = arguments.len().checked_sub(1)?;
+    for argument in arguments.iter().take(last).skip(1) {
+        match argument
+            .as_expression()
+            .map(Expression::get_inner_expression)
+        {
+            Some(Expression::ObjectExpression(options)) => {
+                let off = options.properties.iter().any(|property| match property {
+                    ObjectPropertyKind::ObjectProperty(p) => {
+                        prop_name(&p.key).as_deref() == spec.unless_false.as_deref()
+                            && !matches!(p.value.get_inner_expression(),
+                                Expression::BooleanLiteral(b) if b.value)
+                    }
+                    ObjectPropertyKind::SpreadProperty(_) => true,
+                });
+                if off {
+                    return None;
+                }
+            }
+            // `open(p, opts, cb)`: options it cannot read.
+            _ => return None,
+        }
+    }
+    Some(spec.param)
 }
 
 /// An arrow function or a function expression (in parentheses or under a cast too).
@@ -4748,6 +4798,15 @@ impl Walker<'_> {
             None
         };
         self.scope_stack.push(params.span.start);
+        // `yauzl.open(p, opts, (err, zipfile) => ...)`: `zipfile` checks its entries' names.
+        if let Some(index) = self.pending_archive.take()
+            && let Some(name) = params
+                .items
+                .get(index)
+                .and_then(|p| p.pattern.get_identifier_name())
+        {
+            env.validated_archives.insert(name.to_string());
+        }
         env.auth = env.auth.max(std::mem::take(&mut self.pending_auth));
         let names: Vec<Option<&str>> = params
             .items
@@ -8097,6 +8156,7 @@ impl Walker<'_> {
             .map(|o| o.step(call.span.start, format!("element of .{method_name}()")));
         let mut callback_result: Option<Origin> = None;
         let mut taints = Vec::with_capacity(call.arguments.len());
+        self.pending_archive = checked_archive(&callee, &call.arguments);
         for (index, argument) in call.arguments.iter().enumerate() {
             let arg_role = match shape {
                 Shape::LastCallback if index != last => Role::Plain,
@@ -8183,6 +8243,8 @@ impl Walker<'_> {
             }
             taints.push(taint);
         }
+        // A callback passed by name, or none: no parameter of a later function is the archive.
+        self.pending_archive = None;
         self.call_tail(
             call,
             env,
@@ -9331,8 +9393,11 @@ impl Walker<'_> {
             Callee::Module { family, .. } => Some(*family),
             _ => None,
         };
+        // `zipfile.on('entry', ...)` on an archive whose library checks entry names.
+        let checked = object.is_some_and(|o| env.validated_archives.contains(o));
         for source in &model.client_sources {
             if !has(&source.methods, method)
+                || checked
                 || source.object.as_deref().is_some_and(|o| object != Some(o))
                 // The receiver's name, class or chain: `emailQueue`, `q = new Queue('emails')`,
                 // `t.procedure.input(schema).query(..)`.
@@ -12828,6 +12893,24 @@ mod tests {
         // Judged by its body, not by its name: inside the base the attacker chose.
         assert!(one(&format!("{helpers}app.get('/c', (req, res) => {{ const f = path.join(ROOT, req.query.n); if (!isWithin(ROOT, f)) {{ return res.end(); }} res.send(fs.readFileSync(f)); }});")).is_empty());
         assert_eq!(one(&format!("{helpers}app.get('/d', (req, res) => {{ const f = path.join(ROOT, req.query.n); if (!isWithin(req.query.base, f)) {{ return res.end(); }} res.send(fs.readFileSync(f)); }});")).len(), 1);
+    }
+
+    #[test]
+    fn archives_whose_library_checks_entry_names() {
+        // blot: yauzl rejects absolute and `..` entry names unless `decodeStrings: false`.
+        let unzip = |options: &str| {
+            one(&format!(
+                "const yauzl = require('yauzl');\nfunction extract(zipPath, dir) {{ yauzl.open(zipPath, {options}, (err, zipfile) => {{ zipfile.on('entry', (entry) => {{ fs.createWriteStream(path.join(dir, entry.fileName)); }}); }}); }}"
+            ))
+        };
+        assert!(unzip("{ lazyEntries: true }").is_empty());
+        assert_eq!(
+            unzip("{ lazyEntries: true, decodeStrings: false }").len(),
+            1
+        );
+        assert_eq!(unzip("opts").len(), 1);
+        // Another library's entries are the archive author's.
+        assert_eq!(one("const unzipper = require('unzipper');\nfunction extract(stream, dir) { stream.pipe(unzipper.Parse()).on('entry', (entry) => { fs.createWriteStream(path.join(dir, entry.path)); }); }").len(), 1);
     }
 
     #[test]

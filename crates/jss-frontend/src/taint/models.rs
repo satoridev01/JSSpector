@@ -82,6 +82,9 @@ pub struct Pack {
     pub sockets: SocketSpec,
     #[serde(default)]
     pub client_sources: Vec<ClientSource>,
+    /// Openers whose archives check every entry's name (see [`ValidatedArchive`]).
+    #[serde(default)]
+    pub validated_archives: Vec<ValidatedArchive>,
     #[serde(default)]
     pub result_sources: Vec<ResultSource>,
     #[serde(default)]
@@ -473,6 +476,22 @@ pub struct ClientSource {
     /// upload's temporary `path`.
     #[serde(default)]
     pub server_fields: Vec<String>,
+}
+
+/// A library call that opens an archive whose entries' names it checks (no absolute path, no
+/// `..` segment): yauzl's `open(path, options, (err, zipfile) => ...)`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatedArchive {
+    /// The module family.
+    pub module: String,
+    pub exports: Vec<String>,
+    /// The callback's parameter that receives the archive.
+    pub param: usize,
+    /// An option that, written `false`, turns the check off (`decodeStrings`); options the
+    /// walker cannot read count as off.
+    #[serde(default)]
+    pub unless_false: Option<String>,
 }
 
 /// Request props that hold no objects from a major version of a package on.
@@ -944,6 +963,7 @@ pub struct Model {
     pub socket_ack_names: Vec<String>,
     pub socket_any_methods: Vec<String>,
     pub client_sources: Vec<ClientSource>,
+    pub validated_archives: Vec<ValidatedArchive>,
     pub result_sources: Vec<ResultSource>,
     pub pass_methods: Vec<String>,
     pub receiver_reads: Vec<String>,
@@ -1148,6 +1168,7 @@ impl Model {
         self.socket_ack_names.extend(s.ack_names);
         self.socket_any_methods.extend(s.any_methods);
         self.client_sources.extend(pack.client_sources);
+        self.validated_archives.extend(pack.validated_archives);
         self.result_sources.extend(pack.result_sources);
         self.pass_methods.extend(pack.propagation.pass_methods);
         self.receiver_reads.extend(pack.propagation.receiver_reads);

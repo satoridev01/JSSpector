@@ -1,6 +1,14 @@
 # Archive readers: entry names are chosen by the archive's author.
 name: archive
+modules:
+  yauzl: yauzl
 client_sources:
   - {methods: [on], event: entry, params: first, kind: archive}
+# yauzl checks the name of every entry it reads (no absolute path, no `..` segment, no
+# backslash) unless told not to decode names (`decodeStrings: false`): the entries of an archive
+# it opened (the callback's second parameter) carry no path of the attacker's.
+validated_archives:
+  - {module: yauzl, exports: [open, fromBuffer, fromFd, fromRandomAccessReader], param: 1,
+     unless_false: decodeStrings}
 result_sources:
   - {methods: [getEntries], kind: archive}

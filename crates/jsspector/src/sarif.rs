@@ -22,9 +22,18 @@ pub struct Note<'a> {
 
 /// The SARIF log of a scan of `root` (absolute) that reported `findings`. With `baseline`, every
 /// result is marked `baselineState: new` (findings in the baseline are not reported at all).
-pub fn document(root: &Path, findings: &[Finding], notes: &[Note<'_>], baseline: bool) -> Value {
+pub fn document(
+    root: &Path,
+    findings: &[Finding],
+    notes: &[Note<'_>],
+    baseline: bool,
+    verified: &std::collections::BTreeMap<String, &str>,
+) -> Value {
     let rules: Vec<Value> = CLASSES.iter().map(|class| rule(*class)).collect();
-    let results: Vec<Value> = findings.iter().map(|f| result(f, baseline)).collect();
+    let results: Vec<Value> = findings
+        .iter()
+        .map(|f| result(f, baseline, verified.get(f.fingerprint.as_str()).copied()))
+        .collect();
     let notifications: Vec<Value> = notes
         .iter()
         .map(|note| {
@@ -88,7 +97,7 @@ fn rule(class: jss_core::VulnClass) -> Value {
     })
 }
 
-fn result(f: &Finding, baseline: bool) -> Value {
+fn result(f: &Finding, baseline: bool, verification: Option<&str>) -> Value {
     let sink_file = f.sink.file.as_deref().unwrap_or(&f.file);
     let mut message = format!(
         "Data from `{}` ({}) {}: `{}`.",
@@ -126,6 +135,10 @@ fn result(f: &Finding, baseline: bool) -> Value {
     });
     if let (Some(entry), Some(map)) = (&f.entry, properties.as_object_mut()) {
         map.insert("entry".to_owned(), json!(entry));
+    }
+    // `--verify` outcome, when the run verified findings dynamically.
+    if let (Some(outcome), Some(map)) = (verification, properties.as_object_mut()) {
+        map.insert("verification".to_owned(), json!(outcome));
     }
     let mut result = json!({
         "ruleId": rules::id(f.class),
@@ -263,7 +276,13 @@ mod tests {
 
     #[test]
     fn a_finding_becomes_a_result_with_its_flow() {
-        let log = document(Path::new("/repo dir"), &[finding()], &[], true);
+        let log = document(
+            Path::new("/repo dir"),
+            &[finding()],
+            &[],
+            true,
+            &std::collections::BTreeMap::new(),
+        );
         let run = &log["runs"][0];
         assert_eq!(log["version"], "2.1.0");
         assert_eq!(run["columnKind"], "utf16CodeUnits");
@@ -305,6 +324,19 @@ mod tests {
             "src/db.js"
         );
         assert_eq!(result["properties"]["entry"], "GET /items");
+        // No verification property unless a verdict was supplied.
+        assert!(result["properties"].get("verification").is_none());
+    }
+
+    #[test]
+    fn a_verified_finding_carries_its_outcome() {
+        let mut verified = std::collections::BTreeMap::new();
+        verified.insert(finding().fingerprint, "verified");
+        let log = document(Path::new("/r"), &[finding()], &[], false, &verified);
+        assert_eq!(
+            log["runs"][0]["results"][0]["properties"]["verification"],
+            "verified"
+        );
     }
 
     #[test]

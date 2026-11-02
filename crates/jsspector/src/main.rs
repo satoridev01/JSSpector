@@ -8,6 +8,7 @@ mod report;
 mod rules;
 mod sarif;
 mod text;
+mod verify;
 
 use std::fmt::Display;
 use std::io::{self, BufWriter, IsTerminal, Write};
@@ -151,8 +152,21 @@ struct ScanArgs {
     /// Record the findings reported now in FILE, to accept them as a baseline.
     #[arg(long, value_name = "FILE")]
     write_baseline: Option<PathBuf>,
+    /// Confirm each reported finding by running the app in a throwaway Docker container and
+    /// sending the request it implies (opt-in; needs a running Docker daemon). `--verify=strict`
+    /// fails the command when Docker is unreachable instead of skipping.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "best-effort")]
+    verify: Option<VerifyMode>,
     #[command(flatten)]
     config: ConfigArgs,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum VerifyMode {
+    /// Skip verification when Docker is unreachable.
+    BestEffort,
+    /// Fail when Docker is unreachable.
+    Strict,
 }
 
 #[derive(Args)]
@@ -190,6 +204,9 @@ struct ScanOutput<'a> {
     skipped: &'a [FileNote],
     /// Files where the walker hit its depth cap.
     truncated: &'a [String],
+    /// `--verify` verdicts, one per reported finding; empty when `--verify` was not given.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    verification: &'a [verify::Verdict],
 }
 
 /// A finding as `scan --json` prints it: a title first, the finding, then the fields issue
@@ -450,6 +467,22 @@ fn scan(args: &ScanArgs) -> ExitCode {
         None => (reported, Vec::new()),
     };
 
+    // `--verify`: run the app and confirm each finding. Only when asked; a failure to reach
+    // Docker in strict mode is a usage error.
+    let verification = match args.verify {
+        None => Vec::new(),
+        Some(mode) => {
+            let missing = match mode {
+                VerifyMode::Strict => verify::Missing::Fail,
+                VerifyMode::BestEffort => verify::Missing::Skip,
+            };
+            match verify::run(&analysis.root, &findings, missing) {
+                Ok(verdicts) => verdicts,
+                Err(err) => return fail(EXIT_USAGE, err),
+            }
+        }
+    };
+
     let format = match (args.format, args.json) {
         (Some(format), _) => format,
         (None, true) => Format::Json,
@@ -465,6 +498,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 ignored,
                 skipped: &analysis.skipped,
                 truncated: &analysis.truncated,
+                verification: &verification,
             };
             serde_json::to_writer_pretty(&mut *out, &output)
                 .map_err(io::Error::from)
@@ -480,7 +514,17 @@ fn scan(args: &ScanArgs) -> ExitCode {
                     error: note.panicked,
                 })
                 .collect();
-            let log = sarif::document(&analysis.root, &findings, &notes, accepted.is_some());
+            let verified: std::collections::BTreeMap<String, &str> = verification
+                .iter()
+                .map(|v| (v.fingerprint.clone(), v.outcome.label()))
+                .collect();
+            let log = sarif::document(
+                &analysis.root,
+                &findings,
+                &notes,
+                accepted.is_some(),
+                &verified,
+            );
             serde_json::to_writer_pretty(&mut *out, &log)
                 .map_err(io::Error::from)
                 .and_then(|()| writeln!(out))
@@ -497,7 +541,8 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 elapsed: started.elapsed(),
             },
             &text::Style::new(color),
-        ),
+        )
+        .and_then(|()| verify::write_text(out, &verification, color)),
     });
     if let Err(err) = written {
         return fail(EXIT_ENGINE, format!("cannot write the report: {err}"));

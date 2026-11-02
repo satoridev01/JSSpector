@@ -1647,6 +1647,179 @@ fn any_contains<'n>(mut names: impl Iterator<Item = &'n str>, needles: &[String]
     })
 }
 
+/// The identifiers and property names an expression reads (not inside nested functions).
+fn names_in(expr: &Expression<'_>, out: &mut Vec<String>) {
+    fn walk(expr: &Expression<'_>, out: &mut Vec<String>, depth: usize) {
+        if depth > 32 {
+            return;
+        }
+        let deeper = |e: &Expression<'_>, out: &mut Vec<String>| walk(e, out, depth + 1);
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) => out.push(id.name.as_str().to_owned()),
+            Expression::BinaryExpression(b) => {
+                deeper(&b.left, out);
+                deeper(&b.right, out);
+            }
+            Expression::LogicalExpression(l) => {
+                deeper(&l.left, out);
+                deeper(&l.right, out);
+            }
+            Expression::UnaryExpression(u) => deeper(&u.argument, out),
+            Expression::ConditionalExpression(c) => {
+                deeper(&c.test, out);
+                deeper(&c.consequent, out);
+                deeper(&c.alternate, out);
+            }
+            Expression::CallExpression(c) => {
+                deeper(&c.callee, out);
+                for a in &c.arguments {
+                    if let Some(e) = a.as_expression() {
+                        deeper(e, out);
+                    }
+                }
+            }
+            other => {
+                if let Some(member) = other.as_member_expression() {
+                    if let Some(name) = member.static_property_name().and_then(|n| n.as_str()) {
+                        out.push(name.to_owned());
+                    }
+                    deeper(member.object(), out);
+                }
+            }
+        }
+    }
+    walk(expr, out, 0);
+}
+
+/// The authentication an inline middleware enforces before `next()`: an `if` that answers 401
+/// or 403 and returns. Admin when the check names an admin word (`req.user.admin !== true`) or
+/// compares a value of the request with one of the server (`req.header('Authorization') !==
+/// SECRET`, a shared secret); a user otherwise (`!req.session.user`).
+fn inline_guard_auth(expr: &Expression<'_>) -> Option<Auth> {
+    let (params, statements) = match expr.get_inner_expression() {
+        Expression::ArrowFunctionExpression(f) => match &f.body {
+            ArrowFunctionBody::FunctionBody(body) => (&f.params, &body.statements),
+            _ => return None,
+        },
+        Expression::FunctionExpression(f) => (&f.params, &f.body.as_ref()?.statements),
+        _ => return None,
+    };
+    if params.items.len() < 3 {
+        return None;
+    }
+    let request = params
+        .items
+        .first()?
+        .pattern
+        .get_identifier_name()?
+        .to_string();
+    // `const authorization = req.header('Authorization')`: read from the request.
+    let mut from_request: BTreeSet<String> = BTreeSet::from([request]);
+    let mut level: Option<Auth> = None;
+    for statement in statements {
+        match statement {
+            Statement::VariableDeclaration(d) => {
+                for declarator in &d.declarations {
+                    let (Some(name), Some(init)) =
+                        (declarator.id.get_identifier_name(), &declarator.init)
+                    else {
+                        continue;
+                    };
+                    let mut names = Vec::new();
+                    names_in(init, &mut names);
+                    if names.iter().any(|n| from_request.contains(n)) {
+                        from_request.insert(name.to_string());
+                    }
+                }
+            }
+            Statement::IfStatement(i)
+                if guards::exits(&i.consequent) && answers_denied(&i.consequent) =>
+            {
+                let mut names = Vec::new();
+                names_in(&i.test, &mut names);
+                if !names.iter().any(|n| from_request.contains(n)) {
+                    continue;
+                }
+                let admin = names.iter().any(|n| {
+                    let lower = n.to_ascii_lowercase();
+                    m().auth_admin.iter().any(|a| lower.contains(a.as_str()))
+                });
+                let this = if admin || compares_to_server(&i.test, &from_request) {
+                    Auth::Admin
+                } else {
+                    Auth::User
+                };
+                level = level.max(Some(this));
+            }
+            _ => {}
+        }
+    }
+    level
+}
+
+/// `x !== SECRET` with `x` read from the request and `SECRET` not: a shared secret.
+fn compares_to_server(test: &Expression<'_>, from_request: &BTreeSet<String>) -> bool {
+    match test.get_inner_expression() {
+        Expression::LogicalExpression(l) => {
+            compares_to_server(&l.left, from_request) || compares_to_server(&l.right, from_request)
+        }
+        Expression::UnaryExpression(u) => compares_to_server(&u.argument, from_request),
+        Expression::BinaryExpression(b)
+            if matches!(
+                b.operator,
+                BinaryOperator::StrictInequality | BinaryOperator::Inequality
+            ) =>
+        {
+            let reads = |e: &Expression<'_>| {
+                let mut names = Vec::new();
+                names_in(e, &mut names);
+                names.iter().any(|n| from_request.contains(n))
+            };
+            let server = |e: &Expression<'_>| {
+                matches!(e.get_inner_expression(), Expression::Identifier(_))
+                    || e.get_inner_expression().as_member_expression().is_some()
+            };
+            (reads(&b.left) && !reads(&b.right) && server(&b.right))
+                || (reads(&b.right) && !reads(&b.left) && server(&b.left))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a statement answers 401 or 403 (`return res.status(403).send(..)`).
+fn answers_denied(statement: &Statement<'_>) -> bool {
+    fn denied(expr: &Expression<'_>, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        let Expression::CallExpression(c) = expr.get_inner_expression() else {
+            return false;
+        };
+        let here = c
+            .callee
+            .get_inner_expression()
+            .as_member_expression()
+            .and_then(|m| m.static_property_name())
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| has(&m().auth_denial_methods, n))
+            && matches!(
+                c.arguments.first(),
+                Some(Argument::NumericLiteral(n)) if n.value == 401.0 || n.value == 403.0
+            );
+        here || c
+            .callee
+            .get_inner_expression()
+            .as_member_expression()
+            .is_some_and(|m| denied(m.object(), depth + 1))
+    }
+    match statement {
+        Statement::BlockStatement(b) => b.body.iter().any(answers_denied),
+        Statement::ReturnStatement(r) => r.argument.as_ref().is_some_and(|e| denied(e, 0)),
+        Statement::ExpressionStatement(e) => denied(&e.expression, 0),
+        _ => false,
+    }
+}
+
 /// Whether evaluating `expr` can assign a variable or field (`flag && (x = 'ls')`), not counting
 /// nested functions.
 fn may_assign(expr: &Expression<'_>) -> bool {
@@ -2766,7 +2939,9 @@ impl Walker<'_> {
                             kind: "default-export",
                         });
                     }
-                    self.function(f, env, name, Role::Plain);
+                    // An anonymous one goes by `<default>`, the name its export points at.
+                    let walked = name.or_else(|| Some("<default>".to_owned()));
+                    self.function(f, env, walked, Role::Plain);
                 }
                 ExportDefaultDeclarationKind::ClassDeclaration(c) => {
                     if let Some(id) = &c.id {
@@ -2778,10 +2953,21 @@ impl Walker<'_> {
                 }
                 other => {
                     if let Some(expr) = other.as_expression() {
-                        if let Expression::Identifier(id) = expr.get_inner_expression() {
-                            self.facts
-                                .exports
-                                .insert("default".to_owned(), id.name.as_str().to_owned());
+                        match expr.get_inner_expression() {
+                            Expression::Identifier(id) => {
+                                self.facts
+                                    .exports
+                                    .insert("default".to_owned(), id.name.as_str().to_owned());
+                            }
+                            // `export default async (req, res) => {}`, imported elsewhere as
+                            // `import deleteRoute from './routes/delete.js'`.
+                            Expression::ArrowFunctionExpression(_)
+                            | Expression::FunctionExpression(_) => {
+                                self.facts
+                                    .exports
+                                    .insert("default".to_owned(), "<default>".to_owned());
+                            }
+                            _ => {}
                         }
                         // `export default async (req, res) => {}`, `export default handler`,
                         // `export default withAuth(handler)`: a pages/api route's handler.
@@ -2817,6 +3003,19 @@ impl Walker<'_> {
                                 self.maybe_function(expr, env, Some(handler), Role::Route);
                                 return;
                             }
+                        }
+                        // Any other anonymous function: walked by its export's name.
+                        if matches!(
+                            expr.get_inner_expression(),
+                            Expression::ArrowFunctionExpression(_)
+                                | Expression::FunctionExpression(_)
+                        ) && self.maybe_function(
+                            expr,
+                            env,
+                            Some("<default>".to_owned()),
+                            Role::Plain,
+                        ) {
+                            return;
                         }
                         self.expr(expr, env);
                     }
@@ -6896,10 +7095,14 @@ impl Walker<'_> {
                 .get(usize::from(prefix.is_some())..)
                 .unwrap_or(&[]);
             if !middleware.iter().any(|e| self.mountable(e)) {
+                // `app.use((req, res, next) => { if (..) return res.status(403)..; next(); })`
                 let used = middleware
                     .iter()
-                    .filter_map(|e| callee_name(e))
-                    .filter_map(|name| m().auth_of(&name))
+                    .filter_map(|e| {
+                        callee_name(e)
+                            .and_then(|name| m().auth_of(&name))
+                            .or_else(|| inline_guard_auth(e))
+                    })
                     .max();
                 if let Some(level) = used {
                     self.router_auth
@@ -6908,6 +7111,38 @@ impl Walker<'_> {
                         .push((prefix.unwrap_or_default(), level));
                 }
             }
+        }
+        // `mstream.all('/api/v1/admin/{*path}', (req, res, next) => { if (!req.user.admin) return
+        // res.status(403)..; next(); })`: guards the routes registered after it under that path.
+        if let Callee::Method {
+            object: Some(object),
+            method,
+        } = &callee
+            && !has(&m().mount_methods, method)
+            && has(&m().route_methods, method)
+            && call.arguments.len() == 2
+            && let Some(level) = call
+                .arguments
+                .last()
+                .and_then(Argument::as_expression)
+                .and_then(inline_guard_auth)
+            && let Some(prefix) = call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .and_then(|e| self.mount_path(e, env))
+        {
+            // Up to the first wildcard: `/api/v1/admin/{*path}` guards `/api/v1/admin/...`.
+            let cut = ["{*", "*", "("]
+                .iter()
+                .filter_map(|w| prefix.find(w))
+                .min()
+                .unwrap_or(prefix.len());
+            let prefix = prefix.get(..cut).unwrap_or(&prefix).to_owned();
+            self.router_auth
+                .entry(router_key(object, env))
+                .or_default()
+                .push((prefix, level));
         }
         // Routes are kept from the final pass only (facts reset before it); templates from any.
         {
@@ -9306,7 +9541,7 @@ impl Walker<'_> {
         let handler = last
             .and_then(|e| match e.get_inner_expression() {
                 Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => None,
-                other => callee_name(other),
+                other => self.route_handler_name(other),
             })
             .unwrap_or_else(|| {
                 self.inline_route_name(
@@ -9537,17 +9772,29 @@ impl Walker<'_> {
             receiver_param.is_some() || object.as_deref().is_some_and(|o| self.is_router(o));
         // `export function setup(mstream) { mstream.post('/api/x', h) }`: a literal path on a
         // parameter not named like a router is still the caller's router's route.
+        // Also through a factory declared here and called with constants
+        // (`mstream.all('/dlna/event/cds', genaRoute('cds'))`).
         let param_router = receiver_param.is_some()
             && !object.as_deref().is_some_and(|o| self.is_router(o))
             && call
                 .arguments
                 .last()
                 .and_then(Argument::as_expression)
-                .is_some_and(|e| {
-                    matches!(
-                        e.get_inner_expression(),
-                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
-                    )
+                .is_some_and(|e| match e.get_inner_expression() {
+                    Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => {
+                        true
+                    }
+                    Expression::CallExpression(c) => {
+                        matches!(c.callee.get_inner_expression(),
+                            Expression::Identifier(f) if env.locals.contains(f.name.as_str()))
+                            && c.arguments.iter().all(|a| {
+                                matches!(
+                                    a,
+                                    Argument::StringLiteral(_) | Argument::NumericLiteral(_)
+                                )
+                            })
+                    }
+                    _ => false,
                 });
         if role == Role::Route
             && (depends_on_params || param_router)
@@ -9608,7 +9855,7 @@ impl Walker<'_> {
                 // here that is none of the parameters.
                 handler: inline_handler.or_else(|| {
                     last.filter(|_| handler_param.is_none())
-                        .and_then(callee_name)
+                        .and_then(|e| self.route_handler_name(e))
                 }),
                 handler_param,
                 auth,
@@ -9668,7 +9915,7 @@ impl Walker<'_> {
         let handler = last
             .and_then(|e| match e.get_inner_expression() {
                 Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => None,
-                other => callee_name(other),
+                other => self.route_handler_name(other),
             })
             .unwrap_or_else(|| {
                 self.inline_route_name(method, &path, object.as_deref(), call.span.start)
@@ -10132,7 +10379,7 @@ impl Walker<'_> {
                         .or_else(|| {
                             passed_handler
                                 .filter(|e| param_of(Some(e)).is_none())
-                                .and_then(callee_name)
+                                .and_then(|e| self.route_handler_name(e))
                         }),
                     // Handed on by one of our parameters: our callers pass it.
                     handler_param: passed_handler.and_then(|e| param_of(Some(e))),
@@ -10178,7 +10425,7 @@ impl Walker<'_> {
                 // argument.
                 (None, _) => passed_handler
                     .or_else(|| call.arguments.last().and_then(Argument::as_expression))
-                    .and_then(callee_name)
+                    .and_then(|e| self.route_handler_name(e))
                     .unwrap_or_else(|| format!("{name}()")),
             },
             span: call.span,
@@ -10303,6 +10550,36 @@ impl Walker<'_> {
             }
             _ => false,
         }
+    }
+
+    /// The name a route's handler goes by (`listUsers`, `users.list`); through a one-argument
+    /// wrapper around a function of ours (`asyncHandler(deleteRoute)`, `catchAsync(list)`), the
+    /// wrapped one, which is what runs for the route (`serveStatic(dir)` keeps its name); for a
+    /// factory called with constants (`genaRoute('cds')`), the factory.
+    fn route_handler_name(&self, expr: &Expression<'_>) -> Option<String> {
+        if let Expression::CallExpression(c) = expr.get_inner_expression()
+            && c.arguments.len() == 1
+            && let Some(Expression::Identifier(inner)) = c
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .map(Expression::get_inner_expression)
+            && (self.relative.contains_key(inner.name.as_str())
+                || self.summaries.contains_key(inner.name.as_str()))
+        {
+            return Some(inner.name.as_str().to_owned());
+        }
+        // `genaRoute('cds')`: a factory whose returned handler is a closure of it (its calls
+        // and findings are the factory's own).
+        if let Expression::CallExpression(c) = expr.get_inner_expression()
+            && let Expression::Identifier(factory) = c.callee.get_inner_expression()
+            && c.arguments
+                .iter()
+                .all(|a| matches!(a, Argument::StringLiteral(_) | Argument::NumericLiteral(_)))
+        {
+            return Some(factory.name.as_str().to_owned());
+        }
+        callee_name(expr)
     }
 
     /// The variable a call names the same file as: `path.resolve(file)`, `path.normalize(file)`
@@ -11464,6 +11741,36 @@ mod tests {
             "let video = null; video = '<video src=' + location.hash + '>'; $(media).append(video);",
         );
         assert!(found.iter().any(|f| f.0 == VulnClass::Xss), "{found:?}");
+    }
+
+    #[test]
+    fn inline_middleware_that_answers_403_is_authentication() {
+        let admin_area = "const fs = require('fs');\nconst app = express();\n\
+            app.get('/admin/before', (req, res) => { res.send(fs.readFileSync(req.query.f)); });\n\
+            app.all('/admin/{*path}', (req, res, next) => { if (req.user.admin !== true) { return res.status(403).end(); } next(); });\n\
+            app.post('/admin/files', (req, res) => { res.send(fs.readFileSync(req.body.p)); });\n";
+        let found = one(admin_area);
+        assert!(found.iter().any(|f| f.1 == Severity::Medium), "{found:?}");
+        assert!(
+            found.iter().any(|f| f.1 == Severity::High),
+            "registered before the guard: {found:?}"
+        );
+        // blot's internal service: a request header against a secret of the server.
+        let secret = one("const fs = require('fs');\nconst app = express();\n\
+            app.use((req, res, next) => { const authorization = req.header('Authorization'); if (authorization !== Authorization) { return res.status(403).send('no'); } next(); });\n\
+            app.post('/delete', (req, res) => { fs.unlinkSync(req.body.path); res.end(); });\n");
+        assert!(
+            secret.iter().all(|f| f.1 == Severity::Medium) && !secret.is_empty(),
+            "{secret:?}"
+        );
+        // A logged-in user is not an admin: still high.
+        let user = one("const fs = require('fs');\nconst app = express();\n\
+            app.use((req, res, next) => { if (!req.session.user) { return res.sendStatus(401); } next(); });\n\
+            app.get('/f', (req, res) => { res.send(fs.readFileSync(req.query.f)); });\n");
+        assert!(
+            user.iter().all(|f| f.1 == Severity::High) && !user.is_empty(),
+            "{user:?}"
+        );
     }
 
     #[test]

@@ -2037,3 +2037,169 @@ fn imported_string_validators_keep_query_operators_out() {
         .collect();
     assert_eq!(entries, vec!["POST /unchecked"]);
 }
+
+/// An internal service behind inline middleware that answers 403 unless a request header
+/// equals a secret of the server (blot's iCloud macserver), whose routes wrap handlers from
+/// other files (`asyncHandler(deleteRoute)`): the route names the wrapped handler, and the
+/// findings in it are the route's, at admin level.
+#[test]
+fn wrapped_handlers_behind_a_shared_secret_guard_are_admin_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "routes/delete.js",
+        "import fs from 'fs';\nexport default async function deleteRoute(req, res) {\n  \
+         fs.unlinkSync('/data/' + req.header('blogID') + '/' + req.body.path);\n  res.end();\n}\n",
+    );
+    // An anonymous default export (`export default async (req, res) => {}`), as blot writes them.
+    write(
+        root,
+        "routes/mkdir.js",
+        "import fs from 'fs';\nexport default async (req, res) => {\n  \
+         fs.mkdirSync('/data/' + req.header('blogID') + '/' + req.body.path);\n  res.end();\n};\n",
+    );
+    write(
+        root,
+        "index.js",
+        "import express from 'express';\nimport { Authorization } from './config.js';\n\
+         import deleteRoute from './routes/delete.js';\nimport mkdirRoute from './routes/mkdir.js';\n\
+         const asyncHandler = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);\n\
+         const app = express();\n\
+         app.use((req, res, next) => { const authorization = req.header('Authorization'); \
+         if (authorization !== Authorization) { return res.status(403).send('Unauthorized'); } next(); });\n\
+         app.post('/delete', asyncHandler(deleteRoute));\napp.post('/mkdir', asyncHandler(mkdirRoute));\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let handlers: Vec<&str> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["handler"].as_str().unwrap())
+        .collect();
+    assert_eq!(handlers, vec!["deleteRoute", "mkdirRoute"]);
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings: Vec<(String, String, String)> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["entry"].as_str().unwrap_or("").to_owned(),
+                f["auth"].as_str().unwrap_or("").to_owned(),
+                f["severity"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    let mut findings = findings;
+    findings.sort();
+    assert_eq!(
+        findings,
+        vec![
+            (
+                "POST /delete".to_owned(),
+                "admin".to_owned(),
+                "medium".to_owned()
+            ),
+            (
+                "POST /mkdir".to_owned(),
+                "admin".to_owned(),
+                "medium".to_owned()
+            )
+        ]
+    );
+}
+
+/// mStream's DLNA routes: `all(path, genaRoute('cds'))` registers the closure a factory
+/// returns. The route goes by the factory, whose closure calls the sink's function, so that
+/// public route is the finding's entry, even though an admin-only route reaches the same
+/// function.
+#[test]
+fn a_handler_made_by_a_factory_links_the_public_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "dlna.js",
+        "const http = require('http');\nconst express = require('express');\nconst app = express();\n\
+         function handleSubscribe(req, res) { const u = new URL(req.headers['callback']); http.request({ hostname: u.hostname, path: u.pathname }).end(); res.end(); }\n\
+         function genaRoute(service) { return (req, res) => { if (req.method === 'SUBSCRIBE') { return handleSubscribe(req, res); } res.status(405).end(); }; }\n\
+         app.all('/dlna/event/cds', genaRoute('cds'));\n\
+         app.all('/admin/{*path}', (req, res, next) => { if (req.user.admin !== true) { return res.status(403).end(); } next(); });\n\
+         app.delete('/admin/directory', (req, res) => { handleSubscribe(req, res); });\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings: Vec<(String, String, String)> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["class"].as_str().unwrap_or("").to_owned(),
+                f["severity"].as_str().unwrap_or("").to_owned(),
+                f["entry"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        findings,
+        vec![(
+            "ssrf".to_owned(),
+            "high".to_owned(),
+            "ALL /dlna/event/cds".to_owned()
+        )]
+    );
+}
+
+/// The same, registered by a helper on the router its caller hands it
+/// (`export function setup(mstream) { mstream.all(path, genaRoute('cds')) }`).
+#[test]
+fn a_factory_handler_on_a_handed_router_is_a_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/api/dlna.js",
+        "import http from 'http';\nexport function setup(mstream) {\n  \
+         function handleSubscribe(req, res) { const u = new URL(req.headers['callback']); http.request({ hostname: u.hostname, path: u.pathname }).end(); res.end(); }\n  \
+         function genaRoute(service) { return (req, res) => { if (req.method === 'SUBSCRIBE') { return handleSubscribe(req, res); } res.status(405).end(); }; }\n  \
+         mstream.all('/dlna/event/cds', genaRoute('cds'));\n}\n",
+    );
+    write(
+        root,
+        "src/server.js",
+        "import express from 'express';\nimport * as dlnaApi from './api/dlna.js';\n\
+         const app = express();\ndlnaApi.setup(app);\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let entries: Vec<(&str, &str)> = scan["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["severity"].as_str().unwrap_or(""),
+                f["entry"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(entries, vec![("high", "ALL /dlna/event/cds")]);
+}

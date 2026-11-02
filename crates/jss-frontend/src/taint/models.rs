@@ -190,6 +190,10 @@ pub struct AuthSpec {
     /// case-insensitive): `session(...)`, `passport.initialize()`.
     #[serde(default)]
     pub setup: Vec<String>,
+    /// Response methods that answer with a status (`res.status(403)`, `res.sendStatus(401)`):
+    /// an inline middleware that answers 401/403 and returns guards what follows it.
+    #[serde(default)]
+    pub denial_methods: Vec<String>,
 }
 
 /// An authentication level in a pack.
@@ -983,6 +987,7 @@ pub struct Model {
     pub input_fields: Vec<String>,
     pub auth_middleware: Vec<String>,
     pub auth_admin: Vec<String>,
+    pub auth_denial_methods: Vec<String>,
     pub auth_request_fields: Vec<String>,
     pub auth_decorators: Vec<String>,
     pub auth_setup: Vec<String>,
@@ -1233,6 +1238,7 @@ impl Model {
         self.module_pass.extend(pack.module_pass);
         self.auth_middleware.extend(pack.auth.middleware);
         self.auth_admin.extend(pack.auth.admin);
+        self.auth_denial_methods.extend(pack.auth.denial_methods);
         self.auth_request_fields.extend(pack.auth.request_fields);
         self.auth_setup
             .extend(pack.auth.setup.iter().map(|n| n.to_ascii_lowercase()));

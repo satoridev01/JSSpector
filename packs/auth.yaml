@@ -10,3 +10,5 @@ auth:
   decorators: [UseGuards, Auth, Roles, Authorized, Protected]
   # Named like auth but only set things up: no request is refused.
   setup: [session, cookieSession, expressSession, passport.initialize, passport.session]
+  # `return res.status(403).send(..)` in an inline `(req, res, next)` middleware: a guard.
+  denial_methods: [status, sendStatus, writeHead]

@@ -235,6 +235,12 @@ pub const RULES: &[Rule] = &[
         pattern: Pattern::DirOutsideSrc(&["spec"]),
     },
     Rule {
+        // Benchmark harnesses and their fixtures (`bench/`, `scripts/benchmarks/`): run by
+        // developers, never shipped. Under `src/` a bench module may be a feature.
+        class: FileClass::Test,
+        pattern: Pattern::DirOutsideSrc(&["bench", "benchmark", "benchmarks"]),
+    },
+    Rule {
         class: FileClass::Test,
         pattern: Pattern::Infix(&[".test.", ".spec.", ".e2e.", ".stories."]),
     },
@@ -416,9 +422,14 @@ mod tests {
             "e2e",
             "cypress",
             "playwright",
+            "bench",
+            "benchmark",
+            "benchmarks",
         ] {
             assert_eq!(c(&format!("{dir}/a.js")), FileClass::Test, "{dir}");
         }
+        assert_eq!(c("scripts/bench/server.js"), FileClass::Test);
+        assert_eq!(c("src/bench/a.js"), FileClass::Source);
         for name in [
             "jest.config.js",
             "jest.setup.ts",

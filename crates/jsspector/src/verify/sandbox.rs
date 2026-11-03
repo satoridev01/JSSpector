@@ -49,7 +49,15 @@ impl Session {
     /// Builds the image from `root` and starts the app and marker service, or returns why it
     /// could not (no start script, build failure, app never listened). The caller turns an `Err`
     /// here into a skip reason for every drivable finding.
+    #[cfg(test)]
     pub fn start(root: &std::path::Path) -> Result<Self, String> {
+        Self::start_in(root, std::path::Path::new(""))
+    }
+
+    /// Like [`Self::start`], but launches the package at `app` (relative to `root`, as chosen by
+    /// [`app_dir`]) while the whole repo stays in the image, so the app can still import files
+    /// outside its own directory.
+    pub fn start_in(root: &std::path::Path, app_path: &std::path::Path) -> Result<Self, String> {
         let id = run_id();
         let canary = Canary::new(format!("{id}{}", short_rand()));
         let tag = format!("jsspector-verify:{id}");
@@ -58,10 +66,21 @@ impl Session {
         let marker = format!("jss-verify-marker-{id}");
         let port = 3000;
 
-        let start_command = start_command(root)
+        let app_root = root.join(app_path);
+        let start_command = start_command(&app_root)
             .ok_or_else(|| "no `start` script in package.json to launch the app".to_owned())?;
+        let workdir = container_dir(app_path)
+            .ok_or_else(|| format!("unsupported app directory `{}`", app_path.display()))?;
 
-        build_image(root, &tag, &canary, &start_command, port)?;
+        build_image(
+            root,
+            &app_root,
+            &workdir,
+            &tag,
+            &canary,
+            &start_command,
+            port,
+        )?;
 
         // An internal network: DNS between its members, no route to the internet.
         docker(&["network", "create", "--internal", &network])
@@ -323,6 +342,8 @@ impl Drop for Session {
 /// only one with network access.
 fn build_image(
     root: &std::path::Path,
+    app_root: &std::path::Path,
+    workdir: &str,
     tag: &str,
     canary: &Canary,
     start_command: &str,
@@ -331,8 +352,8 @@ fn build_image(
     let context = root
         .to_str()
         .ok_or_else(|| "the repository path is not valid UTF-8".to_owned())?;
-    let image = base_image(root);
-    let dockerfile = dockerfile(&image, canary, start_command, port);
+    let image = base_image(app_root);
+    let dockerfile = dockerfile(&image, workdir, canary, start_command, port);
     build_from_dockerfile(&dockerfile, tag, context)
 }
 
@@ -420,24 +441,36 @@ fn tail_logs(name: &str) -> String {
 /// The generated Dockerfile. `npm ci` when a lockfile is present (reproducible), else `npm
 /// install`; both tolerate the absence of a build script. The marker file and the two helper
 /// scripts are written through base64 so no shell or printf escaping can corrupt them.
-fn dockerfile(image: &str, canary: &Canary, start_command: &str, port: u16) -> String {
+fn dockerfile(
+    image: &str,
+    workdir: &str,
+    canary: &Canary,
+    start_command: &str,
+    port: u16,
+) -> String {
     let marker_file = canary.planted_file();
     let token = &canary.token;
     format!(
         "FROM {image}\n\
          WORKDIR /app\n\
          COPY . /app\n\
+         WORKDIR {workdir}\n\
          RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund || true\n\
          RUN for example in .env.example .env.sample .env.template; do \
          if [ ! -e .env ] && [ -f \"$example\" ]; then cp \"$example\" .env; fi; done\n\
          RUN printf '%s' '{token}' > {marker_file}\n\
          RUN echo {} | base64 -d > /jss-driver.js\n\
          RUN echo {} | base64 -d > /jss-marker.js\n\
+         RUN echo {} | base64 -d > /jss-marker.crt\n\
+         RUN echo {} | base64 -d > /jss-marker.key\n\
+         ENV NODE_EXTRA_CA_CERTS=/jss-marker.crt\n\
          ENV PORT={port}\n\
          ENV HOST=0.0.0.0\n\
          CMD {start_command}\n",
         base64(DRIVER_JS.as_bytes()),
         base64(MARKER_JS.as_bytes()),
+        base64(MARKER_CERT.as_bytes()),
+        base64(MARKER_KEY.as_bytes()),
     )
 }
 
@@ -471,19 +504,84 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// The app's launch command for the image `CMD`. Only `npm start` in v1: explicit, and what most
-/// Node servers document. `None` when there is no start script.
+/// The app's launch command for the image `CMD`: `npm start` when the package has a start
+/// script (explicit, and what most Node servers document); otherwise the package's own entry
+/// point, its `main` file, run with `node` — what a service package without scripts is started
+/// with. `None` when the package declares neither.
 fn start_command(root: &std::path::Path) -> Option<String> {
     let manifest = std::fs::read_to_string(root.join("package.json")).ok()?;
-    // A cheap check: a `"start"` key under a `"scripts"` object. Good enough to decide launch;
-    // the real command runs through npm.
-    let scripts = manifest.split("\"scripts\"").nth(1)?;
-    let head = &scripts[..scripts.len().min(2000)];
-    if head.contains("\"start\"") {
-        Some("[\"npm\",\"start\"]".to_owned())
-    } else {
-        None
+    if has_start_script(&manifest) {
+        return Some("[\"npm\",\"start\"]".to_owned());
     }
+    let json = serde_json::from_str::<serde_json::Value>(&manifest).ok()?;
+    let main = json.get("main")?.as_str()?.trim_start_matches("./");
+    let safe = !main.is_empty()
+        && !main.starts_with('/')
+        && !main.split('/').any(|part| part == "..")
+        && main
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@'));
+    (safe && root.join(main).is_file()).then(|| format!("[\"node\",\"{main}\"]"))
+}
+
+/// A cheap check for a `"start"` key under a `"scripts"` object. Good enough to decide launch;
+/// the real command runs through npm.
+fn has_start_script(manifest: &str) -> bool {
+    manifest.split("\"scripts\"").nth(1).is_some_and(|scripts| {
+        let head = &scripts[..scripts.floor_char_boundary(2000)];
+        head.contains("\"start\"")
+    })
+}
+
+/// The package (directory with a `package.json`, relative to `root`) that serves a route declared
+/// in `file`. The nearest enclosing package when it can be launched: a separate service in a
+/// subdirectory (`capture/`, `server/`) is its own app, not the repo root's. Otherwise the nearest
+/// ancestor with a start script, and the repo root when none has one.
+pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::PathBuf {
+    let mut packages = Vec::new();
+    let mut dir = file.parent();
+    while let Some(current) = dir {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+        if root.join(current).join("package.json").is_file() {
+            packages.push(current.to_path_buf());
+        }
+        dir = current.parent();
+    }
+    if let Some(nearest) = packages.first()
+        && start_command(&root.join(nearest)).is_some()
+    {
+        return nearest.clone();
+    }
+    packages
+        .into_iter()
+        .find(|dir| {
+            std::fs::read_to_string(root.join(dir).join("package.json"))
+                .is_ok_and(|manifest| has_start_script(&manifest))
+        })
+        .unwrap_or_default()
+}
+
+/// The image working directory for an app directory relative to the repo: `/app` for the repo
+/// root, `/app/<dir>` otherwise. `None` for a path that cannot appear safely in a Dockerfile.
+fn container_dir(app: &std::path::Path) -> Option<String> {
+    let mut out = String::from("/app");
+    for part in app.components() {
+        let std::path::Component::Normal(part) = part else {
+            return None;
+        };
+        let part = part.to_str()?;
+        if !part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'))
+        {
+            return None;
+        }
+        out.push('/');
+        out.push_str(part);
+    }
+    Some(out)
 }
 
 /// The request the driver sends, as a compact JSON spec on one argv slot.
@@ -600,10 +698,81 @@ req.end();
 "#;
 
 /// Records the path of every request it receives, on stdout, so a marker hit shows in the
-/// container logs. Listens on port 80 on the private network.
+/// container logs. Listens on HTTP port 80 and, when the planted certificate is present, HTTPS
+/// port 443 — so an outbound request whose host (not whole URL) is attacker-controlled still
+/// lands here even when the app uses `https`/`http.request` against a fixed port. The certificate
+/// is trusted by the app through `NODE_EXTRA_CA_CERTS`, so TLS verification passes honestly
+/// instead of being disabled.
 const MARKER_JS: &str = r#"
 const http = require('http');
-http.createServer((req,res)=>{console.log('MARKER '+req.url);res.end('ok');}).listen(80,'0.0.0.0');
+const log = (req, res) => { console.log('MARKER ' + req.url); res.end('ok'); };
+http.createServer(log).listen(80, '0.0.0.0');
+try {
+  const fs = require('fs');
+  const https = require('https');
+  const key = fs.readFileSync('/jss-marker.key');
+  const cert = fs.readFileSync('/jss-marker.crt');
+  https.createServer({ key, cert }, log).listen(443, '0.0.0.0');
+} catch (e) {
+  console.error('marker: TLS listener disabled (' + e.message + ')');
+}
+"#;
+
+/// A self-signed certificate (and its key) for the host `jss-marker`, baked in as a verification
+/// fixture — not a secret. The marker serves TLS with it and the app image trusts it as a CA
+/// (`NODE_EXTRA_CA_CERTS`), so the app's own `https` verification accepts the marker without being
+/// weakened. SAN is `DNS:jss-marker`, matching the network alias; validity runs to 2126.
+const MARKER_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDJDCCAgygAwIBAgIUftLDL4Vr1Ml5LgbJGBgAmUWw810wDQYJKoZIhvcNAQEL
+BQAwFTETMBEGA1UEAwwKanNzLW1hcmtlcjAgFw0yNjExMDMyMTQwMjJaGA8yMTI2
+MTAxMDIxNDAyMlowFTETMBEGA1UEAwwKanNzLW1hcmtlcjCCASIwDQYJKoZIhvcN
+AQEBBQADggEPADCCAQoCggEBANgmb3Seut5AAC+eYFshT1Mf9lpyRqC0VmGs22N4
+a0OKWRVvZ7gUH0ZGK65t9jZ7DiP4vmKMFJnt4RGYoYnqUixhQoxy+weSLLLF1JBh
+32sBW/iMy19bsWqmopaX1lAsQDS50oJEUil8Mbt58fyYHhb8dXpICA1x5duRuiUX
+BD6KImDyNHCkeq3wkkpyMj1Q1c/lBAV8UVF+SHQn1eIcgExtkpRZzAMmfZHER+PI
+NILtINMESEb0BfxnY3s4Kx+nZOoiajBHjNdmbWeolM9gzPUvGApkYz6VANjJwWUg
+X2VLfvcHuaviwbkyXzZamSrsAVpd133loAGCLpDWBvnCew0CAwEAAaNqMGgwHQYD
+VR0OBBYEFH6cydpB1sESWixE6OIqU2PCkv5gMB8GA1UdIwQYMBaAFH6cydpB1sES
+WixE6OIqU2PCkv5gMA8GA1UdEwEB/wQFMAMBAf8wFQYDVR0RBA4wDIIKanNzLW1h
+cmtlcjANBgkqhkiG9w0BAQsFAAOCAQEAu1Wrz3WoE2+zeijmE4k3+IPyV5cEfeJi
+uNeaMcwcmBWTyvKxFhQJ4ePMCjUOaZFaif5tGvaOo3Vhd6OYZDGbJ24EPYS6fTEc
+OrdGqWjIWTeunJ/Z9SUydx/QQZ3jywJFz29mLOwM7yMXqtGCXeW+ej47ga0wiHuJ
+JmpJqEubm4VSpLP25/bxdyjj7pVQuNP3F4WdwvmLFO3h+8D+qM1R6aErvVmrf0bJ
+IJYc03Nc2HAb8p+qFHZnkq42HuW8v6iBRci1nxu2JKAuYSzS/KOD28nNEXXI8WIG
+1OqBPnwKyuYXWys+W2Y2nl1uFx+uFdgdZ+7RBVkJzBRtHkgcorG+nw==
+-----END CERTIFICATE-----
+"#;
+
+/// The private key for [`MARKER_CERT`]. A throwaway key for an isolated, internal-only test
+/// service; it secures nothing and is intentionally public.
+const MARKER_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDYJm90nrreQAAv
+nmBbIU9TH/ZackagtFZhrNtjeGtDilkVb2e4FB9GRiuubfY2ew4j+L5ijBSZ7eER
+mKGJ6lIsYUKMcvsHkiyyxdSQYd9rAVv4jMtfW7FqpqKWl9ZQLEA0udKCRFIpfDG7
+efH8mB4W/HV6SAgNceXbkbolFwQ+iiJg8jRwpHqt8JJKcjI9UNXP5QQFfFFRfkh0
+J9XiHIBMbZKUWcwDJn2RxEfjyDSC7SDTBEhG9AX8Z2N7OCsfp2TqImowR4zXZm1n
+qJTPYMz1LxgKZGM+lQDYycFlIF9lS373B7mr4sG5Ml82Wpkq7AFaXdd95aABgi6Q
+1gb5wnsNAgMBAAECggEABTJseIPNOX9Ph6cGupul9z8L8TZoilGIyFeEcWe5hfVh
+3yBWrxJDVGtPrQKbR4Pgo8vc/olmaWeYsdWFupi19xTWew3T8ghh+L5oZJll01Oh
+UANga7D7JpirQV1POKVZLjb+SHRxWI11EWGzqyJ1imKruj57fIlzhowN+crdbJ95
+ZFd+7WKn9JJFSOXJM93973OldCp9pe6Zw6RA2ZdpeDezh/iuV8W7iQcm6yG9yAzh
+nlWDLXnzKaLGjlHc7ieSws9Wx54w9caH2tf28fFwAvFEywQpfaJWNorPuCVqIm6L
+1NwViJX6IIVCfxPDdvXAAlZN3GeLUhFe9G7l+9YnJQKBgQDzP6JsfiCEY2t7809G
+B9WavpgvpkA3xQu/+E1Wnfy0UjKXd5xivaZ5Yp6pHK9PEkxtgmOKxJXMVhvAcuQc
+UhsMc37uQye7RAsExcpGahIo7KiF3vL+GYF1UT3SeyA3LrFVI26vQgCaz5MaBslg
+bgI4CQB4mTGHEstVNwliv/rIDwKBgQDjeySvJ2JZsoE9tA4B7qFDyIojbyaJdl7w
+ZG0bq8N9/trjD8RvTDFznWDazJo7cng6CXoFJKoQ8/p2Q/GjMHsydVKZWqjjpOW5
+6D6yZnxUioaVm+fDpM01OKieEphTe77w5eGkjr0vrb4mixxdpcdg4hlxatkniyEV
+HEsedPvPIwKBgBII5sb6dvi50k9HU9pSXGDzvp7RybMY1e0uwLUqU4EfEwct5Bdi
+DkSzriXFra3EIox//VddiemzfK1BF26OG9lJeuC5c+mretGoxH2CAcSs/zWluQhj
+5bhIBLhlTpcozBcO4Hb4Asl3mGV2mVmf7mQvLqzCVuy31QGFahm7OCG7AoGAfZ7A
+SFVoc34m7ssivSBpP8RbvGuiDWEn1nqu4gv9XfPCLofDg27BFEaBePJp7ZAuImaf
+Un3HyKri0jJ9GxAnyFqPrY4qG+Qw1HQTQ3NjD1CcN7wrxZeZlt1eCETeh6Obcu6P
+p88HXHAGxMQnevOUYcUaJc7KcpLbRwwj04Lol58CgYBOU+E5XyTFENcfXQqmevqG
+jHsK6ZuxTJBu3/ljnl/s4eDRdDQeWg9jxHjCIb+RZ+lzLDBrK72e8uGTAzy2bJOo
+TMKYIU1ehZPUtYF64aOhLdUeKbibo7gMuVOuuNnQn/fQmDyQPv0MAfDeYp5BHMlY
+TMvXfMFYx7ZXHLP5nQYIeQ==
+-----END PRIVATE KEY-----
 "#;
 
 // ----- browser phase (DOM-source XSS and client-side redirects) ---------------------------------
@@ -1060,6 +1229,96 @@ mod tests {
         assert_eq!(value["port"], 3000);
         assert_eq!(value["headers"]["Content-Type"], "application/json");
         assert_eq!(value["body"], "{\"url\":\"http://jss-marker/t\"}");
+    }
+
+    fn write(root: &std::path::Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_route_in_a_separate_service_package_launches_that_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"next start"}}"#,
+        );
+        write(root, "pages/api/x.js", "");
+        // A service with no scripts, started by its `main` file.
+        write(
+            root,
+            "svc/package.json",
+            r#"{"name":"svc","main":"index.js"}"#,
+        );
+        write(root, "svc/index.js", "");
+        write(root, "svc/routes/media.js", "");
+        // A library package nested in the repo: nothing to launch, so the root app serves it.
+        write(root, "lib/util/package.json", r#"{"name":"util"}"#);
+        write(root, "lib/util/route.js", "");
+
+        let path = std::path::Path::new;
+        assert_eq!(app_dir(root, path("svc/index.js")), path("svc"));
+        assert_eq!(app_dir(root, path("svc/routes/media.js")), path("svc"));
+        assert_eq!(app_dir(root, path("pages/api/x.js")), path(""));
+        assert_eq!(app_dir(root, path("server.js")), path(""));
+        assert_eq!(app_dir(root, path("lib/util/route.js")), path(""));
+
+        assert_eq!(
+            start_command(&root.join("svc")).as_deref(),
+            Some(r#"["node","index.js"]"#)
+        );
+        assert_eq!(start_command(root).as_deref(), Some(r#"["npm","start"]"#));
+        assert_eq!(start_command(&root.join("lib/util")), None);
+    }
+
+    #[test]
+    fn a_main_entry_outside_the_package_or_missing_is_not_launched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for main in [
+            "../escape.js",
+            "/etc/passwd",
+            "missing.js",
+            "a b.js",
+            "x\".js",
+        ] {
+            let manifest = serde_json::json!({ "main": main }).to_string();
+            write(root, "package.json", &manifest);
+            assert_eq!(start_command(root), None, "main {main:?}");
+        }
+    }
+
+    #[test]
+    fn the_image_starts_the_app_from_its_own_directory() {
+        let path = std::path::Path::new;
+        assert_eq!(container_dir(path("")).as_deref(), Some("/app"));
+        assert_eq!(
+            container_dir(path("capture")).as_deref(),
+            Some("/app/capture")
+        );
+        assert_eq!(
+            container_dir(path("a/@b/c-d")).as_deref(),
+            Some("/app/a/@b/c-d")
+        );
+        assert_eq!(container_dir(path("../x")), None);
+        assert_eq!(container_dir(path("a b")), None);
+
+        let canary = Canary::new("tok".to_owned());
+        let file = dockerfile(
+            "node:22-slim",
+            "/app/svc",
+            &canary,
+            r#"["node","index.js"]"#,
+            3000,
+        );
+        let copy = file.find("COPY . /app\n").unwrap();
+        let workdir = file.find("WORKDIR /app/svc\n").unwrap();
+        let install = file.find("RUN npm ci").unwrap();
+        assert!(copy < workdir && workdir < install, "{file}");
+        assert!(file.ends_with("CMD [\"node\",\"index.js\"]\n"));
     }
 
     #[test]

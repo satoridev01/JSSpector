@@ -89,10 +89,20 @@ pub enum BrowserSink {
     Navigation,
 }
 
-/// The sandbox's decision for a finding: drive it, or skip it with a reason.
+/// The sandbox's decision for a finding: drive it, or skip it with a reason. The source-free
+/// convenience form of [`plan_with_source`], used where the handler source is not at hand.
+#[allow(dead_code)]
 pub fn plan(finding: &Finding) -> Result<Plan, Skip> {
+    plan_with_source(finding, None)
+}
+
+/// Like [`plan`], but given the handler's own source (the finding's file) it can resolve a
+/// request input the finding only names coarsely — e.g. a `req.headers` source whose specific
+/// header the handler reads in a URL/host position. `None` source falls back to finding fields
+/// alone.
+pub fn plan_with_source(finding: &Finding, source: Option<&str>) -> Result<Plan, Skip> {
     // Server-side HTTP findings first.
-    match Probe::from_finding(finding) {
+    match Probe::from_finding_with_source(finding, source) {
         Ok(probe) => return Ok(Plan::Http(probe)),
         Err(http_skip) => {
             // Only fall through to the browser phase for a page-side (DOM) source; otherwise the
@@ -221,7 +231,14 @@ impl Probe {
     /// The request a finding implies, or why it cannot be driven. Only unauthenticated HTTP
     /// findings of a class the sandbox can exercise are eligible; everything else is skipped
     /// with a reason, never guessed at.
+    #[allow(dead_code)]
     pub fn from_finding(finding: &Finding) -> Result<Self, Skip> {
+        Self::from_finding_with_source(finding, None)
+    }
+
+    /// Like [`Self::from_finding`], but may consult the handler's `source` to resolve a coarsely
+    /// named request input (see [`plan_with_source`]).
+    pub fn from_finding_with_source(finding: &Finding, source: Option<&str>) -> Result<Self, Skip> {
         let skip = |reason: &str| Err(Skip(reason.to_owned()));
         if !matches!(
             finding.class,
@@ -255,7 +272,7 @@ impl Probe {
         // The engine's `source.expr` is often the coarse request object (`req.query`); the
         // specific accessor (`req.query.name`) tends to appear in the sink argument. Gather the
         // request-access paths from both and keep the most specific.
-        let entry = best_entry(finding, &path).ok_or_else(|| {
+        let entry = best_entry(finding, &path, source).ok_or_else(|| {
             Skip(format!(
                 "cannot tell which request input reaches the sink (source `{}`, argument `{}`)",
                 finding.source.expr, finding.sink.arg
@@ -609,7 +626,7 @@ pub fn declared_mount_prefix(source: &str) -> Option<String> {
 
 /// The most specific request entry among the finding's sink argument and source expression: a
 /// named query/body/path/header parameter is preferred over a whole-object body or the raw URL.
-fn best_entry(finding: &Finding, path: &str) -> Option<Entry> {
+fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
     let mut candidates: Vec<Entry> = Vec::new();
     for text in [finding.sink.arg.as_str(), finding.source.expr.as_str()] {
         for accessor in request_accessors(text) {
@@ -628,6 +645,58 @@ fn best_entry(finding: &Finding, path: &str) -> Option<Entry> {
         .into_iter()
         .next()
         .or_else(|| destructured_entry(finding, path))
+        .or_else(|| source.and_then(|src| coarse_header_entry(finding, src)))
+}
+
+/// The specific header a finding whose source is the whole `req.headers` object actually reads in
+/// a URL/host position, recovered from the handler source: `host: req.headers["wx-host"]` yields
+/// `Entry::Header("wx-host")`. Only a header the handler uses to build an outbound request's
+/// target is taken, so an unrelated header (a logged `pragma`) is not mistaken for the input.
+fn coarse_header_entry(finding: &Finding, source: &str) -> Option<Entry> {
+    // Only when the source expression is the whole headers object, with no specific name already.
+    let part = strip_request_receiver(finding.source.expr.trim())?;
+    if !matches!(part, "headers" | "header") {
+        return None;
+    }
+    header_in_target_position(source).map(Entry::Header)
+}
+
+/// The name of the request header a handler assigns to an outbound request's target property
+/// (`host`, `hostname`, `url`, ...): the header value that chooses where the server-side request
+/// goes. Prefers the host-choosing keys. `None` when no header sits in such a position.
+fn header_in_target_position(source: &str) -> Option<String> {
+    const KEYS: [&str; 8] = [
+        "host", "hostname", "url", "uri", "href", "endpoint", "baseURL", "target",
+    ];
+    KEYS.iter().find_map(|key| header_value_of_key(source, key))
+}
+
+/// The header named by the first request header accessor that begins the value of object key
+/// `key` (`host: req.headers["wx-host"]` -> `wx-host`). `key` must appear as a whole-word object
+/// key immediately followed by `:` and then the accessor.
+fn header_value_of_key(source: &str, key: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(key) {
+        let at = from + rel;
+        from = at + key.len();
+        let whole_word = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident(*b));
+        if !whole_word {
+            continue;
+        }
+        let Some(after) = source[at + key.len()..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let value = after.trim_start();
+        // The accessor must open the value, so `key` really takes it (not some later expression).
+        if let Some(accessor) = request_accessors(value).into_iter().next()
+            && value.starts_with(&accessor)
+            && let Some(Entry::Header(name)) = source_entry(&accessor, "")
+        {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// `const { client_id } = request.query`: the source is the whole request object, and the sink
@@ -991,6 +1060,47 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_coarse_headers_source_resolves_the_host_header_from_the_handler() {
+        // The finding names only `req.headers`; the handler reads `req.headers["wx-host"]` as the
+        // request host (and an unrelated header in a logged field). The host one is recovered.
+        let source = r#"
+          const proxyRequestSettings = {
+            host: req.headers["wx-host"] ?? "api.weather.gov",
+            port: 443,
+            headers: { pragma: req.headers.pragma },
+          };
+          https.request(proxyRequestSettings);
+        "#;
+        let mut f = finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("GET /{any}"),
+            "req.headers",
+        );
+        f.sink.arg = "proxyRequestSettings".to_owned();
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::Header("wx-host".to_owned()));
+        // Without the source it stays unresolved, not guessed.
+        assert!(Probe::from_finding(&f).is_err());
+    }
+
+    #[test]
+    fn an_unrelated_coarse_header_is_not_taken() {
+        // No header sits in a request-target position: nothing is resolved.
+        let source = r#"
+          log({ pragma: req.headers.pragma });
+          fetch("https://api.example.test/fixed");
+        "#;
+        let f = finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("GET /{any}"),
+            "req.headers",
+        );
+        assert!(Probe::from_finding_with_source(&f, Some(source)).is_err());
     }
 
     #[test]

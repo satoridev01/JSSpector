@@ -7,6 +7,10 @@
 use super::plan::{Entry, Probe};
 use jss_core::VulnClass;
 
+/// The network alias the sandbox gives the marker service. An outbound request aimed here reaches
+/// the marker; kept in one place so the host-only SSRF payload and [`Canary::service_url`] agree.
+pub const MARKER_HOST: &str = "jss-marker";
+
 /// A per-run marker. Everything a payload does is tagged with `token`, so a reproduction is told
 /// from the app's normal behavior by the token alone.
 #[derive(Debug, Clone)]
@@ -39,7 +43,7 @@ impl Canary {
     /// The marker service URL a request-payload is aimed at, carrying the probe's token in its
     /// path. The sandbox runs the service on the app's private network under `jss-marker`.
     pub fn service_url(&self, nonce: u32) -> String {
-        format!("http://jss-marker/{}", self.service_token(nonce))
+        format!("http://{MARKER_HOST}/{}", self.service_token(nonce))
     }
 }
 
@@ -73,6 +77,43 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
     payloads(probe.class, canary, nonce)
         .into_iter()
         .flat_map(|(value, signal)| {
+            if let Entry::Header(name) = &probe.entry
+                && probe.class == VulnClass::Ssrf
+            {
+                // A tainted header that reaches an outbound request has two shapes: the whole
+                // value is the URL (`fetch(req.headers['x'])`), or the value is only the
+                // destination host of a fixed-scheme/port request (`http.request({ host })`). Send
+                // both — the full marker URL as the header, and, as a host, the marker alias with
+                // the probe token in the route path the handler forwards onward. Either one that
+                // lands at the marker confirms the SSRF.
+                let as_url = place(probe, verb, &value, signal.clone());
+                let token = canary.service_token(nonce);
+                let as_host = Attempt {
+                    verb,
+                    target: route_with_token(&probe.path, &token),
+                    body: None,
+                    headers: vec![(name.clone(), MARKER_HOST.to_owned())],
+                    signal: Signal::ServiceReached(token),
+                };
+                return vec![as_url, as_host];
+            }
+            if let Entry::PathParam(name) = &probe.entry
+                && value.contains('/')
+            {
+                // A route parameter usually matches one path segment (`/media/:url`), so a value
+                // with a literal `/` never reaches the handler. Send it also as one segment, `/`
+                // percent-encoded; the router decodes it back before the handler reads it. The
+                // literal form stays first for multi-segment (wildcard) parameters.
+                let attempt = place(probe, verb, &value, signal);
+                let segment = attempt.target_with(name, &probe.path, &encode_segment(&value));
+                return vec![
+                    attempt.clone(),
+                    Attempt {
+                        target: segment,
+                        ..attempt
+                    },
+                ];
+            }
             if !matches!(probe.entry, Entry::Body(None)) {
                 return vec![place(probe, verb, &value, signal)];
             }
@@ -241,6 +282,22 @@ pub fn reproduced(
     }
 }
 
+/// The route with its first `{param}` slot carrying `token` (so a handler that forwards the
+/// request path onward carries the token to the marker) and any other slot filled with a
+/// placeholder. A route with no slot is returned unchanged — the token cannot ride a fixed path,
+/// and that attempt simply will not reproduce. `token` is alphanumeric with `-`, safe in a path
+/// segment unencoded.
+fn route_with_token(route: &str, token: &str) -> String {
+    let filled = match (route.find('{'), route.find('}')) {
+        (Some(start), Some(_)) => match route[start..].find('}').map(|end| start + end) {
+            Some(end) => format!("{}{}{}", &route[..start], token, &route[end + 1..]),
+            None => route.to_owned(),
+        },
+        _ => route.to_owned(),
+    };
+    fill_remaining(&filled)
+}
+
 /// Fills any remaining `{name}` route slot with a harmless placeholder so the path matches.
 fn fill_remaining(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
@@ -272,6 +329,28 @@ fn encode(text: &str) -> String {
                 out.push(byte as char);
             }
             other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+impl Attempt {
+    /// The probe's route with the `{name}` slot filled by an already-encoded `encoded` value and
+    /// any other slot given a placeholder, as [`place`] does.
+    fn target_with(&self, name: &str, route: &str, encoded: &str) -> String {
+        fill_remaining(&route.replace(&format!("{{{name}}}"), encoded))
+    }
+}
+
+/// Encoding for a value that must stay one path segment: everything but RFC 3986 unreserved
+/// characters is percent-encoded, `/` included.
+fn encode_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
     out
@@ -405,6 +484,38 @@ mod tests {
     }
 
     #[test]
+    fn a_header_ssrf_tries_the_url_and_the_host_shapes() {
+        // The header may carry a whole URL, or just the destination host of a fixed-port request.
+        let canary = Canary::new("tok".to_owned());
+        let a = attempts(
+            &probe(
+                VulnClass::Ssrf,
+                "/{any}",
+                Entry::Header("wx-host".to_owned()),
+            ),
+            &canary,
+            2,
+        );
+        assert_eq!(a.len(), 2);
+        // URL shape: the full marker URL as the header value, route path a placeholder.
+        assert_eq!(
+            a[0].headers,
+            vec![("wx-host".to_owned(), "http://jss-marker/tok-2".to_owned())]
+        );
+        // Host shape: the bare marker host as the header, the probe token riding the forwarded
+        // route path.
+        assert_eq!(
+            a[1].headers,
+            vec![("wx-host".to_owned(), "jss-marker".to_owned())]
+        );
+        assert_eq!(a[1].target, "/tok-2");
+        assert!(
+            a.iter()
+                .all(|x| x.signal == Signal::ServiceReached("tok-2".to_owned()))
+        );
+    }
+
+    #[test]
     fn an_unnamed_body_tries_likely_fields() {
         let canary = Canary::new("tok".to_owned());
         let a = attempts(
@@ -459,6 +570,31 @@ mod tests {
         );
         assert!(a.iter().all(|x| x.target.starts_with("/barcode/")));
         assert!(a.iter().all(|x| !x.target.contains("{key}")));
+    }
+
+    #[test]
+    fn a_path_param_ssrf_url_is_also_sent_as_one_encoded_segment() {
+        let canary = Canary::new("s".to_owned());
+        let a = attempts(
+            &probe(
+                VulnClass::Ssrf,
+                "/media/{url}",
+                Entry::PathParam("url".to_owned()),
+            ),
+            &canary,
+            3,
+        );
+        let url = canary.service_url(3);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].target, format!("/media/{url}"));
+        assert_eq!(
+            a[1].target,
+            format!("/media/{}", url.replace(':', "%3A").replace('/', "%2F"))
+        );
+        assert!(
+            a.iter()
+                .all(|x| x.signal == Signal::ServiceReached(canary.service_token(3)))
+        );
     }
 
     #[test]

@@ -81,7 +81,16 @@ pub fn run(
     findings: &[Finding],
     missing: Missing,
 ) -> Result<Vec<Verdict>, String> {
-    let mut plans: Vec<Result<plan::Plan, plan::Skip>> = findings.iter().map(plan::plan).collect();
+    // Plan each finding, giving the planner the handler's own source so it can resolve a request
+    // input the finding only names coarsely (a `req.headers` source whose specific header the
+    // handler reads in a host/URL position).
+    let mut plans: Vec<Result<plan::Plan, plan::Skip>> = findings
+        .iter()
+        .map(|finding| {
+            let source = std::fs::read_to_string(root.join(&finding.file)).ok();
+            plan::plan_with_source(finding, source.as_deref())
+        })
+        .collect();
     // A route the host app mounts under a prefix the module declares (`mountPath: "/auth"`).
     for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
         if let Ok(plan::Plan::Http(probe)) = planned
@@ -146,7 +155,10 @@ pub fn run(
 
     // Build the sessions the plans need. A build failure for one phase skips only that phase's
     // findings, with the failure as the reason.
-    let mut http = needs_http.then(|| sandbox::Session::start(root));
+    // An HTTP finding runs against the package that serves its route: a repo can hold several
+    // apps (a web front end and a separate API or worker service). One session per app, started
+    // on first use and reused.
+    let mut http: Vec<(std::path::PathBuf, Result<sandbox::Session, String>)> = Vec::new();
     let mut browser = needs_browser.then(|| sandbox::BrowserSession::start(root));
 
     let verdicts = findings
@@ -157,15 +169,30 @@ pub fn run(
                 Err(skip) => Outcome::Skipped {
                     reason: skip.0.clone(),
                 },
-                Ok(plan::Plan::Http(probe)) => match http.as_mut() {
-                    Some(Ok(session)) => session.exercise(probe),
-                    Some(Err(err)) => Outcome::Skipped {
-                        reason: format!("the app could not be launched: {err}"),
-                    },
-                    None => Outcome::Skipped {
-                        reason: "not attempted".to_owned(),
-                    },
-                },
+                Ok(plan::Plan::Http(probe)) => {
+                    let declared = finding
+                        .entry_at
+                        .as_ref()
+                        .map_or(&finding.file, |at| &at.file);
+                    let app = sandbox::app_dir(root, std::path::Path::new(declared));
+                    let index = match http.iter().position(|(dir, _)| *dir == app) {
+                        Some(index) => index,
+                        None => {
+                            let session = sandbox::Session::start_in(root, &app);
+                            http.push((app, session));
+                            http.len() - 1
+                        }
+                    };
+                    match http.get_mut(index).map(|(_, session)| session) {
+                        Some(Ok(session)) => session.exercise(probe),
+                        Some(Err(err)) => Outcome::Skipped {
+                            reason: format!("the app could not be launched: {err}"),
+                        },
+                        None => Outcome::Skipped {
+                            reason: "not attempted".to_owned(),
+                        },
+                    }
+                }
                 Ok(plan::Plan::Browser(probe)) => match browser.as_mut() {
                     Some(Ok(session)) => session.exercise(probe),
                     Some(Err(err)) => Outcome::Skipped {
@@ -180,8 +207,10 @@ pub fn run(
         })
         .collect();
 
-    if let Some(Ok(session)) = http.as_mut() {
-        session.teardown();
+    for (_, session) in &mut http {
+        if let Ok(session) = session {
+            session.teardown();
+        }
     }
     if let Some(Ok(session)) = browser.as_mut() {
         session.teardown();

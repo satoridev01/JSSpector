@@ -14,6 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// its own.
 const BASE_IMAGE: &str = "node:20-slim";
 
+/// An optional supervisor-supplied label lets a caller remove only this run's resources if
+/// the scanner is interrupted before its normal teardown can run.
+const VERIFY_RUN_LABEL_KEY: &str = "ci.satori.jsspector.verify-run";
+
 /// Whether a Docker daemon is reachable. The CLI on some platforms exits 0 even when it cannot
 /// connect, so this checks that `docker info` actually printed a server version, not an error.
 pub fn available() -> bool {
@@ -274,7 +278,7 @@ fn build_image(
 /// trimmed error log on failure.
 fn build_from_dockerfile(dockerfile: &str, tag: &str, context: &str) -> Result<(), String> {
     let mut child = Command::new("docker")
-        .args(["build", "-t", tag, "-f", "-", context])
+        .args(docker_args(&["build", "-t", tag, "-f", "-", context]))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -430,7 +434,7 @@ fn tail(text: &str, lines: usize) -> String {
 
 fn docker(args: &[&str]) -> Result<String, String> {
     let output = Command::new("docker")
-        .args(args)
+        .args(docker_args(args))
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
@@ -438,6 +442,38 @@ fn docker(args: &[&str]) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
+}
+
+/// Label resource creation only; probes, execution and teardown keep their original arguments.
+fn docker_args(args: &[&str]) -> Vec<String> {
+    let label = std::env::var("JSS_VERIFY_RUN_LABEL").ok();
+    docker_args_with_label(args, label.as_deref())
+}
+
+fn docker_args_with_label(args: &[&str], label: Option<&str>) -> Vec<String> {
+    let label = label.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    });
+    let insertion = match args {
+        ["run" | "build", ..] => 1,
+        ["network", "create", ..] => 2,
+        _ => 0,
+    };
+    let mut command = Vec::with_capacity(args.len() + 2);
+    for (index, arg) in args.iter().enumerate() {
+        command.push((*arg).to_owned());
+        if index + 1 == insertion
+            && let Some(label) = label
+        {
+            command.push("--label".to_owned());
+            command.push(format!("{VERIFY_RUN_LABEL_KEY}={label}"));
+        }
+    }
+    command
 }
 
 fn run_id() -> String {
@@ -813,6 +849,92 @@ const { chromium } = require('playwright');
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_args_label_resource_creation_only() {
+        let label = "monitor_42-a";
+        let expected_label = format!("{VERIFY_RUN_LABEL_KEY}={label}");
+        assert_eq!(
+            docker_args_with_label(&["run", "-d", "--name", "app", "image"], Some(label)),
+            [
+                "run",
+                "--label",
+                &expected_label,
+                "-d",
+                "--name",
+                "app",
+                "image"
+            ]
+        );
+        assert_eq!(
+            docker_args_with_label(&["network", "create", "--internal", "net"], Some(label)),
+            [
+                "network",
+                "create",
+                "--label",
+                &expected_label,
+                "--internal",
+                "net"
+            ]
+        );
+        assert_eq!(
+            docker_args_with_label(&["build", "-t", "image", "-f", "-", "."], Some(label)),
+            [
+                "build",
+                "--label",
+                &expected_label,
+                "-t",
+                "image",
+                "-f",
+                "-",
+                "."
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_args_without_label_preserves_every_argument() {
+        for args in [
+            vec!["run", "-d", "image", "argument with spaces"],
+            vec!["network", "create", "--internal", "net"],
+            vec!["build", "-t", "image", "-f", "-", "."],
+        ] {
+            assert_eq!(docker_args_with_label(&args, None), args);
+        }
+    }
+
+    #[test]
+    fn docker_args_reject_invalid_labels_and_accept_the_length_limit() {
+        let oversized = "a".repeat(65);
+        for label in ["", " ", "a=b", "a/b", "a.b", "a\nb", "café", &oversized] {
+            assert_eq!(
+                docker_args_with_label(&["run", "image"], Some(label)),
+                ["run", "image"]
+            );
+        }
+        let longest = "a".repeat(64);
+        let expected = format!("{VERIFY_RUN_LABEL_KEY}={longest}");
+        assert_eq!(
+            docker_args_with_label(&["run", "image"], Some(&longest)),
+            ["run", "--label", &expected, "image"]
+        );
+    }
+
+    #[test]
+    fn docker_args_leave_existing_resource_operations_unaffected() {
+        for args in [
+            vec!["exec", "app", "node", "driver.js"],
+            vec!["info", "--format", "{{.ServerVersion}}"],
+            vec!["rm", "-f", "app"],
+            vec!["rmi", "-f", "image"],
+            vec!["network", "rm", "net"],
+            vec!["logs", "--tail", "50", "app"],
+            vec!["inspect", "-f", "{{.State.Running}}", "app"],
+            vec![],
+        ] {
+            assert_eq!(docker_args_with_label(&args, Some("run_42")), args);
+        }
+    }
 
     #[test]
     fn request_spec_is_valid_json_for_a_body() {

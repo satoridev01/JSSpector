@@ -479,6 +479,7 @@ fn scan_file_program_inner(
         service_worker: false,
         modules: BTreeMap::new(),
         relative: BTreeMap::new(),
+        factory_bindings: BTreeMap::new(),
         result: ScanResult::default(),
         depth: 0,
         summarize: true,
@@ -1391,6 +1392,9 @@ struct Walker<'e> {
     modules: BTreeMap<String, Imported>,
     /// Local names bound to relative modules: name -> (specifier, export or None).
     relative: BTreeMap<String, (String, Option<String>)>,
+    /// Variables bound to the result of calling an imported factory
+    /// (`const authorization = authorizationController(options)`): name -> factory.
+    factory_bindings: BTreeMap<String, String>,
     result: ScanResult,
     depth: u32,
     /// Summary pass: parameters of named functions are tainted, and findings become summaries.
@@ -2874,6 +2878,20 @@ fn is_function_value(expr: &Expression<'_>) -> bool {
     )
 }
 
+/// `controller.get`, `authorization.post`: a member named after an HTTP verb, which is a route
+/// action of a controller object rather than middleware.
+fn is_controller_action(expr: &Expression<'_>) -> bool {
+    expr.get_inner_expression()
+        .as_member_expression()
+        .and_then(|m| m.static_property_name())
+        .is_some_and(|p| {
+            matches!(
+                p.as_str().unwrap_or(""),
+                "get" | "post" | "put" | "patch" | "delete"
+            )
+        })
+}
+
 fn callee_name(expr: &Expression<'_>) -> Option<String> {
     callee_name_within(expr, 32)
 }
@@ -3843,6 +3861,23 @@ impl Walker<'_> {
             }
             // `const _mounts = { user: require('./user'), admin: require('./admin') }`: a table of
             // functions.
+            if let Some(name) = &name_hint {
+                match init.get_inner_expression() {
+                    Expression::CallExpression(c)
+                        if matches!(c.callee.get_inner_expression(),
+                            Expression::Identifier(f)
+                                if self.relative.contains_key(f.name.as_str())) =>
+                    {
+                        if let Expression::Identifier(f) = c.callee.get_inner_expression() {
+                            self.factory_bindings
+                                .insert(name.clone(), f.name.as_str().to_owned());
+                        }
+                    }
+                    _ => {
+                        self.factory_bindings.remove(name);
+                    }
+                }
+            }
             if let (Some(name), Expression::ObjectExpression(object)) =
                 (&name_hint, init.get_inner_expression())
             {
@@ -8068,6 +8103,8 @@ impl Walker<'_> {
                     .collect::<Vec<_>>(),
                 other => vec![other],
             })
+            // `authorization.get`: a controller action, not a guard, whatever its name says.
+            .filter(|e| !is_controller_action(e))
             .filter_map(callee_name)
             .filter_map(|name| m().auth_of(&name))
             .max()
@@ -11042,6 +11079,34 @@ impl Walker<'_> {
                     });
                     return;
                 }
+                // `router.get('/', controller.get, render)`: an earlier controller action of
+                // the chain answers the request too, so it is reachable from this route.
+                let chain: Vec<&Expression<'_>> = call
+                    .arguments
+                    .iter()
+                    .filter_map(Argument::as_expression)
+                    .collect();
+                let earlier: Vec<String> = chain
+                    .get(1..chain.len().saturating_sub(1))
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|e| is_controller_action(e))
+                    .filter_map(|e| self.route_handler_name(e.get_inner_expression()))
+                    .filter(|name| *name != handler)
+                    .collect();
+                for earlier_handler in earlier {
+                    self.facts.routes.push(RouteFact {
+                        at: None,
+                        receiver: object.clone(),
+                        receiver_file: None,
+                        method: method.to_ascii_uppercase(),
+                        path: path.clone(),
+                        handler: earlier_handler,
+                        span: call.span,
+                        auth,
+                        kind: "http",
+                    });
+                }
                 self.facts.routes.push(RouteFact {
                     at: None,
                     receiver: object.clone(),
@@ -11679,6 +11744,15 @@ impl Walker<'_> {
                 .all(|a| matches!(a, Argument::StringLiteral(_) | Argument::NumericLiteral(_)))
         {
             return Some(factory.name.as_str().to_owned());
+        }
+        // `authorization.get` with `const authorization = authorizationController(options)`:
+        // the action of the object the imported factory returns.
+        if let Some(member) = expr.get_inner_expression().as_member_expression()
+            && let Expression::Identifier(object) = member.object().get_inner_expression()
+            && let Some(factory) = self.factory_bindings.get(object.name.as_str())
+            && let Some(property) = member.static_property_name()
+        {
+            return Some(format!("{factory}.{}", property.as_str().unwrap_or("")));
         }
         callee_name(expr)
     }

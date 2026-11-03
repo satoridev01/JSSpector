@@ -72,8 +72,51 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
     let verb = probe.method.verb(&probe.entry);
     payloads(probe.class, canary, nonce)
         .into_iter()
-        .map(|(value, signal)| place(probe, verb, &value, signal))
+        .flat_map(|(value, signal)| {
+            if !matches!(probe.entry, Entry::Body(None)) {
+                return vec![place(probe, verb, &value, signal)];
+            }
+            let mut entries = vec![Entry::Body(None)];
+            entries.extend(
+                body_fields(probe.class)
+                    .iter()
+                    .map(|field| Entry::Body(Some((*field).to_owned()))),
+            );
+            entries
+                .into_iter()
+                .flat_map(|entry| {
+                    let mut candidate = probe.clone();
+                    candidate.entry = entry.clone();
+                    let attempt = place(&candidate, verb, &value, signal.clone());
+                    let mut variants = vec![attempt.clone()];
+                    if probe.class == VulnClass::Ssrf
+                        && matches!(entry, Entry::Body(Some(ref field)) if field == "url")
+                    {
+                        variants.push(Attempt {
+                            body: Some(json_object_with_field(
+                                "url",
+                                &value,
+                                "filepath",
+                                "jsspector-placeholder",
+                            )),
+                            ..attempt
+                        });
+                    }
+                    variants
+                })
+                .collect()
+        })
         .collect()
+}
+
+fn body_fields(class: VulnClass) -> &'static [&'static str] {
+    match class {
+        VulnClass::Ssrf => &["url", "uri", "host", "endpoint", "target", "callback"],
+        VulnClass::PathTraversal => &["path", "file", "filename", "name"],
+        VulnClass::CommandInjection => &["command", "cmd", "input", "host"],
+        VulnClass::CodeInjection => &["code", "script", "input"],
+        _ => &[],
+    }
 }
 
 /// The payload strings for a class, each with the signal it would trip. A read-marker payload is
@@ -148,10 +191,15 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
         Entry::Query(name) => {
             let sep = if target.contains('?') { '&' } else { '?' };
             target = format!("{target}{sep}{}={}", encode(name), encode(value));
+            // The other query parameters the handler requires alongside this one.
+            for (key, val) in &probe.siblings {
+                target = format!("{target}&{}={}", encode(key), encode(val));
+            }
         }
         Entry::Body(name) => {
             body = Some(match name {
-                Some(field) => json_object(field, value),
+                // The field under test, plus the other body fields the handler requires.
+                Some(field) => json_object_fields(field, value, &probe.siblings),
                 None => json_string(value),
             });
             headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
@@ -257,6 +305,36 @@ fn json_object(field: &str, value: &str) -> String {
     format!("{{\"{}\":\"{}\"}}", json_escape(field), json_escape(value))
 }
 
+/// A JSON object of the field under test plus any sibling body fields (skipping any that would
+/// duplicate the field under test).
+fn json_object_fields(field: &str, value: &str, siblings: &[(String, String)]) -> String {
+    let base = json_object(field, value);
+    let extra: Vec<&(String, String)> = siblings.iter().filter(|(key, _)| key != field).collect();
+    if extra.is_empty() {
+        return base;
+    }
+    let mut out = base.trim_end_matches('}').to_owned();
+    for (key, val) in extra {
+        out.push_str(&format!(
+            ",\"{}\":\"{}\"",
+            json_escape(key),
+            json_escape(val)
+        ));
+    }
+    out.push('}');
+    out
+}
+
+fn json_object_with_field(field: &str, value: &str, other: &str, other_value: &str) -> String {
+    format!(
+        "{{\"{}\":\"{}\",\"{}\":\"{}\"}}",
+        json_escape(field),
+        json_escape(value),
+        json_escape(other),
+        json_escape(other_value)
+    )
+}
+
 fn json_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -283,6 +361,7 @@ mod tests {
             path: path.to_owned(),
             entry,
             class,
+            siblings: Vec::new(),
         }
     }
 
@@ -323,6 +402,27 @@ mod tests {
             a[0].body.as_deref(),
             Some("{\"url\":\"http://jss-marker/tok-0\"}")
         );
+    }
+
+    #[test]
+    fn an_unnamed_body_tries_likely_fields() {
+        let canary = Canary::new("tok".to_owned());
+        let a = attempts(
+            &probe(VulnClass::Ssrf, "/fetch", Entry::Body(None)),
+            &canary,
+            0,
+        );
+        assert_eq!(a.len(), 8);
+        assert_eq!(a[0].body.as_deref(), Some("\"http://jss-marker/tok-0\""));
+        assert!(a.iter().any(|attempt| {
+            attempt.body.as_deref() == Some("{\"url\":\"http://jss-marker/tok-0\"}")
+        }));
+        assert!(a.iter().any(|attempt| {
+            attempt.body.as_deref()
+                == Some(
+                    "{\"url\":\"http://jss-marker/tok-0\",\"filepath\":\"jsspector-placeholder\"}",
+                )
+        }));
     }
 
     #[test]

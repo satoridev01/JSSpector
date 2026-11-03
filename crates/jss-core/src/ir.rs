@@ -319,9 +319,12 @@ fn resolve_in(
     // `import { find } ...; find()`, `import svc ...; svc.find()`, `import { Users } ...; Users.find()`.
     let candidates: Vec<String> = match (import.export.as_deref(), rest) {
         (Some(export), None) => vec![exported(export)],
+        // The last candidate: a method of the object a factory export returns
+        // (`export const controller = () => ({ get() {} })`) is the function `get`.
         (Some(export), Some(method)) => vec![
             format!("{export}.{method}"),
             format!("{}.{method}", exported(export)),
+            method.to_owned(),
         ],
         (None, Some(method)) => {
             let mut names = vec![method.to_owned()];

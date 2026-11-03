@@ -4,18 +4,15 @@
 //! published and no Rust HTTP client is pulled in — requests are made by Node already present in
 //! the image, so all traffic stays on a private network.
 
-use super::Outcome;
 use super::payload::{self, Attempt, Canary, Signal};
 use super::plan::Probe;
+use super::{Outcome, Reproduction};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The base image. A pinned slim Node: present everywhere, has `node` for the driver, no app of
-/// its own.
-const BASE_IMAGE: &str = "node:20-slim";
+const BASE_IMAGE: &str = "node:22-slim";
+const DEFAULT_NODE_MAJOR: u32 = 22;
 
-/// An optional supervisor-supplied label lets a caller remove only this run's resources if
-/// the scanner is interrupted before its normal teardown can run.
 const VERIFY_RUN_LABEL_KEY: &str = "ci.satori.jsspector.verify-run";
 
 /// Whether a Docker daemon is reachable. The CLI on some platforms exits 0 even when it cannot
@@ -179,9 +176,10 @@ impl Session {
         let attempts = payload::attempts(probe, &self.canary, self.nonce);
         let tried = attempts.len();
         for attempt in &attempts {
-            if self.send(attempt) {
+            if let Some(poc) = self.send(attempt) {
                 return Outcome::Verified {
                     how: format!("{} {}", attempt.verb, attempt.target),
+                    poc,
                 };
             }
         }
@@ -189,11 +187,11 @@ impl Session {
     }
 
     /// Sends one request from inside the app container and checks its signal.
-    fn send(&self, attempt: &Attempt) -> bool {
+    fn send(&self, attempt: &Attempt) -> Option<Reproduction> {
         let spec = request_spec(attempt, self.port);
         let output = match self.exec(&self.app, &["node", "/jss-driver.js", &spec]) {
             Ok(output) => output,
-            Err(_) => return false,
+            Err(_) => return None,
         };
         let body = String::from_utf8_lossy(&output.stdout);
         // `JSS_VERIFY_DEBUG=1` prints each request and its response, to diagnose why a finding
@@ -208,7 +206,7 @@ impl Session {
                 body.trim()
             );
         }
-        match &attempt.signal {
+        let reproduced = match &attempt.signal {
             Signal::InResponse => payload::reproduced(attempt, &self.canary, &body, false, false),
             Signal::FileWritten(path) => {
                 let exists = self
@@ -221,13 +219,76 @@ impl Session {
                 let reached = self.tail_logs(&self.marker).contains(token);
                 payload::reproduced(attempt, &self.canary, &body, false, reached)
             }
-        }
+        };
+        reproduced.then(|| Reproduction {
+            command: curl_command(attempt, self.port),
+            method: attempt.verb.to_owned(),
+            target: attempt.target.clone(),
+            headers: attempt
+                .headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}"))
+                .collect(),
+            body: attempt.body.clone(),
+            evidence: observed_evidence(&attempt.signal),
+            response: body.trim().to_owned(),
+        })
     }
 
     fn exec(&self, container: &str, cmd: &[&str]) -> Result<Output, String> {
         exec_in(container, cmd)
     }
+}
 
+fn observed_evidence(signal: &Signal) -> String {
+    match signal {
+        Signal::InResponse => "the canary token appeared in the application response".to_owned(),
+        Signal::FileWritten(path) => {
+            format!("the application created the canary file `{path}`")
+        }
+        Signal::ServiceReached(token) => {
+            format!("the isolated marker service received callback token `{token}`")
+        }
+    }
+}
+
+fn curl_command(attempt: &Attempt, port: u16) -> String {
+    let mut target = attempt.target.clone();
+    let mut body = attempt.body.clone();
+    if let Signal::ServiceReached(token) = &attempt.signal {
+        let private = format!("http://jss-marker/{token}");
+        let callback = "http://CALLBACK_HOST/jsspector";
+        target = target.replace(&private, callback).replace(
+            &format!("http%3A%2F%2Fjss-marker%2F{token}"),
+            "http%3A%2F%2FCALLBACK_HOST%2Fjsspector",
+        );
+        body = body.map(|value| value.replace(&private, callback));
+    }
+    let mut parts = vec![
+        "curl -i -sS".to_owned(),
+        format!("--request {}", attempt.verb),
+        format!(
+            "--url {}",
+            shell_quote(&format!("http://TARGET_HOST:{port}{target}"))
+        ),
+    ];
+    parts.extend(
+        attempt
+            .headers
+            .iter()
+            .map(|(name, value)| format!("--header {}", shell_quote(&format!("{name}: {value}")))),
+    );
+    if let Some(body) = body {
+        parts.push(format!("--data-raw {}", shell_quote(&body)));
+    }
+    parts.join(" \\\n  ")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+impl Session {
     fn container_running(&self, name: &str) -> bool {
         docker(&["inspect", "-f", "{{.State.Running}}", name])
             .map(|out| out.trim() == "true")
@@ -270,8 +331,37 @@ fn build_image(
     let context = root
         .to_str()
         .ok_or_else(|| "the repository path is not valid UTF-8".to_owned())?;
-    let dockerfile = dockerfile(canary, start_command, port);
+    let image = base_image(root);
+    let dockerfile = dockerfile(&image, canary, start_command, port);
     build_from_dockerfile(&dockerfile, tag, context)
+}
+
+/// The Node image the app needs: the major of the lowest Node version `engines.node` of the
+/// repo's `package.json` allows (`>=24.17` -> 24), never older than the default.
+fn base_image(root: &std::path::Path) -> String {
+    let major = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| {
+            json.get("engines")
+                .and_then(|engines| engines.get("node"))
+                .and_then(|node| node.as_str())
+                .and_then(engine_major)
+        });
+    match major {
+        Some(major) if major > DEFAULT_NODE_MAJOR && major < 100 => format!("node:{major}-slim"),
+        _ => BASE_IMAGE.to_owned(),
+    }
+}
+
+/// The first version number of a semver range: `>=24.17` and `^24.0.0 || ^22` -> 24 and 24.
+fn engine_major(range: &str) -> Option<u32> {
+    let digits: String = range
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Runs `docker build` with the Dockerfile on stdin and the context directory given, returning a
@@ -330,14 +420,16 @@ fn tail_logs(name: &str) -> String {
 /// The generated Dockerfile. `npm ci` when a lockfile is present (reproducible), else `npm
 /// install`; both tolerate the absence of a build script. The marker file and the two helper
 /// scripts are written through base64 so no shell or printf escaping can corrupt them.
-fn dockerfile(canary: &Canary, start_command: &str, port: u16) -> String {
+fn dockerfile(image: &str, canary: &Canary, start_command: &str, port: u16) -> String {
     let marker_file = canary.planted_file();
     let token = &canary.token;
     format!(
-        "FROM {BASE_IMAGE}\n\
+        "FROM {image}\n\
          WORKDIR /app\n\
          COPY . /app\n\
          RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund || true\n\
+         RUN for example in .env.example .env.sample .env.template; do \
+         if [ ! -e .env ] && [ -f \"$example\" ]; then cp \"$example\" .env; fi; done\n\
          RUN printf '%s' '{token}' > {marker_file}\n\
          RUN echo {} | base64 -d > /jss-driver.js\n\
          RUN echo {} | base64 -d > /jss-marker.js\n\
@@ -444,7 +536,6 @@ fn docker(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Label resource creation only; probes, execution and teardown keep their original arguments.
 fn docker_args(args: &[&str]) -> Vec<String> {
     let label = std::env::var("JSS_VERIFY_RUN_LABEL").ok();
     docker_args_with_label(args, label.as_deref())
@@ -668,6 +759,23 @@ impl BrowserSession {
             if tail_logs(&self.marker).contains(hit) {
                 return Outcome::Verified {
                     how: format!("browser load {}", attempt.url),
+                    poc: Reproduction {
+                        command: format!(
+                            "Open {} in a browser",
+                            shell_quote(&format!(
+                                "http://TARGET_HOST:{}{}",
+                                self.port, attempt.url
+                            ))
+                        ),
+                        method: "BROWSER".to_owned(),
+                        target: attempt.url.clone(),
+                        headers: Vec::new(),
+                        body: None,
+                        evidence: format!(
+                            "the isolated marker service received callback token `{hit}`"
+                        ),
+                        response: String::new(),
+                    },
                 };
             }
         }
@@ -1035,24 +1143,28 @@ http.createServer((req, res) => {
             path: "/read".to_owned(),
             entry: Entry::Query("name".to_owned()),
             class: VulnClass::PathTraversal,
+            siblings: Vec::new(),
         };
         let confined = Probe {
             method: Method::Get,
             path: "/safe".to_owned(),
             entry: Entry::Query("name".to_owned()),
             class: VulnClass::PathTraversal,
+            siblings: Vec::new(),
         };
         let command = Probe {
             method: Method::Get,
             path: "/ping".to_owned(),
             entry: Entry::Query("host".to_owned()),
             class: VulnClass::CommandInjection,
+            siblings: Vec::new(),
         };
         let ssrf = Probe {
             method: Method::Get,
             path: "/fetch".to_owned(),
             entry: Entry::Query("url".to_owned()),
             class: VulnClass::Ssrf,
+            siblings: Vec::new(),
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

@@ -20,11 +20,28 @@ use serde::Serialize;
 #[serde(tag = "outcome", rename_all = "kebab-case")]
 pub enum Outcome {
     /// The app reproduced the finding; `how` names the request that did it.
-    Verified { how: String },
+    Verified { how: String, poc: Reproduction },
     /// Every derived request was sent and none tripped the marker.
     NotReproduced { tried: usize },
     /// The finding was not driven; `reason` says why.
     Skipped { reason: String },
+}
+
+/// The exact request that reproduced a finding plus a copyable, parameterized command and the
+/// signal the sandbox observed. Keeping this in the JSON report makes `verified` independently
+/// auditable instead of forcing callers to infer a proof from debug stderr.
+#[derive(Debug, Clone, Serialize)]
+pub struct Reproduction {
+    pub command: String,
+    pub method: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub evidence: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub response: String,
 }
 
 impl Outcome {
@@ -64,7 +81,32 @@ pub fn run(
     findings: &[Finding],
     missing: Missing,
 ) -> Result<Vec<Verdict>, String> {
-    let plans: Vec<Result<plan::Plan, plan::Skip>> = findings.iter().map(plan::plan).collect();
+    let mut plans: Vec<Result<plan::Plan, plan::Skip>> = findings.iter().map(plan::plan).collect();
+    // A route the host app mounts under a prefix the module declares (`mountPath: "/auth"`).
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some(at) = &finding.entry_at
+            && let Ok(source) = std::fs::read_to_string(root.join(&at.file))
+            && let Some(prefix) = plan::declared_mount_prefix(&source)
+            && !probe.path.starts_with(&format!("{prefix}/"))
+        {
+            probe.path = if probe.path == "/" {
+                prefix
+            } else {
+                format!("{prefix}{}", probe.path)
+            };
+        }
+    }
+    // Other request parameters the handler requires alongside the tainted one: without them it
+    // rejects the request before the sink is reached. Read from the handler source.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some((part, target)) = probe.entry_part().map(|(p, t)| (p, t.to_owned()))
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            probe.siblings = plan::required_siblings(&source, part, &target);
+        }
+    }
 
     let needs_http = plans.iter().any(|p| matches!(p, Ok(plan::Plan::Http(_))));
     let needs_browser = plans
@@ -176,7 +218,7 @@ pub fn write_text(
     for v in verdicts {
         let entry = v.entry.as_deref().unwrap_or(&v.class);
         match &v.outcome {
-            Outcome::Verified { how } => {
+            Outcome::Verified { how, .. } => {
                 verified += 1;
                 writeln!(
                     out,

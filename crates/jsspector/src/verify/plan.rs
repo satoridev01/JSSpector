@@ -30,6 +30,23 @@ pub struct Probe {
     pub path: String,
     pub entry: Entry,
     pub class: VulnClass,
+    /// Other request parameters, in the same part as `entry` (query or body), the handler needs
+    /// present and valid before the tainted one reaches the sink — name and value. Filled from the
+    /// handler source (see [`required_siblings`]); empty for a handler that guards nothing else.
+    pub siblings: Vec<(String, String)>,
+}
+
+impl Probe {
+    /// The request part and parameter name the payload enters through, when it is a named query or
+    /// body field — the only entries that take sibling parameters. `None` for a header, path
+    /// segment, whole body or raw URL.
+    pub fn entry_part(&self) -> Option<(&'static str, &str)> {
+        match &self.entry {
+            Entry::Query(name) => Some(("query", name)),
+            Entry::Body(Some(name)) => Some(("body", name)),
+            _ => None,
+        }
+    }
 }
 
 /// What the sandbox should do with a finding: drive it as an HTTP request (the server-side
@@ -249,8 +266,345 @@ impl Probe {
             path,
             entry,
             class: finding.class,
+            siblings: Vec::new(),
         })
     }
+}
+
+/// Request parameters, besides the one under test, that a handler requires present and valid
+/// before the tainted parameter reaches the sink, each paired with a value chosen to pass the
+/// handler's own validation. A handler often reaches its sink only after a cluster of parameters
+/// checks out (`client_id` alongside a `redirect_uri`, a `response_type` and a `state`); a probe
+/// that drives one parameter and omits the rest is rejected early and the sink is never reached.
+///
+/// Mined from the handler source only, so nothing here is specific to an app: the names it reads
+/// from the same request part by explicit member access (the ones it handles individually, which
+/// tend to be the required ones — destructured-only names are often optional and left out), and,
+/// for each, a value that gets past its guard — a string literal the source constrains it to, a
+/// URL when the name asks for one, or a neutral filler.
+pub fn required_siblings(source: &str, part: &str, target: &str) -> Vec<(String, String)> {
+    let mut names: Vec<String> = member_params(source, part)
+        .into_iter()
+        .filter(|name| name != target)
+        .collect();
+    names.sort();
+    names.dedup();
+    names.truncate(12);
+    names
+        .into_iter()
+        .map(|name| {
+            let value = sibling_value(source, part, &name);
+            (name, value)
+        })
+        .collect()
+}
+
+/// Parameter names read by explicit member access on a request part (`request.query.name`,
+/// `req.body["name"]`): the parameters a handler names one by one.
+fn member_params(source: &str, part: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (needle, bracket) in [(format!(".{part}."), false), (format!(".{part}["), true)] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            if !receiver_before(&source[..at]) {
+                continue;
+            }
+            let after = &source[at + needle.len()..];
+            let name = if bracket {
+                bracket_literal(after)
+            } else {
+                let ident: String = after.chars().take_while(|c| is_ident(*c as u8)).collect();
+                (!ident.is_empty()).then_some(ident)
+            };
+            if let Some(name) = name {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Whether the identifier ending a string is a request receiver (`req`, `request`, `ctx`), so
+/// `request.query` is one but `this.query` is not.
+fn receiver_before(pre: &str) -> bool {
+    let token: String = pre
+        .bytes()
+        .rev()
+        .take_while(|b| is_ident(*b))
+        .map(|b| b as char)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    matches!(token.as_str(), "req" | "request" | "ctx")
+}
+
+/// The string literal at the start of `after` (just past a `[`): `"name"]` -> `name`.
+fn bracket_literal(after: &str) -> Option<String> {
+    let after = after.trim_start();
+    let quote = after
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let body = &after[1..];
+    let end = body.find(quote)?;
+    let name = &body[..end];
+    (!name.is_empty() && name.bytes().all(is_ident)).then(|| name.to_owned())
+}
+
+/// A value for a sibling parameter that satisfies the handler's guard on it.
+fn sibling_value(source: &str, part: &str, name: &str) -> String {
+    if let Some(literal) = constrained_literal(source, part, name) {
+        return literal;
+    }
+    if is_urlish(name) {
+        // A syntactically valid absolute URL that does not resolve to the marker service, so it
+        // passes a `URL.canParse` / `new URL()` guard without tripping the probe's own signal.
+        return "http://jss-filler.test/".to_owned();
+    }
+    "jsspector".to_owned()
+}
+
+/// Whether a parameter name asks for a URL, so a URL-shaped filler passes its guard.
+fn is_urlish(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        "url", "uri", "redirect", "endpoint", "callback", "href", "webhook", "link", "return",
+        "origin",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// A string literal the handler constrains a parameter to: a value it compares the parameter (or a
+/// variable bound from it) against with `===`/`==`, or an alternative of a `/^(a|b)$/.test(...)`
+/// guard. `None` when the parameter is not pinned to a literal.
+fn constrained_literal(source: &str, part: &str, name: &str) -> Option<String> {
+    let mut ids = aliases(source, part, name);
+    ids.push(name.to_owned());
+    for id in &ids {
+        if let Some(literal) = regex_literal(source, id).or_else(|| equality_literal(source, id)) {
+            return Some(literal);
+        }
+    }
+    None
+}
+
+/// Local variables bound directly from `<receiver>.<part>.<name>`
+/// (`const responseType = request.query.response_type ?? ...` -> `responseType`).
+fn aliases(source: &str, part: &str, name: &str) -> Vec<String> {
+    let access = format!(".{part}.{name}");
+    let mut out = Vec::new();
+    for keyword in ["const ", "let ", "var "] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(keyword) {
+            let at = from + rel + keyword.len();
+            from = at;
+            let rest = &source[at..];
+            let ident: String = rest.chars().take_while(|c| is_ident(*c as u8)).collect();
+            if ident.is_empty() {
+                continue;
+            }
+            let tail = rest[ident.len()..].trim_start();
+            // A binding, not a comparison: a single `=`.
+            let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
+                continue;
+            };
+            // A statement ends at `;`; it may span lines, so do not stop at a newline. Capped so a
+            // missing semicolon cannot scan the whole file.
+            let end = rhs.find(';').unwrap_or(rhs.len()).min(300);
+            let stmt = &rhs[..end];
+            if let Some(pos) = stmt.find(&access)
+                && receiver_before(&stmt[..pos])
+            {
+                out.push(ident);
+            }
+        }
+    }
+    out
+}
+
+/// A plain-word alternative of a `/^(a|b|c)$/.test(ARG)` guard whose `ARG` mentions `id`.
+fn regex_literal(source: &str, id: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(".test(") {
+        let dot = from + rel;
+        from = dot + ".test(".len();
+        let Some(body) = regex_before(source, dot) else {
+            continue;
+        };
+        let Some(arg) = balanced_arg(&source[from..]) else {
+            continue;
+        };
+        if !mentions(arg, id) {
+            continue;
+        }
+        let trimmed = body.trim_start_matches('^').trim_end_matches('$');
+        let trimmed = trimmed
+            .strip_prefix('(')
+            .and_then(|t| t.strip_suffix(')'))
+            .unwrap_or(trimmed);
+        if let Some(alt) = trimmed
+            .split('|')
+            .map(str::trim)
+            .find(|a| !a.is_empty() && a.bytes().all(|b| is_ident(b) || b == b'-'))
+        {
+            return Some(alt.to_owned());
+        }
+    }
+    None
+}
+
+/// The body of the regular-expression literal ending just before `.test(` at `dot`: the text
+/// between its delimiting slashes. Backslash-escaped slashes inside are not the delimiter.
+fn regex_before(source: &str, dot: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    if dot == 0 || bytes.get(dot - 1) != Some(&b'/') {
+        return None;
+    }
+    let close = dot - 1;
+    let mut i = close;
+    while i > 0 {
+        i -= 1;
+        if bytes.get(i) == Some(&b'/') && (i == 0 || bytes.get(i - 1) != Some(&b'\\')) {
+            return source.get(i + 1..close);
+        }
+    }
+    None
+}
+
+/// The text of the first argument inside a just-opened `(`: up to the matching close paren.
+fn balanced_arg(after: &str) -> Option<&str> {
+    let mut depth = 1usize;
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A string literal the handler compares `id` against with `===`/`==`, in either order.
+fn equality_literal(source: &str, id: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(id) {
+        let at = from + rel;
+        from = at + id.len();
+        // A whole-word match, not a substring of a longer identifier.
+        let before_ok = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident(*b));
+        let after_idx = at + id.len();
+        let after_ok = source[after_idx..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_ident(c as u8));
+        if !before_ok || !after_ok {
+            continue;
+        }
+        // `id === 'lit'`
+        let tail = source[after_idx..].trim_start();
+        if let Some(rest) = tail.strip_prefix("===").or_else(|| tail.strip_prefix("=="))
+            && let Some(lit) = leading_string(rest.trim_start())
+        {
+            return Some(lit);
+        }
+        // `'lit' === id`
+        let head = source[..at].trim_end();
+        if let Some(head) = head.strip_suffix("===").or_else(|| head.strip_suffix("=="))
+            && let Some(lit) = trailing_string(head.trim_end())
+        {
+            return Some(lit);
+        }
+    }
+    None
+}
+
+/// Whether `text` contains `id` as a whole word.
+fn mentions(text: &str, id: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(id) {
+        let at = from + rel;
+        from = at + id.len();
+        let before = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident(*b));
+        let after = text[at + id.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_ident(c as u8));
+        if before && after {
+            return true;
+        }
+    }
+    false
+}
+
+/// The string literal at the start of `text` (`'code'` / `"code"`), its contents.
+fn leading_string(text: &str) -> Option<String> {
+    let quote = text
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let body = &text[1..];
+    let end = body.find(quote)?;
+    Some(body[..end].to_owned())
+}
+
+/// The string literal at the end of `text` (`'code'` / `"code"`), its contents.
+fn trailing_string(text: &str) -> Option<String> {
+    let quote = text
+        .chars()
+        .last()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))?;
+    let body = &text[..text.len() - 1];
+    let start = body.rfind(quote)?;
+    Some(body[start + 1..].to_owned())
+}
+
+/// The prefix a plug-in-style app mounts a module's routes under, when the module declares it as
+/// a literal: `mountPath: "/auth"` or `mountPath = '/auth'`. The routes are registered on a
+/// router the host mounts at that path at startup, which no call in the module shows.
+pub fn declared_mount_prefix(source: &str) -> Option<String> {
+    const KEYS: [&str; 2] = ["mountPath", "mountpath"];
+    for key in KEYS {
+        let mut from = 0;
+        while let Some(found) = source[from..].find(key) {
+            let after = from + found + key.len();
+            from = after;
+            let rest = source[after..].trim_start();
+            let Some(rest) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('=')) else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(quote) = rest
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '"' | '\'' | '`'))
+            else {
+                continue;
+            };
+            let body = &rest[1..];
+            let Some(end) = body.find(quote) else {
+                continue;
+            };
+            let value = &body[..end];
+            if value.starts_with('/')
+                && value.len() > 1
+                && !value.contains(['$', ' ', '{', '*', ':'])
+            {
+                return Some(value.trim_end_matches('/').to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// The most specific request entry among the finding's sink argument and source expression: a
@@ -270,7 +624,26 @@ fn best_entry(finding: &Finding, path: &str) -> Option<Entry> {
         Entry::Body(None) => 1,
         Entry::Url => 2,
     });
-    candidates.into_iter().next()
+    candidates
+        .into_iter()
+        .next()
+        .or_else(|| destructured_entry(finding, path))
+}
+
+/// `const { client_id } = request.query`: the source is the whole request object, and the sink
+/// argument is a variable the first trace step says was assigned from it. The destructured key
+/// is the parameter name.
+fn destructured_entry(finding: &Finding, path: &str) -> Option<Entry> {
+    let part = strip_request_receiver(finding.source.expr.trim())?;
+    if !matches!(part, "query" | "body" | "params") {
+        return None;
+    }
+    let step = finding.trace.first().filter(|s| s.file.is_none())?;
+    let name = step.note.strip_prefix("assigned to `")?.strip_suffix('`')?;
+    if name.is_empty() || !name.bytes().all(is_ident) {
+        return None;
+    }
+    source_entry(&format!("request.{part}.{name}"), path)
 }
 
 /// The request-access paths inside an expression: `path.join(ROOT, req.query.name)` yields
@@ -420,6 +793,59 @@ fn unquote(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_mount_prefix_reads_a_literal_default() {
+        use super::declared_mount_prefix as p;
+        assert_eq!(
+            p("const defaults = {\n  mountPath: \"/auth\",\n};").as_deref(),
+            Some("/auth")
+        );
+        assert_eq!(p("this.mountPath = '/files/'").as_deref(), Some("/files"));
+        assert_eq!(p("this.mountPath = this.options.mountPath;"), None);
+        assert_eq!(p("mountPath: \"/\""), None);
+    }
+
+    #[test]
+    fn required_siblings_fill_a_handlers_other_guards() {
+        // A handler that reaches its sink only after a cluster of query parameters checks out: one
+        // pinned to a literal by a regex guard (via an aliased variable), one that wants a URL,
+        // and one merely required present.
+        let source = r#"
+          const responseType =
+            request.query.response_type ?? (deprecated ? "id" : undefined);
+          const required = {
+            client_id: request.query.client_id,
+            redirect_uri: request.query.redirect_uri,
+            response_type: responseType,
+            state: request.query.state,
+          };
+          if (!/^(code|id)$/.test(String(responseType))) throw new Error("bad");
+        "#;
+        let siblings = required_siblings(source, "query", "client_id");
+        assert_eq!(
+            siblings,
+            vec![
+                (
+                    "redirect_uri".to_owned(),
+                    "http://jss-filler.test/".to_owned()
+                ),
+                ("response_type".to_owned(), "code".to_owned()),
+                ("state".to_owned(), "jsspector".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn required_siblings_read_an_equality_guard_and_skip_destructured_only_names() {
+        // `mode` is pinned by `===`; `token` is only destructured (optional), so it is not sent.
+        let source = r#"
+          const { token } = req.query;
+          if (req.query.mode === 'strict') { use(req.query.name); }
+        "#;
+        let siblings = required_siblings(source, "query", "name");
+        assert_eq!(siblings, vec![("mode".to_owned(), "strict".to_owned())]);
+    }
+
     use super::*;
     use jss_core::{SinkLoc, SourceLoc, TraceStep};
 

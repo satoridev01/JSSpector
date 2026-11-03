@@ -148,6 +148,24 @@ fn continuation(sources: &mut Sources, file: &str, line: u32) -> (Vec<u32>, bool
     let mut depth = open_brackets(first);
     let mut lines = Vec::new();
     let mut next = line;
+    if depth == 0 {
+        let chained = line + 1;
+        if sources
+            .line(file, chained)
+            .is_some_and(|text| text.trim_start().starts_with('.'))
+        {
+            next = chained;
+            let text = sources.line(file, next).unwrap_or_default();
+            depth = open_brackets(text);
+            lines.push(next);
+            if depth > 0
+                && text.trim_end().ends_with('{')
+                && (text.contains("=>") || text.contains("function"))
+            {
+                return (lines, true);
+            }
+        }
+    }
     while depth > 0 {
         if lines.len() >= MAX_CONTINUATION as usize {
             return (lines, true);
@@ -421,6 +439,12 @@ mod tests {
             continuation(&mut sources, "src/b.js", 1),
             (Vec::new(), false)
         );
+        std::fs::write(
+            dir.join("src/c.js"),
+            "const proxy = https\n  .request(options, response => {\n  response.resume();\n});\n",
+        )
+        .unwrap();
+        assert_eq!(continuation(&mut sources, "src/c.js", 1), (vec![2], true));
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(open_brackets("f('(', \"[\", `{`) // ("), 0);
     }

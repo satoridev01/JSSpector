@@ -16,17 +16,37 @@ pub const MARKER_HOST: &str = "jss-marker";
 #[derive(Debug, Clone)]
 pub struct Canary {
     pub token: String,
+    callback_host: Option<String>,
 }
 
 impl Canary {
     pub fn new(token: String) -> Self {
-        Self { token }
+        Self {
+            token,
+            callback_host: None,
+        }
     }
 
-    /// The file planted in the image for a read to find (`/jss-marker-<token>`), holding the
-    /// token.
+    /// Use a registered public callback host while the target remains on the isolated verifier
+    /// network. The host must be a short-lived Satori callback token, never an arbitrary URL.
+    pub fn with_callback_host(mut self, host: Option<String>) -> Self {
+        self.callback_host = host;
+        self
+    }
+
+    pub fn marker_host(&self) -> &str {
+        self.callback_host.as_deref().unwrap_or(MARKER_HOST)
+    }
+
+    pub fn callback_host(&self) -> Option<&str> {
+        self.callback_host.as_deref()
+    }
+
+    /// The file planted in the image for a read to find, holding the secret token. Its path is
+    /// deliberately independent of the token: an endpoint that merely reflects the requested
+    /// URL must never satisfy the read proof.
     pub fn planted_file(&self) -> String {
-        format!("/jss-marker-{}", self.token)
+        "/jss-canary-read".to_owned()
     }
 
     /// The file a write-payload is asked to create, tagged with the probe's `nonce` so one
@@ -43,7 +63,11 @@ impl Canary {
     /// The marker service URL a request-payload is aimed at, carrying the probe's token in its
     /// path. The sandbox runs the service on the app's private network under `jss-marker`.
     pub fn service_url(&self, nonce: u32) -> String {
-        format!("http://{MARKER_HOST}/{}", self.service_token(nonce))
+        format!(
+            "http://{}/{}",
+            self.marker_host(),
+            self.service_token(nonce)
+        )
     }
 }
 
@@ -52,6 +76,9 @@ impl Canary {
 pub enum Signal {
     /// The token appears in the HTTP response body (a planted file was read back).
     InResponse,
+    /// Known file contents appear in the response body. Used only inside the disposable Linux
+    /// verifier container to prove a traversal can read outside the application tree.
+    ResponseContains(String),
     /// A file at this path now exists in the app container (a write-payload ran).
     FileWritten(String),
     /// The marker service was reached carrying this token (a request-payload ran). The sandbox
@@ -92,7 +119,7 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                     verb,
                     target: route_with_token(&probe.path, &token),
                     body: None,
-                    headers: vec![(name.clone(), MARKER_HOST.to_owned())],
+                    headers: vec![(name.clone(), canary.marker_host().to_owned())],
                     signal: Signal::ServiceReached(token),
                 };
                 return vec![as_url, as_host];
@@ -113,6 +140,52 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                         ..attempt
                     },
                 ];
+            }
+            if probe.entry == Entry::Url && probe.class == VulnClass::Ssrf {
+                // An upgrade entry (`server.on('upgrade', ...)`) forwards the request URL too, but
+                // reaches only through an HTTP upgrade request, and often only for paths it
+                // recognizes. Send the marker URL as an absolute-form upgrade target: bare, and
+                // under each gate path the handler accepts, with the token carried onward either as
+                // a sub-path (for `startsWith` gates) or in the query (for exact-match gates).
+                if probe.method.is_upgrade() {
+                    let token = canary.service_token(nonce);
+                    let headers = vec![
+                        ("Connection".to_owned(), "Upgrade".to_owned()),
+                        ("Upgrade".to_owned(), "websocket".to_owned()),
+                    ];
+                    let upgrade = |target: String| Attempt {
+                        verb,
+                        target,
+                        body: None,
+                        headers: headers.clone(),
+                        signal: signal.clone(),
+                    };
+                    let mut out = vec![upgrade(value.clone())];
+                    for gate in &probe.gate_paths {
+                        let gate = gate.trim_end_matches('/');
+                        out.push(upgrade(format!(
+                            "http://{}{gate}/{token}",
+                            canary.marker_host()
+                        )));
+                        out.push(upgrade(format!(
+                            "http://{}{gate}?jss={token}",
+                            canary.marker_host()
+                        )));
+                    }
+                    return out;
+                }
+                // The request target itself reaches an outbound request
+                // (`new URL(req.url, base)`, a forward proxy). HTTP lets a client send it in
+                // absolute form (`GET http://host/path HTTP/1.1`, RFC 9112 §3.2.2), and a URL
+                // resolved against a base then keeps the client's host. Send the marker URL that
+                // way too; the path form stays first for a handler that appends the path to a
+                // URL of its own.
+                let as_path = place(probe, verb, &value, signal);
+                let absolute = Attempt {
+                    target: value.clone(),
+                    ..as_path.clone()
+                };
+                return vec![as_path, absolute];
             }
             if !matches!(probe.entry, Entry::Body(None)) {
                 return vec![place(probe, verb, &value, signal)];
@@ -167,16 +240,30 @@ fn payloads(class: VulnClass, canary: &Canary, nonce: u32) -> Vec<(String, Signa
         VulnClass::PathTraversal => {
             let file = canary.planted_file();
             let name = file.trim_start_matches('/');
-            // Absolute, then climbing from several depths, raw and with an encoded separator.
-            let mut out = vec![file.clone(), format!("/{name}")];
+            // First prove an unmistakable OS-file read in the disposable Linux container. Keep
+            // the canary variants as a fallback for applications that reject `/etc/passwd` by
+            // name but still allow traversal outside their intended root.
+            let passwd = "etc/passwd";
+            let passwd_signal = Signal::ResponseContains("root:x:0:0:root:".to_owned());
+            let mut out = vec![
+                (format!("/{passwd}"), passwd_signal.clone()),
+                (file.clone(), Signal::InResponse),
+                (format!("/{name}"), Signal::InResponse),
+            ];
             for depth in [1usize, 3, 6, 10] {
                 let up = "../".repeat(depth);
-                out.push(format!("{up}{name}"));
-                out.push(format!("{}{name}", "..%2f".repeat(depth)));
+                out.push((format!("{up}{passwd}"), passwd_signal.clone()));
+                out.push((
+                    format!("{}etc%2fpasswd", "..%2f".repeat(depth)),
+                    passwd_signal.clone(),
+                ));
+                out.push((format!("{up}{name}"), Signal::InResponse));
+                out.push((
+                    format!("{}{name}", "..%2f".repeat(depth)),
+                    Signal::InResponse,
+                ));
             }
-            out.into_iter()
-                .map(|value| (value, Signal::InResponse))
-                .collect()
+            out
         }
         VulnClass::CommandInjection => {
             // A benign write of the marker file, reached through the metacharacters a shell
@@ -277,6 +364,7 @@ pub fn reproduced(
 ) -> bool {
     match &attempt.signal {
         Signal::InResponse => response_body.contains(&canary.token),
+        Signal::ResponseContains(expected) => response_body.contains(expected),
         Signal::FileWritten(_) => marker_file_exists,
         Signal::ServiceReached(_) => service_reached,
     }
@@ -441,6 +529,7 @@ mod tests {
             entry,
             class,
             siblings: Vec::new(),
+            gate_paths: Vec::new(),
         }
     }
 
@@ -457,9 +546,14 @@ mod tests {
             0,
         );
         assert!(a.iter().all(|x| x.target.starts_with("/api/files?name=")));
-        assert!(a.iter().all(|x| x.signal == Signal::InResponse));
-        // The planted marker's name rides in every payload.
-        assert!(a.iter().all(|x| x.target.contains("marker-abc123")));
+        assert!(a.iter().any(|x| {
+            matches!(&x.signal, Signal::ResponseContains(expected)
+                if expected == "root:x:0:0:root:")
+                && x.target.contains("etc")
+                && x.target.contains("passwd")
+        }));
+        // The canary secret is content only. Echoing a requested URL cannot verify the read.
+        assert!(a.iter().all(|x| !x.target.contains("abc123")));
         assert!(a.len() >= 4);
     }
 
@@ -481,6 +575,14 @@ mod tests {
             a[0].body.as_deref(),
             Some("{\"url\":\"http://jss-marker/tok-0\"}")
         );
+    }
+
+    #[test]
+    fn a_registered_callback_replaces_the_private_marker_hostname() {
+        let host = format!("{}.callback.satori.ci", "a".repeat(32));
+        let canary = Canary::new("run".to_owned()).with_callback_host(Some(host.clone()));
+        assert_eq!(canary.marker_host(), host);
+        assert_eq!(canary.service_url(2), format!("http://{host}/run-2"));
     }
 
     #[test]
@@ -609,6 +711,33 @@ mod tests {
         assert!(a.iter().all(|x| !x.target.contains("{wildcard}")));
     }
 
+    /// An SSRF through the request target itself (`new URL(req.url, base)`): the marker URL as a
+    /// path, then as an absolute-form request target, both tied to the probe's own token.
+    #[test]
+    fn a_url_ssrf_is_also_sent_as_an_absolute_form_target() {
+        let canary = Canary::new("u".to_owned());
+        let a = attempts(
+            &probe(VulnClass::Ssrf, "/{wildcard}", Entry::Url),
+            &canary,
+            4,
+        );
+        let url = canary.service_url(4);
+        let targets: Vec<&str> = a.iter().map(|x| x.target.as_str()).collect();
+        assert_eq!(targets, [format!("/{url}"), url.clone()]);
+        assert!(a.iter().all(|x| x.verb == "GET" && x.body.is_none()));
+        assert!(
+            a.iter()
+                .all(|x| x.signal == Signal::ServiceReached(canary.service_token(4)))
+        );
+        // Other classes through the URL keep the path form only.
+        let traversal = attempts(
+            &probe(VulnClass::PathTraversal, "/{wildcard}", Entry::Url),
+            &canary,
+            4,
+        );
+        assert!(traversal.iter().all(|x| x.target.starts_with('/')));
+    }
+
     #[test]
     fn reproduced_reads_the_signal() {
         let canary = Canary::new("TOKEN".to_owned());
@@ -627,6 +756,24 @@ mod tests {
             false
         ));
         assert!(!reproduced(&in_response, &canary, "nothing", true, true));
+        let passwd = Attempt {
+            signal: Signal::ResponseContains("root:x:0:0:root:".to_owned()),
+            ..in_response.clone()
+        };
+        assert!(reproduced(
+            &passwd,
+            &canary,
+            "root:x:0:0:root:/root:/bin/bash",
+            false,
+            false
+        ));
+        assert!(!reproduced(
+            &passwd,
+            &canary,
+            "/../../../etc/passwd",
+            false,
+            false
+        ));
         let written = Attempt {
             signal: Signal::FileWritten(canary.written_file(0)),
             ..in_response.clone()

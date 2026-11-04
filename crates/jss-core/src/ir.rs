@@ -129,6 +129,10 @@ pub struct Entry {
     pub auth: Auth,
     pub kind: String,
     pub inputs: Vec<(String, String)>,
+    /// For an inline handler walked as part of its enclosing function (`handler` names that
+    /// function), the handler's first and last lines: the entry reaches the findings there only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<(u32, u32)>,
 }
 
 /// `router.use('/prefix', child)`.

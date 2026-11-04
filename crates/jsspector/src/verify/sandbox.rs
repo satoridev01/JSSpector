@@ -38,7 +38,8 @@ pub struct Session {
     app: String,
     marker: String,
     canary: Canary,
-    /// The container port the app listens on (we set it, via `PORT`).
+    /// The container port the app listens on: the one we ask for via `PORT`, or, for an app that
+    /// fixes its own, the one port it is found listening on (see [`listening_probe`]).
     port: u16,
     /// Bumped per probe, so one probe's write/service marker never confirms another's.
     nonce: u32,
@@ -59,7 +60,8 @@ impl Session {
     /// outside its own directory.
     pub fn start_in(root: &std::path::Path, app_path: &std::path::Path) -> Result<Self, String> {
         let id = run_id();
-        let canary = Canary::new(format!("{id}{}", short_rand()));
+        let canary = Canary::new(format!("{id}{}", short_rand()))
+            .with_callback_host(configured_callback_host()?);
         let tag = format!("jsspector-verify:{id}");
         let network = format!("jss-verify-net-{id}");
         let app = format!("jss-verify-app-{id}");
@@ -104,28 +106,62 @@ impl Session {
     }
 
     /// Starts the marker service and the app, and waits for the app to listen.
-    fn boot(&self) -> Result<(), String> {
+    fn boot(&mut self) -> Result<(), String> {
         // The marker service: records every path it is asked for. Reached only from inside the
         // private network, as `jss-marker`.
-        docker(&[
-            "run",
-            "-d",
-            "--name",
-            &self.marker,
-            "--network",
-            &self.network,
-            "--network-alias",
-            "jss-marker",
-            "--entrypoint",
-            "node",
-            &self.tag,
-            "/jss-marker.js",
-        ])
-        .map_err(|e| format!("could not start the marker service: {e}"))?;
+        let mut marker_args = vec![
+            "run".to_owned(),
+            "-d".to_owned(),
+            "--name".to_owned(),
+            self.marker.clone(),
+            "--network".to_owned(),
+            self.network.clone(),
+            "--network-alias".to_owned(),
+            "jss-marker".to_owned(),
+        ];
+        if let Some(host) = self.canary.callback_host() {
+            marker_args.extend(["--network-alias".to_owned(), host.to_owned()]);
+        }
+        marker_args.extend([
+            "--entrypoint".to_owned(),
+            "node".to_owned(),
+            self.tag.clone(),
+            "/jss-marker.js".to_owned(),
+        ]);
+        let marker_args: Vec<&str> = marker_args.iter().map(String::as_str).collect();
+        docker(&marker_args).map_err(|e| format!("could not start the marker service: {e}"))?;
 
+        // An app that refuses to start without an environment variable its deployment supplies
+        // (`NOOBOT_WORKSPACE_ROOT is required`) is started again with it set to a neutral value
+        // (see [`required_env`]), a few times at most.
+        let mut env: Vec<RequiredEnv> = Vec::new();
+        for _ in 0..4 {
+            self.run_app(&env)?;
+            let err = match self.wait_until_listening() {
+                Ok(port) => {
+                    self.port = port;
+                    return Ok(());
+                }
+                Err(err) => err,
+            };
+            let missing: Vec<RequiredEnv> = required_env(&err)
+                .into_iter()
+                .filter(|wanted| env.iter().all(|have| have.name != wanted.name))
+                .collect();
+            if missing.is_empty() {
+                return Err(err);
+            }
+            let _ = docker(&["rm", "-f", &self.app]);
+            env.extend(missing);
+        }
+        Err("the app still exited for want of environment variables after four starts".to_owned())
+    }
+
+    /// Starts the app container, with `env` on top of the variables every app gets.
+    fn run_app(&self, env: &[RequiredEnv]) -> Result<(), String> {
         // The app: on the private network, hardened, its scratch space in tmpfs, no extra
         // privileges, bounded memory, CPUs and processes.
-        docker(&[
+        let mut args: Vec<String> = [
             "run",
             "-d",
             "--name",
@@ -150,31 +186,39 @@ impl Session {
             "HOST=0.0.0.0",
             "-e",
             "NODE_ENV=development",
-            &self.tag,
-        ])
-        .map_err(|e| format!("could not start the app: {e}"))?;
-
-        self.wait_until_listening()
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        for var in env {
+            // A directory the app names by a variable: its own empty scratch space.
+            if var.directory {
+                args.push("--tmpfs".to_owned());
+                args.push(var.value.clone());
+            }
+            args.push("-e".to_owned());
+            args.push(format!("{}={}", var.name, var.value));
+        }
+        args.push(self.tag.clone());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        docker(&args).map_err(|e| format!("could not start the app: {e}"))?;
+        Ok(())
     }
 
-    /// Polls the app's port from inside its own container until it answers or the deadline
-    /// passes.
-    fn wait_until_listening(&self) -> Result<(), String> {
+    /// Polls from inside the app's own container until the app answers on a port, or the
+    /// deadline passes, and returns that port.
+    fn wait_until_listening(&self) -> Result<u16, String> {
         // Up to ~90s: `npm start` may build first. The probe is one Node connect attempt.
+        let script = listening_probe(self.port);
         for _ in 0..90 {
-            let probe = self.exec(
-                &self.app,
-                &[
-                    "node",
-                    "-e",
-                    &format!(
-                        "require('net').connect({{port:{},host:'127.0.0.1'}}).on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))",
-                        self.port
-                    ),
-                ],
-            );
-            if probe.map(|o| o.status.success()).unwrap_or(false) {
-                return Ok(());
+            let probe = self.exec(&self.app, &["node", "-e", &script]);
+            if let Some(port) = probe.ok().filter(|o| o.status.success()).and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+            }) {
+                return Ok(port);
             }
             // Give up early if the app container has already exited.
             if !self.container_running(&self.app) {
@@ -226,7 +270,9 @@ impl Session {
             );
         }
         let reproduced = match &attempt.signal {
-            Signal::InResponse => payload::reproduced(attempt, &self.canary, &body, false, false),
+            Signal::InResponse | Signal::ResponseContains(_) => {
+                payload::reproduced(attempt, &self.canary, &body, false, false)
+            }
             Signal::FileWritten(path) => {
                 let exists = self
                     .exec(&self.app, &["test", "-f", path])
@@ -235,7 +281,8 @@ impl Session {
                 payload::reproduced(attempt, &self.canary, &body, exists, false)
             }
             Signal::ServiceReached(token) => {
-                let reached = self.tail_logs(&self.marker).contains(token);
+                let reached = self.tail_logs(&self.marker).contains(token)
+                    && self.relay_public_callback(token);
                 payload::reproduced(attempt, &self.canary, &body, false, reached)
             }
         };
@@ -249,7 +296,7 @@ impl Session {
                 .map(|(name, value)| format!("{name}: {value}"))
                 .collect(),
             body: attempt.body.clone(),
-            evidence: observed_evidence(&attempt.signal),
+            evidence: observed_evidence(&attempt.signal, self.canary.callback_host()),
             response: body.trim().to_owned(),
         })
     }
@@ -257,18 +304,93 @@ impl Session {
     fn exec(&self, container: &str, cmd: &[&str]) -> Result<Output, String> {
         exec_in(container, cmd)
     }
+
+    /// Mirror an isolated marker hit to the registered public callback from the verifier host.
+    /// The untrusted application container remains on its `--internal` network; only this fixed,
+    /// validated Satori hostname is contacted. A registered canary response is required.
+    fn relay_public_callback(&self, token: &str) -> bool {
+        let Some(host) = self.canary.callback_host() else {
+            return true;
+        };
+        let logs = self.tail_logs(&self.marker);
+        let Some(path) = logs
+            .lines()
+            .rev()
+            .find(|line| line.contains(token))
+            .and_then(|line| line.split_once("MARKER ").map(|(_, path)| path.trim()))
+        else {
+            return false;
+        };
+        let url = format!("https://{host}{path}");
+        let Ok(output) = Command::new("curl")
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "10",
+                &url,
+            ])
+            .output()
+        else {
+            return false;
+        };
+        let registered_token = host.split('.').next().unwrap_or_default();
+        let confirmed = output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("SATORI_CANARY_{registered_token}"));
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] callback relay {} -> status {:?} confirmed={confirmed}",
+                url,
+                output.status.code()
+            );
+        }
+        confirmed
+    }
 }
 
-fn observed_evidence(signal: &Signal) -> String {
+fn observed_evidence(signal: &Signal, callback_host: Option<&str>) -> String {
     match signal {
         Signal::InResponse => "the canary token appeared in the application response".to_owned(),
+        Signal::ResponseContains(expected) => {
+            format!("the application response contained known file content `{expected}`")
+        }
         Signal::FileWritten(path) => {
             format!("the application created the canary file `{path}`")
         }
         Signal::ServiceReached(token) => {
-            format!("the isolated marker service received callback token `{token}`")
+            if let Some(host) = callback_host {
+                format!(
+                    "the isolated request carrying `{token}` was confirmed by the registered Satori callback `{host}`"
+                )
+            } else {
+                format!("the isolated marker service received callback token `{token}`")
+            }
         }
     }
+}
+
+fn configured_callback_host() -> Result<Option<String>, String> {
+    let Some(value) = std::env::var_os("JSS_VERIFY_CALLBACK_URL") else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "JSS_VERIFY_CALLBACK_URL is not UTF-8".to_owned())?;
+    let host = value
+        .strip_prefix("https://")
+        .and_then(|rest| rest.strip_suffix('/').or(Some(rest)))
+        .ok_or_else(|| "JSS_VERIFY_CALLBACK_URL must use https".to_owned())?;
+    let Some(token) = host.strip_suffix(".callback.satori.ci") else {
+        return Err("JSS_VERIFY_CALLBACK_URL must use callback.satori.ci".to_owned());
+    };
+    if token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "JSS_VERIFY_CALLBACK_URL must contain a 32-character hexadecimal token".to_owned(),
+        );
+    }
+    Ok(Some(host.to_ascii_lowercase()))
 }
 
 fn curl_command(attempt: &Attempt, port: u16) -> String {
@@ -276,21 +398,30 @@ fn curl_command(attempt: &Attempt, port: u16) -> String {
     let mut body = attempt.body.clone();
     if let Signal::ServiceReached(token) = &attempt.signal {
         let private = format!("http://jss-marker/{token}");
-        let callback = "http://CALLBACK_HOST/jsspector";
+        let callback = "http://CALLBACK_HOST";
         target = target.replace(&private, callback).replace(
             &format!("http%3A%2F%2Fjss-marker%2F{token}"),
-            "http%3A%2F%2FCALLBACK_HOST%2Fjsspector",
+            "http%3A%2F%2FCALLBACK_HOST",
         );
         body = body.map(|value| value.replace(&private, callback));
     }
     let mut parts = vec![
         "curl -i -sS".to_owned(),
         format!("--request {}", attempt.verb),
-        format!(
+    ];
+    if target.starts_with('/') {
+        parts.push(format!(
             "--url {}",
             shell_quote(&format!("http://TARGET_HOST:{port}{target}"))
-        ),
-    ];
+        ));
+    } else {
+        // An absolute-form request target (`GET http://host/path HTTP/1.1`), sent as is.
+        parts.push(format!(
+            "--url {}",
+            shell_quote(&format!("http://TARGET_HOST:{port}"))
+        ));
+        parts.push(format!("--request-target {}", shell_quote(&target)));
+    }
     parts.extend(
         attempt
             .headers
@@ -504,24 +635,195 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
+/// An environment variable the app refused to start without, and the value it is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredEnv {
+    name: String,
+    value: String,
+    /// The value is a directory (mounted empty and writable for the app).
+    directory: bool,
+}
+
+/// The environment variables an app's startup failure says it requires: a variable-style name
+/// (`UPPER_SNAKE`, with an underscore) followed in its log by `is required` / `must be set` /
+/// `is not set` / `is missing` (`Error: NOOBOT_WORKSPACE_ROOT is required`), or after
+/// `environment variable` / `missing` (`Missing required environment variable: DATABASE_URL`).
+/// Each gets a neutral value of the kind its name asks for: a fresh empty directory for a
+/// `_ROOT`/`_DIR`/`_PATH`/`_HOME` name, a URL that resolves nowhere for a `_URL`/`_URI`, else a
+/// plain word. Never one the sandbox sets itself, nor Node's or npm's own (`NODE_OPTIONS`):
+/// those would change the sandbox, not satisfy the app.
+fn required_env(log: &str) -> Vec<RequiredEnv> {
+    const AFTER: [&str; 8] = [
+        "is required",
+        "must be set",
+        "is not set",
+        "is missing",
+        "must be provided",
+        "must be defined",
+        "is undefined",
+        "not set",
+    ];
+    const BEFORE: [&str; 3] = ["environment variable", "env var", "missing"];
+    let variable = |word: &str| {
+        word.len() <= 64
+            && word.contains('_')
+            && word.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            && !word.starts_with("ERR_")
+            && !word.starts_with("NODE_")
+            && !word.starts_with("NPM_")
+            && !matches!(word, "PORT" | "HOST" | "NODE_ENV")
+    };
+    let mut out: Vec<RequiredEnv> = Vec::new();
+    for line in log.lines() {
+        // ASCII lowercasing keeps byte offsets, and a word is ASCII, so offsets stay on
+        // character boundaries.
+        let lower = line.to_ascii_lowercase();
+        let bytes = line.as_bytes();
+        let word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut words: Vec<(usize, &str)> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !bytes.get(i).copied().is_some_and(word_byte) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while bytes.get(i).copied().is_some_and(word_byte) {
+                i += 1;
+            }
+            if let Some(word) = line.get(start..i).filter(|w| variable(w)) {
+                words.push((start, word));
+            }
+        }
+        for (at, word) in words {
+            const QUOTES: [char; 5] = ['"', '\'', '`', ' ', ':'];
+            let after = lower[at + word.len()..].trim_start_matches(QUOTES);
+            let before = lower[..at].trim_end_matches(QUOTES);
+            let demanded = AFTER.iter().any(|p| after.starts_with(p))
+                || BEFORE.iter().any(|p| before.ends_with(p));
+            if demanded && out.iter().all(|e| e.name != word) {
+                let last = word.rsplit('_').next().unwrap_or(word);
+                let (value, directory) = match last {
+                    "ROOT" | "DIR" | "DIRECTORY" | "PATH" | "HOME" | "FOLDER" => {
+                        (format!("/jss-env/{}", word.to_ascii_lowercase()), true)
+                    }
+                    "URL" | "URI" => ("http://jss-filler.test/".to_owned(), false),
+                    _ => ("jsspector".to_owned(), false),
+                };
+                out.push(RequiredEnv {
+                    name: word.to_owned(),
+                    value,
+                    directory,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// A Node script, run inside the app container, that prints the port the app answers on and
+/// exits 0, else exits 1. The port asked for via `PORT` when the app listens there; otherwise,
+/// for an app that fixes its own port (`server.listen(8000)`), the one TCP port the container
+/// listens on where the driver reaches it (from `/proc/net/tcp*`, bound to every address or to
+/// `127.0.0.1`/`::1`; Docker's own resolver on `127.0.0.11` is not the app, and nothing else
+/// runs there). Several candidates and none on `PORT` is ambiguous: not ready.
+fn listening_probe(wanted: u16) -> String {
+    format!(
+        "const fs=require('fs'),net=require('net');const ports=new Set();\
+         for(const f of ['/proc/net/tcp','/proc/net/tcp6']){{let t='';try{{t=fs.readFileSync(f,'utf8')}}catch{{}}\
+         for(const l of t.split('\\n').slice(1)){{const c=l.trim().split(/\\s+/);\
+         const [a,p]=(c[1]||'').split(':');\
+         if(c[3]==='0A'&&p&&(/^0+$/.test(a)||a==='0100007F'||a==='00000000000000000000000001000000'))ports.add(parseInt(p,16))}}}}\
+         const list=[...ports];const port=ports.has({wanted})||!list.length?{wanted}:(list.length===1?list[0]:0);\
+         if(!port)process.exit(1);\
+         net.connect({{port,host:'127.0.0.1'}}).on('connect',()=>{{console.log(port);process.exit(0)}}).on('error',()=>process.exit(1));"
+    )
+}
+
 /// The app's launch command for the image `CMD`: `npm start` when the package has a start
 /// script (explicit, and what most Node servers document); otherwise the package's own entry
 /// point, its `main` file, run with `node` — what a service package without scripts is started
 /// with. `None` when the package declares neither.
 fn start_command(root: &std::path::Path) -> Option<String> {
     let manifest = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&manifest).ok();
     if has_start_script(&manifest) {
-        return Some("[\"npm\",\"start\"]".to_owned());
+        // A start script that only detaches the server (`./server.js > log 2>&1 & disown`)
+        // returns at once, and the container with it: run the detached file in the foreground.
+        let detached = json
+            .as_ref()
+            .and_then(|json| json.get("scripts")?.get("start")?.as_str())
+            .and_then(detached_script)
+            .and_then(|file| package_file(root, file));
+        return Some(match detached {
+            Some(file) => format!("[\"node\",\"{file}\"]"),
+            None => "[\"npm\",\"start\"]".to_owned(),
+        });
     }
-    let json = serde_json::from_str::<serde_json::Value>(&manifest).ok()?;
-    let main = json.get("main")?.as_str()?.trim_start_matches("./");
-    let safe = !main.is_empty()
-        && !main.starts_with('/')
-        && !main.split('/').any(|part| part == "..")
-        && main
+    let main = json?.get("main")?.as_str()?.to_owned();
+    package_file(root, &main).map(|main| format!("[\"node\",\"{main}\"]"))
+}
+
+/// A file of the package by a relative path its manifest gives (`./server.js`), when it exists
+/// and its name is plain enough to place in the image `CMD` unquoted: never outside the package.
+fn package_file(root: &std::path::Path, path: &str) -> Option<String> {
+    let path = path.trim_start_matches("./");
+    let safe = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.split('/').any(|part| part == "..")
+        && path
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@'));
-    (safe && root.join(main).is_file()).then(|| format!("[\"node\",\"{main}\"]"))
+    (safe && root.join(path).is_file()).then(|| path.to_owned())
+}
+
+/// The JavaScript file a start script runs in the background and leaves running, when that is
+/// all it does: `./server.js > /dev/null 2>&1 & disown`, `nohup node server.js &`. Output
+/// redirections are dropped; anything else (a second command, `&&`, a pipe, arguments) is not
+/// a plain detached server, and `None`.
+fn detached_script(script: &str) -> Option<&str> {
+    let script = script.trim();
+    let script = script.strip_suffix("disown").unwrap_or(script).trim_end();
+    let command = script.strip_suffix('&')?;
+    let mut words = command.split_whitespace().peekable();
+    if words.peek() == Some(&"nohup") {
+        words.next();
+    }
+    if words.peek() == Some(&"node") {
+        words.next();
+    }
+    let file = words.next()?;
+    let plain = |w: &str| {
+        !w.is_empty()
+            && w.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@'))
+    };
+    if !plain(file)
+        || ![".js", ".mjs", ".cjs"]
+            .iter()
+            .any(|ext| file.ends_with(ext))
+    {
+        return None;
+    }
+    // Only output redirections may follow: `> /dev/null`, `>>log`, `2>&1`.
+    while let Some(word) = words.next() {
+        let op = word.trim_start_matches(|c: char| c.is_ascii_digit());
+        let target = op.strip_prefix(">>").or_else(|| op.strip_prefix('>'))?;
+        let target = match target {
+            "" => words.next()?,
+            t => t,
+        };
+        let duplicate = target
+            .strip_prefix('&')
+            .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()));
+        if !duplicate && !plain(target) {
+            return None;
+        }
+    }
+    Some(file)
 }
 
 /// A cheap check for a `"start"` key under a `"scripts"` object. Good enough to decide launch;
@@ -691,6 +993,9 @@ const req = http.request({host:'127.0.0.1',port:spec.port,method:spec.method,pat
   res.on('data',(c)=>{data+=c; if(data.length>65536){res.destroy();}});
   res.on('end',()=>{process.stdout.write(data);process.exit(0);});
 });
+// An upgrade request completes with an 'upgrade' event instead of a response; the out-of-band
+// marker signal is what confirms it, so just end the request once it is answered either way.
+req.on('upgrade',(res,socket)=>{try{socket.destroy();}catch(e){}process.exit(0);});
 req.on('error',()=>process.exit(0));
 req.on('timeout',()=>{req.destroy();process.exit(0);});
 if(spec.body){req.write(spec.body);}
@@ -706,13 +1011,21 @@ req.end();
 const MARKER_JS: &str = r#"
 const http = require('http');
 const log = (req, res) => { console.log('MARKER ' + req.url); res.end('ok'); };
-http.createServer(log).listen(80, '0.0.0.0');
+// An outbound request whose host is attacker-controlled may be forwarded with upgrade headers
+// (a proxied WebSocket/upgrade request). Record those too, so a reached-service signal is seen
+// however the request arrives, then drop the raw socket.
+const logUpgrade = (req, socket) => { console.log('MARKER ' + req.url); try { socket.destroy(); } catch (e) {} };
+const httpServer = http.createServer(log);
+httpServer.on('upgrade', logUpgrade);
+httpServer.listen(80, '0.0.0.0');
 try {
   const fs = require('fs');
   const https = require('https');
   const key = fs.readFileSync('/jss-marker.key');
   const cert = fs.readFileSync('/jss-marker.crt');
-  https.createServer({ key, cert }, log).listen(443, '0.0.0.0');
+  const httpsServer = https.createServer({ key, cert }, log);
+  httpsServer.on('upgrade', logUpgrade);
+  httpsServer.listen(443, '0.0.0.0');
 } catch (e) {
   console.error('marker: TLS listener disabled (' + e.message + ')');
 }
@@ -1127,6 +1440,71 @@ const { chromium } = require('playwright');
 mod tests {
     use super::*;
 
+    /// The variables a startup failure demands, read from the app's own error; each with a value
+    /// of the kind its name asks for. Source echoes, error codes, Node's own and the sandbox's
+    /// variables are not taken.
+    #[test]
+    fn required_env_reads_a_startup_failure() {
+        let log = "file:///app/x/workspace-root.js:42\n\
+            \x20 if (!value) throw new Error(`${WORKSPACE_ROOT_ENV} is required`);\n\
+            Error: NOOBOT_WORKSPACE_ROOT is required\n\
+            Missing required environment variable: DATABASE_URL\n\
+            \"SESSION_SECRET\" must be set\n\
+            Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'x' is missing\n\
+            NODE_OPTIONS is not set\n\
+            PORT is required\n\
+            Error: NOOBOT_WORKSPACE_ROOT is required\n\
+            LOG_LEVEL defaults to info\n";
+        let env = required_env(log);
+        let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["NOOBOT_WORKSPACE_ROOT", "DATABASE_URL", "SESSION_SECRET"]
+        );
+        assert_eq!(
+            env[0],
+            RequiredEnv {
+                name: "NOOBOT_WORKSPACE_ROOT".to_owned(),
+                value: "/jss-env/noobot_workspace_root".to_owned(),
+                directory: true,
+            }
+        );
+        assert_eq!(env[1].value, "http://jss-filler.test/");
+        assert!(!env[1].directory);
+        assert_eq!(env[2].value, "jsspector");
+        assert!(required_env("the app did not listen within 90s").is_empty());
+    }
+
+    /// The copyable command for an absolute-form request target sends it as is, to the app.
+    #[test]
+    fn an_absolute_form_target_reproduces_with_request_target() {
+        let token = "t-1".to_owned();
+        let attempt = Attempt {
+            verb: "GET",
+            target: format!("http://jss-marker/{token}"),
+            body: None,
+            headers: Vec::new(),
+            signal: Signal::ServiceReached(token),
+        };
+        let command = curl_command(&attempt, 8000);
+        assert!(
+            command.contains("--url 'http://TARGET_HOST:8000'"),
+            "{command}"
+        );
+        assert!(
+            command.contains("--request-target 'http://CALLBACK_HOST'"),
+            "{command}"
+        );
+        let path = Attempt {
+            target: "/x?u=1".to_owned(),
+            signal: Signal::InResponse,
+            ..attempt
+        };
+        let command = curl_command(&path, 8000);
+        assert!(command.contains("--url 'http://TARGET_HOST:8000/x?u=1'"));
+        assert!(!command.contains("--request-target"));
+    }
+
     #[test]
     fn docker_args_label_resource_creation_only() {
         let label = "monitor_42-a";
@@ -1275,6 +1653,78 @@ mod tests {
     }
 
     #[test]
+    fn a_start_script_that_detaches_its_server_runs_it_in_the_foreground() {
+        for (script, file) in [
+            (
+                "./scripts/start.js > /dev/null 2>&1 & disown",
+                Some("./scripts/start.js"),
+            ),
+            ("nohup node server.js &", Some("server.js")),
+            ("node dist/main.mjs >>log.txt 2>&1 &", Some("dist/main.mjs")),
+            ("node server.js", None),
+            ("node server.js && echo done &", None),
+            ("node a.js & node b.js &", None),
+            ("node --inspect server.js &", None),
+            ("node server.js | tee log &", None),
+            ("node server.js > $(pwd)/log &", None),
+            ("./build.sh &", None),
+        ] {
+            assert_eq!(detached_script(script), file, "{script}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "package.json",
+            r#"{"main":"main.js","scripts":{"start":"./scripts/start.js > /dev/null 2>&1 & disown"}}"#,
+        );
+        // The detached file must exist in the package.
+        assert_eq!(start_command(root).as_deref(), Some(r#"["npm","start"]"#));
+        write(root, "scripts/start.js", "");
+        assert_eq!(
+            start_command(root).as_deref(),
+            Some(r#"["node","scripts/start.js"]"#)
+        );
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"node ../outside.js &"}}"#,
+        );
+        assert_eq!(start_command(root).as_deref(), Some(r#"["npm","start"]"#));
+    }
+
+    /// The readiness probe is valid Node and reports the port asked for when the app listens
+    /// there (where `/proc/net/tcp` is absent, the only port it can try).
+    #[test]
+    fn the_listening_probe_reports_the_port_answering() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let out = Command::new("node")
+            .args(["-e", &listening_probe(port)])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            port.to_string()
+        );
+        drop(listener);
+        let out = Command::new("node")
+            .args(["-e", &listening_probe(port)])
+            .output()
+            .unwrap();
+        assert!(!out.status.success() || std::path::Path::new("/proc/net/tcp").exists());
+    }
+
+    #[test]
     fn a_main_entry_outside_the_package_or_missing_is_not_launched() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1403,6 +1853,7 @@ http.createServer((req, res) => {
             entry: Entry::Query("name".to_owned()),
             class: VulnClass::PathTraversal,
             siblings: Vec::new(),
+            gate_paths: Vec::new(),
         };
         let confined = Probe {
             method: Method::Get,
@@ -1410,6 +1861,7 @@ http.createServer((req, res) => {
             entry: Entry::Query("name".to_owned()),
             class: VulnClass::PathTraversal,
             siblings: Vec::new(),
+            gate_paths: Vec::new(),
         };
         let command = Probe {
             method: Method::Get,
@@ -1417,6 +1869,7 @@ http.createServer((req, res) => {
             entry: Entry::Query("host".to_owned()),
             class: VulnClass::CommandInjection,
             siblings: Vec::new(),
+            gate_paths: Vec::new(),
         };
         let ssrf = Probe {
             method: Method::Get,
@@ -1424,6 +1877,7 @@ http.createServer((req, res) => {
             entry: Entry::Query("url".to_owned()),
             class: VulnClass::Ssrf,
             siblings: Vec::new(),
+            gate_paths: Vec::new(),
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

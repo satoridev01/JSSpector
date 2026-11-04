@@ -116,6 +116,17 @@ pub fn run(
             probe.siblings = plan::required_siblings(&source, part, &target);
         }
     }
+    // An upgrade entry that forwards the request URL (SSRF) often reaches its sink only for paths
+    // it recognizes. Mine those gate paths from the handler source so the upgrade request can be
+    // sent under one the handler accepts.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.method.is_upgrade()
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            probe.gate_paths = plan::gate_paths(&source);
+        }
+    }
 
     let needs_http = plans.iter().any(|p| matches!(p, Ok(plan::Plan::Http(_))));
     let needs_browser = plans

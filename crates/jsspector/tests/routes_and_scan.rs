@@ -1767,6 +1767,223 @@ fn routers_in_fields_and_included_classes_are_inventoried() {
     assert!(routes.iter().any(|r| r == "GET /from-test"), "{routes:?}");
 }
 
+/// `server.on('request', (req, res) => ...)` on a server from `http.createServer(opts)` handles
+/// every request, like a handler passed to the factory; `server.on('upgrade', ...)` handles every
+/// HTTP upgrade request and is marked a distinct `UPGRADE` method. The callback is walked as
+/// before, so its findings keep their function (and fingerprint); each listener's entry covers its
+/// own lines only, and the same listener on an emitter that is not a server is not an entry.
+#[test]
+fn server_request_listeners_are_catch_all_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "server.js",
+        "import fs from 'fs';\nimport http from 'http';\n\
+         const server = http.createServer({ keepAlive: false }, void 0);\n\
+         server.on('request', (req, res) => { const p = new URL(req.url, 'http://x').pathname; fs.createReadStream('./static/' + decodeURIComponent(p)).pipe(res); });\n\
+         server.on('upgrade', (req, sock) => { fs.createReadStream('./ws/' + req.url).pipe(sock); });\n\
+         server.listen(8000);\n",
+    );
+    write(
+        root,
+        "inline.js",
+        "import fs from 'fs';\nimport http from 'http';\n\
+         http.createServer((req, res) => { fs.createReadStream('./static/' + req.url).pipe(res); }).listen(8001);\n",
+    );
+    write(
+        root,
+        "other.js",
+        "import fs from 'fs';\nimport { EventEmitter } from 'events';\n\
+         const bus = new EventEmitter();\n\
+         bus.on('request', (req, res) => { fs.createReadStream('./static/' + req.url).pipe(res); });\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings = scan["findings"].as_array().unwrap();
+    let entry = |file: &str| -> Vec<String> {
+        findings
+            .iter()
+            .filter(|f| f["file"].as_str() == Some(file))
+            .map(|f| f["entry"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+    let inline = entry("inline.js");
+    assert_eq!(inline.len(), 1, "{findings:?}");
+    assert!(inline[0].starts_with("ANY /"), "{inline:?}");
+    let server: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["file"].as_str() == Some("server.js"))
+        .collect();
+    assert_eq!(server.len(), 2, "{findings:?}");
+    for f in &server {
+        assert_eq!(f["function"], "<module>", "{f:?}");
+        // The `'request'` listener (line 4) is a plain catch-all; the `'upgrade'` listener (line 5)
+        // is the same path but marked `UPGRADE`.
+        let expected = if f["sink"]["line"] == 4 {
+            Some(inline[0].as_str())
+        } else {
+            Some("UPGRADE /{wildcard}")
+        };
+        assert_eq!(f["entry"].as_str(), expected, "{f:?}");
+    }
+    assert!(
+        entry("other.js").iter().all(|e| e.is_empty()),
+        "{findings:?}"
+    );
+}
+
+/// `http.createServer(handle)` with a function of the file, or `http.createServer(make(rt))` with
+/// a local factory returning the handler, handles every request: the findings the handler reaches
+/// (here or in another file) get the catch-all entry. `http.createServer(app)` on something that
+/// is no function of the file, or a call to a function that returns no closure, is not one.
+#[test]
+fn named_and_factory_made_server_handlers_are_catch_all_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "named.js",
+        "import http from 'node:http';\n\
+         function handle(req, res) { http.request(new URL(req.url, 'http://x')).end(); }\n\
+         http.createServer(handle).listen(1);\n",
+    );
+    write(
+        root,
+        "made.js",
+        "import http from 'node:http';\nimport { forward } from './forward.js';\n\
+         function makeHandler(runtime) {\n\
+         \x20 return (request, response) => { if (request.url === '/health') return; forward(request, response); };\n\
+         }\n\
+         export async function start() { const server = http.createServer(makeHandler({})); server.listen(2); }\n",
+    );
+    write(
+        root,
+        "forward.js",
+        "import http from 'node:http';\n\
+         export function forward(request, response) {\n\
+         \x20 const target = new URL(request?.url || '/', 'http://upstream');\n\
+         \x20 http.request({ hostname: target.hostname, path: target.pathname }).end();\n\
+         }\n",
+    );
+    write(
+        root,
+        "other.js",
+        "import http from 'node:http';\nimport express from 'express';\n\
+         const app = express();\n\
+         function options() { return { keepAlive: true }; }\n\
+         function unrelated(req) { http.request(new URL(req.url, 'http://x')).end(); }\n\
+         http.createServer(app).listen(3);\n\
+         http.createServer(options()).listen(4);\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let handlers: Vec<(String, String)> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["file"].as_str().unwrap_or("").to_owned(),
+                r["handler"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        handlers.contains(&("named.js".to_owned(), "handle".to_owned())),
+        "{handlers:?}"
+    );
+    assert!(
+        handlers.contains(&("made.js".to_owned(), "makeHandler".to_owned())),
+        "{handlers:?}"
+    );
+    assert!(
+        handlers.iter().all(|(file, _)| file != "other.js"),
+        "{handlers:?}"
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings = scan["findings"].as_array().unwrap();
+    let entry = |file: &str| -> Vec<Option<String>> {
+        findings
+            .iter()
+            .filter(|f| f["file"].as_str() == Some(file))
+            .map(|f| f["entry"].as_str().map(str::to_owned))
+            .collect()
+    };
+    for file in ["named.js", "forward.js"] {
+        let entries = entry(file);
+        assert!(!entries.is_empty(), "{file}: {findings:?}");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.as_deref().is_some_and(|e| e.starts_with("ANY /"))),
+            "{file}: {entries:?}"
+        );
+    }
+    assert!(
+        entry("other.js").iter().all(Option::is_none),
+        "{findings:?}"
+    );
+}
+
+/// `server.on('upgrade', makeUpgradeHandler(rt))` with a local factory returning the handler
+/// closure links the HTTP-upgrade entry to the sink the closure reaches in another file, and marks
+/// it `UPGRADE` so verification drives it as an upgrade request rather than a plain one.
+#[test]
+fn factory_made_upgrade_handlers_link_the_upgrade_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "server.js",
+        "import http from 'node:http';\nimport { proxyUpgrade } from './upgrade.js';\n\
+         function makeUpgradeHandler(runtime) {\n\
+         \x20 return (request, socket, head) => { proxyUpgrade(request, socket, head); };\n\
+         }\n\
+         const server = http.createServer((req, res) => res.end('ok'));\n\
+         server.on('upgrade', makeUpgradeHandler({}));\n\
+         server.listen(2);\n",
+    );
+    write(
+        root,
+        "upgrade.js",
+        "import http from 'node:http';\n\
+         export function proxyUpgrade(request, socket, head) {\n\
+         \x20 const upstream = new URL(request?.url || '/', 'http://upstream');\n\
+         \x20 http.request({ hostname: upstream.hostname, path: upstream.pathname }).end();\n\
+         }\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings = scan["findings"].as_array().unwrap();
+    let upgrade: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["file"].as_str() == Some("upgrade.js"))
+        .collect();
+    assert!(!upgrade.is_empty(), "{findings:?}");
+    assert!(
+        upgrade
+            .iter()
+            .all(|f| f["entry"].as_str() == Some("UPGRADE /{wildcard}")),
+        "{upgrade:?}"
+    );
+}
+
 /// Entry points beyond routes and events: an LLM tool (named by its `name`), a dev server's
 /// middleware, and, for browser-side data no route reaches, the page or the component.
 #[test]

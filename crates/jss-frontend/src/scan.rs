@@ -764,7 +764,21 @@ fn analyze(
                     .get(&r.handler)
                     .map(|set| set.iter().cloned().collect())
                     .unwrap_or_default(),
+                lines: None,
             })
+            .chain(facts.scoped_routes.iter().map(|(r, within)| ir::Entry {
+                receiver: r.receiver.clone(),
+                receiver_file: r.receiver_file.clone(),
+                method: r.method.clone(),
+                path: r.path.clone(),
+                handler: r.handler.clone(),
+                line: line(r.span.start),
+                at: r.at.clone(),
+                auth: r.auth,
+                kind: r.kind.to_owned(),
+                inputs: Vec::new(),
+                lines: Some((line(within.start), line(within.end))),
+            }))
             .collect(),
         reexports: facts.reexports,
         classes: facts.classes,

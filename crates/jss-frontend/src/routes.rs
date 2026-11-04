@@ -34,6 +34,10 @@ pub struct Route {
     pub kind: String,
     /// Request inputs the handler reads: `query.q`, `body.email`.
     pub inputs: Vec<String>,
+    /// An inline handler walked as part of `handler` (its enclosing function): the handler's
+    /// first and last lines. It reaches the findings there, not the whole of `handler`.
+    #[serde(skip)]
+    pub lines: Option<(u32, u32)>,
 }
 
 /// Links findings to the entry points that reach them: each route's handler is resolved to a
@@ -41,7 +45,9 @@ pub struct Route {
 /// reached function gets the route (`entry`) and, when stronger, the route's authentication (an
 /// admin-only route lowers the severity one level).
 pub fn attach_entries(reports: &mut [ScanReport]) {
-    let routes = inventory(reports);
+    let (scoped, routes): (Vec<Route>, Vec<Route>) = inventory(reports)
+        .into_iter()
+        .partition(|r| r.lines.is_some());
     let modules: Vec<jss_core::ir::Module> = reports.iter().map(|r| r.module.clone()).collect();
     let by_file: BTreeMap<&str, &jss_core::ir::Module> =
         modules.iter().map(|m| (m.file.as_str(), m)).collect();
@@ -99,17 +105,50 @@ pub fn attach_entries(reports: &mut [ScanReport]) {
             };
             finding.entry = Some(label.clone());
             finding.entry_at = Some(at.clone());
-            if *auth > finding.auth {
-                if *auth == Auth::Admin && finding.auth != Auth::Admin {
-                    finding.severity = match finding.severity {
-                        jss_core::Severity::Critical => jss_core::Severity::High,
-                        jss_core::Severity::High => jss_core::Severity::Medium,
-                        _ => jss_core::Severity::Low,
-                    };
-                }
-                finding.auth = *auth;
-            }
+            raise_auth(finding, *auth);
         }
+    }
+    // Inline handlers walked inside another function: the findings whose source and sink both
+    // lie in the handler's lines (and in this file), weakest authentication first.
+    let mut scoped = scoped;
+    scoped.sort_by_key(|r| r.auth);
+    for report in reports.iter_mut() {
+        for finding in &mut report.findings {
+            if finding.entry.is_some() || finding.sink.file.is_some() {
+                continue;
+            }
+            let Some(route) = scoped.iter().find(|r| {
+                r.file == finding.file
+                    && r.handler_ref == finding.function
+                    && r.lines.is_some_and(|(first, last)| {
+                        (first..=last).contains(&finding.sink.line)
+                            && (first..=last).contains(&finding.source.line)
+                    })
+            }) else {
+                continue;
+            };
+            finding.entry = Some(format!("{} {}", route.method, route.path));
+            finding.entry_at = Some(jss_core::EntryLoc {
+                file: route.file.clone(),
+                line: route.line,
+            });
+            raise_auth(finding, route.auth);
+        }
+    }
+}
+
+/// A finding takes the stronger authentication of the entry that reaches it; an admin-only
+/// entry lowers its severity one level.
+fn raise_auth(finding: &mut jss_core::Finding, auth: Auth) {
+    if auth > finding.auth {
+        if auth == Auth::Admin && finding.auth != Auth::Admin {
+            finding.severity = match finding.severity {
+                jss_core::Severity::Critical => jss_core::Severity::High,
+                jss_core::Severity::High => jss_core::Severity::Medium,
+                _ => jss_core::Severity::Low,
+            };
+        }
+        finding.auth = auth;
     }
 }
 
@@ -200,6 +239,7 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                         .iter()
                         .map(|(l, n)| format!("{l}.{n}"))
                         .collect(),
+                    lines: entry.lines,
                 });
             }
         }

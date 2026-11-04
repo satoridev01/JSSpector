@@ -34,6 +34,11 @@ pub struct Probe {
     /// present and valid before the tainted one reaches the sink — name and value. Filled from the
     /// handler source (see [`required_siblings`]); empty for a handler that guards nothing else.
     pub siblings: Vec<(String, String)>,
+    /// URL path prefixes the handler compares the request path against before it reaches the sink
+    /// (`pathname === "/ide"`, `pathname.startsWith("/ide/")`). Mined from the handler source, so a
+    /// gated forward-proxy sink can be reached under a path it actually accepts. Empty when the
+    /// handler guards no path.
+    pub gate_paths: Vec<String>,
 }
 
 impl Probe {
@@ -193,6 +198,9 @@ pub enum Method {
     Patch,
     Delete,
     Any,
+    /// An HTTP upgrade (WebSocket) entry: `server.on('upgrade', ...)`. Driven as a GET carrying
+    /// the upgrade handshake headers, so it reaches the upgrade handler rather than the request one.
+    Upgrade,
 }
 
 impl Method {
@@ -204,6 +212,7 @@ impl Method {
             "PATCH" => Self::Patch,
             "DELETE" => Self::Delete,
             "ANY" => Self::Any,
+            "UPGRADE" => Self::Upgrade,
             _ => return None,
         })
     }
@@ -217,8 +226,13 @@ impl Method {
             Self::Patch => "PATCH",
             Self::Delete => "DELETE",
             Self::Any if matches!(entry, Entry::Body(_)) => "POST",
-            Self::Any => "GET",
+            Self::Any | Self::Upgrade => "GET",
         }
+    }
+
+    /// Whether this entry is reached by an HTTP upgrade request.
+    pub fn is_upgrade(self) -> bool {
+        matches!(self, Self::Upgrade)
     }
 }
 
@@ -284,6 +298,7 @@ impl Probe {
             entry,
             class: finding.class,
             siblings: Vec::new(),
+            gate_paths: Vec::new(),
         })
     }
 }
@@ -624,6 +639,55 @@ pub fn declared_mount_prefix(source: &str) -> Option<String> {
     None
 }
 
+/// URL path prefixes a handler compares the request path against before forwarding
+/// (`pathname === "/ide"`, `pathname.startsWith("/ide/")`, `["/logs/ws"].includes(pathname)`).
+/// Mined from the handler source so a gated forward-proxy (SSRF through `req.url`) can be reached
+/// under a path it actually accepts. Any absolute-path string literal that is an operand of an
+/// equality test or the argument of a `startsWith`/`includes` call qualifies; this is derived from
+/// the app's own source, never a built-in list of paths. Deduplicated and bounded.
+pub fn gate_paths(source: &str) -> Vec<String> {
+    const MAX: usize = 16;
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |value: &str| {
+        let value = value.trim_end_matches('/');
+        if value.len() > 1
+            && value.starts_with('/')
+            && !value.contains(['$', ' ', '{', '}', '*', ':', '\\', '\n'])
+            && !out.iter().any(|existing| existing == value)
+            && out.len() < MAX
+        {
+            out.push(value.to_owned());
+        }
+    };
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if matches!(c, b'"' | b'\'' | b'`') {
+            // A string literal; keep it only when its surroundings are a path comparison.
+            if let Some(end) = source[i + 1..].find(c as char) {
+                let literal = &source[i + 1..i + 1 + end];
+                let before = source[..i].trim_end();
+                let after = source[i + 1 + end + 1..].trim_start();
+                let compared = before.ends_with("===")
+                    || before.ends_with("==")
+                    || before.ends_with("startsWith(")
+                    || before.ends_with("includes(")
+                    || after.starts_with("===")
+                    || after.starts_with("==")
+                    || after.starts_with("].includes(");
+                if compared && literal.starts_with('/') {
+                    push(literal);
+                }
+                i += 1 + end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// The most specific request entry among the finding's sink argument and source expression: a
 /// named query/body/path/header parameter is preferred over a whole-object body or the raw URL.
 fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
@@ -717,9 +781,11 @@ fn destructured_entry(finding: &Finding, path: &str) -> Option<Entry> {
 
 /// The request-access paths inside an expression: `path.join(ROOT, req.query.name)` yields
 /// `req.query.name`. Each run starts at a request receiver and runs through identifier, `.`,
-/// and bracket/paren characters.
+/// and bracket/paren characters. Optional chaining reads the same input (`request?.url` is
+/// `request.url`, `req.headers?.["x"]` is `req.headers["x"]`).
 fn request_accessors(text: &str) -> Vec<String> {
     const RECEIVERS: [&str; 3] = ["req", "request", "ctx"];
+    let text = &without_optional_chaining(text);
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -745,6 +811,26 @@ fn request_accessors(text: &str) -> Vec<String> {
         }
         i += 1;
     }
+    out
+}
+
+/// `a?.b` -> `a.b`, `a?.[k]` -> `a[k]`, `a?.(x)` -> `a(x)`. A `?.` before a digit is a
+/// conditional and a number (`c ?.5 : 1`), left alone.
+fn without_optional_chaining(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("?.") {
+        let (head, tail) = rest.split_at(at);
+        out.push_str(head);
+        let after = &tail[2..];
+        match after.as_bytes().first() {
+            Some(b) if b.is_ascii_digit() => out.push_str("?."),
+            Some(b'[' | b'(') => {}
+            _ => out.push('.'),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
     out
 }
 
@@ -1041,6 +1127,40 @@ mod tests {
     }
 
     #[test]
+    fn an_upgrade_entry_is_a_get_marked_for_upgrade() {
+        let probe = Probe::from_finding(&finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("UPGRADE /{wildcard}"),
+            "request?.url",
+        ))
+        .unwrap();
+        assert_eq!(probe.method, Method::Upgrade);
+        assert!(probe.method.is_upgrade());
+        assert_eq!(probe.method.verb(&probe.entry), "GET");
+        assert_eq!(probe.entry, Entry::Url);
+        assert!(!Method::Any.is_upgrade());
+    }
+
+    #[test]
+    fn gate_paths_are_mined_from_the_handlers_own_comparisons() {
+        let source = "function isIde(p) { return p === \"/ide\" || p.startsWith(\"/ide/\"); }\n\
+             function isLog(p) { return p === '/logs/ws' || p === '/api/logs/ws'; }\n\
+             const ok = [\"/health\"].includes(path);\n\
+             const name = user.name === \"alice\";\n\
+             const rel = \"./static/\" + req.url;\n";
+        let paths = super::gate_paths(source);
+        assert!(paths.contains(&"/ide".to_owned()), "{paths:?}");
+        assert!(paths.contains(&"/logs/ws".to_owned()), "{paths:?}");
+        assert!(paths.contains(&"/api/logs/ws".to_owned()), "{paths:?}");
+        assert!(paths.contains(&"/health".to_owned()), "{paths:?}");
+        // `startsWith("/ide/")` collapses onto `/ide`; non-path and non-compared literals are left out.
+        assert!(!paths.iter().any(|p| p == "/ide/"), "{paths:?}");
+        assert!(!paths.iter().any(|p| p == "./static/"), "{paths:?}");
+        assert!(!paths.iter().any(|p| p == "alice"), "{paths:?}");
+    }
+
+    #[test]
     fn a_path_param_must_have_a_slot_in_the_route() {
         let ok = Probe::from_finding(&finding(
             VulnClass::PathTraversal,
@@ -1128,6 +1248,33 @@ mod tests {
         .unwrap();
         assert_eq!(probe.entry, Entry::Url);
         assert_eq!(probe.method.verb(&probe.entry), "GET");
+    }
+
+    /// Optional chaining reads the same request input: `request?.url`, `req.query?.name`,
+    /// `req.headers?.["x"]`. A conditional before a number is not optional chaining.
+    #[test]
+    fn optional_chaining_names_the_same_input() {
+        for (expr, entry) in [
+            ("request?.url", Entry::Url),
+            ("req?.query?.name", Entry::Query("name".to_owned())),
+            (
+                "req.headers?.['x-forward']",
+                Entry::Header("x-forward".to_owned()),
+            ),
+        ] {
+            let probe = Probe::from_finding(&finding(
+                VulnClass::Ssrf,
+                Auth::NoneDetected,
+                Some("ANY /{wildcard}"),
+                expr,
+            ))
+            .unwrap();
+            assert_eq!(probe.entry, entry, "{expr}");
+        }
+        assert_eq!(
+            super::without_optional_chaining("a?.b?.[c]?.(d) ? x :y?.5:1"),
+            "a.b[c](d) ? x :y?.5:1"
+        );
     }
 
     #[test]

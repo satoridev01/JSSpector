@@ -444,6 +444,9 @@ fn scan_file_program_inner(
         router_auth: BTreeMap::new(),
         inline_names: BTreeMap::new(),
         routers: BTreeSet::new(),
+        servers: BTreeSet::new(),
+        closure_factories: closure_factories(&program.body),
+        named_server_handlers: Vec::new(),
         router_prefixes: BTreeMap::new(),
         chain_receiver: None,
         injected: BTreeMap::new(),
@@ -535,6 +538,14 @@ fn scan_file_program_inner(
     let mut result = walker.result;
     result.summaries = walker.summaries;
     let mut facts = walker.facts;
+    // `http.createServer(handle)`: an entry only when `handle` is a function of this file (not
+    // `http.createServer(app)` on an app whose own routes are listed already).
+    let named = std::mem::take(&mut walker.named_server_handlers);
+    facts.routes.extend(
+        named
+            .into_iter()
+            .filter(|route| facts.functions.contains_key(&route.handler)),
+    );
     for (local, (spec, export)) in &walker.relative {
         facts.imports.push(jss_core::ir::Import {
             local: local.clone(),
@@ -553,6 +564,9 @@ fn scan_file_program_inner(
 #[derive(Debug, Default, Clone)]
 pub struct FileFacts {
     pub routes: Vec<RouteFact>,
+    /// Entries whose handler is an inline callback walked as part of its enclosing function
+    /// (`handler` names that function): they reach only the findings inside the span.
+    pub scoped_routes: Vec<(RouteFact, Span)>,
     pub mounts: Vec<MountFact>,
     /// Export name (`default` for `module.exports =` / `export default`) to local name.
     pub exports: BTreeMap<String, String>,
@@ -1298,6 +1312,14 @@ struct Walker<'e> {
     inline_names: BTreeMap<String, u32>,
     /// Variables bound to a router or app from a factory: `const router = express.Router()`.
     routers: BTreeSet<String>,
+    /// Variables bound to a server from a server factory: `const server = http.createServer()`.
+    /// Its `server.on('request', (req, res) => ...)` handles every request.
+    servers: BTreeSet<String>,
+    /// Top-level functions that return a function they define (see [`closure_factories`]).
+    closure_factories: BTreeSet<String>,
+    /// `http.createServer(handle)` with a named handler: kept as entries only if `handle` turns
+    /// out to be a function of this file (known once the file is walked).
+    named_server_handlers: Vec<RouteFact>,
     /// A router's own path prefix: `new Router({ prefix: '/api' })`, `router.prefix('/api')`,
     /// `new Hono().basePath('/api')`.
     router_prefixes: BTreeMap<String, String>,
@@ -2892,6 +2914,72 @@ fn is_controller_action(expr: &Expression<'_>) -> bool {
         })
 }
 
+/// The top-level functions of a file that return a function they define: `function
+/// makeHandler(rt) { return (req, res) => ... }`, `const make = (rt) => (req, res) => ...`
+/// (exported or not). The returned closure is walked as part of the factory, so its calls are the
+/// factory's own: a server handler made by calling one is reached through the factory.
+fn closure_factories(body: &[Statement<'_>]) -> BTreeSet<String> {
+    fn is_function(e: &Expression<'_>) -> bool {
+        matches!(
+            e.get_inner_expression(),
+            Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+        )
+    }
+    fn returns_function(statements: &[Statement<'_>]) -> bool {
+        statements.iter().any(|s| {
+            matches!(s, Statement::ReturnStatement(r) if r.argument.as_ref().is_some_and(is_function))
+        })
+    }
+    fn declared(f: &Function<'_>) -> Option<String> {
+        let name = f.id.as_ref()?.name.as_str().to_owned();
+        returns_function(&f.body.as_ref()?.statements).then_some(name)
+    }
+    fn bound(d: &VariableDeclaration<'_>, out: &mut BTreeSet<String>) {
+        for declarator in &d.declarations {
+            let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+                continue;
+            };
+            let factory = match declarator
+                .init
+                .as_ref()
+                .map(Expression::get_inner_expression)
+            {
+                Some(Expression::ArrowFunctionExpression(f)) => match &f.body {
+                    ArrowFunctionBody::FunctionBody(body) => returns_function(&body.statements),
+                    other => other.as_expression().is_some_and(is_function),
+                },
+                Some(Expression::FunctionExpression(f)) => f
+                    .body
+                    .as_ref()
+                    .is_some_and(|b| returns_function(&b.statements)),
+                _ => false,
+            };
+            if factory {
+                out.insert(id.name.as_str().to_owned());
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    for statement in body {
+        match statement {
+            Statement::FunctionDeclaration(f) => out.extend(declared(f)),
+            Statement::VariableDeclaration(d) => bound(d, &mut out),
+            Statement::ExportDeclaration(e) => match &e.declaration {
+                Declaration::FunctionDeclaration(f) => out.extend(declared(f)),
+                Declaration::VariableDeclaration(d) => bound(d, &mut out),
+                _ => {}
+            },
+            Statement::ExportDefaultDeclaration(e) => {
+                if let ExportDefaultDeclarationKind::FunctionDeclaration(f) = &e.declaration {
+                    out.extend(declared(f));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn callee_name(expr: &Expression<'_>) -> Option<String> {
     callee_name_within(expr, 32)
 }
@@ -3993,6 +4081,14 @@ impl Walker<'_> {
                     }
                     _ => None,
                 };
+                // `const server = http.createServer(opts)`: the server itself, not a chain on it.
+                if std::ptr::eq(root, init.get_inner_expression())
+                    && factory.as_deref().is_some_and(|f| {
+                        has(&m().server_factories, f.rsplit('.').next().unwrap_or(f))
+                    })
+                {
+                    self.servers.insert(name.clone());
+                }
                 if factory.as_deref().is_some_and(is_router_factory) || from_router.is_some() {
                     self.routers.insert(name.clone());
                     // Its own prefix: `new Router({ prefix: '/api' })`, `.basePath('/api')`.
@@ -8063,6 +8159,98 @@ impl Walker<'_> {
                     name
                 })
         });
+        // `http.createServer(handle)` / `http.createServer(makeHandler(runtime))`: every request,
+        // handled by a function of this file or by the closure a local factory returns (walked as
+        // the factory's own, so the factory stands for it).
+        if route_name.is_none()
+            && role == Role::Route
+            && !self.summarize
+            && !self.record_only
+            && match &callee {
+                Callee::Module {
+                    export: Some(e), ..
+                }
+                | Callee::Method { method: e, .. } => has(&m().server_factories, e),
+                Callee::Global(name) => has(&m().server_factories, name),
+                Callee::Module { export: None, .. } => false,
+            }
+            && let Some(last) = call.arguments.last().and_then(Argument::as_expression)
+        {
+            let fact = |handler: String| RouteFact {
+                at: None,
+                receiver: None,
+                receiver_file: None,
+                method: "ANY".to_owned(),
+                path: "*".to_owned(),
+                handler,
+                span: call.span,
+                auth: Auth::NoneDetected,
+                kind: "http",
+            };
+            match last.get_inner_expression() {
+                Expression::Identifier(id) if !env.params.iter().any(|p| p == id.name.as_str()) => {
+                    self.named_server_handlers
+                        .push(fact(id.name.as_str().to_owned()));
+                }
+                Expression::CallExpression(made) => {
+                    if let Expression::Identifier(factory) = made.callee.get_inner_expression()
+                        && self.closure_factories.contains(factory.name.as_str())
+                    {
+                        self.facts
+                            .routes
+                            .push(fact(factory.name.as_str().to_owned()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `server.on('request', ...)` / `server.on('upgrade', ...)` on a server from a server
+        // factory: every request (or every upgrade request), like `http.createServer(handler)`.
+        // The handler may be an inline callback (walked as part of its enclosing function, so the
+        // entry covers the listener's own lines), a named function, or the closure a local factory
+        // returns (`createUpgradeHandler(runtime)`, walked as the factory's own). `'upgrade'` is
+        // marked a distinct method so verification drives it as an HTTP upgrade, not a plain request.
+        if !self.summarize
+            && !self.record_only
+            && let Some(event) = self.server_event_listener(&callee, &call.arguments)
+            && let Some(handler) = call.arguments.last().and_then(Argument::as_expression)
+        {
+            let method = if event == "upgrade" { "UPGRADE" } else { "ANY" };
+            let fact = |handler: String| RouteFact {
+                at: None,
+                receiver: None,
+                receiver_file: None,
+                method: method.to_owned(),
+                path: "*".to_owned(),
+                handler,
+                span: call.span,
+                auth: Auth::NoneDetected,
+                kind: "http",
+            };
+            match handler.get_inner_expression() {
+                Expression::ArrowFunctionExpression(f) => {
+                    let scoped = fact(env.function.clone());
+                    self.facts.scoped_routes.push((scoped, f.span));
+                }
+                Expression::FunctionExpression(f) => {
+                    let scoped = fact(env.function.clone());
+                    self.facts.scoped_routes.push((scoped, f.span));
+                }
+                // The named function is the handler.
+                Expression::Identifier(id) => self.facts.routes.push(fact(id.name.to_string())),
+                // `createUpgradeHandler(runtime)`: a local factory that returns the handler closure.
+                Expression::CallExpression(made) => {
+                    if let Expression::Identifier(factory) = made.callee.get_inner_expression()
+                        && self.closure_factories.contains(factory.name.as_str())
+                    {
+                        self.facts
+                            .routes
+                            .push(fact(factory.name.as_str().to_owned()));
+                    }
+                }
+                _ => {}
+            }
+        }
         // `socket.on('join', (data) => ...)`: the callback goes by its entry's name, so the
         // findings in it are linked to that entry.
         let client_name = match (&role, &callee) {
@@ -11318,7 +11506,36 @@ impl Walker<'_> {
         }
     }
 
-    /// A router or app variable: from a factory, or named like one.
+    /// A server-request listener on a server from a server factory, and which event it is: Node's
+    /// `'request'` event is the same handler `http.createServer(handler)` installs, and `'upgrade'`
+    /// is the entry for HTTP upgrade (WebSocket) requests. Returns the event name, or `None` when
+    /// this is not such a listener.
+    fn server_event_listener(
+        &self,
+        callee: &Callee,
+        arguments: &[Argument<'_>],
+    ) -> Option<&'static str> {
+        const LISTENERS: [&str; 4] = ["on", "once", "addListener", "prependListener"];
+        let Callee::Method {
+            object: Some(object),
+            method,
+        } = callee
+        else {
+            return None;
+        };
+        if !LISTENERS.contains(&method.as_str())
+            || !self.servers.contains(object)
+            || arguments.len() != 2
+        {
+            return None;
+        }
+        match arguments.first() {
+            Some(Argument::StringLiteral(lit)) if lit.value == "request" => Some("request"),
+            Some(Argument::StringLiteral(lit)) if lit.value == "upgrade" => Some("upgrade"),
+            _ => None,
+        }
+    }
+
     fn is_router(&self, name: &str) -> bool {
         self.routers.contains(name) || {
             let lower = name.to_ascii_lowercase();

@@ -691,6 +691,12 @@ pub fn gate_paths(source: &str) -> Vec<String> {
 /// The most specific request entry among the finding's sink argument and source expression: a
 /// named query/body/path/header parameter is preferred over a whole-object body or the raw URL.
 fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
+    // A file-based route's dynamic segment is merged into the request parameters, so a handler that
+    // reads it via `req.query.<name>` is reading the URL path. Driving it as a query string is
+    // overridden by the real path segment and never reaches the sink, so this placement wins.
+    if let Some(entry) = file_route_path_param(finding, path, source) {
+        return Some(entry);
+    }
     let mut candidates: Vec<Entry> = Vec::new();
     for text in [finding.sink.arg.as_str(), finding.source.expr.as_str()] {
         for accessor in request_accessors(text) {
@@ -710,6 +716,77 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
         .next()
         .or_else(|| destructured_entry(finding, path))
         .or_else(|| source.and_then(|src| coarse_header_entry(finding, src)))
+}
+
+/// The names of dynamic route segments a file-based router declares in a path, by the shared
+/// convention of bracketing the parameter: `[id]` (single), `[...path]` (catch-all) and
+/// `[[...slug]]` (optional catch-all) each name a path parameter. Next.js, SvelteKit, Remix and
+/// Nuxt file routers use this shape, and the handler reads those names from the merged request
+/// parameters (`req.query.path`, `params.id`). Not tied to any one app: it is the framework
+/// convention encoded in the file path.
+fn dynamic_route_params(file: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for segment in file.split(['/', '\\']) {
+        let (Some(open), Some(close)) = (segment.find('['), segment.rfind(']')) else {
+            continue;
+        };
+        if close <= open {
+            continue;
+        }
+        let name = segment[open + 1..close]
+            .trim_matches(|c| c == '[' || c == ']')
+            .trim_start_matches('.');
+        if !name.is_empty() && name.bytes().all(is_ident) {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// The route's path-param slot to place a payload in: the slot named for `name` when the route
+/// carries it, else the sole `{...}` slot the route declares (a catch-all the baseline rendered
+/// without a name, `/api/md/{}`). `None` when no slot, or more than one and none matches, so the
+/// placement would be ambiguous.
+fn path_param_slot(path: &str, name: &str) -> Option<String> {
+    if path.contains(&format!("{{{name}}}")) {
+        return Some(name.to_owned());
+    }
+    let mut slots: Vec<String> = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let close = after.find('}')?;
+        slots.push(after[..close].to_owned());
+        rest = &after[close + 1..];
+    }
+    (slots.len() == 1).then(|| slots.remove(0))
+}
+
+/// When the tainted input is a file-based route's path parameter, the entry that places the payload
+/// in the URL path. The finding's source must be a request parameter (`query`/`params`), the file
+/// path must declare a dynamic segment, the handler must actually read one of those segment names
+/// from the request, and the route must carry a slot to fill. Otherwise `None`, and entry
+/// selection proceeds as usual.
+fn file_route_path_param(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
+    let part = strip_request_receiver(finding.source.expr.trim())?;
+    let part = part.split(['.', '[']).next().unwrap_or(part);
+    if !matches!(part, "query" | "params") {
+        return None;
+    }
+    let dynamic = dynamic_route_params(&finding.file);
+    if dynamic.is_empty() {
+        return None;
+    }
+    let src = source?;
+    let reads = |name: &str| {
+        ["query", "params"].iter().any(|p| {
+            src.contains(&format!("{p}.{name}"))
+                || src.contains(&format!("{p}[\"{name}\"]"))
+                || src.contains(&format!("{p}['{name}']"))
+        })
+    };
+    let used = dynamic.iter().find(|name| reads(name))?;
+    path_param_slot(path, used).map(Entry::PathParam)
 }
 
 /// The specific header a finding whose source is the whole `req.headers` object actually reads in
@@ -1111,6 +1188,58 @@ mod tests {
         assert_eq!(probe.method, Method::Get);
         assert_eq!(probe.path, "/api/files");
         assert_eq!(probe.entry, Entry::Query("name".to_owned()));
+    }
+
+    #[test]
+    fn a_file_based_catch_all_param_is_driven_through_the_path() {
+        // `pages/api/md/[...path].ts` reads `req.query.path`: a file router merges the catch-all
+        // segment into the request params, so the payload must fill the URL path slot, not a
+        // `?path=` query that the real path segment would override.
+        let mut f = finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("ANY /api/md/{}"),
+            "req.query",
+        );
+        f.file = "src/pages/api/md/[...path].ts".to_owned();
+        let source =
+            "export default function handler(req, res){ const pathSegments = req.query.path; }";
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::PathParam(String::new()));
+        assert_eq!(probe.path, "/api/md/{}");
+    }
+
+    #[test]
+    fn a_plain_query_traversal_is_not_mistaken_for_a_path_param() {
+        // No dynamic route segment in the file path: the query parameter stays a query entry.
+        let probe = Probe::from_finding_with_source(
+            &finding(
+                VulnClass::PathTraversal,
+                Auth::NoneDetected,
+                Some("GET /api/files"),
+                "req.query.name",
+            ),
+            Some("const n = req.query.name;"),
+        )
+        .unwrap();
+        assert_eq!(probe.entry, Entry::Query("name".to_owned()));
+    }
+
+    #[test]
+    fn dynamic_route_params_reads_the_framework_bracket_convention() {
+        assert_eq!(
+            dynamic_route_params("api/md/[...path].ts"),
+            vec!["path".to_owned()]
+        );
+        assert_eq!(
+            dynamic_route_params("routes/[id].js"),
+            vec!["id".to_owned()]
+        );
+        assert_eq!(
+            dynamic_route_params("app/[[...slug]]/route.ts"),
+            vec!["slug".to_owned()]
+        );
+        assert!(dynamic_route_params("api/files.ts").is_empty());
     }
 
     #[test]

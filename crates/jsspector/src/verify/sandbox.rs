@@ -484,7 +484,10 @@ fn build_image(
         .to_str()
         .ok_or_else(|| "the repository path is not valid UTF-8".to_owned())?;
     let image = base_image(app_root);
-    let dockerfile = dockerfile(&image, workdir, canary, start_command, port);
+    let pm = package_manager(app_root);
+    let has_build = std::fs::read_to_string(app_root.join("package.json"))
+        .is_ok_and(|manifest| has_build_script(&manifest));
+    let dockerfile = dockerfile(&image, workdir, canary, start_command, port, pm, has_build);
     build_from_dockerfile(&dockerfile, tag, context)
 }
 
@@ -504,6 +507,65 @@ fn base_image(root: &std::path::Path) -> String {
         Some(major) if major > DEFAULT_NODE_MAJOR && major < 100 => format!("node:{major}-slim"),
         _ => BASE_IMAGE.to_owned(),
     }
+}
+
+/// Which package manager installs the app's dependencies, chosen by the lockfile present. A yarn or
+/// pnpm project cannot be installed with `npm` (different lockfile, and npm rejects yarn-only
+/// manifest features and strict peer dependencies), so install with the tool the repo targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackageManager {
+    Npm,
+    Yarn,
+    Pnpm,
+}
+
+fn package_manager(root: &std::path::Path) -> PackageManager {
+    if root.join("yarn.lock").is_file() {
+        PackageManager::Yarn
+    } else if root.join("pnpm-lock.yaml").is_file() {
+        PackageManager::Pnpm
+    } else {
+        PackageManager::Npm
+    }
+}
+
+/// The shell command that installs dependencies for a package manager. `corepack` provisions the
+/// yarn/pnpm shim that ships with Node. Each prefers the lockfile-exact path and falls back to a
+/// plain install, and tolerates total failure (`|| true`) so a broken install becomes a launch skip
+/// rather than a build error. The npm fallback accepts legacy peer dependencies, which the
+/// ecosystem's strict default otherwise rejects.
+fn install_command(pm: PackageManager) -> &'static str {
+    match pm {
+        PackageManager::Npm => {
+            "npm ci --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps || true"
+        }
+        PackageManager::Yarn => {
+            "corepack enable && (yarn install --frozen-lockfile || yarn install) || true"
+        }
+        PackageManager::Pnpm => {
+            "corepack enable && (pnpm install --frozen-lockfile || pnpm install) || true"
+        }
+    }
+}
+
+/// The build command for a package manager, run when the app declares a `build` script. A
+/// production server (`next start`, `vite preview`, a compiled `dist/`) serves the build output and
+/// will not start without it. Tolerated failure keeps a sub-step that needs the network (asset
+/// downloads) from failing the image when the primary build has already produced its output.
+fn build_command(pm: PackageManager) -> &'static str {
+    match pm {
+        PackageManager::Npm => "npm run build --if-present || true",
+        PackageManager::Yarn => "yarn build || true",
+        PackageManager::Pnpm => "pnpm run build || true",
+    }
+}
+
+/// A cheap check for a `"build"` key under a `"scripts"` object, mirroring [`has_start_script`].
+fn has_build_script(manifest: &str) -> bool {
+    manifest.split("\"scripts\"").nth(1).is_some_and(|scripts| {
+        let head = &scripts[..scripts.floor_char_boundary(2000)];
+        head.contains("\"build\"")
+    })
 }
 
 /// The first version number of a semver range: `>=24.17` and `^24.0.0 || ^22` -> 24 and 24.
@@ -578,18 +640,30 @@ fn dockerfile(
     canary: &Canary,
     start_command: &str,
     port: u16,
+    pm: PackageManager,
+    has_build: bool,
 ) -> String {
-    let marker_file = canary.planted_file();
     let token = &canary.token;
+    // Plant the canary under every path it may be read through in one pass.
+    let marker_files = canary.planted_files().join(" ");
+    let install = install_command(pm);
+    let build = if has_build {
+        format!("RUN {}\n", build_command(pm))
+    } else {
+        String::new()
+    };
     format!(
         "FROM {image}\n\
+         ENV CI=true\n\
+         ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n\
          WORKDIR /app\n\
          COPY . /app\n\
          WORKDIR {workdir}\n\
-         RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund || true\n\
+         RUN {install}\n\
          RUN for example in .env.example .env.sample .env.template; do \
          if [ ! -e .env ] && [ -f \"$example\" ]; then cp \"$example\" .env; fi; done\n\
-         RUN printf '%s' '{token}' > {marker_file}\n\
+         {build}\
+         RUN for f in {marker_files}; do printf '%s' '{token}' > \"$f\"; done\n\
          RUN echo {} | base64 -d > /jss-driver.js\n\
          RUN echo {} | base64 -d > /jss-marker.js\n\
          RUN echo {} | base64 -d > /jss-marker.crt\n\
@@ -1616,6 +1690,59 @@ mod tests {
     }
 
     #[test]
+    fn the_package_manager_follows_the_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", "{}");
+        assert!(package_manager(root) == PackageManager::Npm);
+        write(root, "pnpm-lock.yaml", "");
+        assert!(package_manager(root) == PackageManager::Pnpm);
+        write(root, "yarn.lock", "");
+        // A yarn lockfile wins: the repo is a yarn project and npm cannot install it.
+        assert!(package_manager(root) == PackageManager::Yarn);
+    }
+
+    #[test]
+    fn a_yarn_project_installs_with_corepack_and_runs_its_build() {
+        // yarn/pnpm are provisioned by corepack; npm keeps its reproducible `ci` path.
+        assert!(install_command(PackageManager::Yarn).contains("corepack enable"));
+        assert!(install_command(PackageManager::Pnpm).contains("corepack enable"));
+        assert!(install_command(PackageManager::Npm).contains("npm ci"));
+        assert!(has_build_script(
+            r#"{"scripts":{"build":"next build","start":"next start"}}"#
+        ));
+        // A `prebuild:x` key is not a `build` script.
+        assert!(!has_build_script(r#"{"scripts":{"prebuild:x":"y"}}"#));
+
+        let canary = Canary::new("tok".to_owned());
+        let file = dockerfile(
+            "node:22-slim",
+            "/app",
+            &canary,
+            r#"["npm","start"]"#,
+            3000,
+            PackageManager::Yarn,
+            true,
+        );
+        assert!(file.contains("RUN corepack enable"), "{file}");
+        assert!(file.contains("yarn build"), "{file}");
+        // The canary is planted under its extension variants, so a handler that appends a known
+        // extension to the tainted path (`input + '.md'`) still reads the token.
+        assert!(file.contains("/jss-canary-read.md"), "{file}");
+        // No build step emitted for a package without one.
+        let no_build = dockerfile(
+            "node:22-slim",
+            "/app",
+            &canary,
+            r#"["npm","start"]"#,
+            3000,
+            PackageManager::Npm,
+            false,
+        );
+        assert!(!no_build.contains("build"), "{no_build}");
+    }
+
+    #[test]
     fn a_route_in_a_separate_service_package_launches_that_package() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1763,6 +1890,8 @@ mod tests {
             &canary,
             r#"["node","index.js"]"#,
             3000,
+            PackageManager::Npm,
+            false,
         );
         let copy = file.find("COPY . /app\n").unwrap();
         let workdir = file.find("WORKDIR /app/svc\n").unwrap();

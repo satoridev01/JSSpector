@@ -11,6 +11,14 @@ use jss_core::VulnClass;
 /// the marker; kept in one place so the host-only SSRF payload and [`Canary::service_url`] agree.
 pub const MARKER_HOST: &str = "jss-marker";
 
+/// Extensions commonly appended to a tainted file path before the read, plus the empty string for
+/// the raw name. The canary is planted under each so a traversal through a handler that appends one
+/// of these still reads the token. Not tied to any one target: these are the ordinary extensions a
+/// content/download handler suffixes.
+pub const PLANTED_SUFFIXES: &[&str] = &[
+    "", ".md", ".json", ".html", ".htm", ".txt", ".js", ".yml", ".yaml", ".xml", ".csv",
+];
+
 /// A per-run marker. Everything a payload does is tagged with `token`, so a reproduction is told
 /// from the app's normal behavior by the token alone.
 #[derive(Debug, Clone)]
@@ -47,6 +55,18 @@ impl Canary {
     /// URL must never satisfy the read proof.
     pub fn planted_file(&self) -> String {
         "/jss-canary-read".to_owned()
+    }
+
+    /// Every path the canary is planted at: the bare file and one per extension a handler commonly
+    /// appends to a tainted path before the read (`input + '.md'`, `input + '.json'`). The payload
+    /// always asks for the bare name; a handler that appends a known extension then reads
+    /// `<canary><ext>`, which holds the same token, so a genuine traversal still proves itself.
+    pub fn planted_files(&self) -> Vec<String> {
+        let base = self.planted_file();
+        PLANTED_SUFFIXES
+            .iter()
+            .map(|suffix| format!("{base}{suffix}"))
+            .collect()
     }
 
     /// The file a write-payload is asked to create, tagged with the probe's `nonce` so one

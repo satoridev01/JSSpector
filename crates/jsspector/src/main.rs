@@ -223,6 +223,8 @@ struct ReportedFinding<'a> {
     /// The lines the value passes through, entry point to sink, as annotated Markdown code
     /// blocks (one per file).
     affected: String,
+    /// The same source-to-sink flow in the concise form used by the terminal renderer.
+    flow: String,
     remediation: String,
 }
 
@@ -235,6 +237,7 @@ impl<'a> ReportedFinding<'a> {
             resource: rules::resource(finding),
             description: rules::description(finding),
             affected: excerpt::affected(finding, sources),
+            flow: text::flow(finding, sources),
             remediation: rules::remediation(finding.class),
         }
     }

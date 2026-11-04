@@ -135,6 +135,39 @@ pub struct Summary {
     pub elapsed: std::time::Duration,
 }
 
+/// Compact, colorless source-to-sink flow for issue trackers and other machine consumers.
+pub fn flow(f: &Finding, sources: &mut Sources) -> String {
+    let sink_file = f.sink.file.as_deref().unwrap_or(&f.file);
+    let mut lines = vec![format!(
+        "{}: {}",
+        f.sink.line,
+        sources.snippet(sink_file, f.sink.line)
+    )];
+    if f.sink.file.is_some() || f.source.line != f.sink.line {
+        lines.push(format!("   ↳ source: {}:{}", f.file, f.source.line));
+        lines.push(format!(
+            "{}: {}",
+            f.source.line,
+            sources.snippet(&f.file, f.source.line)
+        ));
+        let mut last = (f.file.as_str(), f.source.line);
+        for step in &f.trace {
+            let step_file = step.file.as_deref().unwrap_or(&f.file);
+            if step.line == 0 || (step_file, step.line) == last {
+                continue;
+            }
+            lines.push(format!("   ↳ {}: {step_file}:{}", step.note, step.line));
+            lines.push(format!(
+                "{}: {}",
+                step.line,
+                sources.snippet(step_file, step.line)
+            ));
+            last = (step_file, step.line);
+        }
+    }
+    lines.join("\n")
+}
+
 /// Writes `findings`, grouped by the file of their sink, then the summary line.
 pub fn write(
     out: &mut dyn Write,

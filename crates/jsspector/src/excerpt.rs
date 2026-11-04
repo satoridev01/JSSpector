@@ -141,7 +141,7 @@ fn open_brackets(line: &str) -> i32 {
 /// The lines below the sink that finish its call (`client.get(url, {` then its options), and
 /// whether the rest was left out: the call goes on past a callback's opening line
 /// (`}, res => {`) or past `MAX_CONTINUATION` lines.
-fn continuation(sources: &mut Sources, file: &str, line: u32) -> (Vec<u32>, bool) {
+pub(crate) fn continuation(sources: &mut Sources, file: &str, line: u32) -> (Vec<u32>, bool) {
     let Some(first) = sources.line(file, line) else {
         return (Vec::new(), false);
     };

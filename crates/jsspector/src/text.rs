@@ -143,6 +143,14 @@ pub fn flow(f: &Finding, sources: &mut Sources) -> String {
         f.sink.line,
         sources.snippet(sink_file, f.sink.line)
     )];
+    let (continuation, cut) = crate::excerpt::continuation(sources, sink_file, f.sink.line);
+    if !cut {
+        lines.extend(
+            continuation
+                .into_iter()
+                .map(|line| format!("{line}: {}", sources.snippet(sink_file, line))),
+        );
+    }
     if f.sink.file.is_some() || f.source.line != f.sink.line {
         lines.push(format!("   ↳ source: {}:{}", f.file, f.source.line));
         lines.push(format!(

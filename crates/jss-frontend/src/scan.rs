@@ -77,8 +77,8 @@ struct Context<'a> {
     subclasses: BTreeMap<(String, String), Vec<(String, String)>>,
     /// Request props that hold no objects, per directory of a scanned file.
     scalar: &'a BTreeMap<String, Vec<String>>,
-    /// Packages sinks require that the scanned project depends on (`None`: no manifest).
-    packages: Option<&'a BTreeSet<String>>,
+    /// Packages required by sinks, resolved from each file's package and its ancestors.
+    packages: &'a BTreeMap<String, Option<BTreeSet<String>>>,
     /// The round's summary names by last segment.
     external_names: BTreeMap<String, Vec<String>>,
     /// Properties every typed assignment gives the same class (see [`property_types`]).
@@ -104,7 +104,7 @@ impl ParsePool {
             .map(|r| jss_core::resolve::Workspace::load(r))
             .unwrap_or_default();
         let scalar = scalar_props_by_dir(files, root.as_deref());
-        let packages = project_packages(files, root.as_deref());
+        let packages = project_packages_by_dir(files, root.as_deref());
         let run = |external: &Summaries,
                    reexports: BTreeMap<String, BTreeSet<String>>,
                    templates: taint::Templates,
@@ -122,7 +122,7 @@ impl ParsePool {
                 exports,
                 subclasses,
                 scalar: &scalar,
-                packages: packages.as_ref(),
+                packages: &packages,
                 external_names: taint::index_names(external),
                 properties,
             };
@@ -289,32 +289,29 @@ fn scalar_props_by_dir(
     by_dir
 }
 
-/// The packages some sink `requires` that the scanned project depends on: from every
-/// `package.json` between a scanned file and the scan root (a monorepo's packages share their
-/// drivers: the core package often holds the database client the others are handed), plus
-/// `meteor` for a Meteor app. `None` when the scan has no manifest at all (nothing is held
-/// back then).
-fn project_packages(
+/// Packages a gated sink may use, per source directory. Only the file's nearest package and
+/// its ancestors count: a MongoDB dependency in an unrelated monorepo sibling must not turn a
+/// Knex/PostgreSQL method with the same name into a NoSQL sink. `None` means no manifest was
+/// found on that path, so the conservative single-file behavior remains available.
+fn project_packages_by_dir(
     files: &[SourceFile],
     root: Option<&std::path::Path>,
-) -> Option<BTreeSet<String>> {
+) -> BTreeMap<String, Option<BTreeSet<String>>> {
     let wanted = &taint::models::model().sink_packages;
-    let root = root?;
-    if wanted.is_empty() {
-        return None;
-    }
-    let mut found: BTreeSet<String> = BTreeSet::new();
-    if root.join(".meteor").is_dir() {
-        found.insert("meteor".to_owned());
-    }
+    let mut by_dir = BTreeMap::new();
+    let Some(root) = root else { return by_dir };
     let mut manifests: BTreeMap<std::path::PathBuf, Option<BTreeSet<String>>> = BTreeMap::new();
-    let mut dirs_done: BTreeSet<&str> = BTreeSet::new();
-    let mut seen_manifest = false;
+    let mut saw_any_manifest = false;
     for file in files {
         let dir = parent_dir(&file.rel_path);
-        if !dirs_done.insert(dir) {
+        if by_dir.contains_key(dir) {
             continue;
         }
+        let mut found = BTreeSet::new();
+        if root.join(".meteor").is_dir() {
+            found.insert("meteor".to_owned());
+        }
+        let mut seen_manifest = false;
         let mut cursor = root.join(dir);
         loop {
             let deps = manifests
@@ -337,6 +334,7 @@ fn project_packages(
                 });
             if let Some(deps) = deps {
                 seen_manifest = true;
+                saw_any_manifest = true;
                 found.extend(deps.iter().cloned());
             }
             if cursor.as_path() == root {
@@ -347,8 +345,14 @@ fn project_packages(
                 _ => break,
             }
         }
+        by_dir.insert(dir.to_owned(), seen_manifest.then_some(found));
     }
-    seen_manifest.then_some(found)
+    if saw_any_manifest {
+        for packages in by_dir.values_mut() {
+            packages.get_or_insert_with(BTreeSet::new);
+        }
+    }
+    by_dir
 }
 
 /// The major version a dependency spec starts from: `^5.3.0` -> 5, `~4.18` -> 4, `5.x` -> 5.
@@ -617,7 +621,10 @@ fn analyze(
             .scalar
             .get(parent_dir(&file.rel_path))
             .map_or(&[], Vec::as_slice),
-        packages: context.packages,
+        packages: context
+            .packages
+            .get(parent_dir(&file.rel_path))
+            .and_then(Option::as_ref),
         external_names: &context.external_names,
         properties: &context.properties,
     };

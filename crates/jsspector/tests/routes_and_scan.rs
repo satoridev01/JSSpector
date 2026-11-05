@@ -1205,6 +1205,7 @@ fn nosql_sinks_need_a_mongodb_project() {
         }
         write(dir.path(), "server/app.js", app);
         write(dir.path(), "server/core/db.js", "module.exports = {};\n");
+        write(dir.path(), "other/keep.js", "module.exports = {};\n");
         let report = run(&["scan", "--json", dir.path().to_str().unwrap()]);
         report["findings"]
             .as_array()
@@ -1229,13 +1230,21 @@ fn nosql_sinks_need_a_mongodb_project() {
         count(Some(("package.json", "\"mongodb\": \"^6.0.0\"")), false),
         1
     );
-    // ...or in another package of the monorepo (the core package that hands out collections).
+    // A dependency in the file's package applies.
     assert_eq!(
         count(
-            Some(("server/core/package.json", "\"mongodb\": \"^6.0.0\"")),
+            Some(("server/package.json", "\"mongodb\": \"^6.0.0\"")),
             false
         ),
         1
+    );
+    // A dependency in an unrelated monorepo sibling does not reclassify this app's method.
+    assert_eq!(
+        count(
+            Some(("other/package.json", "\"mongodb\": \"^6.0.0\"")),
+            false
+        ),
+        0
     );
     // A Meteor app's collections.
     assert_eq!(

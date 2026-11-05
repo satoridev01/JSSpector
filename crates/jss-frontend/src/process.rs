@@ -49,7 +49,7 @@ pub const WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
 /// Measured on oxc_parser 0.156 (aarch64, release and test builds), the costliest one-byte
 /// level is `[` in a type (about 1.74 KiB), then `(` (about 1.52 KiB); this leaves room for
 /// other targets and compiler versions.
-pub const STACK_PER_BRACKET_BYTE: usize = 3 * 1024;
+pub const STACK_PER_BRACKET_BYTE: usize = 4 * 1024;
 
 /// Parser stack allowed per other input byte. Recursion without brackets costs at most about
 /// 370 bytes per input byte (`a ? a ? ...`; also `a => a => ...`, `a = a = ...`, labels, unary

@@ -7,6 +7,7 @@
 use super::payload::{self, Attempt, Canary, Signal};
 use super::plan::Probe;
 use super::{Outcome, Reproduction};
+use serde::Deserialize;
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,9 @@ const BASE_IMAGE: &str = "node:22-slim";
 const DEFAULT_NODE_MAJOR: u32 = 22;
 
 const VERIFY_RUN_LABEL_KEY: &str = "ci.satori.jsspector.verify-run";
+const DB_IMAGE: &str = "mongo:6";
+const DB_ALIASES: [&str; 4] = ["mongo", "mongodb", "db", "database"];
+const DB_NAME: &str = "jssverifydb";
 
 /// Whether a Docker daemon is reachable. The CLI on some platforms exits 0 even when it cannot
 /// connect, so this checks that `docker info` actually printed a server version, not an error.
@@ -37,6 +41,8 @@ pub struct Session {
     network: String,
     app: String,
     marker: String,
+    db: Option<String>,
+    db_env: Vec<(String, String)>,
     canary: Canary,
     /// The container port the app listens on: the one we ask for via `PORT`, or, for an app that
     /// fixes its own, the one port it is found listening on (see [`listening_probe`]).
@@ -52,13 +58,19 @@ impl Session {
     /// here into a skip reason for every drivable finding.
     #[cfg(test)]
     pub fn start(root: &std::path::Path) -> Result<Self, String> {
-        Self::start_in(root, std::path::Path::new(""))
+        Self::start_in(root, std::path::Path::new(""), None)
     }
 
     /// Like [`Self::start`], but launches the package at `app` (relative to `root`, as chosen by
     /// [`app_dir`]) while the whole repo stays in the image, so the app can still import files
-    /// outside its own directory.
-    pub fn start_in(root: &std::path::Path, app_path: &std::path::Path) -> Result<Self, String> {
+    /// outside its own directory. `entry_file` (relative to `root`) is the finding's own source
+    /// file, used as the launch target when the app has no launchable manifest but the file is a
+    /// self-contained server.
+    pub fn start_in(
+        root: &std::path::Path,
+        app_path: &std::path::Path,
+        entry_file: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
         let id = run_id();
         let canary = Canary::new(format!("{id}{}", short_rand()))
             .with_callback_host(configured_callback_host()?);
@@ -69,8 +81,15 @@ impl Session {
         let port = 3000;
 
         let app_root = root.join(app_path);
-        let start_command = start_command(&app_root)
-            .ok_or_else(|| "no `start` script in package.json to launch the app".to_owned())?;
+        let db = db_service(&app_root).then(|| format!("jss-verify-db-{id}"));
+        let db_env = if db.is_some() {
+            db_connection_env()
+        } else {
+            Vec::new()
+        };
+        let entry_rel = entry_file.and_then(|file| file.strip_prefix(app_path).ok());
+        let start_command = start_command(&app_root, entry_rel)
+            .ok_or_else(|| "no launchable script or `main` file in package.json".to_owned())?;
         let workdir = container_dir(app_path)
             .ok_or_else(|| format!("unsupported app directory `{}`", app_path.display()))?;
 
@@ -93,6 +112,8 @@ impl Session {
             network,
             app,
             marker,
+            db,
+            db_env,
             canary,
             port,
             nonce: 0,
@@ -131,6 +152,10 @@ impl Session {
         let marker_args: Vec<&str> = marker_args.iter().map(String::as_str).collect();
         docker(&marker_args).map_err(|e| format!("could not start the marker service: {e}"))?;
 
+        if self.db.is_some() {
+            self.start_db()?;
+        }
+
         // An app that refuses to start without an environment variable its deployment supplies
         // (`NOOBOT_WORKSPACE_ROOT is required`) is started again with it set to a neutral value
         // (see [`required_env`]), a few times at most.
@@ -140,6 +165,7 @@ impl Session {
             let err = match self.wait_until_listening() {
                 Ok(port) => {
                     self.port = port;
+                    self.seed_db();
                     return Ok(());
                 }
                 Err(err) => err,
@@ -199,10 +225,73 @@ impl Session {
             args.push("-e".to_owned());
             args.push(format!("{}={}", var.name, var.value));
         }
+        for (name, value) in &self.db_env {
+            args.push("-e".to_owned());
+            args.push(format!("{name}={value}"));
+        }
         args.push(self.tag.clone());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         docker(&args).map_err(|e| format!("could not start the app: {e}"))?;
         Ok(())
+    }
+
+    fn start_db(&self) -> Result<(), String> {
+        let Some(db) = self.db.as_deref() else {
+            return Ok(());
+        };
+        let mut args = vec!["run", "-d", "--name", db, "--network", &self.network];
+        for alias in DB_ALIASES {
+            args.push("--network-alias");
+            args.push(alias);
+        }
+        args.push(DB_IMAGE);
+        docker(&args).map_err(|error| format!("could not start the database sidecar: {error}"))?;
+        for _ in 0..40 {
+            let ping = self.exec(
+                db,
+                &["mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"],
+            );
+            if ping
+                .ok()
+                .filter(|output| output.status.success())
+                .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1")
+            {
+                return Ok(());
+            }
+            if !self.container_running(db) {
+                return Err(format!(
+                    "the database sidecar exited before it was ready:\n{}",
+                    self.tail_logs(db)
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Err("the database sidecar did not become ready within 40s".to_owned())
+    }
+
+    fn seed_db(&self) {
+        let Some(db) = self.db.as_deref() else {
+            return;
+        };
+        let script = "db.getMongo().getDBNames().forEach(function(n){\
+            if(['admin','local','config'].indexOf(n)>=0)return;\
+            var d=db.getSiblingDB(n);\
+            d.getCollectionNames().forEach(function(c){\
+              try{if(d.getCollection(c).countDocuments({})===0)\
+                d.getCollection(c).insertOne({jss_seed:1});}catch(e){}\
+            });\
+          });";
+        let output = self.exec(db, &["mongosh", "--quiet", "--eval", script]);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            let (code, message) = match output {
+                Ok(output) => (
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                ),
+                Err(error) => (None, error),
+            };
+            eprintln!("[verify] db seed -> {code:?} {message}");
+        }
     }
 
     /// Polls from inside the app's own container until the app answers on a port, or the
@@ -236,6 +325,9 @@ impl Session {
     /// none did.
     pub fn exercise(&mut self, probe: &Probe) -> Outcome {
         self.nonce += 1;
+        if probe.class == jss_core::VulnClass::NosqlInjection {
+            return self.exercise_nosql(probe);
+        }
         let attempts = payload::attempts(probe, &self.canary, self.nonce);
         let tried = attempts.len();
         for attempt in &attempts {
@@ -247,6 +339,67 @@ impl Session {
             }
         }
         Outcome::NotReproduced { tried }
+    }
+
+    fn exercise_nosql(&self, probe: &Probe) -> Outcome {
+        let cases = payload::nosql_cases(probe, &self.canary, self.nonce);
+        let tried = cases.len();
+        for case in &cases {
+            let (Some(match_all), Some(match_none_eq), Some(match_none_in)) = (
+                self.fetch(&case.match_all),
+                self.fetch(&case.match_none_eq),
+                self.fetch(&case.match_none_in),
+            ) else {
+                continue;
+            };
+            if payload::nosql_reproduced(&match_all, &match_none_eq, &match_none_in) {
+                let attempt = &case.match_all;
+                return Outcome::Verified {
+                    how: format!("{} {} ({}[$ne])", attempt.verb, attempt.target, case.field),
+                    poc: Reproduction {
+                        command: curl_command(attempt, self.port),
+                        method: attempt.verb.to_owned(),
+                        target: attempt.target.clone(),
+                        headers: attempt
+                            .headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}"))
+                            .collect(),
+                        body: attempt.body.clone(),
+                        evidence: format!(
+                            concat!(
+                                "a match-all operator (`{}: {{$ne}}`) returned a record that the ",
+                                "match-none operators (`$eq`, `$in: []`) did not, proving the ",
+                                "object was interpreted as a MongoDB query operator rather than ",
+                                "a scalar"
+                            ),
+                            case.field
+                        ),
+                        response: match_all.trim().to_owned(),
+                    },
+                };
+            }
+        }
+        Outcome::NotReproduced { tried }
+    }
+
+    fn fetch(&self, attempt: &Attempt) -> Option<String> {
+        let spec = request_spec(attempt, self.port);
+        let output = self
+            .exec(&self.app, &["node", "/jss-driver.js", &spec])
+            .ok()?;
+        let body = String::from_utf8_lossy(&output.stdout).into_owned();
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] {} {} body={:?} -> status {:?} body[{}]",
+                attempt.verb,
+                attempt.target,
+                attempt.body,
+                output.status.code(),
+                body.trim()
+            );
+        }
+        Some(body)
     }
 
     /// Sends one request from inside the app container and checks its signal.
@@ -307,30 +460,20 @@ impl Session {
 
     /// Mirror an isolated marker hit to the registered public callback from the verifier host.
     /// The untrusted application container remains on its `--internal` network; only this fixed,
-    /// validated Satori hostname is contacted. A registered canary response is required.
+    /// validated Satori hostname is contacted. The relay carries the target request's method and
+    /// user agent as metadata, so the public interaction cannot be mistaken for a direct `curl`
+    /// request from the verifier. A registered canary response is required.
     fn relay_public_callback(&self, token: &str) -> bool {
         let Some(host) = self.canary.callback_host() else {
             return true;
         };
         let logs = self.tail_logs(&self.marker);
-        let Some(path) = logs
-            .lines()
-            .rev()
-            .find(|line| line.contains(token))
-            .and_then(|line| line.split_once("MARKER ").map(|(_, path)| path.trim()))
-        else {
+        let Some(hit) = marker_hit(&logs, token) else {
             return false;
         };
-        let url = format!("https://{host}{path}");
+        let url = format!("https://{host}{}", hit.path);
         let Ok(output) = Command::new("curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "10",
-                &url,
-            ])
+            .args(callback_relay_args(&url, &hit))
             .output()
         else {
             return false;
@@ -348,6 +491,62 @@ impl Session {
         }
         confirmed
     }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct MarkerHit {
+    method: String,
+    path: String,
+    #[serde(rename = "userAgent")]
+    user_agent: Option<String>,
+}
+
+/// The last structured marker record for this probe. The token must occur in the parsed path,
+/// never merely elsewhere in a log line.
+fn marker_hit(logs: &str, token: &str) -> Option<MarkerHit> {
+    logs.lines().rev().find_map(|line| {
+        let payload = line.split_once("MARKER ")?.1.trim();
+        let hit: MarkerHit = serde_json::from_str(payload).ok()?;
+        (hit.path.contains(token)).then_some(hit)
+    })
+}
+
+fn callback_relay_args(url: &str, hit: &MarkerHit) -> Vec<String> {
+    let args = vec![
+        "--fail".to_owned(),
+        "--silent".to_owned(),
+        "--show-error".to_owned(),
+        "--max-time".to_owned(),
+        "10".to_owned(),
+        "--header".to_owned(),
+        "X-Satori-Callback-Relay: isolated-target".to_owned(),
+        "--header".to_owned(),
+        format!(
+            "X-Satori-Original-Method: {}",
+            safe_method(&hit.method).unwrap_or("UNKNOWN")
+        ),
+        "--user-agent".to_owned(),
+        safe_user_agent(hit.user_agent.as_deref()).unwrap_or_default(),
+        url.to_owned(),
+    ];
+    args
+}
+
+fn safe_user_agent(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| {
+            value.len() <= 512 && !value.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
+        })
+        .map(str::to_owned)
+}
+
+fn safe_method(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte == b'-'))
+    .then_some(value)
 }
 
 fn observed_evidence(signal: &Signal, callback_host: Option<&str>) -> String {
@@ -410,6 +609,10 @@ fn curl_command(attempt: &Attempt, port: u16) -> String {
         format!("--request {}", attempt.verb),
     ];
     if target.starts_with('/') {
+        // The verifier sends the request target verbatim. curl otherwise normalizes dot
+        // segments before sending them, which makes a copyable traversal PoC differ from the
+        // request that was actually verified.
+        parts.push("--path-as-is".to_owned());
         parts.push(format!(
             "--url {}",
             shell_quote(&format!("http://TARGET_HOST:{port}{target}"))
@@ -457,6 +660,9 @@ impl Session {
         self.torn_down = true;
         let _ = docker(&["rm", "-f", &self.app]);
         let _ = docker(&["rm", "-f", &self.marker]);
+        if let Some(db) = &self.db {
+            let _ = docker(&["rm", "-f", db]);
+        }
         let _ = docker(&["network", "rm", &self.network]);
         let _ = docker(&["rmi", "-f", &self.tag]);
     }
@@ -489,6 +695,43 @@ fn build_image(
         .is_ok_and(|manifest| has_build_script(&manifest));
     let dockerfile = dockerfile(&image, workdir, canary, start_command, port, pm, has_build);
     build_from_dockerfile(&dockerfile, tag, context)
+}
+
+fn db_service(app_root: &std::path::Path) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(app_root.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .filter_map(|section| json.get(section).and_then(serde_json::Value::as_object))
+        .any(|dependencies| {
+            dependencies.contains_key("mongodb") || dependencies.contains_key("mongoose")
+        })
+}
+
+fn db_connection_env() -> Vec<(String, String)> {
+    let host = DB_ALIASES[0];
+    let url = format!("mongodb://{host}:27017/{DB_NAME}");
+    [
+        ("MONGODB_HOST", host.to_owned()),
+        ("MONGO_HOST", host.to_owned()),
+        ("MONGODB_PORT", "27017".to_owned()),
+        ("MONGO_PORT", "27017".to_owned()),
+        ("MONGODB_DATABASE", DB_NAME.to_owned()),
+        ("MONGODB_DB", DB_NAME.to_owned()),
+        ("MONGO_DB", DB_NAME.to_owned()),
+        ("MONGODB_URL", url.clone()),
+        ("MONGODB_URI", url.clone()),
+        ("MONGO_URL", url.clone()),
+        ("MONGO_URI", url.clone()),
+        ("DATABASE_URL", url),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value))
+    .collect()
 }
 
 /// The Node image the app needs: the major of the lowest Node version `engines.node` of the
@@ -817,11 +1060,25 @@ fn listening_probe(wanted: u16) -> String {
     )
 }
 
-/// The app's launch command for the image `CMD`: `npm start` when the package has a start
-/// script (explicit, and what most Node servers document); otherwise the package's own entry
-/// point, its `main` file, run with `node` — what a service package without scripts is started
-/// with. `None` when the package declares neither.
-fn start_command(root: &std::path::Path) -> Option<String> {
+/// The app's launch command for the image `CMD`. A launchable package manifest
+/// ([`manifest_start_command`]) is preferred; failing that, when the finding's own file
+/// (`entry`, relative to `root`) is a self-contained server that constructs a listener and calls
+/// `.listen`, it is run directly with `node`. This lets a repository of standalone scripts with no
+/// `package.json` still be exercised.
+fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Option<String> {
+    if let Some(command) = manifest_start_command(root) {
+        return Some(command);
+    }
+    let rel = entry?.to_str()?;
+    let file = package_file(root, rel)?;
+    is_standalone_server(&root.join(&file)).then(|| format!("[\"node\",\"{file}\"]"))
+}
+
+/// A launch command read from the package manifest. Prefer the conventional `start` script, then
+/// the common server aliases used by applications that reserve `start` for deployment tooling, then
+/// a package `main` file. Arbitrary build/test scripts are never selected. `None` when the
+/// directory has no `package.json` or it declares no launchable entry.
+fn manifest_start_command(root: &std::path::Path) -> Option<String> {
     let manifest = std::fs::read_to_string(root.join("package.json")).ok()?;
     let json = serde_json::from_str::<serde_json::Value>(&manifest).ok();
     if has_start_script(&manifest) {
@@ -837,8 +1094,49 @@ fn start_command(root: &std::path::Path) -> Option<String> {
             None => "[\"npm\",\"start\"]".to_owned(),
         });
     }
+    if let Some(script) = json
+        .as_ref()
+        .and_then(|value| value.get("scripts"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|scripts| {
+            ["serve", "server", "app"].into_iter().find(|name| {
+                scripts
+                    .get(*name)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|command| !command.trim().is_empty())
+            })
+        })
+    {
+        return Some(format!("[\"npm\",\"run\",\"{script}\"]"));
+    }
     let main = json?.get("main")?.as_str()?.to_owned();
     package_file(root, &main).map(|main| format!("[\"node\",\"{main}\"]"))
+}
+
+/// Whether a JavaScript file is a self-contained server: one that both constructs a listener
+/// (`http.createServer`, an `express()`/`koa`/`fastify`/`polka` app, `new Server`) and calls
+/// `.listen(`. Such a file starts a server on its own when run with `node <file>`, so a repository
+/// of standalone scripts with no manifest is still launchable. A plain module that merely exports a
+/// handler (no `.listen`) is not selected.
+fn is_standalone_server(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let listens = src.contains(".listen(");
+    let constructs = src.contains("createServer")
+        || src.contains("express(")
+        || src.contains("new Koa")
+        || src.contains("fastify(")
+        || src.contains("polka(")
+        || src.contains("new Server");
+    listens && constructs
 }
 
 /// A file of the package by a relative path its manifest gives (`./server.js`), when it exists
@@ -912,7 +1210,9 @@ fn has_start_script(manifest: &str) -> bool {
 /// The package (directory with a `package.json`, relative to `root`) that serves a route declared
 /// in `file`. The nearest enclosing package when it can be launched: a separate service in a
 /// subdirectory (`capture/`, `server/`) is its own app, not the repo root's. Otherwise the nearest
-/// ancestor with a start script, and the repo root when none has one.
+/// ancestor with a start script. When no enclosing package can be launched but the finding's own
+/// file is a self-contained server, its own directory (so `node <file>` runs with the right
+/// working directory); the repo root when none of these apply.
 pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::PathBuf {
     let mut packages = Vec::new();
     let mut dir = file.parent();
@@ -926,17 +1226,24 @@ pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::Pat
         dir = current.parent();
     }
     if let Some(nearest) = packages.first()
-        && start_command(&root.join(nearest)).is_some()
+        && manifest_start_command(&root.join(nearest)).is_some()
     {
         return nearest.clone();
     }
-    packages
-        .into_iter()
-        .find(|dir| {
-            std::fs::read_to_string(root.join(dir).join("package.json"))
-                .is_ok_and(|manifest| has_start_script(&manifest))
-        })
-        .unwrap_or_default()
+    if let Some(dir) = packages.iter().find(|dir| {
+        std::fs::read_to_string(root.join(dir).join("package.json"))
+            .is_ok_and(|manifest| has_start_script(&manifest))
+    }) {
+        return dir.clone();
+    }
+    // No launchable enclosing package: run the finding's own file in place when it is itself a
+    // self-contained server, so it does not need a manifest to be exercised.
+    if is_standalone_server(&root.join(file))
+        && let Some(parent) = file.parent()
+    {
+        return parent.to_path_buf();
+    }
+    std::path::PathBuf::new()
 }
 
 /// The image working directory for an app directory relative to the repo: `/app` for the repo
@@ -1084,11 +1391,16 @@ req.end();
 /// instead of being disabled.
 const MARKER_JS: &str = r#"
 const http = require('http');
-const log = (req, res) => { console.log('MARKER ' + req.url); res.end('ok'); };
+const record = (req) => console.log('MARKER ' + JSON.stringify({
+  method: req.method,
+  path: req.url,
+  userAgent: req.headers['user-agent'] || null,
+}));
+const log = (req, res) => { record(req); res.end('ok'); };
 // An outbound request whose host is attacker-controlled may be forwarded with upgrade headers
 // (a proxied WebSocket/upgrade request). Record those too, so a reached-service signal is seen
 // however the request arrives, then drop the raw socket.
-const logUpgrade = (req, socket) => { console.log('MARKER ' + req.url); try { socket.destroy(); } catch (e) {} };
+const logUpgrade = (req, socket) => { record(req); try { socket.destroy(); } catch (e) {} };
 const httpServer = http.createServer(log);
 httpServer.on('upgrade', logUpgrade);
 httpServer.listen(80, '0.0.0.0');
@@ -1575,8 +1887,23 @@ mod tests {
             ..attempt
         };
         let command = curl_command(&path, 8000);
+        assert!(command.contains("--path-as-is"));
         assert!(command.contains("--url 'http://TARGET_HOST:8000/x?u=1'"));
         assert!(!command.contains("--request-target"));
+    }
+
+    #[test]
+    fn a_traversal_poc_preserves_dot_segments() {
+        let attempt = Attempt {
+            verb: "GET",
+            target: "/../../etc/passwd".to_owned(),
+            body: None,
+            headers: Vec::new(),
+            signal: Signal::InResponse,
+        };
+        let command = curl_command(&attempt, 8000);
+        assert!(command.contains("--path-as-is"));
+        assert!(command.contains("--url 'http://TARGET_HOST:8000/../../etc/passwd'"));
     }
 
     #[test]
@@ -1683,6 +2010,70 @@ mod tests {
         assert_eq!(value["body"], "{\"url\":\"http://jss-marker/t\"}");
     }
 
+    #[test]
+    fn marker_hit_preserves_target_request_metadata_for_the_public_relay() {
+        let logs = concat!(
+            "ordinary output\n",
+            "MARKER {\"method\":\"NOTIFY\",\"path\":\"/other\",",
+            "\"userAgent\":null}\n",
+            "MARKER {\"method\":\"GET\",\"path\":\"/run-token-2\",",
+            "\"userAgent\":\"mStream/6.0 (https://mstream.io)\"}\n",
+        );
+        let hit = marker_hit(logs, "run-token-2").unwrap();
+        assert_eq!(
+            hit,
+            MarkerHit {
+                method: "GET".to_owned(),
+                path: "/run-token-2".to_owned(),
+                user_agent: Some("mStream/6.0 (https://mstream.io)".to_owned()),
+            }
+        );
+        let args = callback_relay_args("https://token.callback.satori.ci/run-token-2", &hit);
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--header", "X-Satori-Callback-Relay: isolated-target"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--header", "X-Satori-Original-Method: GET"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--user-agent", "mStream/6.0 (https://mstream.io)"] })
+        );
+    }
+
+    #[test]
+    fn marker_hit_ignores_unstructured_and_wrong_token_lines() {
+        let logs = "MARKER /run-token-2\n\
+                    MARKER {\"method\":\"GET\",\"path\":\"/other\",\"userAgent\":null}\n";
+        assert!(marker_hit(logs, "run-token-2").is_none());
+        assert_eq!(safe_method("GET"), Some("GET"));
+        assert_eq!(safe_method("GET\r\nInjected"), None);
+        assert_eq!(safe_user_agent(Some("bad\r\nheader")), None);
+    }
+
+    #[test]
+    fn mongo_sidecar_is_selected_from_declared_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"dependencies":{"mongoose":"8"}}"#,
+        );
+        assert!(db_service(dir.path()));
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"dependencies":{"express":"5"}}"#,
+        );
+        assert!(!db_service(dir.path()));
+        let env = db_connection_env();
+        assert!(env.iter().any(|(name, value)| {
+            name == "MONGODB_URI" && value == "mongodb://mongo:27017/jssverifydb"
+        }));
+    }
+
     fn write(root: &std::path::Path, rel: &str, text: &str) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1772,11 +2163,14 @@ mod tests {
         assert_eq!(app_dir(root, path("lib/util/route.js")), path(""));
 
         assert_eq!(
-            start_command(&root.join("svc")).as_deref(),
+            manifest_start_command(&root.join("svc")).as_deref(),
             Some(r#"["node","index.js"]"#)
         );
-        assert_eq!(start_command(root).as_deref(), Some(r#"["npm","start"]"#));
-        assert_eq!(start_command(&root.join("lib/util")), None);
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["npm","start"]"#)
+        );
+        assert_eq!(manifest_start_command(&root.join("lib/util")), None);
     }
 
     #[test]
@@ -1807,10 +2201,13 @@ mod tests {
             r#"{"main":"main.js","scripts":{"start":"./scripts/start.js > /dev/null 2>&1 & disown"}}"#,
         );
         // The detached file must exist in the package.
-        assert_eq!(start_command(root).as_deref(), Some(r#"["npm","start"]"#));
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["npm","start"]"#)
+        );
         write(root, "scripts/start.js", "");
         assert_eq!(
-            start_command(root).as_deref(),
+            manifest_start_command(root).as_deref(),
             Some(r#"["node","scripts/start.js"]"#)
         );
         write(
@@ -1818,7 +2215,58 @@ mod tests {
             "package.json",
             r#"{"scripts":{"start":"node ../outside.js &"}}"#,
         );
-        assert_eq!(start_command(root).as_deref(), Some(r#"["npm","start"]"#));
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["npm","start"]"#)
+        );
+    }
+
+    #[test]
+    fn a_standalone_server_file_is_launched_when_no_manifest_can_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A self-contained server in a subdirectory, with no package.json anywhere.
+        write(
+            root,
+            "tools/viewer/server.js",
+            "const http=require('http');\n\
+             http.createServer((req,res)=>res.end('ok')).listen(8000);\n",
+        );
+        // A plain helper that only exports a handler is not a launchable server.
+        write(
+            root,
+            "tools/viewer/app.js",
+            "module.exports = (req, res) => res.end('ok');\n",
+        );
+
+        let path = std::path::Path::new;
+        assert!(is_standalone_server(&root.join("tools/viewer/server.js")));
+        assert!(!is_standalone_server(&root.join("tools/viewer/app.js")));
+
+        // The finding's own directory serves it, and the file is run directly with node.
+        let app = app_dir(root, path("tools/viewer/server.js"));
+        assert_eq!(app, path("tools/viewer"));
+        assert_eq!(
+            start_command(&root.join(&app), Some(path("server.js"))).as_deref(),
+            Some(r#"["node","server.js"]"#)
+        );
+        // The non-server helper, even though it exists, is never launched this way.
+        assert_eq!(app_dir(root, path("tools/viewer/app.js")), path(""));
+        assert_eq!(start_command(&root.join(&app), Some(path("app.js"))), None);
+    }
+
+    #[test]
+    fn a_server_alias_is_used_when_start_and_main_are_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts":{"build":"echo build","app":"node server.js"}}"#,
+        );
+        assert_eq!(
+            manifest_start_command(dir.path()).as_deref(),
+            Some(r#"["npm","run","app"]"#)
+        );
     }
 
     /// The readiness probe is valid Node and reports the port asked for when the app listens
@@ -1864,7 +2312,7 @@ mod tests {
         ] {
             let manifest = serde_json::json!({ "main": main }).to_string();
             write(root, "package.json", &manifest);
-            assert_eq!(start_command(root), None, "main {main:?}");
+            assert_eq!(manifest_start_command(root), None, "main {main:?}");
         }
     }
 

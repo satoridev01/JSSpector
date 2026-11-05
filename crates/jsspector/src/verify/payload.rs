@@ -243,6 +243,49 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
         .collect()
 }
 
+/// Three otherwise-identical NoSQL requests: one match-all operator and two independent
+/// match-none controls. Only a database interpreting the object as an operator should make the
+/// first response differ while both controls agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NosqlCase {
+    pub field: String,
+    pub match_all: Attempt,
+    pub match_none_eq: Attempt,
+    pub match_none_in: Attempt,
+}
+
+const NOSQL_FIELDS: [&str; 15] = [
+    "id", "_id", "user", "userId", "user_id", "username", "email", "login", "uid", "name",
+    "handle", "token", "key", "slug", "account",
+];
+
+pub fn nosql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<NosqlCase> {
+    let verb = probe.method.verb(&Entry::Body(None));
+    let absent = format!("jssnomatch{}{nonce}", canary.token);
+    NOSQL_FIELDS
+        .iter()
+        .map(|field| {
+            let body = |operator: String| Attempt {
+                verb,
+                target: fill_remaining(&probe.path),
+                body: Some(format!("{{\"{}\":{operator}}}", json_escape(field))),
+                headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+                signal: Signal::InResponse,
+            };
+            NosqlCase {
+                field: (*field).to_owned(),
+                match_all: body(format!("{{\"$ne\":\"{}\"}}", json_escape(&absent))),
+                match_none_eq: body(format!("{{\"$eq\":\"{}\"}}", json_escape(&absent))),
+                match_none_in: body("{\"$in\":[]}".to_owned()),
+            }
+        })
+        .collect()
+}
+
+pub fn nosql_reproduced(match_all: &str, match_none_eq: &str, match_none_in: &str) -> bool {
+    match_none_eq == match_none_in && match_all != match_none_eq && !match_all.trim().is_empty()
+}
+
 fn body_fields(class: VulnClass) -> &'static [&'static str] {
     match class {
         VulnClass::Ssrf => &["url", "uri", "host", "endpoint", "target", "callback"],
@@ -756,6 +799,42 @@ mod tests {
             4,
         );
         assert!(traversal.iter().all(|x| x.target.starts_with('/')));
+    }
+
+    #[test]
+    fn nosql_cases_place_matching_operators_in_the_body() {
+        let canary = Canary::new("tok".to_owned());
+        let cases = nosql_cases(
+            &probe(VulnClass::NosqlInjection, "/api/user", Entry::Body(None)),
+            &canary,
+            1,
+        );
+        assert_eq!(cases.len(), NOSQL_FIELDS.len());
+        let id = cases.iter().find(|case| case.field == "id").unwrap();
+        assert_eq!(
+            id.match_all.body.as_deref(),
+            Some("{\"id\":{\"$ne\":\"jssnomatchtok1\"}}")
+        );
+        assert_eq!(
+            id.match_none_eq.body.as_deref(),
+            Some("{\"id\":{\"$eq\":\"jssnomatchtok1\"}}")
+        );
+        assert_eq!(
+            id.match_none_in.body.as_deref(),
+            Some("{\"id\":{\"$in\":[]}}")
+        );
+    }
+
+    #[test]
+    fn nosql_reproduction_needs_agreeing_controls_and_a_distinct_match_all() {
+        assert!(nosql_reproduced(
+            "{\"_id\":\"abc\"}",
+            "{\"error\":\"not found\"}",
+            "{\"error\":\"not found\"}"
+        ));
+        assert!(!nosql_reproduced("not found", "not found", "not found"));
+        assert!(!nosql_reproduced("record", "echo $eq", "echo $in"));
+        assert!(!nosql_reproduced("  ", "not found", "not found"));
     }
 
     #[test]

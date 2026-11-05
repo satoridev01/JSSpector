@@ -260,9 +260,10 @@ impl Probe {
                 | VulnClass::CommandInjection
                 | VulnClass::CodeInjection
                 | VulnClass::Ssrf
+                | VulnClass::NosqlInjection
         ) {
             return skip(&format!(
-                "{} is not driven by verify v1 (HTTP path-traversal, command/code-injection and SSRF only)",
+                "{} is not driven by verify v1 (HTTP path-traversal, command/code-injection, SSRF and NoSQL injection only)",
                 finding.class.name()
             ));
         }
@@ -662,7 +663,9 @@ pub fn gate_paths(source: &str) -> Vec<String> {
     let bytes = source.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i];
+        let Some(&c) = bytes.get(i) else {
+            break;
+        };
         if matches!(c, b'"' | b'\'' | b'`') {
             // A string literal; keep it only when its surroundings are a path comparison.
             if let Some(end) = source[i + 1..].find(c as char) {
@@ -1023,8 +1026,77 @@ fn unquote(text: &str) -> Option<String> {
     }
 }
 
+/// Derives a conservative HTTP entry for a handler under a conventional routing directory when
+/// static route registration was unavailable. This only creates a request candidate; dynamic
+/// verification still needs independent runtime evidence before reporting success.
+pub fn derive_http_entry(finding: &Finding) -> Option<String> {
+    const ROOTS: [&str; 8] = [
+        "controllers",
+        "controller",
+        "routes",
+        "route",
+        "handlers",
+        "handler",
+        "endpoints",
+        "resolvers",
+    ];
+    let file = finding.file.replace('\\', "/");
+    let parts: Vec<&str> = file.split('/').filter(|part| !part.is_empty()).collect();
+    let root = parts.iter().position(|part| ROOTS.contains(part))?;
+    let mut segments: Vec<&str> = parts.get(root + 1..)?.to_vec();
+    let last = segments.pop()?;
+    let stem = last.rsplit_once('.').map_or(last, |(name, _)| name);
+    if stem != "index" && stem != "route" {
+        segments.push(stem);
+    }
+    if segments.is_empty()
+        || !segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return None;
+    }
+    let method = if finding.source.expr.contains("body") || finding.source.expr.contains("payload")
+    {
+        "POST"
+    } else {
+        "GET"
+    };
+    Some(format!("{method} /{}", segments.join("/")))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn convention_based_http_entries_are_conservative() {
+        let mut body = finding(
+            VulnClass::NosqlInjection,
+            Auth::NoneDetected,
+            None,
+            "request.body",
+        );
+        body.file = "app/controllers/api/user.js".to_owned();
+        assert_eq!(derive_http_entry(&body).as_deref(), Some("POST /api/user"));
+        body.entry = derive_http_entry(&body);
+        let probe = Probe::from_finding(&body).unwrap();
+        assert_eq!(probe.class, VulnClass::NosqlInjection);
+        assert_eq!(probe.path, "/api/user");
+
+        let mut query = finding(
+            VulnClass::NosqlInjection,
+            Auth::NoneDetected,
+            None,
+            "req.query.id",
+        );
+        query.file = "src/routes/users/index.js".to_owned();
+        assert_eq!(derive_http_entry(&query).as_deref(), Some("GET /users"));
+        query.file = "lib/helpers/db.js".to_owned();
+        assert_eq!(derive_http_entry(&query), None);
+    }
+
     #[test]
     fn declared_mount_prefix_reads_a_literal_default() {
         use super::declared_mount_prefix as p;

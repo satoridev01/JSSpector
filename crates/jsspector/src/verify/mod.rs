@@ -81,6 +81,25 @@ pub fn run(
     findings: &[Finding],
     missing: Missing,
 ) -> Result<Vec<Verdict>, String> {
+    // A custom or convention-based router may leave a handler without an inventory entry. For an
+    // HTTP finding, try a conservative route derived from a recognized controller/routes tree.
+    // A wrong guess can only fail to reproduce; it never creates a verified outcome by itself.
+    let owned: Vec<Finding> = findings
+        .iter()
+        .map(|finding| {
+            if finding.entry.is_none()
+                && finding.source.kind == "http"
+                && let Some(entry) = plan::derive_http_entry(finding)
+            {
+                let mut derived = finding.clone();
+                derived.entry = Some(entry);
+                derived
+            } else {
+                finding.clone()
+            }
+        })
+        .collect();
+    let findings = owned.as_slice();
     // Plan each finding, giving the planner the handler's own source so it can resolve a request
     // input the finding only names coarsely (a `req.headers` source whose specific header the
     // handler reads in a host/URL position).
@@ -185,11 +204,12 @@ pub fn run(
                         .entry_at
                         .as_ref()
                         .map_or(&finding.file, |at| &at.file);
-                    let app = sandbox::app_dir(root, std::path::Path::new(declared));
+                    let declared = std::path::Path::new(declared);
+                    let app = sandbox::app_dir(root, declared);
                     let index = match http.iter().position(|(dir, _)| *dir == app) {
                         Some(index) => index,
                         None => {
-                            let session = sandbox::Session::start_in(root, &app);
+                            let session = sandbox::Session::start_in(root, &app, Some(declared));
                             http.push((app, session));
                             http.len() - 1
                         }

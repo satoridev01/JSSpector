@@ -525,6 +525,9 @@ pub struct NosqlCase {
     pub match_all: Attempt,
     pub match_none_eq: Attempt,
     pub match_none_in: Attempt,
+    /// The absent scalar token injected inside the operator objects, so a response that echoes the
+    /// payload (a cast-error message, say) can be normalized out before the controls are compared.
+    pub absent: String,
 }
 
 const NOSQL_FIELDS: [&str; 15] = [
@@ -535,28 +538,110 @@ const NOSQL_FIELDS: [&str; 15] = [
 pub fn nosql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<NosqlCase> {
     let verb = probe.method.verb(&Entry::Body(None));
     let absent = format!("jssnomatch{}{nonce}", canary.token);
-    NOSQL_FIELDS
+    let primary = match &probe.entry {
+        Entry::Body(Some(name)) => Some(name.clone()),
+        _ => None,
+    };
+    let mut fields = Vec::new();
+    if let Some(name) = &primary {
+        fields.push(name.clone());
+    }
+    for name in NOSQL_FIELDS {
+        if !fields.iter().any(|existing| existing == name) {
+            fields.push(name.to_owned());
+        }
+    }
+    fields
         .iter()
         .map(|field| {
-            let body = |operator: String| Attempt {
-                verb,
-                target: fill_remaining(&probe.path, &probe.path_fillers),
-                body: Some(format!("{{\"{}\":{operator}}}", json_escape(field))),
-                headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
-                signal: Signal::InResponse,
+            let body = |operator: String| {
+                let mut members = probe.siblings.clone();
+                if let Some(name) = &primary
+                    && name != field
+                    && members.iter().all(|(key, _)| key != name)
+                {
+                    members.push((name.clone(), ENVELOPE_PLACEHOLDER.to_owned()));
+                }
+                members.retain(|(key, _)| key != field);
+                let mut obj = format!("{{\"{}\":{operator}", json_escape(field));
+                for (key, value) in &members {
+                    obj.push_str(&format!(
+                        ",\"{}\":\"{}\"",
+                        json_escape(key),
+                        json_escape(value)
+                    ));
+                }
+                obj.push('}');
+                Attempt {
+                    verb,
+                    target: fill_remaining(&probe.path, &probe.path_fillers),
+                    body: Some(obj),
+                    headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+                    signal: Signal::InResponse,
+                }
             };
             NosqlCase {
-                field: (*field).to_owned(),
+                field: field.clone(),
                 match_all: body(format!("{{\"$ne\":\"{}\"}}", json_escape(&absent))),
                 match_none_eq: body(format!("{{\"$eq\":\"{}\"}}", json_escape(&absent))),
                 match_none_in: body("{\"$in\":[]}".to_owned()),
+                absent: absent.clone(),
             }
         })
         .collect()
 }
 
-pub fn nosql_reproduced(match_all: &str, match_none_eq: &str, match_none_in: &str) -> bool {
-    match_none_eq == match_none_in && match_all != match_none_eq && !match_all.trim().is_empty()
+/// Whether the three responses prove the object was interpreted as a database operator. Operator
+/// objects echoed in cast errors are normalized before comparison; a pure input-echo response then
+/// normalizes identically for all three cases and cannot become a false proof.
+pub fn nosql_reproduced(
+    match_all: &str,
+    match_none_eq: &str,
+    match_none_in: &str,
+    absent: &str,
+) -> bool {
+    let all = redact_nosql_echo(match_all, absent);
+    let none_eq = redact_nosql_echo(match_none_eq, absent);
+    let none_in = redact_nosql_echo(match_none_in, absent);
+    none_eq == none_in && all != none_eq && !all.trim().is_empty()
+}
+
+fn redact_nosql_echo(response: &str, absent: &str) -> String {
+    let redacted = redact_operator_objects(response);
+    if absent.is_empty() {
+        redacted
+    } else {
+        redacted.replace(absent, "<redacted>")
+    }
+}
+
+/// Replaces flat serialized Mongo operator objects while leaving their surrounding response intact.
+fn redact_operator_objects(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            let inner = &after[..close];
+            if !inner.contains('{') && contains_mongo_operator(inner) {
+                out.push_str("<op>");
+                rest = &after[close + 1..];
+                continue;
+            }
+        }
+        out.push('{');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn contains_mongo_operator(inner: &str) -> bool {
+    inner
+        .as_bytes()
+        .windows(2)
+        .any(|pair| pair.first() == Some(&b'$') && pair.get(1).is_some_and(u8::is_ascii_alphabetic))
 }
 
 fn body_fields(class: VulnClass) -> &'static [&'static str] {
@@ -1380,6 +1465,24 @@ mod tests {
             id.match_none_in.body.as_deref(),
             Some("{\"id\":{\"$in\":[]}}")
         );
+
+        let mut targeted = probe(
+            VulnClass::NosqlInjection,
+            "/api/auth/signup",
+            Entry::Body(Some("email".to_owned())),
+        );
+        targeted.siblings = vec![
+            ("name".to_owned(), "jsspector".to_owned()),
+            ("password".to_owned(), "Valid1!x".to_owned()),
+        ];
+        let targeted = nosql_cases(&targeted, &canary, 2);
+        assert_eq!(targeted[0].field, "email");
+        assert_eq!(
+            targeted[0].match_all.body.as_deref(),
+            Some(
+                "{\"email\":{\"$ne\":\"jssnomatchtok2\"},\"name\":\"jsspector\",\"password\":\"Valid1!x\"}"
+            )
+        );
     }
 
     #[test]
@@ -1387,11 +1490,26 @@ mod tests {
         assert!(nosql_reproduced(
             "{\"_id\":\"abc\"}",
             "{\"error\":\"not found\"}",
-            "{\"error\":\"not found\"}"
+            "{\"error\":\"not found\"}",
+            ""
         ));
-        assert!(!nosql_reproduced("not found", "not found", "not found"));
-        assert!(!nosql_reproduced("record", "echo $eq", "echo $in"));
-        assert!(!nosql_reproduced("  ", "not found", "not found"));
+        assert!(!nosql_reproduced("not found", "not found", "not found", ""));
+        assert!(!nosql_reproduced("record", "echo $eq", "echo $in", ""));
+        assert!(!nosql_reproduced("  ", "not found", "not found", ""));
+    }
+
+    #[test]
+    fn nosql_reproduction_normalizes_operator_echoes_without_accepting_plain_echoes() {
+        let token = "jssnomatchtok1";
+        let found = "{\"message\":\"already exists\"}";
+        let eq = "{\"error\":\"cast { '$eq': 'jssnomatchtok1' }\"}";
+        let inside = "{\"error\":\"cast { '$in': [] }\"}";
+        assert!(nosql_reproduced(found, eq, inside, token));
+
+        let ne_echo = "{\"echo\":{\"$ne\":\"jssnomatchtok1\"}}";
+        let eq_echo = "{\"echo\":{\"$eq\":\"jssnomatchtok1\"}}";
+        let in_echo = "{\"echo\":{\"$in\":[]}}";
+        assert!(!nosql_reproduced(ne_echo, eq_echo, in_echo, token));
     }
 
     #[test]

@@ -2610,6 +2610,140 @@ pub fn guard_required_fields(
         let value = lit.unwrap_or_else(|| "jsspector".to_owned());
         out.push((id, value));
     }
+    // Guard clauses reject missing fields before the sink instead of enclosing the sink. Their
+    // negated disjuncts must all be truthy for execution to continue.
+    for id in presence_guard_fields(source, anchors) {
+        if id != target
+            && is_request_field(source, part, &id)
+            && out.iter().all(|(name, _)| *name != id)
+        {
+            out.push((id, "jsspector".to_owned()));
+        }
+    }
+    out
+}
+
+/// Fields required by an early exit such as `if (!email || !name) return`: only pure top-level
+/// disjunctions of negated identifiers are accepted, and only before the latest flow anchor inside
+/// the same enclosing block.
+fn presence_guard_fields(source: &str, anchors: &[u32]) -> Vec<String> {
+    let offsets: Vec<usize> = anchors
+        .iter()
+        .filter_map(|line| line_offset(source, *line as usize))
+        .collect();
+    let (Some(&lo), Some(&hi)) = (offsets.iter().min(), offsets.iter().max()) else {
+        return Vec::new();
+    };
+    let Some((open, close)) = enclosing_block(source, lo) else {
+        return Vec::new();
+    };
+    let upper = hi.min(close);
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = open;
+    while i + 2 <= upper {
+        let boundary = i == 0 || bytes.get(i - 1).is_some_and(|byte| !is_ident(*byte));
+        if boundary
+            && bytes.get(i..i + 2) == Some(b"if")
+            && bytes.get(i + 2).is_none_or(|byte| !is_ident(*byte))
+            && let Some(paren) = source[i + 2..].find('(').map(|at| i + 2 + at)
+            && source[i + 2..paren].trim().is_empty()
+            && let Some(end) = matching_close_paren(source, paren)
+        {
+            if end + 1 < upper && guard_clause_exits(&source[end + 1..]) {
+                for id in negated_disjuncts(&source[paren + 1..end]) {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+            i = paren + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn enclosing_block(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let mut stack = Vec::new();
+    for (at, byte) in source.bytes().enumerate().take(offset) {
+        match byte {
+            b'{' => stack.push(at),
+            b'}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let open = *stack.last()?;
+    Some((open, matching_close_brace(source, open)?))
+}
+
+fn guard_clause_exits(after: &str) -> bool {
+    let trimmed = after.trim_start();
+    let body = if trimmed.starts_with('{') {
+        let close = matching_close_brace(trimmed, 0).unwrap_or(trimmed.len());
+        &trimmed[1..close]
+    } else {
+        &trimmed[..trimmed.find(';').unwrap_or(trimmed.len())]
+    };
+    let body = body.trim_start();
+    ["return", "throw", "next"]
+        .iter()
+        .any(|keyword| starts_with_keyword(body, keyword))
+}
+
+fn starts_with_keyword(text: &str, keyword: &str) -> bool {
+    text.strip_prefix(keyword)
+        .is_some_and(|rest| rest.as_bytes().first().is_none_or(|byte| !is_ident(*byte)))
+}
+
+fn negated_disjuncts(condition: &str) -> Vec<String> {
+    if split_top_level(condition, "&&").len() > 1 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for part in split_top_level(condition, "||") {
+        let Some(id) = part.trim().strip_prefix('!').map(str::trim) else {
+            return Vec::new();
+        };
+        if !is_plain_identifier(id) {
+            return Vec::new();
+        }
+        out.push(id.to_owned());
+    }
+    out
+}
+
+fn split_top_level(input: &str, separator: &str) -> Vec<String> {
+    let separator = separator.as_bytes();
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some(&byte) = bytes.get(i) else {
+            break;
+        };
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0
+            && i + separator.len() <= bytes.len()
+            && bytes.get(i..i + separator.len()) == Some(separator)
+        {
+            out.push(input[start..i].to_owned());
+            i += separator.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(input[start..].to_owned());
     out
 }
 
@@ -3416,6 +3550,54 @@ mod tests {
         assert!(guard_required_fields(source, "body", "base", &[sink_line]).is_empty());
         let required = guard_required_fields(source, "body", "base", &anchors);
         assert_eq!(required, vec![("token".to_owned(), "jsspector".to_owned())]);
+    }
+
+    #[test]
+    fn an_early_return_presence_guard_supplies_required_body_siblings() {
+        let source = r#"
+          async function signup(req, res, next) {
+            const { email, name, firstName, lastName, password } = req.body;
+            if (!email || !name || !firstName || !lastName || !password) {
+              return next(new Error('missing'));
+            }
+            const user = await User.findOne({ $or: [{ email }, { name }] });
+          }
+        "#;
+        let line = |needle: &str| {
+            source
+                .lines()
+                .position(|text| text.contains(needle))
+                .map(|index| index as u32 + 1)
+                .unwrap()
+        };
+        assert_eq!(
+            guard_required_fields(
+                source,
+                "body",
+                "email",
+                &[line("const { email"), line("User.findOne")],
+            ),
+            vec![
+                ("name".to_owned(), "jsspector".to_owned()),
+                ("firstName".to_owned(), "jsspector".to_owned()),
+                ("lastName".to_owned(), "jsspector".to_owned()),
+                ("password".to_owned(), "jsspector".to_owned()),
+            ]
+        );
+
+        let mixed = source.replace(
+            "!email || !name || !firstName || !lastName || !password",
+            "!email && !name",
+        );
+        assert!(
+            guard_required_fields(
+                &mixed,
+                "body",
+                "email",
+                &[line("const { email"), line("User.findOne")],
+            )
+            .is_empty()
+        );
     }
 
     use super::*;

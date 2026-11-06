@@ -543,7 +543,7 @@ impl Session {
             ) else {
                 continue;
             };
-            if payload::nosql_reproduced(&match_all, &match_none_eq, &match_none_in) {
+            if payload::nosql_reproduced(&match_all, &match_none_eq, &match_none_in, &case.absent) {
                 let attempt = &case.match_all;
                 return Outcome::Verified {
                     how: format!("{} {} ({}[$ne])", attempt.verb, attempt.target, case.field),
@@ -1168,6 +1168,7 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-marker.crt\n\
          RUN echo {} | base64 -d > /jss-marker.key\n\
          RUN echo {} | base64 -d > /jss-launch-shim.js\n\
+         RUN echo {} | base64 -d > /jss-esm-hook.mjs\n\
          RUN echo {} | base64 -d > /jss-plugin-host.mjs\n\
          RUN echo {} | base64 -d > /jss-express-host.mjs\n\
          RUN echo {} | base64 -d > /jss-lifecycle-host.mjs\n\
@@ -1181,6 +1182,7 @@ fn dockerfile(
         base64(MARKER_CERT.as_bytes()),
         base64(MARKER_KEY.as_bytes()),
         base64(LAUNCH_SHIM_JS.as_bytes()),
+        base64(LAUNCH_ESM_HOOK_JS.as_bytes()),
         base64(PLUGIN_HOST_JS.as_bytes()),
         base64(EXPRESS_HOST_JS.as_bytes()),
         base64(LIFECYCLE_HOST_JS.as_bytes()),
@@ -1231,6 +1233,9 @@ struct RequiredEnv {
     /// The value is a directory (mounted empty and writable for the app).
     directory: bool,
 }
+
+/// A non-secret value long enough to satisfy startup checks for secret-like environment variables.
+const STRONG_FILLER_SECRET: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a0ffeeddccbbaa998877665544332211009f8e7d6c5b4a39281706f5e4d3c2b1a0ffeeddccbbaa99887766554433221100";
 
 /// The environment variables an app's startup failure says it requires: a variable-style name
 /// (`UPPER_SNAKE`, with an underscore) followed in its log by `is required` / `must be set` /
@@ -1299,6 +1304,11 @@ fn required_env(log: &str) -> Vec<RequiredEnv> {
                         (format!("/jss-env/{}", word.to_ascii_lowercase()), true)
                     }
                     "URL" | "URI" => ("http://jss-filler.test/".to_owned(), false),
+                    "SECRET" | "SECRETS" | "KEY" | "KEYS" | "TOKEN" | "PASSWORD" | "PASS"
+                    | "PASSPHRASE" | "SALT" | "SEED" | "NONCE" | "PEPPER" | "SIGNATURE"
+                    | "CREDENTIAL" | "CREDENTIALS" | "PRIVATEKEY" | "SIGNINGKEY" => {
+                        (STRONG_FILLER_SECRET.to_owned(), false)
+                    }
                     _ => ("jsspector".to_owned(), false),
                 };
                 out.push(RequiredEnv {
@@ -1921,6 +1931,78 @@ Module._load = function (request, parent, isMain) {
     throw err;
   }
 };
+try {
+  if (typeof Module.register === 'function') {
+    Module.register(require('url').pathToFileURL('/jss-esm-hook.mjs').href);
+  }
+} catch (err) {}
+"#;
+
+/// ESM counterpart of [`LAUNCH_SHIM_JS`]. Only an undeclared bare module that fails with
+/// `ERR_MODULE_NOT_FOUND` is replaced; relative files and other resolver failures retain Node's
+/// behavior. Named imports are recovered from the importing statement so the inert stub can link.
+const LAUNCH_ESM_HOOK_JS: &str = r#"
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const SCHEME = 'jss-stub:';
+
+function isBare(specifier) {
+  return typeof specifier === 'string' && specifier.length > 0 &&
+    specifier[0] !== '.' && specifier[0] !== '/' &&
+    !specifier.startsWith('node:') && !specifier.startsWith('data:') &&
+    !specifier.startsWith('file:');
+}
+
+export async function resolve(specifier, context, nextResolve) {
+  try {
+    return await nextResolve(specifier, context);
+  } catch (error) {
+    if (!isBare(specifier) || !error || error.code !== 'ERR_MODULE_NOT_FOUND') throw error;
+    const parent = context && typeof context.parentURL === 'string' ? context.parentURL : '';
+    return {
+      url: SCHEME + encodeURIComponent(specifier) + '?parent=' + encodeURIComponent(parent),
+      shortCircuit: true,
+    };
+  }
+}
+
+function requestedNames(parentURL, specifier) {
+  const names = new Set();
+  if (!parentURL.startsWith('file:')) return names;
+  let source;
+  try { source = readFileSync(fileURLToPath(parentURL), 'utf8'); } catch (error) { return names; }
+  const escaped = specifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const imports = new RegExp("import\\s+([^;]*?)\\s+from\\s+['\"]" + escaped + "['\"]", 'g');
+  let match;
+  while ((match = imports.exec(source))) {
+    const braces = match[1].match(/\{([^}]*)\}/);
+    if (!braces) continue;
+    for (let part of braces[1].split(',')) {
+      part = part.trim();
+      if (!part) continue;
+      const at = part.search(/\sas\s/);
+      const name = (at >= 0 ? part.slice(0, at) : part).trim();
+      if (name !== 'default' && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) names.add(name);
+    }
+  }
+  return names;
+}
+
+export async function load(url, context, nextLoad) {
+  if (!url.startsWith(SCHEME)) return nextLoad(url, context);
+  const rest = url.slice(SCHEME.length);
+  const query = rest.indexOf('?parent=');
+  const specifier = decodeURIComponent(query >= 0 ? rest.slice(0, query) : rest);
+  const parent = query >= 0 ? decodeURIComponent(rest.slice(query + 8)) : '';
+  const lines = [
+    "const handler = { get(t, p) { if (p === 'then') return undefined; if (p === Symbol.toPrimitive) return () => ''; if (p === Symbol.iterator || p === Symbol.asyncIterator) return undefined; return stub; }, apply() { return stub; }, construct() { return stub; } };",
+    'const stub = new Proxy(function () {}, handler);',
+    'export default stub;',
+  ];
+  for (const name of requestedNames(parent, specifier)) lines.push('export const ' + name + ' = stub;');
+  return { format: 'module', source: lines.join('\n'), shortCircuit: true };
+}
 "#;
 
 /// Mounts a plug-in handler module that registers an HTTP request handler on a host-provided service
@@ -2781,8 +2863,30 @@ mod tests {
         );
         assert_eq!(env[1].value, "http://jss-filler.test/");
         assert!(!env[1].directory);
-        assert_eq!(env[2].value, "jsspector");
+        assert_eq!(env[2].value, STRONG_FILLER_SECRET);
+        assert!(STRONG_FILLER_SECRET.len() >= 64);
         assert!(required_env("the app did not listen within 90s").is_empty());
+    }
+
+    #[test]
+    fn the_esm_missing_module_hook_is_valid_and_only_handles_missing_bare_packages() {
+        assert!(LAUNCH_ESM_HOOK_JS.contains("error.code !== 'ERR_MODULE_NOT_FOUND'"));
+        assert!(LAUNCH_ESM_HOOK_JS.contains("!isBare(specifier)"));
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "hook.mjs", LAUNCH_ESM_HOOK_JS);
+        let output = Command::new("node")
+            .args(["--check", "hook.mjs"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The copyable command for an absolute-form request target sends it as is, to the app.

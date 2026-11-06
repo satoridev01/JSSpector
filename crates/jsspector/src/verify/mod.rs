@@ -143,9 +143,12 @@ pub fn run(
             // A handler may reach its sink only on a guarded branch (`else if (agentKey)`,
             // `if (mode === 'raw')`); the member that gates it must be present, or the request takes
             // a different branch and never reaches the sink. Add any such field of the same part.
-            for (name, value) in
-                plan::guard_required_fields(&source, part, &target, finding.sink.line)
-            {
+            for (name, value) in plan::guard_required_fields(
+                &source,
+                part,
+                &target,
+                &plan::guard_anchor_lines(finding),
+            ) {
                 if siblings.iter().all(|(k, _)| *k != name) {
                     siblings.push((name, value));
                 }
@@ -160,8 +163,12 @@ pub fn run(
         if let Ok(plan::Plan::Http(probe)) = planned
             && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
         {
-            probe.path_fillers =
-                plan::path_slot_fillers(&source, &probe.path, &probe.entry, finding.sink.line);
+            probe.path_fillers = plan::path_slot_fillers(
+                &source,
+                &probe.path,
+                &probe.entry,
+                &plan::guard_anchor_lines(finding),
+            );
         }
     }
     // An entry that forwards the request URL (SSRF) often reaches its sink only for paths the handler

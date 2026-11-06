@@ -1847,21 +1847,61 @@ fn string_literal_value(text: &str) -> Option<String> {
     Some(inner.to_owned())
 }
 
+/// The lines in the finding's own source file where a guard gating the sink may sit: the source
+/// line, the sink line (only when the sink is in this file), and every same-file trace step. For a
+/// cross-function sink the guard that pins a non-payload path segment (`platform === 'truuze'`) or
+/// selects the branch that reaches the sink (`else if (token)`) encloses the in-handler point where
+/// the taint is read or passed into the callee — a trace step — not the sink line inside the callee.
+/// Considering every same-file flow position, rather than the sink line alone, lets a guard be found
+/// wherever along the flow it sits. Mined from the finding's own locations; nothing is app-specific.
+pub fn guard_anchor_lines(finding: &Finding) -> Vec<u32> {
+    let mut lines = vec![finding.source.line];
+    if finding.sink.file.is_none() {
+        lines.push(finding.sink.line);
+    }
+    for step in &finding.trace {
+        if step.file.is_none() {
+            lines.push(step.line);
+        }
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+/// The union of [`enclosing_guards`] taken at each anchor line: every guard that encloses any of the
+/// flow's same-file positions. The first binding of each identifier is kept, except that a literal
+/// equality (`id === "lit"`) upgrades an earlier bare truthiness binding of the same identifier, so a
+/// pinned value is preferred over a placeholder when the same field is both tested and compared.
+fn enclosing_guards_over(source: &str, anchors: &[u32]) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for &line in anchors {
+        for (id, lit) in enclosing_guards(source, line) {
+            match out.iter_mut().find(|(existing, _)| *existing == id) {
+                Some(slot) if slot.1.is_none() && lit.is_some() => slot.1 = lit,
+                Some(_) => {}
+                None => out.push((id, lit)),
+            }
+        }
+    }
+    out
+}
+
 /// Values for route `{slot}` segments other than the payload-bearing one, chosen from a guard that
-/// encloses the sink. When a non-payload segment's local is pinned by an equality guard around the
-/// sink (`platform === 'truuze'`), the request must carry that literal to reach the sink; the generic
-/// placeholder is rejected. Mined from the route and handler source only.
+/// encloses the flow. When a non-payload segment's local is pinned by an equality guard around a
+/// flow position (`platform === 'truuze'`), the request must carry that literal to reach the sink;
+/// the generic placeholder is rejected. Mined from the route and handler source only.
 pub fn path_slot_fillers(
     source: &str,
     path: &str,
     entry: &Entry,
-    sink_line: u32,
+    anchors: &[u32],
 ) -> Vec<(String, String)> {
     let payload_slot = match entry {
         Entry::PathParam(name) => Some(name.as_str()),
         _ => None,
     };
-    let guards = enclosing_guards(source, sink_line);
+    let guards = enclosing_guards_over(source, anchors);
     let mut out = Vec::new();
     for slot in route_slots(path) {
         if Some(slot.as_str()) == payload_slot {
@@ -1884,10 +1924,10 @@ pub fn guard_required_fields(
     source: &str,
     part: &str,
     target: &str,
-    sink_line: u32,
+    anchors: &[u32],
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for (id, lit) in enclosing_guards(source, sink_line) {
+    for (id, lit) in enclosing_guards_over(source, anchors) {
         if id == target || !is_request_field(source, part, &id) {
             continue;
         }
@@ -2618,12 +2658,87 @@ mod tests {
             source,
             "/svc/{kind}",
             &Entry::Body(Some("base".to_owned())),
-            sink_line,
+            &[sink_line],
         );
         assert_eq!(fillers, vec![("kind".to_owned(), "go".to_owned())]);
 
-        let required = guard_required_fields(source, "body", "base", sink_line);
+        let required = guard_required_fields(source, "body", "base", &[sink_line]);
         assert_eq!(required, vec![("agent".to_owned(), "jsspector".to_owned())]);
+    }
+
+    #[test]
+    fn a_cross_function_sink_picks_up_guards_enclosing_the_in_handler_flow() {
+        // The tainted URL is forwarded into a helper, so the sink `fetch` sits in the callee with no
+        // enclosing guard of its own. The guards that gate reaching it — a non-payload path segment
+        // (`kind === 'go'`) and the branch field (`token`) — enclose the handler-side flow positions:
+        // the source read and the call site. Anchoring the guard search on every same-file flow line,
+        // not the callee's sink line alone, recovers both. (With the sink line alone, neither is seen.)
+        let source = r#"
+          async function upload(base) {
+            const r = await fetch(`${base}/account/agent/profile/`);
+            return r;
+          }
+          router.post('/svc/:kind', async (req, res) => {
+            const valid = ['go', 'stop'];
+            if (!valid.includes(kind)) return;
+            if (kind === 'go') {
+              const { token, base } = req.body;
+              if (token) {
+                await upload(base);
+              }
+            }
+          });
+        "#;
+        let line_of = |needle: &str| {
+            source
+                .lines()
+                .position(|l| l.contains(needle))
+                .map(|i| i as u32 + 1)
+                .unwrap()
+        };
+        let sink_line = line_of("fetch(");
+        let source_line = line_of("const { token, base }");
+        let call_line = line_of("await upload(base)");
+
+        // The finding's own locations: source in the handler, sink in the callee, a trace step at the
+        // call site. All share the finding's file, so each contributes an anchor line.
+        let mut f = finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("POST /svc/{kind}"),
+            "req.body",
+        );
+        f.source.line = source_line;
+        f.sink.line = sink_line;
+        f.trace = vec![TraceStep {
+            file: None,
+            line: call_line,
+            col: 1,
+            note: "passed to upload()".to_owned(),
+        }];
+        let anchors = guard_anchor_lines(&f);
+
+        // The sink line alone finds nothing; the full flow recovers both guards.
+        assert!(
+            path_slot_fillers(
+                source,
+                "/svc/{kind}",
+                &Entry::Body(Some("base".to_owned())),
+                &[sink_line]
+            )
+            .is_empty()
+        );
+        let fillers = path_slot_fillers(
+            source,
+            "/svc/{kind}",
+            &Entry::Body(Some("base".to_owned())),
+            &anchors,
+        );
+        assert_eq!(fillers, vec![("kind".to_owned(), "go".to_owned())]);
+
+        assert!(guard_required_fields(source, "body", "base", &[sink_line]).is_empty());
+        let required = guard_required_fields(source, "body", "base", &anchors);
+        assert_eq!(required, vec![("token".to_owned(), "jsspector".to_owned())]);
     }
 
     use super::*;

@@ -42,21 +42,22 @@ pub fn browser_attempts(
             token: token.clone(),
         })
     };
+    let params = param_names(probe);
     match probe.vector {
         UrlVector::Search => {
-            for param in PARAM_CANDIDATES {
+            for param in &params {
                 push(format!("{page}?{param}={encoded}"));
             }
         }
         UrlVector::Hash => {
             push(format!("{page}#{encoded}"));
-            for param in PARAM_CANDIDATES {
+            for param in &params {
                 push(format!("{page}#{param}={encoded}"));
             }
         }
         UrlVector::Href => {
             // The value is read from anywhere in the URL: try both query and hash.
-            for param in PARAM_CANDIDATES {
+            for param in &params {
                 push(format!("{page}?{param}={encoded}"));
                 push(format!("{page}#{param}={encoded}"));
             }
@@ -65,6 +66,25 @@ pub fn browser_attempts(
         UrlVector::Referrer => {
             // The sandbox sets the referrer separately; the page itself carries no payload.
             push(page.to_owned());
+        }
+    }
+    out
+}
+
+/// The parameter names to try for a URL-sourced probe: the ones the script actually reads off the
+/// page URL (mined from its source) first, then the generic candidates for anything not already
+/// covered. Trying the real name first means a page reading an uncommon parameter is driven on the
+/// first relevant load rather than missed entirely.
+fn param_names(probe: &BrowserProbe) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in &probe.params {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.clone());
+        }
+    }
+    for name in PARAM_CANDIDATES {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_owned());
         }
     }
     out
@@ -116,6 +136,7 @@ mod tests {
             file: "web/pages.js".to_owned(),
             vector,
             sink,
+            params: Vec::new(),
         }
     }
 
@@ -134,6 +155,20 @@ mod tests {
         // The image onerror payload, percent-encoded, carries the marker call.
         assert!(a.iter().all(|x| x.url.contains("onerror")));
         assert!(a[0].url.contains("jss-marker") && a[0].url.contains("tok-1"));
+    }
+
+    #[test]
+    fn a_mined_param_is_tried_before_the_generic_candidates() {
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(UrlVector::Search, BrowserSink::Html);
+        // A page that reads an uncommon parameter name off its URL.
+        p.params = vec!["state".to_owned()];
+        let a = browser_attempts(&p, "/index.html", &canary, 1);
+        // The real parameter is driven first, ahead of the generic candidates, and is not dropped.
+        assert!(a[0].url.starts_with("/index.html?state="));
+        assert!(a.iter().filter(|x| x.url.contains("?state=")).count() == 1);
+        // The generic candidates still follow, so an unknown name is not regressed.
+        assert!(a.iter().any(|x| x.url.contains("?q=")));
     }
 
     #[test]

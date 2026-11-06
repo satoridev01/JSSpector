@@ -3420,11 +3420,13 @@ http.createServer((req, res) => {
             file: "app.js".to_owned(),
             vector: UrlVector::Search,
             sink: BrowserSink::Html,
+            params: Vec::new(),
         });
         let safe = session.exercise(&BrowserProbe {
             file: "safe.html".to_owned(),
             vector: UrlVector::Search,
             sink: BrowserSink::Html,
+            params: Vec::new(),
         });
         session.teardown();
 

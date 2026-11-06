@@ -164,6 +164,12 @@ pub struct BrowserProbe {
     pub file: String,
     pub vector: UrlVector,
     pub sink: BrowserSink,
+    /// The exact query/hash parameter names the script reads off the page URL
+    /// (`new URLSearchParams(location.search).get('state')` -> `state`). Mined from the script
+    /// source only; the browser phase tries these before the generic candidate names, so a page
+    /// that reads an uncommon parameter is still driven. Empty when the source is unavailable or
+    /// reads no named parameter (the value is the whole search/hash).
+    pub params: Vec<String>,
 }
 
 /// Where in the page URL the attacker value is read from.
@@ -211,11 +217,11 @@ pub fn plan_with_source(finding: &Finding, source: Option<&str>) -> Result<Plan,
             }
         }
     }
-    browser_probe(finding).map(Plan::Browser)
+    browser_probe(finding, source).map(Plan::Browser)
 }
 
 /// A DOM-source XSS or client-side redirect the browser phase can drive, or why not.
-fn browser_probe(finding: &Finding) -> Result<BrowserProbe, Skip> {
+fn browser_probe(finding: &Finding, source: Option<&str>) -> Result<BrowserProbe, Skip> {
     if finding.class != VulnClass::Xss {
         return Err(Skip(format!(
             "{} from a DOM source is not driven by verify v1 (DOM XSS and client-side redirects only)",
@@ -242,7 +248,101 @@ fn browser_probe(finding: &Finding) -> Result<BrowserProbe, Skip> {
             .unwrap_or_else(|| finding.file.clone()),
         vector,
         sink,
+        params: source.map(url_param_reads).unwrap_or_default(),
     })
+}
+
+/// The query/hash parameter names a DOM script reads off the page URL through a `URLSearchParams`
+/// or a `URL`'s `searchParams` (`new URLSearchParams(location.search).get('state')`,
+/// `url.searchParams.get('q')`, `params.getAll('id')`). Returns the string-literal argument of each
+/// such `.get(...)`/`.getAll(...)`, first-seen and deduplicated. Gated on the source actually
+/// building search parameters, so an unrelated `map.get('x')` is not mistaken for a URL parameter.
+/// Mined from the script source only, so nothing here is tied to a specific app.
+fn url_param_reads(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for op in [".get(", ".getAll("] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(op) {
+            let at = from + rel;
+            let open = at + op.len();
+            from = open;
+            if !url_params_receiver(source, at) {
+                continue;
+            }
+            let Some(inner) = balanced_arg(&source[open..]) else {
+                continue;
+            };
+            let Some(first) = split_top_level_commas(inner).into_iter().next() else {
+                continue;
+            };
+            if let Some(name) = string_literal_arg(first.trim())
+                && !name.is_empty()
+                && !out.contains(&name)
+            {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Whether the expression immediately before `.get`/`.getAll` is known to hold URL search
+/// parameters: a direct constructor chain, a `.searchParams` member, or a local initialized from
+/// either. This keeps an unrelated `map.get('x')` out even when the same file also reads the URL.
+fn url_params_receiver(source: &str, dot: usize) -> bool {
+    let before = source.get(..dot).unwrap_or("").trim_end();
+    if before.ends_with(".searchParams") {
+        return true;
+    }
+    if before.ends_with(')') {
+        let mut depth = 0usize;
+        for (at, ch) in before.char_indices().rev() {
+            match ch {
+                ')' => depth += 1,
+                '(' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return before[..at].trim_end().ends_with("URLSearchParams");
+                    }
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
+    let start = before
+        .as_bytes()
+        .iter()
+        .rposition(|byte| !is_ident(*byte))
+        .map_or(0, |at| at + 1);
+    let name = &before[start..];
+    !name.is_empty() && assigned_url_params(source, name)
+}
+
+fn assigned_url_params(source: &str, name: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = source[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        if (at > 0 && bytes.get(at - 1).is_some_and(|byte| is_ident(*byte)))
+            || bytes.get(from).is_some_and(|byte| is_ident(*byte))
+        {
+            continue;
+        }
+        let Some(value) = source[from..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if value.starts_with('=') {
+            continue;
+        }
+        let value = value.trim_start();
+        let value = value.split([';', '\n']).next().unwrap_or(value).trim_end();
+        if value.starts_with("new URLSearchParams(") || value.ends_with(".searchParams") {
+            return true;
+        }
+    }
+    false
 }
 
 /// The URL part a DOM source reads from.
@@ -3373,6 +3473,45 @@ mod tests {
         assert_eq!(probe.vector, UrlVector::Search);
         assert_eq!(probe.sink, BrowserSink::Html);
         assert_eq!(probe.file, "web/pages.js");
+    }
+
+    #[test]
+    fn a_browser_probe_mines_the_real_url_parameter_from_source() {
+        let src = "const state = new URLSearchParams(window.location.search).get('state') || 'd';\n\
+                   app.innerHTML = `<p>${state}</p>`;";
+        let plan = plan_with_source(
+            &dom_finding("window.location.search", ".innerHTML =", "app.js"),
+            Some(src),
+        )
+        .unwrap();
+        let Plan::Browser(probe) = plan else {
+            panic!("expected a browser probe");
+        };
+        // The exact parameter the script reads off the URL is mined, so the browser phase drives it.
+        assert_eq!(probe.params, vec!["state".to_owned()]);
+    }
+
+    #[test]
+    fn param_mining_is_gated_on_building_url_search_params() {
+        // A plain Map `.get` in a script that never builds URL search parameters is not a URL param.
+        assert!(url_param_reads("const cache = new Map(); cache.get('ignored');").is_empty());
+        // Nor is it confused with a real URLSearchParams receiver elsewhere in the same file.
+        assert_eq!(
+            url_param_reads(
+                "const params = new URLSearchParams(location.search);\n\
+                 const cache = new Map(); cache.get('ignored'); params.get('state');"
+            ),
+            vec!["state".to_owned()]
+        );
+        // Chained and via `searchParams`, both forms are recovered.
+        assert_eq!(
+            url_param_reads("new URLSearchParams(location.search).get('q')"),
+            vec!["q".to_owned()]
+        );
+        assert_eq!(
+            url_param_reads("new URL(location.href).searchParams.get('next')"),
+            vec!["next".to_owned()]
+        );
     }
 
     #[test]

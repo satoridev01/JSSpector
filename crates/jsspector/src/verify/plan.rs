@@ -2210,7 +2210,7 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
     // (`const { baseUrl } = req.body`) names the specific field; keep it as a candidate so the ranking
     // prefers it over the vaguer whole-part entry. Without this the payload has no field to ride and
     // the handler's other required members are never sent.
-    if let Some(entry) = destructured_entry(finding, path) {
+    if let Some(entry) = destructured_entry(finding, path, source) {
         candidates.push(entry);
     }
     // Rank: a named vector first, the vaguer ones last.
@@ -2222,7 +2222,7 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
     candidates
         .into_iter()
         .next()
-        .or_else(|| destructured_entry(finding, path))
+        .or_else(|| destructured_entry(finding, path, source))
         .or_else(|| coarse_params_entry(finding, path, source))
         .or_else(|| source.and_then(|src| coarse_header_entry(finding, src)))
 }
@@ -3224,10 +3224,14 @@ fn header_value_of_key(source: &str, key: &str) -> Option<String> {
     None
 }
 
-/// `const { client_id } = request.query`: the source is the whole request object, and the sink
-/// argument is a variable the first trace step says was assigned from it. The destructured key
-/// is the parameter name.
-fn destructured_entry(finding: &Finding, path: &str) -> Option<Entry> {
+/// `const { client_id } = request.query`: the source is the whole request part, and the sink
+/// argument is a variable the first trace step says was assigned from it. The parameter name is
+/// recovered from how that local is bound in the handler source. Two shapes both record the same
+/// `assigned to `name`` trace step: a destructuring bind (`const { file } = req.query`), where the
+/// local *is* the parameter name; and a member read (`let subtitlePath = req.query.file`), where the
+/// parameter is the member accessed, not the local it is stored in. The member read is resolved from
+/// the handler source so the real parameter name (`file`) is driven, not the local (`subtitlePath`).
+fn destructured_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
     let part = strip_request_receiver(finding.source.expr.trim())?;
     if !matches!(part, "query" | "body" | "params") {
         return None;
@@ -3237,7 +3241,65 @@ fn destructured_entry(finding: &Finding, path: &str) -> Option<Entry> {
     if name.is_empty() || !name.bytes().all(is_ident) {
         return None;
     }
+    // A member read assigned to the local names the real parameter; prefer it over the local's own
+    // name, which equals the parameter only for a destructuring bind.
+    if let Some(src) = source
+        && let Some(entry) = request_field_assigned_to(src, name, part, path)
+    {
+        return Some(entry);
+    }
     source_entry(&format!("request.{part}.{name}"), path)
+}
+
+/// The request-part field a local is assigned from in the handler source: for `let subtitlePath =
+/// req.query.file`, the `file` of `req.query.<field>` (or `req.query['field']`). Scans every
+/// assignment whose target is `local` and returns the first whose right-hand side reads the given
+/// request `part` by a named member. `None` when the local is bound some other way (a bare
+/// destructuring of the whole part, a transform with no request access), leaving the caller to fall
+/// back to the local's own name.
+fn request_field_assigned_to(source: &str, local: &str, part: &str, path: &str) -> Option<Entry> {
+    for rhs in assignment_rhs(source, local) {
+        for accessor in request_accessors(rhs) {
+            let names_part = strip_request_receiver(&accessor)
+                .and_then(|chain| chain.split('.').next().map(str::to_owned))
+                .is_some_and(|first| first == part);
+            if names_part && let Some(entry) = source_entry(&accessor, path) {
+                return Some(entry);
+            }
+        }
+    }
+    None
+}
+
+/// The right-hand sides of assignments whose target is the identifier `local`: `local = <rhs>`,
+/// with or without a `let`/`const`/`var` keyword, each cut at the end of its statement. A comparison
+/// (`==`, `===`) or an arrow (`=>`) is not an assignment and is skipped.
+fn assignment_rhs<'a>(source: &'a str, local: &str) -> Vec<&'a str> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(local) {
+        let at = from + rel;
+        from = at + local.len();
+        let boundary_before = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident(*b));
+        let boundary_after = bytes.get(at + local.len()).is_none_or(|b| !is_ident(*b));
+        if !boundary_before || !boundary_after {
+            continue;
+        }
+        let mut i = at + local.len();
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') || matches!(bytes.get(i + 1), Some(b'=' | b'>')) {
+            continue;
+        }
+        let rhs_start = i + 1;
+        let end = source[rhs_start..]
+            .find(['\n', ';'])
+            .map_or(source.len(), |e| rhs_start + e);
+        out.push(&source[rhs_start..end]);
+    }
+    out
 }
 
 /// The request-access paths inside an expression: `path.join(ROOT, req.query.name)` yields
@@ -3976,6 +4038,33 @@ mod tests {
         assert_eq!(probe.method, Method::Get);
         assert_eq!(probe.path, "/api/files");
         assert_eq!(probe.entry, Entry::Query("name".to_owned()));
+    }
+
+    #[test]
+    fn a_coarse_query_member_read_drives_the_accessed_parameter_not_the_local() {
+        // The engine reports the coarse `req.query` as the source and the local the value is stored in
+        // (`subtitlePath`) as the sink argument. The real parameter is the member actually read
+        // (`req.query.file`), recovered from the handler source — not the local's own name.
+        let source = "router.get('/subtitles', (req, res) => { \
+            let subtitlePath = req.query.file; \
+            subtitlePath = decodeURIComponent(subtitlePath); \
+            return res.sendFile(subtitlePath, { dotfiles: 'allow' }); });";
+        let mut f = finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("GET /subtitles"),
+            "req.query",
+        );
+        f.sink.api = "res.sendFile".to_owned();
+        f.sink.arg = "subtitlePath".to_owned();
+        f.trace = vec![TraceStep {
+            file: None,
+            line: 1,
+            col: 1,
+            note: "assigned to `subtitlePath`".to_owned(),
+        }];
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::Query("file".to_owned()));
     }
 
     #[test]

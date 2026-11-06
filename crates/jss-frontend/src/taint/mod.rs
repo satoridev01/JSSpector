@@ -3060,6 +3060,24 @@ fn route_middleware_auth(expr: &Expression<'_>) -> Option<Auth> {
     }
 }
 
+/// Authentication named in a convention-router middleware declaration. Unlike positional route
+/// arguments, these declarations may use strings (`["withAuthentication"]`), so string values are
+/// middleware names rather than paths.
+fn declared_middleware_auth(expr: &Expression<'_>) -> Option<Auth> {
+    match expr.get_inner_expression() {
+        Expression::StringLiteral(literal) => {
+            literal.value.as_str().and_then(|name| m().auth_of(name))
+        }
+        Expression::ArrayExpression(list) => list
+            .elements
+            .iter()
+            .filter_map(ArrayExpressionElement::as_expression)
+            .filter_map(declared_middleware_auth)
+            .max(),
+        _ => route_middleware_auth(expr),
+    }
+}
+
 /// `require('x')` → `x`.
 fn require_spec(expr: &Expression<'_>) -> Option<String> {
     let Expression::CallExpression(call) = expr.get_inner_expression() else {
@@ -6648,6 +6666,25 @@ impl Walker<'_> {
             }
             Expression::ObjectExpression(object) => {
                 let mut taint = None;
+                // Convention routers can declare middleware beside their handler rather than pass
+                // it positionally: `{ useMiddlewares: ["withAuthentication"], fn(req) { ... } }`.
+                // Ground the handler's auth in those declared names just as route arguments are.
+                let configured_auth = object
+                    .properties
+                    .iter()
+                    .filter_map(|property| {
+                        let ObjectPropertyKind::ObjectProperty(property) = property else {
+                            return None;
+                        };
+                        matches!(
+                            prop_name(&property.key).as_deref(),
+                            Some("middleware" | "middlewares" | "useMiddlewares")
+                        )
+                        .then(|| declared_middleware_auth(&property.value))
+                        .flatten()
+                    })
+                    .max()
+                    .unwrap_or_default();
                 // `{ parameters, handler: async (args) => ... }`: an LLM tool.
                 let tool = tool_object(object);
                 // `{ name: 'run-sql', parameters, handler }`: an entry named by the tool, and its
@@ -6803,7 +6840,19 @@ impl Walker<'_> {
                                             });
                                         }
                                     }
-                                    self.expr_named(&p.value, env, name)
+                                    if configured_auth != Auth::NoneDetected
+                                        && name
+                                            .as_deref()
+                                            .is_some_and(|key| matches!(key, "fn" | "handler"))
+                                    {
+                                        let pending = self.pending_auth;
+                                        self.pending_auth = pending.max(configured_auth);
+                                        let value = self.expr_named(&p.value, env, name);
+                                        self.pending_auth = pending;
+                                        value
+                                    } else {
+                                        self.expr_named(&p.value, env, name)
+                                    }
                                 }
                             }
                         }
@@ -14542,6 +14591,12 @@ mod tests {
         assert_eq!(
             auth_of(
                 "fastify.post('/p', { onRequest: [fastify.authenticate] }, async req => { exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "defineRoute()({ useMiddlewares: ['withAuthentication'], fn: async (req, res) => { exec('ping ' + req.query.h); } });"
             ),
             vec![(Auth::User, Severity::Critical)]
         );

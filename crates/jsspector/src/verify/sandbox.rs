@@ -62,6 +62,11 @@ pub struct Session {
     /// succeed honestly (the uid/gid/port variables a privilege-dropping app reads). Seeded into
     /// every launch attempt.
     base_env: Vec<RequiredEnv>,
+    /// `NODE_PATH` for the launched module when its dependencies are installed in a sibling
+    /// application package that bundles it (see [`dependency_provider`]), pointing at that package's
+    /// `node_modules` so the module's bare `require(...)` resolves — the same resolution the real app
+    /// sets up for its bundled code. `None` when dependencies install in the launch directory itself.
+    node_path: Option<String>,
     torn_down: bool,
 }
 
@@ -109,7 +114,20 @@ impl Session {
         // directory. A standalone server launched from a manifest-less subdirectory draws its
         // dependencies from an ancestor package, so installing in the launch directory alone would
         // leave `require(...)` unresolved.
-        let install_rel = install_path(root, app_path);
+        let mut install_rel = install_path(root, app_path);
+        // A shared route/server module whose own tree declares none of the packages it imports draws
+        // its dependencies from a sibling application package that bundles it at build time (an
+        // Electron desktop app, an embedded mobile backend) rather than from an ancestor manifest.
+        // Install from that package and expose its `node_modules` through NODE_PATH — the same
+        // resolution the real app wires up for its bundled code — or `require(...)` in the mounted
+        // module stays unresolved and the app exits before it listens.
+        let node_path = entry_file
+            .and_then(|module| dependency_provider(root, &install_rel, module))
+            .and_then(|provider| {
+                let modules = format!("{}/node_modules", container_dir(&provider)?);
+                install_rel = provider;
+                Some(modules)
+            });
         let install_root = root.join(&install_rel);
         let install_workdir = container_dir(&install_rel)
             .ok_or_else(|| format!("unsupported install directory `{}`", install_rel.display()))?;
@@ -150,6 +168,7 @@ impl Session {
             nonce: 0,
             run_as,
             base_env,
+            node_path,
             torn_down: false,
         };
         if let Err(err) = session.boot() {
@@ -252,6 +271,13 @@ impl Session {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+        // Dependencies installed in a sibling package that bundles this module: point the module's
+        // module resolution at that package's `node_modules`, the way the real app does for its
+        // bundled code.
+        if let Some(node_path) = &self.node_path {
+            args.push("-e".to_owned());
+            args.push(format!("NODE_PATH={node_path}"));
+        }
         // An app that drops root at startup is run as the very uid/gid it drops to, so its
         // `setuid`/`setgid` are legal no-ops to the identity it already holds: the process ends up
         // unprivileged exactly as designed, with no capability added and nothing suppressed.
@@ -965,6 +991,282 @@ fn install_path(root: &std::path::Path, app_path: &std::path::Path) -> std::path
         };
     }
     app_path.to_path_buf()
+}
+
+/// Node's built-in modules, by the root segment that appears in an import specifier (`fs/promises`
+/// -> `fs`). Specifiers naming these are never installed from a registry, so they are not weighed
+/// when choosing a dependency provider.
+const NODE_BUILTINS: [&str; 41] = [
+    "assert",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "timers",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "worker_threads",
+    "zlib",
+];
+
+/// The quoted specifiers a JavaScript source imports through `require(...)`, `import(...)` or a
+/// static `from '...'`. A deliberately simple textual scan: only enough to recognize which packages
+/// a module pulls in. Specifiers that are not real imports (text inside a comment, say) are filtered
+/// out later by intersecting with declared dependencies.
+fn import_specifiers(src: &str) -> Vec<String> {
+    const MARKERS: [&str; 3] = ["require(", "import(", "from"];
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    for marker in MARKERS {
+        let mut from = 0;
+        while let Some(rel) = src[from..].find(marker) {
+            let mut i = from + rel + marker.len();
+            from = i;
+            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            let Some(&quote) = bytes.get(i) else {
+                continue;
+            };
+            if !matches!(quote, b'\'' | b'"' | b'`') {
+                continue;
+            }
+            let start = i + 1;
+            let Some(end) = src[start..].find(quote as char) else {
+                continue;
+            };
+            let spec = &src[start..start + end];
+            if !spec.is_empty() {
+                out.push(spec.to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// The package name a specifier resolves to: its first path segment, or the first two for a scoped
+/// package (`@scope/name/sub` -> `@scope/name`).
+fn package_root(spec: &str) -> String {
+    if let Some(scoped) = spec.strip_prefix('@') {
+        let mut parts = scoped.splitn(3, '/');
+        let scope = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        if scope.is_empty() || name.is_empty() {
+            String::new()
+        } else {
+            format!("@{scope}/{name}")
+        }
+    } else {
+        spec.split('/').next().unwrap_or("").to_owned()
+    }
+}
+
+/// The registry package names a JavaScript source imports: bare specifiers only (not relative or
+/// absolute paths, not `node:` or built-in modules), reduced to their package root.
+fn bare_specifiers(src: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for spec in import_specifiers(src) {
+        if spec.starts_with('.') || spec.starts_with('/') || spec.starts_with("node:") {
+            continue;
+        }
+        let pkg = package_root(&spec);
+        if pkg.is_empty() || NODE_BUILTINS.contains(&pkg.as_str()) {
+            continue;
+        }
+        out.insert(pkg);
+    }
+    out
+}
+
+/// Every registry package name imported anywhere in a source subtree (bounded by [`app_source_files`]).
+fn subtree_specifiers(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for src in app_source_files(dir) {
+        out.extend(bare_specifiers(&src));
+    }
+    out
+}
+
+/// Every dependency a package manifest declares, across the runtime, development, optional and peer
+/// sections — the names that will have a directory under its `node_modules` after an install.
+fn manifest_declared_deps(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else {
+        return out;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return out;
+    };
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
+        if let Some(obj) = json.get(section).and_then(serde_json::Value::as_object) {
+            out.extend(obj.keys().cloned());
+        }
+    }
+    out
+}
+
+/// Whether a package runs an install-time lifecycle script (`preinstall`/`install`/`postinstall`/
+/// `prepare`/`prepack`). Such a script often needs the real deployment to succeed (an Electron app
+/// rebuilds native modules, downloads platform binaries), so a package that only lends its
+/// dependencies to a bundled module is a poor install source when it carries one.
+fn has_install_lifecycle(dir: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    json.get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            ["preinstall", "install", "postinstall", "prepare", "prepack"]
+                .iter()
+                .any(|name| {
+                    scripts
+                        .get(*name)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|command| !command.trim().is_empty())
+                })
+        })
+}
+
+/// Every package directory in the repo (relative to `root`), by a bounded breadth-limited walk that
+/// skips `node_modules` and build output.
+fn package_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    const SKIP_DIRS: [&str; 5] = ["node_modules", ".git", "dist", "build", "coverage"];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 5 || out.len() >= 200 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref()) {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if entry.file_name() == "package.json"
+                && let Ok(rel) = dir.strip_prefix(root)
+            {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+    out
+}
+
+/// The package that supplies the dependencies for a module whose own install directory declares none
+/// of them. A repo can hold shared route/server modules in a directory with no manifest of its own
+/// (`backend/`), whose dependencies are declared — and bundled at build time — by a sibling
+/// application package (an Electron desktop app, an embedded mobile backend). Launching that module
+/// then needs those dependencies on its module path, exactly as the real app arranges. Returns the
+/// sibling package to install from (and whose `node_modules` the caller exposes via `NODE_PATH`), or
+/// `None` when the install directory already declares what the module imports, or no clean sibling
+/// does.
+///
+/// A provider must declare every package the module directly imports, must come from outside the
+/// module's own (manifest-less) subtree, and must install without a lifecycle script that needs the
+/// real deployment. Among those, the one whose dependencies cover the most of the subtree's imports
+/// wins, then the tightest dependency set, then the shortest path — a deterministic choice.
+fn dependency_provider(
+    root: &std::path::Path,
+    install_rel: &std::path::Path,
+    module_rel: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let module_src = std::fs::read_to_string(root.join(module_rel)).ok()?;
+    let direct = bare_specifiers(&module_src);
+    if direct.is_empty() {
+        return None;
+    }
+    let install_deps = manifest_declared_deps(&root.join(install_rel));
+    if direct.iter().all(|dep| install_deps.contains(dep)) {
+        return None;
+    }
+    // The module's own manifest-less subtree: the first path segment below the install directory.
+    let relative = module_rel.strip_prefix(install_rel).ok()?;
+    let std::path::Component::Normal(first) = relative.components().next()? else {
+        return None;
+    };
+    let subtree = install_rel.join(first);
+    let needed = subtree_specifiers(&root.join(&subtree));
+
+    let mut best: Option<(usize, usize, std::path::PathBuf)> = None;
+    for dir in package_dirs(root) {
+        if dir == *install_rel || dir.starts_with(&subtree) {
+            continue;
+        }
+        if has_install_lifecycle(&root.join(&dir)) {
+            continue;
+        }
+        let deps = manifest_declared_deps(&root.join(&dir));
+        if !direct.iter().all(|dep| deps.contains(dep)) {
+            continue;
+        }
+        let coverage = needed.iter().filter(|dep| deps.contains(*dep)).count();
+        let total = deps.len();
+        let better = match &best {
+            None => true,
+            Some((best_cov, best_total, best_dir)) => {
+                coverage > *best_cov
+                    || (coverage == *best_cov && total < *best_total)
+                    || (coverage == *best_cov
+                        && total == *best_total
+                        && dir.as_os_str().len() < best_dir.as_os_str().len())
+                    || (coverage == *best_cov
+                        && total == *best_total
+                        && dir.as_os_str().len() == best_dir.as_os_str().len()
+                        && dir < *best_dir)
+            }
+        };
+        if better {
+            best = Some((coverage, total, dir));
+        }
+    }
+    best.map(|(_, _, dir)| dir)
 }
 
 fn db_service(app_root: &std::path::Path) -> bool {
@@ -3836,6 +4138,63 @@ mod tests {
         assert_eq!(
             start_command(root, Some(path("src/server/api.js"))).as_deref(),
             Some(r#"["node","/jss-express-host.mjs","src/server/api.js"]"#)
+        );
+    }
+
+    #[test]
+    fn a_shared_module_draws_dependencies_from_a_clean_bundling_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        // A repo root that launches nothing and declares no dependencies.
+        write(root, "package.json", r#"{"private":true}"#);
+        // A shared backend module that imports packages its own tree declares nowhere.
+        write(
+            root,
+            "backend/routes/media.js",
+            "const express = require('express');\n\
+             const JSZip = require('jszip');\n\
+             const router = express.Router();\n\
+             router.get('/x', (req, res) => res.end('ok'));\n\
+             module.exports = router;\n",
+        );
+        // A desktop package that bundles the backend but rebuilds native modules on install — a poor
+        // install source because its lifecycle script needs the real deployment.
+        write(
+            root,
+            "desktop/package.json",
+            r#"{"name":"desktop","scripts":{"postinstall":"electron-builder install-app-deps"},
+                "dependencies":{"express":"^5","jszip":"^3","electron-updater":"^6"},
+                "devDependencies":{"electron":"^30"}}"#,
+        );
+        // A mobile backend package that declares the same runtime dependencies and installs cleanly.
+        write(
+            root,
+            "mobile/nodejs/package.json",
+            r#"{"name":"mobile-backend","private":true,
+                "dependencies":{"express":"^4","jszip":"^3"}}"#,
+        );
+
+        // The clean package is chosen over the one with an install lifecycle script.
+        let provider = dependency_provider(root, path(""), path("backend/routes/media.js"));
+        assert_eq!(provider.as_deref(), Some(path("mobile/nodejs")));
+
+        // When the launch directory already declares the imports, no provider is needed.
+        write(
+            root,
+            "self/package.json",
+            r#"{"dependencies":{"express":"^4","jszip":"^3"}}"#,
+        );
+        write(
+            root,
+            "self/routes.js",
+            "const express = require('express');\n\
+             const JSZip = require('jszip');\n\
+             module.exports = express.Router();\n",
+        );
+        assert_eq!(
+            dependency_provider(root, path("self"), path("self/routes.js")),
+            None
         );
     }
 

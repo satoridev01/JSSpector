@@ -1555,6 +1555,7 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-plugin-host.mjs\n\
          RUN echo {} | base64 -d > /jss-express-host.mjs\n\
          RUN echo {} | base64 -d > /jss-lifecycle-host.mjs\n\
+         RUN echo {} | base64 -d > /jss-route-host.mjs\n\
          ENV NODE_EXTRA_CA_CERTS=/jss-marker.crt\n\
          ENV PORT={port}\n\
          ENV HOST=0.0.0.0\n\
@@ -1568,6 +1569,7 @@ fn dockerfile(
         base64(PLUGIN_HOST_JS.as_bytes()),
         base64(EXPRESS_HOST_JS.as_bytes()),
         base64(LIFECYCLE_HOST_JS.as_bytes()),
+        base64(ROUTE_HOST_JS.as_bytes()),
     )
 }
 
@@ -2048,7 +2050,10 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
     if is_plugin_handler(&root.join(&file)) {
         return Some(plugin_host_command(&file));
     }
-    is_lifecycle_server_module(&root.join(&file)).then(|| lifecycle_host_command(&file))
+    if is_lifecycle_server_module(&root.join(&file)) {
+        return Some(lifecycle_host_command(&file));
+    }
+    is_route_handler_module(&root.join(&file)).then(|| route_host_command(&file))
 }
 
 /// Whether the package manifest's only selectable launch is a CLI dispatcher `main` file. Mirrors
@@ -2191,6 +2196,166 @@ fn is_lifecycle_server_module(path: &std::path::Path) -> bool {
     let namespaces = src.contains(".resource(");
     let is_factory_module = src.contains("module.exports") || src.contains("export default");
     namespaces && registers_route && is_factory_module
+}
+
+/// The launch command that mounts a file-system route handler module through the route host shim
+/// ([`ROUTE_HOST_JS`]): the shim imports the module, takes the request handler it exports (a bare
+/// handler function, or the `fn`/`handler` of a descriptor object), and serves it over HTTP on
+/// `PORT`.
+fn route_host_command(file: &str) -> String {
+    format!("[\"node\",\"/jss-route-host.mjs\",\"{file}\"]")
+}
+
+/// HTTP method names a convention-based file-system router uses as the route file's own name.
+const ROUTE_METHOD_STEMS: [&str; 10] = [
+    "get", "post", "put", "patch", "delete", "head", "options", "all", "any", "ws",
+];
+
+/// Whether a JavaScript file is a file-system route handler module: a module inside a `routes` tree
+/// whose own file name is an HTTP method (`routes/users/get.js`, `routes/foo/post.js`) and whose
+/// default export is the request handler for that method — a bare `(req, res, ctx) => ...` function,
+/// or a descriptor object that carries the handler under `fn`/`handler` (alongside optional metadata
+/// such as the contexts it declares). A convention-based router (linebridge, Nitro/h3 and similar)
+/// discovers these files, derives the route path from their directory and the method from their file
+/// name, and invokes the handler per request; the file publishes no server of its own (no
+/// `.listen(`), so it is launched through the route host shim, which reconstructs that contract on a
+/// throwaway server rather than running the module directly (which would only evaluate and exit).
+/// Matched after the self-contained-server, Express-router, plug-in and lifecycle shapes.
+fn is_route_handler_module(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    if !ROUTE_METHOD_STEMS.contains(&stem) {
+        return false;
+    }
+    // The file-system router convention: the handler file lives within a `routes` directory tree.
+    let in_routes = path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if name.eq_ignore_ascii_case("routes"))
+    });
+    if !in_routes {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    exports_route_handler(&src)
+}
+
+/// Whether a module's default export is a request handler the route host shim can mount: a function
+/// (`export default (req, res) => ...`, `module.exports = function (req, res) {...}`), or an object
+/// literal carrying the handler under an `fn`/`handler` property. A plain data export (a config
+/// object with neither) is not matched.
+fn exports_route_handler(src: &str) -> bool {
+    for marker in ["export default", "module.exports"] {
+        let Some(at) = src.find(marker) else {
+            continue;
+        };
+        let mut rhs = src[at + marker.len()..].trim_start();
+        if marker == "module.exports" {
+            let Some(stripped) = rhs.strip_prefix('=') else {
+                continue;
+            };
+            rhs = stripped.trim_start();
+        }
+        // A bare function handler.
+        if rhs.starts_with("function")
+            || rhs.starts_with("async")
+            || rhs.starts_with('(')
+            || rhs.starts_with("() =>")
+        {
+            return true;
+        }
+        // A descriptor object exposing the handler under `fn`/`handler`.
+        if rhs.starts_with('{')
+            && let Some(object) = balanced_object(rhs)
+        {
+            for key in ["fn", "handler"] {
+                if object_has_function_property(&object, key) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The `{ ... }` object literal text at the start of `rhs` (including the braces), by brace matching
+/// that skips string and template literals. `None` when `rhs` does not open with a balanced object.
+fn balanced_object(rhs: &str) -> Option<String> {
+    let bytes = rhs.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'\'' | b'"' | b'`' => quote = Some(b),
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rhs[..=i].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether an object literal's text declares a property named `key` whose value is a function: the
+/// `key:` form (`fn: async (req, res) => ...`, `handler: function () {}`) or the method shorthand
+/// (`fn(req, res) {}`, `async handler() {}`). A non-function property of the same name is not matched.
+fn object_has_function_property(object: &str, key: &str) -> bool {
+    let bytes = object.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = object[from..].find(key) {
+        let at = from + rel;
+        from = at + key.len();
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let before_ok = at == 0 || bytes.get(at - 1).is_none_or(|b| !ident(*b));
+        if !before_ok {
+            continue;
+        }
+        let after = object[at + key.len()..].trim_start();
+        // `key: <function>`
+        if let Some(value) = after.strip_prefix(':') {
+            let value = value.trim_start();
+            if value.starts_with("function") || value.starts_with("async") || value.starts_with('(')
+            {
+                return true;
+            }
+            continue;
+        }
+        // `key(...) {` or `async key(...) {` method shorthand.
+        if after.starts_with('(') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether a JavaScript file is a command-line dispatcher: it drives a CLI argument parser
@@ -2423,7 +2588,9 @@ pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::Pat
     // self-contained server, or a lifecycle server module the host shim can launch, so it does not
     // need a start script to be exercised. Its own directory is also where its dependencies are
     // declared, so installing there resolves the module's `require(...)`.
-    if (is_standalone_server(&root.join(file)) || is_lifecycle_server_module(&root.join(file)))
+    if (is_standalone_server(&root.join(file))
+        || is_lifecycle_server_module(&root.join(file))
+        || is_route_handler_module(&root.join(file)))
         && let Some(parent) = file.parent()
     {
         return parent.to_path_buf();
@@ -3087,6 +3254,120 @@ http.createServer((req, res) => {
     res.statusCode = 404; res.end('no route');
   });
 }).listen(port, '0.0.0.0', () => console.error('[lifecycle-host] listening on ' + port + ' routes=' + routes.map((r) => r.method + ' ' + r.path).join(',')));
+"#;
+
+/// Mounts a file-system route handler module (linebridge, Nitro/h3 and similar conventions): a
+/// module whose default export is the request handler for a single route+method — a bare
+/// `(req, res, ctx) => ...` function, or a descriptor object carrying the handler under `fn`/`handler`
+/// (alongside metadata such as the contexts it declares). The shim imports the target, takes that
+/// handler, and serves it on `PORT`, reconstructing the request/response/context contract the
+/// framework would supply: a parsed `req` (query, body, params, headers), an Express-compatible `res`,
+/// and a permissive context stub whose method calls resolve to `undefined` — so a cache/lookup read is
+/// falsy and the handler proceeds to its real work, never a truthy placeholder that would divert
+/// control flow. The handler's own return value is serialized as the response, mirroring the auto-send
+/// such routers perform. It fabricates nothing: a verification still requires the real canary to flow
+/// through the module's own handler into the real sink. Dependency-free (core `http`); imports the
+/// target with dynamic `import()`, so it mounts ESM and CommonJS modules alike.
+const ROUTE_HOST_JS: &str = r#"
+import http from 'node:http';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+const port = Number(process.env.PORT || 3000);
+const target = path.resolve(process.cwd(), process.argv[2] || '');
+
+let handler = null;
+try {
+  const mod = await import(pathToFileURL(target).href);
+  const def = (mod && mod.default != null) ? mod.default : mod;
+  if (typeof def === 'function') handler = def;
+  else if (def && typeof def === 'object') {
+    if (typeof def.fn === 'function') handler = def.fn;
+    else if (typeof def.handler === 'function') handler = def.handler;
+  }
+} catch (e) {
+  console.error('[route-host] load error: ' + (e && e.message));
+}
+if (!handler) console.error('[route-host] no handler export found');
+
+// A permissive context stub: every property access yields another stub, and calling any stubbed
+// method yields `undefined` (so a cache/lookup read is falsy and the handler takes its real
+// work path), never a truthy placeholder that could divert control flow. It reaches no network and
+// fabricates no data; the handler's own sink is what a verification must exercise.
+function stub() {
+  return new Proxy(function () { return undefined; }, {
+    get(_t, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === Symbol.toPrimitive) return () => '';
+      if (prop === Symbol.iterator || prop === Symbol.asyncIterator) return undefined;
+      return stub();
+    },
+    apply() { return undefined; },
+    construct() { return stub(); },
+  });
+}
+
+function decorate(res) {
+  res.status = (c) => { res.statusCode = c; return res; };
+  res.set = res.header = (k, v) => {
+    if (k && typeof k === 'object') { for (const n in k) { try { res.setHeader(n, k[n]); } catch (e) {} } }
+    else { try { res.setHeader(k, v); } catch (e) {} }
+    return res;
+  };
+  res.type = (t) => { try { res.setHeader('Content-Type', t); } catch (e) {} return res; };
+  res.json = (obj) => { try { if (!res.headersSent) res.setHeader('Content-Type', 'application/json'); } catch (e) {} res.end(JSON.stringify(obj)); return res; };
+  res.send = (b) => {
+    if (b !== null && typeof b === 'object' && !Buffer.isBuffer(b)) return res.json(b);
+    res.end(b == null ? '' : (Buffer.isBuffer(b) ? b : String(b)));
+    return res;
+  };
+  res.sendStatus = (c) => { res.statusCode = c; res.end(String(c)); return res; };
+  res.redirect = (loc) => { res.statusCode = 302; try { res.setHeader('Location', loc); } catch (e) {} res.end(); return res; };
+  return res;
+}
+
+function parseBody(req, raw) {
+  if (!raw) return {};
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  try {
+    if (ct.indexOf('application/x-www-form-urlencoded') >= 0) return Object.fromEntries(new URLSearchParams(raw));
+    return JSON.parse(raw);
+  } catch (e) { return raw; }
+}
+
+http.createServer((req, res) => {
+  decorate(res);
+  req.get = req.header = (h) => req.headers[String(h).toLowerCase()];
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch (e) { res.statusCode = 400; res.end(); return; }
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => { size += c.length; if (size <= 5 * 1024 * 1024) chunks.push(c); });
+  req.on('error', () => { try { res.statusCode = 400; res.end(); } catch (e) {} });
+  req.on('end', async () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    req.rawBody = raw;
+    req.body = parseBody(req, raw);
+    req.query = Object.fromEntries(u.searchParams);
+    req.params = {};
+    req.path = u.pathname;
+    if (!handler) { res.statusCode = 404; res.end('no handler'); return; }
+    try {
+      const result = await handler(req, res, stub());
+      if (!res.writableEnded) {
+        if (res.headersSent) res.end();
+        else if (result === undefined || result === null) res.end();
+        else if (typeof result === 'object' && !Buffer.isBuffer(result)) res.json(result);
+        else res.send(result);
+      }
+    } catch (e) {
+      try { if (!res.headersSent) res.statusCode = 502; if (!res.writableEnded) res.end(); } catch (x) {}
+    }
+  });
+}).listen(port, '0.0.0.0', () => console.error('[route-host] listening on ' + port));
 "#;
 
 /// Sends one request to the app on localhost and prints the response body. Reads its spec from
@@ -4285,6 +4566,68 @@ mod tests {
         // The non-server helper, even though it exists, is never launched this way.
         assert_eq!(app_dir(root, path("tools/viewer/app.js")), path(""));
         assert_eq!(start_command(&root.join(&app), Some(path("app.js"))), None);
+    }
+
+    #[test]
+    fn a_filesystem_route_handler_module_is_hosted_when_no_manifest_can_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        // A convention-based file-system route: method as the file name, under a `routes` tree, a
+        // descriptor object exporting the handler under `fn`. No launchable manifest anywhere.
+        write(
+            root,
+            "services/api/routes/query_url/get.js",
+            "export default {\n\
+             \tuseContexts: [\"redis\"],\n\
+             \tfn: async (req, res, ctx) => {\n\
+             \t\tconst url = req.query.url\n\
+             \t\treturn await fetch(url, { method: \"HEAD\" })\n\
+             \t},\n\
+             }\n",
+        );
+        // A bare-function handler form under the same convention.
+        write(
+            root,
+            "services/api/routes/ping/get.js",
+            "export default () => ({ ok: true })\n",
+        );
+        // A plain data module whose file name is a method but exports no handler is not matched.
+        write(
+            root,
+            "services/api/routes/config/get.js",
+            "export default { timeout: 5000 }\n",
+        );
+        // A method-named module outside any `routes` tree is not matched.
+        write(
+            root,
+            "lib/get.js",
+            "export default (req, res) => res.end()\n",
+        );
+
+        assert!(is_route_handler_module(
+            &root.join("services/api/routes/query_url/get.js")
+        ));
+        assert!(is_route_handler_module(
+            &root.join("services/api/routes/ping/get.js")
+        ));
+        assert!(!is_route_handler_module(
+            &root.join("services/api/routes/config/get.js")
+        ));
+        assert!(!is_route_handler_module(&root.join("lib/get.js")));
+
+        // The finding's own directory serves it, and it is launched through the route host shim.
+        let app = app_dir(root, path("services/api/routes/query_url/get.js"));
+        assert_eq!(app, path("services/api/routes/query_url"));
+        assert_eq!(
+            start_command(&root.join(&app), Some(path("get.js"))).as_deref(),
+            Some(r#"["node","/jss-route-host.mjs","get.js"]"#)
+        );
+        // The data module, even though it exists, is never launched this way.
+        assert_eq!(
+            app_dir(root, path("services/api/routes/config/get.js")),
+            path("")
+        );
     }
 
     #[test]

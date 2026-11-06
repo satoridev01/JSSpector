@@ -337,10 +337,17 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                 }
                 return out;
             }
-            if probe.entry == Entry::Url && probe.class == VulnClass::PathTraversal {
-                // The request URL is parsed and the file path is read from one of its query
-                // parameters (`const u = new URL(req.url); const p =
-                // Object.fromEntries(u.searchParams); readFile(p.file)`), so the climbing payload
+            if probe.entry == Entry::Url
+                && matches!(
+                    probe.class,
+                    VulnClass::PathTraversal
+                        | VulnClass::CommandInjection
+                        | VulnClass::CodeInjection
+                )
+            {
+                // The request URL is parsed and the tainted value is read from one of its query
+                // parameters (`const u = new URL(req.url); const owner = u.searchParams.get('owner')`,
+                // `const p = Object.fromEntries(u.searchParams); readFile(p.file)`), so the payload
                 // never reaches the sink as the request path. Send each payload in each mined query
                 // parameter, under each path the handler dispatches on, alongside the path form.
                 let mut out = vec![place(probe, verb, &value, signal.clone())];
@@ -1586,6 +1593,33 @@ mod tests {
         );
         // The payload value is the marker URL, never a target-specific host.
         assert!(a.iter().all(|x| !x.target.contains("127.0.0.1")));
+    }
+
+    #[test]
+    fn a_url_sourced_command_injection_rides_each_query_param_under_the_gate() {
+        // The request URL is parsed and the tainted value is read from a query parameter the handler
+        // dispatches to, so the shell payload must ride that parameter under the gate path rather
+        // than the raw request path.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(VulnClass::CommandInjection, "/{wildcard}", Entry::Url);
+        p.gate_paths = vec!["/api/github/repos".to_owned()];
+        p.url_query_params = vec!["owner".to_owned()];
+
+        let a = attempts(&p, &canary, 1);
+        assert!(
+            a.iter()
+                .any(|x| x.target.starts_with("/api/github/repos?owner=")),
+            "no query-param command-injection attempt: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
+        // A separator-bearing payload rides that parameter, percent-encoded so the query survives.
+        assert!(
+            a.iter()
+                .any(|x| x.target.starts_with("/api/github/repos?owner=")
+                    && x.target.contains("touch")),
+            "the injected command never reaches the mined query parameter: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
     }
 
     #[test]

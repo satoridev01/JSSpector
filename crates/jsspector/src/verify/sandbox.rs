@@ -76,18 +76,22 @@ impl Session {
     /// here into a skip reason for every drivable finding.
     #[cfg(test)]
     pub fn start(root: &std::path::Path) -> Result<Self, String> {
-        Self::start_in(root, std::path::Path::new(""), None)
+        Self::start_in(root, std::path::Path::new(""), None, &[])
     }
 
     /// Like [`Self::start`], but launches the package at `app` (relative to `root`, as chosen by
     /// [`app_dir`]) while the whole repo stays in the image, so the app can still import files
     /// outside its own directory. `entry_file` (relative to `root`) is the finding's own source
     /// file, used as the launch target when the app has no launchable manifest but the file is a
-    /// self-contained server.
+    /// self-contained server. `gating_sources` are the source texts of the sink's own module and the
+    /// modules it imports: any external-service credential they read by name (a GitHub/API token the
+    /// handler requires before it shells out) is reproduced as a configured deployment value so the
+    /// sink's credential-gated branch is active (see [`credential_env`]).
     pub fn start_in(
         root: &std::path::Path,
         app_path: &std::path::Path,
         entry_file: Option<&std::path::Path>,
+        gating_sources: &[String],
     ) -> Result<Self, String> {
         let id = run_id();
         let canary = Canary::new(format!("{id}{}", short_rand()))
@@ -151,10 +155,20 @@ impl Session {
         // An app that drops root at startup needs a matching runtime user and the uid/gid/port
         // variables its deployment supplies; discover them from its own source so the privilege drop
         // runs honestly in the sandbox instead of crashing on an unset/undroppable id.
-        let (run_as, base_env) = match privilege_drop_fixture(&app_root, port) {
+        let (run_as, mut base_env) = match privilege_drop_fixture(&app_root, port) {
             Some(fixture) => (Some(fixture.run_as), fixture.env),
             None => (None, Vec::new()),
         };
+        // A sink reached only when the deployment has configured an external-service credential (a
+        // GitHub/API token the handler requires before it shells out) is a configuration precondition,
+        // not input neutralization: reproduce it honestly by setting that credential to a strong
+        // random filler, so the credential-gated branch is live. A random value can only enable a
+        // "credential configured" path, never match a real secret or relax an authentication check.
+        for cred in credential_env(gating_sources) {
+            if base_env.iter().all(|existing| existing.name != cred.name) {
+                base_env.push(cred);
+            }
+        }
 
         let mut session = Self {
             tag,
@@ -213,8 +227,11 @@ impl Session {
         // (see [`required_env`]), a few times at most.
         let mut env: Vec<RequiredEnv> = self.base_env.clone();
         let mut stub_missing_modules = false;
+        // Directories the app tried to write into on startup before their parent existed
+        // (see [`missing_write_dir`]); mounted as empty writable scratch on the next attempt.
+        let mut scratch_dirs: Vec<String> = Vec::new();
         for _ in 0..5 {
-            self.run_app(&env, stub_missing_modules)?;
+            self.run_app(&env, stub_missing_modules, &scratch_dirs)?;
             let err = match self.wait_until_listening() {
                 Ok(port) => {
                     self.port = port;
@@ -228,18 +245,29 @@ impl Session {
                 .filter(|wanted| env.iter().all(|have| have.name != wanted.name))
                 .collect();
             let enable_module_stub = !stub_missing_modules && missing_bare_module(&err);
-            if missing.is_empty() && !enable_module_stub {
+            let new_dir = missing_write_dir(&err).filter(|dir| !scratch_dirs.contains(dir));
+            if missing.is_empty() && !enable_module_stub && new_dir.is_none() {
                 return Err(err);
             }
             let _ = docker(&["rm", "-f", &self.app]);
             env.extend(missing);
             stub_missing_modules |= enable_module_stub;
+            if let Some(dir) = new_dir {
+                scratch_dirs.push(dir);
+            }
         }
         Err("the app still could not start after five launch attempts".to_owned())
     }
 
-    /// Starts the app container, with `env` on top of the variables every app gets.
-    fn run_app(&self, env: &[RequiredEnv], stub_missing_modules: bool) -> Result<(), String> {
+    /// Starts the app container, with `env` on top of the variables every app gets, and
+    /// `scratch_dirs` mounted as empty writable tmpfs (directories the app writes into on startup
+    /// before creating them; see [`missing_write_dir`]).
+    fn run_app(
+        &self,
+        env: &[RequiredEnv],
+        stub_missing_modules: bool,
+        scratch_dirs: &[String],
+    ) -> Result<(), String> {
         // The app: on the private network, hardened, its scratch space in tmpfs, no extra
         // privileges, bounded memory, CPUs and processes.
         let mut args: Vec<String> = [
@@ -297,6 +325,12 @@ impl Session {
             }
             args.push("-e".to_owned());
             args.push(format!("{}={}", var.name, var.value));
+        }
+        // A directory the app writes into at startup before ensuring it exists: its own empty,
+        // writable scratch space, so the app's own state seeding succeeds instead of crashing.
+        for dir in scratch_dirs {
+            args.push("--tmpfs".to_owned());
+            args.push(dir.clone());
         }
         for (name, value) in &self.db_env {
             args.push("-e".to_owned());
@@ -1611,6 +1645,105 @@ fn missing_bare_module(log: &str) -> bool {
             })
         })
     })
+}
+
+/// When startup fails because the app tried to create or extend a file (or make a directory) but an
+/// ancestor directory did not exist (`ENOENT` on a write), the directory the app expected its
+/// deployment to provide as writable state (`$HOME/.app/.env` seeded before `$HOME/.app` is made).
+/// The sandbox mounts it as empty writable scratch on the next attempt — the same neutral directory
+/// a `_DIR` environment variable gets. Only a *write* qualifies: conjuring a directory for a failed
+/// *read* could hide a file the app requires, so a read `ENOENT` is left as a genuine failure.
+/// Returns the directory to create, or `None` when the failure is something else.
+fn missing_write_dir(log: &str) -> Option<String> {
+    if !log.contains("ENOENT") {
+        return None;
+    }
+    // A write-family fs operation must appear in the failure: the app meant to produce a file or
+    // directory, not consume one.
+    const WRITE_OPS: [&str; 11] = [
+        "writeFileSync",
+        "appendFileSync",
+        "writeFile",
+        "appendFile",
+        "mkdirSync",
+        "mkdir",
+        "createWriteStream",
+        "copyFileSync",
+        "copyFile",
+        "renameSync",
+        "symlinkSync",
+    ];
+    if !WRITE_OPS.iter().any(|op| log.contains(op)) {
+        return None;
+    }
+    // The failing path is the last single-quoted segment on the message line (`... open
+    // '/root/.app/.env'`; a rename/copy reports source then destination, and the destination —
+    // last — is the one being written).
+    let line = log
+        .lines()
+        .find(|line| line.contains("ENOENT: no such file or directory"))?;
+    let mut path: Option<&str> = None;
+    let mut rest = line;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('\'') else {
+            break;
+        };
+        path = Some(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    let path = path?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let parent = std::path::Path::new(path).parent()?;
+    if parent.as_os_str().is_empty() || parent == std::path::Path::new("/") {
+        return None;
+    }
+    Some(parent.to_string_lossy().into_owned())
+}
+
+/// External-service credential environment variables a sink is gated on, read by name from the
+/// sink's own module and the modules it imports (`gating_sources`). Each is given a strong random
+/// filler so the handler's "a credential is configured" branch — the one the sink sits behind — is
+/// active, reproducing a deployment that configured the integration. Only credential-named variables
+/// qualify (`*_TOKEN`, `*_PAT`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIAL(S)`); a random value can only
+/// enable a configured-credential path, never match a real secret or relax an authentication check,
+/// and the sandbox's own variables (`NODE_*`/`NPM_*`) are never touched.
+fn credential_env(gating_sources: &[String]) -> Vec<RequiredEnv> {
+    let mut out: Vec<RequiredEnv> = Vec::new();
+    for src in gating_sources {
+        for name in env_var_names(src) {
+            if credential_name(&name) && out.iter().all(|existing| existing.name != name) {
+                out.push(RequiredEnv {
+                    name,
+                    value: STRONG_FILLER_SECRET.to_owned(),
+                    directory: false,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Whether an environment variable name denotes an external-service credential the sandbox may set
+/// to a filler to satisfy a configuration precondition: an `_`-delimited segment of `TOKEN`, `PAT`,
+/// `SECRET`, `PASSWORD`, `CREDENTIAL` or `CREDENTIALS` (so `GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_PAT`
+/// qualify but `PATH` does not). Never a variable the sandbox owns.
+fn credential_name(name: &str) -> bool {
+    const KINDS: [&str; 6] = [
+        "TOKEN",
+        "PAT",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "CREDENTIALS",
+    ];
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("NODE_") || upper.starts_with("NPM_") {
+        return false;
+    }
+    upper.split('_').any(|segment| KINDS.contains(&segment))
 }
 
 /// A non-secret value long enough to satisfy startup checks for secret-like environment variables.
@@ -3462,6 +3595,64 @@ mod tests {
         assert!(!missing_bare_module(
             "Error [ERR_MODULE_NOT_FOUND]: an import failed"
         ));
+    }
+
+    /// A startup failure where the app writes a file before creating its directory yields the
+    /// directory to mount as scratch; a failed read, or any non-write failure, yields nothing.
+    #[test]
+    fn missing_write_dir_only_fires_for_a_failed_startup_write() {
+        let write_log = "node:fs:2430\n    return binding.writeFileUtf8(\n\
+            Error: ENOENT: no such file or directory, open '/root/.app/.env'\n\
+            \x20   at Object.writeFileSync (node:fs:2430:20)\n\
+            \x20   at Object.appendFileSync (node:fs:2512:6)\n\
+            \x20 code: 'ENOENT', syscall: 'open', path: '/root/.app/.env'\n";
+        assert_eq!(missing_write_dir(write_log).as_deref(), Some("/root/.app"));
+
+        let mkdir_log = "Error: ENOENT: no such file or directory, mkdir '/var/data/cache'\n\
+            \x20   at Object.mkdirSync (node:fs:1372:26)\n";
+        assert_eq!(missing_write_dir(mkdir_log).as_deref(), Some("/var/data"));
+
+        // A failed read must not conjure a directory that could hide a required file.
+        let read_log = "Error: ENOENT: no such file or directory, open '/app/config/settings.json'\n\
+            \x20   at Object.readFileSync (node:fs:2345:20)\n";
+        assert_eq!(missing_write_dir(read_log), None);
+
+        // A missing module, or the filesystem root, is not a scratch directory.
+        assert_eq!(
+            missing_write_dir("Error: Cannot find module 'express'"),
+            None
+        );
+        let root_log = "Error: ENOENT: no such file or directory, open '/.env'\n\
+            \x20   at Object.writeFileSync (node:fs:2430:20)\n";
+        assert_eq!(missing_write_dir(root_log), None);
+    }
+
+    /// Only external-service credential names are set to a filler, and only from the sink's import
+    /// graph; the sandbox's own variables and non-credential names (including `PATH`) are left alone.
+    #[test]
+    fn credential_env_sets_only_credential_named_variables() {
+        assert!(credential_name("GITHUB_TOKEN"));
+        assert!(credential_name("GH_TOKEN"));
+        assert!(credential_name("GITHUB_PAT"));
+        assert!(credential_name("SESSION_SECRET"));
+        assert!(credential_name("DB_PASSWORD"));
+        assert!(!credential_name("PATH"));
+        assert!(!credential_name("DATABASE_URL"));
+        assert!(!credential_name("NODE_OPTIONS"));
+        assert!(!credential_name("NPM_CONFIG_CACHE"));
+
+        let sources = [
+            "export function auth(){ return process.env.TBC_GITHUB_TOKEN || process.env.GITHUB_PAT; }"
+                .to_owned(),
+            "const p = process.env.PATH; const port = process.env.PORT;".to_owned(),
+        ];
+        let env = credential_env(&sources);
+        let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["TBC_GITHUB_TOKEN", "GITHUB_PAT"]);
+        assert!(
+            env.iter()
+                .all(|e| e.value == STRONG_FILLER_SECRET && !e.directory)
+        );
     }
 
     /// The variables a startup failure demands, read from the app's own error; each with a value

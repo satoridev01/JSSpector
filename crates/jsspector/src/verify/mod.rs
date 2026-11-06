@@ -181,23 +181,44 @@ pub fn run(
             let url_sourced = probe.entry == plan::Entry::Url
                 && matches!(
                     probe.class,
-                    jss_core::VulnClass::Ssrf | jss_core::VulnClass::PathTraversal
+                    jss_core::VulnClass::Ssrf
+                        | jss_core::VulnClass::PathTraversal
+                        | jss_core::VulnClass::CommandInjection
+                        | jss_core::VulnClass::CodeInjection
                 );
-            if (probe.method.is_upgrade() || url_sourced)
-                && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
-            {
-                probe.gate_paths = plan::gate_paths(&source);
-                if url_sourced {
-                    probe.url_query_params = plan::url_search_params(&source);
-                    // The handler may parse the URL here but read its fields in a render/transform
-                    // function it forwards the whole search-parameters object to (possibly in another
-                    // module). Follow that one call hop and add the fields the callee reads, so the
-                    // payload is tried under the query name the sink actually consumes.
-                    for extra in plan::forwarded_search_params(&source, &|fn_name| {
-                        resolve_module_source(root, &finding.file, &source, fn_name)
-                    }) {
-                        if !probe.url_query_params.contains(&extra) {
-                            probe.url_query_params.push(extra);
+            if probe.method.is_upgrade() || url_sourced {
+                // A catch-all entry (`req.url` dispatched by `http.createServer`) recognizes the
+                // path and reads the tainted query parameter inside the route module that owns the
+                // sink, not the entry file. Mine the gate paths and query parameters from both the
+                // handler file and the sink's own file so the request is sent the way the dispatched
+                // handler reads it.
+                let files = [Some(finding.file.as_str()), finding.sink.file.as_deref()];
+                for file in files.into_iter().flatten() {
+                    let Ok(source) = std::fs::read_to_string(root.join(file)) else {
+                        continue;
+                    };
+                    for gate in plan::gate_paths(&source) {
+                        if !probe.gate_paths.contains(&gate) {
+                            probe.gate_paths.push(gate);
+                        }
+                    }
+                    if url_sourced {
+                        for param in plan::url_search_params(&source) {
+                            if !probe.url_query_params.contains(&param) {
+                                probe.url_query_params.push(param);
+                            }
+                        }
+                        // The handler may parse the URL here but read its fields in a render/transform
+                        // function it forwards the whole search-parameters object to (possibly in
+                        // another module). Follow that one call hop and add the fields the callee
+                        // reads, so the payload is tried under the query name the sink actually
+                        // consumes.
+                        for extra in plan::forwarded_search_params(&source, &|fn_name| {
+                            resolve_module_source(root, file, &source, fn_name)
+                        }) {
+                            if !probe.url_query_params.contains(&extra) {
+                                probe.url_query_params.push(extra);
+                            }
                         }
                     }
                 }
@@ -286,7 +307,9 @@ pub fn run(
                     let index = match http.iter().position(|(existing, _)| *existing == key) {
                         Some(index) => index,
                         None => {
-                            let session = sandbox::Session::start_in(root, &app, Some(declared));
+                            let gating = gating_env_sources(root, finding);
+                            let session =
+                                sandbox::Session::start_in(root, &app, Some(declared), &gating);
                             http.push((key, session));
                             http.len() - 1
                         }
@@ -339,12 +362,19 @@ fn resolve_module_source(
         return Some(handler.to_owned());
     }
     let spec = plan::import_source_path(handler, fn_name)?;
+    resolve_relative_source(root, handler_file, &spec)
+}
+
+/// The source text a relative module `spec` imported from `from_file` resolves to, trying the common
+/// JavaScript module file names and an `index.*`. Confined to the repository tree. `None` for a bare
+/// package specifier or a file that cannot be read.
+fn resolve_relative_source(root: &std::path::Path, from_file: &str, spec: &str) -> Option<String> {
     // Only resolve relative specifiers; a bare package import is not part of the app tree.
     if !spec.starts_with('.') {
         return None;
     }
-    let dir = std::path::Path::new(handler_file).parent()?;
-    let base = dir.join(&spec);
+    let dir = std::path::Path::new(from_file).parent()?;
+    let base = dir.join(spec);
     let canonical_root = root.canonicalize().ok()?;
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if base.extension().is_some() {
@@ -366,6 +396,29 @@ fn resolve_module_source(
         }
     }
     None
+}
+
+/// The source texts the sandbox scans for a credential the finding's sink is gated on: the sink's own
+/// module and the modules it imports one hop out (where a `createGithubAuthEnv`-style helper reads the
+/// token). Bounded to relative imports within the repository tree. Empty when the sink file cannot be
+/// read.
+fn gating_env_sources(root: &std::path::Path, finding: &Finding) -> Vec<String> {
+    let sink_file = finding
+        .sink
+        .file
+        .as_deref()
+        .unwrap_or(finding.file.as_str());
+    let Ok(sink_src) = std::fs::read_to_string(root.join(sink_file)) else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    for spec in plan::relative_import_specifiers(&sink_src) {
+        if let Some(text) = resolve_relative_source(root, sink_file, &spec) {
+            sources.push(text);
+        }
+    }
+    sources.push(sink_src);
+    sources
 }
 
 fn verdict(finding: &Finding, outcome: Outcome) -> Verdict {

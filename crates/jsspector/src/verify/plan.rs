@@ -842,6 +842,29 @@ pub fn import_source_path(source: &str, name: &str) -> Option<String> {
     None
 }
 
+/// Every relative module specifier the source imports or requires (`import x from './a'`,
+/// `export { b } from '../b'`, `require('./c')`, `import('./d')`), deduplicated and first-seen. Bare
+/// package specifiers are excluded — they are not part of the app's own source tree. Used to follow
+/// one import hop to the module that reads a credential a sink is gated on.
+pub fn relative_import_specifiers(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for marker in [" from ", "require(", "import("] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(marker) {
+            let at = from + rel;
+            from = at + marker.len();
+            let tail = source[at + marker.len()..].trim_start();
+            if let Some(spec) = leading_string(tail)
+                && spec.starts_with('.')
+                && !out.contains(&spec)
+            {
+                out.push(spec);
+            }
+        }
+    }
+    out
+}
+
 /// The length of the import statement at the start of `stmt`: up to its `;`, or — absent one (ASI) —
 /// the first newline at bracket depth 0 outside any string, so a multi-line named import
 /// (`import {\n  a,\n  b\n} from "x"`) stays whole while the statement does not run past its line.
@@ -3596,6 +3619,27 @@ mod tests {
             super::registered_route_entry("thing.register({ path: '/x' })"),
             None
         );
+    }
+
+    #[test]
+    fn relative_import_specifiers_follow_only_the_app_tree() {
+        let source = "import fs from 'fs';\n\
+            import { sendJson } from '../http.js';\n\
+            import { createGithubAuthEnv } from '../../github-token.js';\n\
+            const log = require('./log');\n\
+            const dyn = await import('./lazy.js');\n";
+        let specs = super::relative_import_specifiers(source);
+        assert_eq!(
+            specs,
+            [
+                "../http.js".to_owned(),
+                "../../github-token.js".to_owned(),
+                "./log".to_owned(),
+                "./lazy.js".to_owned(),
+            ]
+        );
+        // Bare package specifiers (`fs`) are never followed.
+        assert!(!specs.iter().any(|s| s == "fs"));
     }
 
     #[test]

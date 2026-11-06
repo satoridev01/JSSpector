@@ -174,8 +174,9 @@ impl Session {
         // (`NOOBOT_WORKSPACE_ROOT is required`) is started again with it set to a neutral value
         // (see [`required_env`]), a few times at most.
         let mut env: Vec<RequiredEnv> = Vec::new();
-        for _ in 0..4 {
-            self.run_app(&env)?;
+        let mut stub_missing_modules = false;
+        for _ in 0..5 {
+            self.run_app(&env, stub_missing_modules)?;
             let err = match self.wait_until_listening() {
                 Ok(port) => {
                     self.port = port;
@@ -188,17 +189,19 @@ impl Session {
                 .into_iter()
                 .filter(|wanted| env.iter().all(|have| have.name != wanted.name))
                 .collect();
-            if missing.is_empty() {
+            let enable_module_stub = !stub_missing_modules && missing_bare_module(&err);
+            if missing.is_empty() && !enable_module_stub {
                 return Err(err);
             }
             let _ = docker(&["rm", "-f", &self.app]);
             env.extend(missing);
+            stub_missing_modules |= enable_module_stub;
         }
-        Err("the app still exited for want of environment variables after four starts".to_owned())
+        Err("the app still could not start after five launch attempts".to_owned())
     }
 
     /// Starts the app container, with `env` on top of the variables every app gets.
-    fn run_app(&self, env: &[RequiredEnv]) -> Result<(), String> {
+    fn run_app(&self, env: &[RequiredEnv], stub_missing_modules: bool) -> Result<(), String> {
         // The app: on the private network, hardened, its scratch space in tmpfs, no extra
         // privileges, bounded memory, CPUs and processes.
         let mut args: Vec<String> = [
@@ -230,6 +233,10 @@ impl Session {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+        if stub_missing_modules {
+            args.push("-e".to_owned());
+            args.push("NODE_OPTIONS=--require=/jss-launch-shim.js".to_owned());
+        }
         for var in env {
             // A directory the app names by a variable: its own empty scratch space.
             if var.directory {
@@ -1173,7 +1180,6 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-express-host.mjs\n\
          RUN echo {} | base64 -d > /jss-lifecycle-host.mjs\n\
          ENV NODE_EXTRA_CA_CERTS=/jss-marker.crt\n\
-         ENV NODE_OPTIONS=--require=/jss-launch-shim.js\n\
          ENV PORT={port}\n\
          ENV HOST=0.0.0.0\n\
          CMD {start_command}\n",
@@ -1232,6 +1238,37 @@ struct RequiredEnv {
     value: String,
     /// The value is a directory (mounted empty and writable for the app).
     directory: bool,
+}
+
+/// Whether startup failed because a bare package dependency is absent. The launch shim can safely
+/// stand in for that package on a retry; relative or absolute imports remain real application code
+/// and must never be hidden.
+fn missing_bare_module(log: &str) -> bool {
+    const PREFIXES: [&str; 6] = [
+        "Cannot find module '",
+        "Cannot find package '",
+        "Cannot find module \"",
+        "Cannot find package \"",
+        "Cannot find module `",
+        "Cannot find package `",
+    ];
+    log.lines().any(|line| {
+        PREFIXES.iter().any(|prefix| {
+            let Some(rest) = line.split_once(prefix).map(|(_, rest)| rest) else {
+                return false;
+            };
+            let quote = prefix.as_bytes().last().copied().unwrap_or(b'\'');
+            let Some(end) = rest.bytes().position(|byte| byte == quote) else {
+                return false;
+            };
+            rest.get(..end).is_some_and(|specifier| {
+                !specifier.is_empty()
+                    && !specifier.starts_with('.')
+                    && !specifier.starts_with('/')
+                    && !specifier.starts_with("node:")
+            })
+        })
+    })
 }
 
 /// A non-secret value long enough to satisfy startup checks for secret-like environment variables.
@@ -2832,6 +2869,25 @@ const { chromium } = require('playwright');
 mod tests {
     use super::*;
 
+    #[test]
+    fn module_stub_retry_only_accepts_bare_packages() {
+        assert!(missing_bare_module(
+            "Error: Cannot find module 'express'\nRequire stack: /app/index.js"
+        ));
+        assert!(missing_bare_module(
+            "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@scope/plugin' imported from /app/index.mjs"
+        ));
+        assert!(!missing_bare_module(
+            "Error: Cannot find module './local.js'"
+        ));
+        assert!(!missing_bare_module(
+            "Error: Cannot find module '/app/local.js'"
+        ));
+        assert!(!missing_bare_module(
+            "Error [ERR_MODULE_NOT_FOUND]: an import failed"
+        ));
+    }
+
     /// The variables a startup failure demands, read from the app's own error; each with a value
     /// of the kind its name asks for. Source echoes, error codes, Node's own and the sandbox's
     /// variables are not taken.
@@ -3649,6 +3705,7 @@ mod tests {
         let workdir = file.find("WORKDIR /app/svc\n").unwrap();
         let install = file.find("RUN npm ci").unwrap();
         assert!(copy < workdir && workdir < install, "{file}");
+        assert!(!file.contains("ENV NODE_OPTIONS="), "{file}");
         assert!(file.ends_with("CMD [\"node\",\"index.js\"]\n"));
     }
 

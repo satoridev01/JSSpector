@@ -84,6 +84,32 @@ fn classes(report: &Value) -> Vec<String> {
 }
 
 #[test]
+fn verify_fingerprint_limits_dynamic_verification_without_hiding_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    app(dir.path());
+    let output = jsspector(
+        &[
+            "scan",
+            ".",
+            "--format",
+            "json",
+            "--verify=strict",
+            "--verify-fingerprint",
+            "0000000000000000",
+        ],
+        dir.path(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    assert!(!report["findings"].as_array().unwrap().is_empty());
+    assert!(report.get("verification").is_none());
+}
+
+#[test]
 fn fail_on_and_baselines_gate_the_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     app(dir.path());

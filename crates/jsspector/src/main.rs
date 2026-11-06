@@ -158,6 +158,10 @@ struct ScanArgs {
     /// fails the command when Docker is unreachable instead of skipping.
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "best-effort")]
     verify: Option<VerifyMode>,
+    /// Dynamically verify only this exact finding fingerprint. Repeatable; the report still
+    /// includes every static finding. Intended for targeted reproduction and repair checks.
+    #[arg(long, value_name = "FINGERPRINT", requires = "verify")]
+    verify_fingerprint: Vec<String>,
     #[command(flatten)]
     config: ConfigArgs,
 }
@@ -486,7 +490,16 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 VerifyMode::Strict => verify::Missing::Fail,
                 VerifyMode::BestEffort => verify::Missing::Skip,
             };
-            match verify::run(&analysis.root, &findings, missing) {
+            let selected: Vec<Finding> = if args.verify_fingerprint.is_empty() {
+                findings.clone()
+            } else {
+                findings
+                    .iter()
+                    .filter(|finding| args.verify_fingerprint.contains(&finding.fingerprint))
+                    .cloned()
+                    .collect()
+            };
+            match verify::run(&analysis.root, &selected, missing) {
                 Ok(verdicts) => verdicts,
                 Err(err) => return fail(EXIT_USAGE, err),
             }

@@ -171,20 +171,35 @@ pub fn run(
             );
         }
     }
-    // An entry that forwards the request URL (SSRF) often reaches its sink only for paths the handler
-    // recognizes, and may choose the outbound host from a query parameter of the parsed URL. Mine the
-    // gate paths (for an upgrade entry or a URL-sourced forward proxy) and, for the URL-sourced case,
-    // the query parameters, so the marker request can be sent the way the handler actually reads it.
+    // An entry that forwards the request URL often reaches its sink only for paths the handler
+    // recognizes, and may read the tainted value from a query parameter of the parsed URL rather
+    // than from the path — the outbound host of an SSRF, or the file path of a traversal. Mine the
+    // gate paths (for an upgrade entry or a URL-sourced forward proxy/file read) and, for the
+    // URL-sourced case, the query parameters, so the request can be sent the way the handler reads it.
     for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
         if let Ok(plan::Plan::Http(probe)) = planned {
-            let url_ssrf =
-                probe.class == jss_core::VulnClass::Ssrf && probe.entry == plan::Entry::Url;
-            if (probe.method.is_upgrade() || url_ssrf)
+            let url_sourced = probe.entry == plan::Entry::Url
+                && matches!(
+                    probe.class,
+                    jss_core::VulnClass::Ssrf | jss_core::VulnClass::PathTraversal
+                );
+            if (probe.method.is_upgrade() || url_sourced)
                 && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
             {
                 probe.gate_paths = plan::gate_paths(&source);
-                if url_ssrf {
+                if url_sourced {
                     probe.url_query_params = plan::url_search_params(&source);
+                    // The handler may parse the URL here but read its fields in a render/transform
+                    // function it forwards the whole search-parameters object to (possibly in another
+                    // module). Follow that one call hop and add the fields the callee reads, so the
+                    // payload is tried under the query name the sink actually consumes.
+                    for extra in plan::forwarded_search_params(&source, &|fn_name| {
+                        resolve_module_source(root, &finding.file, &source, fn_name)
+                    }) {
+                        if !probe.url_query_params.contains(&extra) {
+                            probe.url_query_params.push(extra);
+                        }
+                    }
                 }
             }
         }

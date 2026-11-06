@@ -444,7 +444,16 @@ impl Session {
     /// unplanted responses must agree, so a handler that confines the path — reaching none of the
     /// three — yields no signal.
     fn verify_read_oracle(&self, probe: &Probe) -> Option<Reproduction> {
-        let oracle = payload::read_oracle(probe, &self.canary, self.nonce)?;
+        // The climbed path may enter the request several ways (the entry, or a parsed query parameter
+        // under a gate) and the found canary has two shapes (text, image); try each until one shows
+        // the file-found/not-found differential.
+        payload::read_oracle(probe, &self.canary, self.nonce)
+            .iter()
+            .find_map(|oracle| self.try_read_oracle(oracle))
+    }
+
+    /// Runs one read-oracle candidate's three-request differential; see [`Self::verify_read_oracle`].
+    fn try_read_oracle(&self, oracle: &payload::ReadOracle) -> Option<Reproduction> {
         let present = self.fetch(&oracle.present)?;
         let absent = self.fetch(&oracle.absent)?;
         let absent_sub = self.fetch(&oracle.absent_sub)?;
@@ -472,7 +481,7 @@ impl Session {
                 its not-found path for an equivalent unplanted path, proving the read opened the \
                 attacker-controlled path outside the base directory"
                 .to_owned(),
-            response: present.trim().chars().take(400).collect(),
+            response: response_excerpt(&present),
         })
     }
 
@@ -1160,6 +1169,10 @@ fn dockerfile(
     // of throwing on invalid JSON, while a handler that serves the bytes raw still echoes the token
     // as a substring. The token alone remains the signal; the quotes only let it survive a parse.
     let marker_files = canary.planted_files().join(" ");
+    // A valid image planted beside the text canary, so a read sink that re-encodes the file instead
+    // of echoing it still has an observably successful file-found branch (see [`payload::PLANTED_IMAGE`]).
+    let canary_image_path = canary.planted_image_file();
+    let canary_image_b64 = payload::PLANTED_IMAGE_PNG_BASE64;
     let install = install_command(pm);
     // npm cannot resolve the `workspace:` protocol a monorepo uses to pin its sibling packages, and
     // aborts the whole install the moment it parses one — so even unrelated registry dependencies
@@ -1196,6 +1209,7 @@ fn dockerfile(
          if [ ! -e .env ] && [ -f \"$example\" ]; then cp \"$example\" .env; fi; done\n\
          {build}\
          RUN for f in {marker_files}; do printf '\"%s\"' '{token}' > \"$f\"; done\n\
+         RUN echo {canary_image_b64} | base64 -d > {canary_image_path}\n\
          RUN echo {} | base64 -d > /jss-driver.js\n\
          RUN echo {} | base64 -d > /jss-marker.js\n\
          RUN echo {} | base64 -d > /jss-marker.crt\n\
@@ -1511,11 +1525,10 @@ fn env_var_names(src: &str) -> Vec<String> {
             }
             src.get(start..i).filter(|n| !n.is_empty())
         } else if bytes.get(i) == Some(&b'[') {
-            let quote = bytes.get(i + 1).copied();
-            if matches!(quote, Some(b'\'') | Some(b'"')) {
+            if let Some(quote @ (b'\'' | b'"')) = bytes.get(i + 1).copied() {
                 let start = i + 2;
                 src[start..]
-                    .find(quote.unwrap() as char)
+                    .find(quote as char)
                     .map(|end| &src[start..start + end])
                     .filter(|n| {
                         !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -1526,10 +1539,10 @@ fn env_var_names(src: &str) -> Vec<String> {
         } else {
             None
         };
-        if let Some(name) = name {
-            if !out.contains(&name.to_owned()) {
-                out.push(name.to_owned());
-            }
+        if let Some(name) = name
+            && !out.iter().any(|existing| existing == name)
+        {
+            out.push(name.to_owned());
         }
         from += rel + needle.len();
     }
@@ -2089,6 +2102,24 @@ fn strip_request_echo(body: &str, target: &str, value: &str) -> String {
     out
 }
 
+/// Keep the report and downstream advisory text safe when a differential oracle's successful
+/// branch returns an image or another binary body. The full body is still used above for the
+/// three-way comparison; only the human-facing excerpt is replaced.
+fn response_excerpt(body: &str) -> String {
+    const MAX_CHARS: usize = 400;
+    let excerpt: String = body.trim().chars().take(MAX_CHARS).collect();
+    let binary = excerpt.chars().any(|character| {
+        character == '\0'
+            || character == '\u{fffd}'
+            || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    });
+    if binary {
+        format!("[binary response omitted; {} bytes captured]", body.len())
+    } else {
+        excerpt
+    }
+}
+
 fn tail(text: &str, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
     all.get(all.len().saturating_sub(lines)..)
@@ -2636,10 +2667,15 @@ let hi = 0;
 function attempt(){
   if(hi>=hosts.length){process.exit(0);}
   const host = hosts[hi++];
+  let sent = false;
+  const done = (data)=>{if(sent){return;} sent=true; try{process.stdout.write(data,()=>process.exit(0));}catch(e){process.exit(0);}};
   const req = http.request({host,port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:10000},(res)=>{
     let data='';
-    res.on('data',(c)=>{data+=c; if(data.length>65536){res.destroy();}});
-    res.on('end',()=>{process.stdout.write(data);process.exit(0);});
+    // Cap how much is kept (a large body is only compared, never parsed), but still emit what was
+    // collected: dropping it entirely would make a large success response read as empty and hide,
+    // from the read oracle, the difference between a file-found render and a not-found error.
+    res.on('data',(c)=>{if(data.length<=65536){data+=c;} if(data.length>65536){done(data);}});
+    res.on('end',()=>{done(data);});
   });
   // An upgrade request completes with an 'upgrade' event instead of a response; the out-of-band
   // marker signal is what confirms it, so just end the request once it is answered either way.
@@ -3094,6 +3130,18 @@ const { chromium } = require('playwright');
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_oracle_responses_are_not_exposed_as_report_text() {
+        assert_eq!(
+            response_excerpt("\u{fffd}PNG\0binary"),
+            "[binary response omitted; 13 bytes captured]"
+        );
+        assert_eq!(
+            response_excerpt("  readable response\n"),
+            "readable response"
+        );
+    }
 
     #[test]
     fn module_stub_retry_only_accepts_bare_packages() {

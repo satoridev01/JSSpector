@@ -823,22 +823,52 @@ pub fn import_source_path(source: &str, name: &str) -> Option<String> {
         if at > 0 && source.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
             continue;
         }
-        let end = source[at..]
-            .find(';')
-            .map(|i| at + i)
-            .unwrap_or_else(|| source.len().min(at + 400));
-        let stmt = &source[at..end];
+        // Bound the match to this import's own statement: its `;`, or — absent one (ASI) — the
+        // newline that ends the (possibly multi-line named) import at bracket depth 0. Without this
+        // a semicolon-free file would merge the import with following statements and could read a
+        // later import's specifier.
+        let window = &source[at..source.len().min(at + 400)];
+        let stmt = &window[..import_statement_end(window)];
         if !contains_word(stmt, name) {
             continue;
         }
         if let Some(fpos) = stmt.find(" from ") {
             let tail = stmt[fpos + " from ".len()..].trim_start();
-            if let Some(path) = string_literal_arg(tail) {
+            if let Some(path) = leading_string(tail) {
                 return Some(path);
             }
         }
     }
     None
+}
+
+/// The length of the import statement at the start of `stmt`: up to its `;`, or — absent one (ASI) —
+/// the first newline at bracket depth 0 outside any string, so a multi-line named import
+/// (`import {\n  a,\n  b\n} from "x"`) stays whole while the statement does not run past its line.
+fn import_statement_end(stmt: &str) -> usize {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in stmt.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth -= 1,
+            ';' | '\n' if depth <= 0 => return i,
+            _ => {}
+        }
+    }
+    stmt.len()
 }
 
 /// Recognizes a handler that passes a tainted body field to a parse function and reads one member of
@@ -1895,6 +1925,131 @@ pub fn url_search_params(source: &str) -> Vec<String> {
     out
 }
 
+/// Additional query-parameter names reached when the search-parameters object is not read in this
+/// handler but forwarded whole into a called function, which reads its fields
+/// (`const params = Object.fromEntries(url.searchParams); renderStoryPng(params)` and, in the
+/// callee, `fetch(params.coinIcon)` -> `coinIcon`). For each variable bound from the search
+/// parameters, each call that passes it as a whole argument is resolved to the callee's definition
+/// (local, or imported — via `resolve`), the argument is mapped to the callee's parameter by
+/// position, and that parameter's members are mined from the callee body. One call hop; the attacker
+/// still chooses the outbound host through one of these. Deduplicated and bounded; empty when the
+/// object is not forwarded or the callee cannot be resolved. Mined from the handler and callee source
+/// only, so nothing here is tied to one app.
+pub fn forwarded_search_params(
+    source: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    const MAX: usize = 16;
+    let mut out: Vec<String> = Vec::new();
+    for var in vars_bound_from(source, "searchParams") {
+        for (callee, pos) in forwarding_calls(source, &var) {
+            let Some(module) = resolve(&callee) else {
+                continue;
+            };
+            let Some(param) = nth_param(&module, &callee, pos) else {
+                continue;
+            };
+            let Some(body) = function_body(&module, &callee) else {
+                continue;
+            };
+            for member in object_members(&body, &param) {
+                push_param(&mut out, &member, MAX);
+            }
+        }
+    }
+    out
+}
+
+/// Calls in `source` that pass `var` as one whole argument (`renderStoryPng(params, assets)` for
+/// `var = "params"` -> `("renderStoryPng", 0)`): the plain-identifier callee and the zero-based
+/// position `var` occupies in its argument list. A control-flow keyword before `(` (`if (params)`)
+/// is not a callee. Deduplicated by (callee, position).
+fn forwarding_calls(source: &str, var: &str) -> Vec<(String, usize)> {
+    const KEYWORDS: [&str; 9] = [
+        "if", "for", "while", "switch", "catch", "return", "function", "await", "typeof",
+    ];
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find('(') {
+        let open = from + rel;
+        from = open + 1;
+        let before = source[..open].trim_end();
+        let name_start = before.len() - before.bytes().rev().take_while(|b| is_ident(*b)).count();
+        let callee = &before[name_start..];
+        if callee.is_empty() || KEYWORDS.contains(&callee) {
+            continue;
+        }
+        let Some(arglist) = balanced_arg(&source[open + 1..]) else {
+            continue;
+        };
+        for (pos, arg) in split_top_level_commas(arglist).iter().enumerate() {
+            if arg.trim() == var {
+                let entry = (callee.to_owned(), pos);
+                if !out.contains(&entry) {
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The identifier of the `pos`-th parameter of the function named `name` in `source`
+/// (`renderStoryPng(params, assets)`, `pos = 0` -> `params`). A default value is stripped; a
+/// destructured or rest parameter yields `None`, as does a missing function or position.
+fn nth_param(source: &str, name: &str, pos: usize) -> Option<String> {
+    let list = function_param_list(source, name)?;
+    let raw = split_top_level_commas(&list).into_iter().nth(pos)?;
+    let base = raw.split('=').next().unwrap_or(&raw).trim();
+    if base.is_empty()
+        || base.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        || !base.bytes().all(is_ident)
+    {
+        return None;
+    }
+    Some(base.to_owned())
+}
+
+/// The parenthesized parameter list of a function named `name` defined in `source`: the first `(`
+/// after a `function name` / `const name =` / `name =` marker (and before any `{`), read balanced.
+/// `None` when no such definition is found.
+fn function_param_list(source: &str, name: &str) -> Option<String> {
+    let markers = [
+        format!("function {name}"),
+        format!("function* {name}"),
+        format!("const {name}"),
+        format!("let {name}"),
+        format!("var {name}"),
+        format!("{name} ="),
+    ];
+    for marker in &markers {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(marker.as_str()) {
+            let at = from + rel;
+            from = at + marker.len();
+            if at > 0 && source.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
+                continue;
+            }
+            let after = &source[at + marker.len()..];
+            if marker.bytes().last().is_some_and(is_ident)
+                && after.bytes().next().is_some_and(is_ident)
+            {
+                continue;
+            }
+            let Some(open) = after.find('(') else {
+                continue;
+            };
+            if after[..open].contains('{') {
+                continue;
+            }
+            if let Some(list) = balanced_arg(&after[open + 1..]) {
+                return Some(list.to_owned());
+            }
+        }
+    }
+    None
+}
+
 /// Appends a plain identifier parameter name if it is new and the list is under its cap.
 fn push_param(out: &mut Vec<String>, name: &str, max: usize) {
     if name
@@ -1911,8 +2066,9 @@ fn push_param(out: &mut Vec<String>, name: &str, max: usize) {
 
 /// The local variables a module binds from an expression that mentions `needle`
 /// (`const query = Object.fromEntries(url.searchParams)` for `needle = "searchParams"` -> `query`).
-/// The right-hand side is read up to the statement's `;` (capped), so a multi-line initializer is
-/// still seen. A binding only (single `=`), never a comparison.
+/// Only the binding's own initializer is examined (see [`statement_rhs`]), so a semicolon-free
+/// (ASI) file does not bleed one binding's right-hand side into the following statements and mistake
+/// an unrelated local for one bound from `needle`. A binding only (single `=`), never a comparison.
 fn vars_bound_from(source: &str, needle: &str) -> Vec<String> {
     let mut out = Vec::new();
     for keyword in ["const ", "let ", "var "] {
@@ -1929,13 +2085,46 @@ fn vars_bound_from(source: &str, needle: &str) -> Vec<String> {
             let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
                 continue;
             };
-            let end = rhs.floor_char_boundary(rhs.find(';').unwrap_or(rhs.len()).min(300));
-            if rhs[..end].contains(needle) && !out.contains(&ident) {
+            if statement_rhs(rhs).contains(needle) && !out.contains(&ident) {
                 out.push(ident);
             }
         }
     }
     out
+}
+
+/// The initializer on the right of a binding, up to the end of its statement: the first `;`, or —
+/// absent one (ASI) — the first newline at bracket depth 0 outside any string. Capped so a
+/// pathological line is still bounded. A multi-line initializer stays intact because its unbalanced
+/// brackets (`Object.fromEntries(\n  url.searchParams\n)`) keep the depth above 0 across the
+/// newlines, while a plain `const x = f()` on one line ends at its newline instead of running on.
+fn statement_rhs(rhs: &str) -> &str {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in rhs.char_indices() {
+        if i >= 300 {
+            return &rhs[..rhs.floor_char_boundary(i)];
+        }
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ';' | '\n' if depth <= 0 => return &rhs[..i],
+            _ => {}
+        }
+    }
+    rhs
 }
 
 /// The HTTP route a module registers on a host-provided web-server service, when no route inventory
@@ -3345,6 +3534,39 @@ mod tests {
             super::registered_route_entry("thing.register({ path: '/x' })"),
             None
         );
+    }
+
+    #[test]
+    fn forwarded_search_params_follow_a_call_into_another_module() {
+        // A semicolon-free (ASI) handler that parses the URL here but forwards the whole
+        // search-parameters object into a render function in another module, which reads its
+        // fields. The query name the sink consumes (`coinIcon`) lives only in the callee.
+        let server = "import { renderStoryPng } from \"./story-render.js\"\n\
+             const url = new URL(req.url, `http://localhost:${PORT}`)\n\
+             const params = Object.fromEntries(url.searchParams)\n\
+             const png = await renderStoryPng(params, assets)\n";
+        // Without a semicolon, the URL-binding statement must not bleed into the next and make
+        // `url` look bound from the search parameters; only `params` is.
+        assert_eq!(
+            super::vars_bound_from(server, "searchParams"),
+            vec!["params".to_owned()]
+        );
+        // The import specifier is recovered even without a terminating semicolon.
+        assert_eq!(
+            super::import_source_path(server, "renderStoryPng").as_deref(),
+            Some("./story-render.js")
+        );
+        let render = "export async function renderStoryPng(params, assets) {\n\
+             const icon = await loadCoinIcon(params.coinIcon)\n\
+             return params.coinName\n\
+             }\n";
+        let mined = super::forwarded_search_params(server, &|name| {
+            (name == "renderStoryPng").then(|| render.to_owned())
+        });
+        assert!(mined.contains(&"coinIcon".to_owned()), "mined {mined:?}");
+        assert!(mined.contains(&"coinName".to_owned()), "mined {mined:?}");
+        // An object that is not forwarded anywhere yields nothing to resolve.
+        assert!(super::forwarded_search_params(server, &|_| None).is_empty());
     }
 
     #[test]

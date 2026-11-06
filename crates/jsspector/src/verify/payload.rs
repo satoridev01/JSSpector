@@ -29,6 +29,19 @@ pub const PLANTED_SUFFIXES: &[&str] = &[
 /// segment completes the path. Kept distinct from [`Canary::planted_file`] so the two never clash.
 pub const PLANTED_DIR: &str = "jss-canary-read.d";
 
+/// The name of the valid *image* canary planted beside the text canary. A read sink that does not
+/// echo the file but re-encodes it (an image/asset pipeline — `satori`, `sharp`, `resvg`) never
+/// reflects the token, and a text canary makes its found-branch error just like a missing path, so
+/// the differential read oracle would see no difference. A real image makes the found-branch render
+/// (a success response) while a missing path still errors, keeping the found/not-found branches
+/// observably distinct. Kept distinct from the text canary so the two never clash.
+pub const PLANTED_IMAGE: &str = "jss-canary-img";
+
+/// A minimal valid 1×1 PNG, standard-alphabet base64, planted at [`Canary::planted_image_file`].
+/// Deliberately token-independent, like the text canary's path: the differential oracle
+/// (found-branch renders, not-found-branch errors), not any reflected content, is the proof.
+pub const PLANTED_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
 /// A per-run marker. Everything a payload does is tagged with `token`, so a reproduction is told
 /// from the app's normal behavior by the token alone.
 #[derive(Debug, Clone)]
@@ -77,6 +90,13 @@ impl Canary {
             .iter()
             .map(|suffix| format!("{base}{suffix}"))
             .collect()
+    }
+
+    /// The valid-image canary's path. Planted beside the text canary so a read sink that re-encodes
+    /// the file (rather than echoing it) has an observably successful found-branch; see
+    /// [`PLANTED_IMAGE`]. Independent of the token, like [`Canary::planted_file`].
+    pub fn planted_image_file(&self) -> String {
+        format!("/{PLANTED_IMAGE}")
     }
 
     /// The directory the sandbox plants for a traversal whose sink appends a fixed segment after the
@@ -317,6 +337,24 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                 }
                 return out;
             }
+            if probe.entry == Entry::Url && probe.class == VulnClass::PathTraversal {
+                // The request URL is parsed and the file path is read from one of its query
+                // parameters (`const u = new URL(req.url); const p =
+                // Object.fromEntries(u.searchParams); readFile(p.file)`), so the climbing payload
+                // never reaches the sink as the request path. Send each payload in each mined query
+                // parameter, under each path the handler dispatches on, alongside the path form.
+                let mut out = vec![place(probe, verb, &value, signal.clone())];
+                for (gate, param) in url_query_targets(probe) {
+                    out.push(Attempt {
+                        verb,
+                        target: format!("{gate}?{}={}", encode(&param), encode(&value)),
+                        body: None,
+                        headers: Vec::new(),
+                        signal: signal.clone(),
+                    });
+                }
+                return out;
+            }
             if !matches!(probe.entry, Entry::Body(None)) {
                 return vec![place(probe, verb, &value, signal)];
             }
@@ -418,34 +456,110 @@ pub struct ReadOracle {
     pub absent_sub_value: String,
 }
 
-/// Builds the read oracle for a path-traversal probe, or `None` for an entry with no placeable path
-/// segment (a header) or a non-traversal class.
-pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<ReadOracle> {
+/// Builds the read-oracle candidates for a path-traversal probe, each to be tried until one shows
+/// the file-found/not-found differential. Empty for a non-traversal class or when no candidate has a
+/// placeable path. More than one candidate arises because the climbed path may enter the request two
+/// ways (the probe's own entry, or — for a URL-sourced sink — a parsed query parameter under a gate
+/// path) and the canary that must be *found* has two shapes (the text canary, and a valid image for a
+/// sink that re-encodes the file instead of echoing it).
+pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<ReadOracle> {
     if probe.class != VulnClass::PathTraversal {
-        return None;
+        return Vec::new();
     }
-    // Where the canary sits: a directory when the sink appends a fixed segment after the tainted
-    // input, otherwise the planted file itself.
-    let present_name = if probe.read_suffix.is_some() {
-        PLANTED_DIR.to_owned()
+    // Where the canary that must be *found* sits. A directory when the sink appends a fixed segment
+    // after the tainted input; otherwise the planted text file, plus the planted image for a sink
+    // that re-encodes the file (so its found-branch renders rather than erroring like a miss).
+    let present_names: Vec<String> = if probe.read_suffix.is_some() {
+        vec![PLANTED_DIR.to_owned()]
     } else {
-        canary.planted_file().trim_start_matches('/').to_owned()
+        vec![
+            canary.planted_file().trim_start_matches('/').to_owned(),
+            canary
+                .planted_image_file()
+                .trim_start_matches('/')
+                .to_owned(),
+        ]
     };
     let absent_name = format!("jss-oracle-absent-{}-{nonce}", canary.token);
     // `..` segments above the filesystem root are dropped by path normalization, so a deep climb
     // reaches the root from any base depth.
     let climb = "../".repeat(12);
-    let present_value = format!("{climb}{present_name}");
-    let absent_value = format!("{climb}{absent_name}");
-    let absent_sub_value = format!("{climb}{present_name}/{absent_name}");
-    Some(ReadOracle {
-        present: place_traversal(probe, &present_value)?,
-        present_value,
-        absent: place_traversal(probe, &absent_value)?,
-        absent_value,
-        absent_sub: place_traversal(probe, &absent_sub_value)?,
-        absent_sub_value,
-    })
+    let mut out = Vec::new();
+    for spec in oracle_placements(probe) {
+        for present_name in &present_names {
+            let present_value = format!("{climb}{present_name}");
+            let absent_value = format!("{climb}{absent_name}");
+            let absent_sub_value = format!("{climb}{present_name}/{absent_name}");
+            let (Some(present), Some(absent), Some(absent_sub)) = (
+                place_oracle(probe, &spec, &present_value),
+                place_oracle(probe, &spec, &absent_value),
+                place_oracle(probe, &spec, &absent_sub_value),
+            ) else {
+                continue;
+            };
+            out.push(ReadOracle {
+                present,
+                present_value,
+                absent,
+                absent_value,
+                absent_sub,
+                absent_sub_value,
+            });
+        }
+    }
+    out
+}
+
+/// Where a path-traversal payload enters the request: the probe's own entry, or — for a sink whose
+/// source is the whole request URL but whose file path is read from a query parameter of the parsed
+/// URL — as `?param=<value>` under a gate path.
+enum OraclePlacement {
+    Entry,
+    Query { gate: String, param: String },
+}
+
+/// The placements to try for a traversal probe: always the probe's own entry, and, for a URL-sourced
+/// sink, each mined query parameter under each gate path the handler dispatches on.
+fn oracle_placements(probe: &Probe) -> Vec<OraclePlacement> {
+    let mut specs = vec![OraclePlacement::Entry];
+    if probe.class == VulnClass::PathTraversal && probe.entry == Entry::Url {
+        for (gate, param) in url_query_targets(probe) {
+            specs.push(OraclePlacement::Query { gate, param });
+        }
+    }
+    specs
+}
+
+/// Places a traversal value per an [`OraclePlacement`]: into the probe's entry, or as a query
+/// parameter under a gate path.
+fn place_oracle(probe: &Probe, spec: &OraclePlacement, value: &str) -> Option<Attempt> {
+    match spec {
+        OraclePlacement::Entry => place_traversal(probe, value),
+        OraclePlacement::Query { gate, param } => Some(Attempt {
+            verb: probe.method.verb(&probe.entry),
+            target: format!("{gate}?{}={}", encode(param), encode(value)),
+            body: None,
+            headers: Vec::new(),
+            signal: Signal::InResponse,
+        }),
+    }
+}
+
+/// The `(gate, query-parameter)` pairs a URL-sourced sink may read the tainted value from: each mined
+/// query-parameter name under each path the handler dispatches on (plus its own route when that is a
+/// fixed path). Empty when no query parameter was mined.
+fn url_query_targets(probe: &Probe) -> Vec<(String, String)> {
+    let mut gates: Vec<String> = probe.gate_paths.clone();
+    if !probe.path.is_empty() && !probe.path.contains('{') && !gates.contains(&probe.path) {
+        gates.push(probe.path.clone());
+    }
+    let mut out = Vec::new();
+    for gate in &gates {
+        for param in &probe.url_query_params {
+            out.push((gate.clone(), param.clone()));
+        }
+    }
+    out
 }
 
 /// The requests and planted paths that prove a removal sink (`fs.unlink`, `fs.rm`, …) opens an
@@ -1472,6 +1586,53 @@ mod tests {
         );
         // The payload value is the marker URL, never a target-specific host.
         assert!(a.iter().all(|x| !x.target.contains("127.0.0.1")));
+    }
+
+    #[test]
+    fn a_url_sourced_traversal_probes_each_query_param_under_the_gate_with_an_image_canary() {
+        // The request URL is parsed and the file path is read from a query parameter of it, so the
+        // climbing payload must ride that parameter under the gate path, not the request path.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(VulnClass::PathTraversal, "/{wildcard}", Entry::Url);
+        p.gate_paths = vec!["/story.png".to_owned()];
+        p.url_query_params = vec!["coinIcon".to_owned()];
+
+        let a = attempts(&p, &canary, 1);
+        assert!(
+            a.iter()
+                .any(|x| x.target.starts_with("/story.png?coinIcon=")),
+            "no query-param traversal attempt: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
+
+        // The read oracle offers a candidate climbing to the valid-image canary via the query
+        // parameter, so a sink that re-encodes the file (never echoing it) still shows a
+        // found/not-found differential; present and absent differ only in the climbed name.
+        let img_name = canary
+            .planted_image_file()
+            .trim_start_matches('/')
+            .to_owned();
+        let oracles = read_oracle(&p, &canary, 1);
+        assert!(
+            oracles.iter().any(|o| {
+                o.present.target.starts_with("/story.png?coinIcon=")
+                    && o.present_value.ends_with(&img_name)
+                    && o.absent.target.starts_with("/story.png?coinIcon=")
+                    && o.present.target != o.absent.target
+            }),
+            "no image-canary query oracle: {:?}",
+            oracles
+                .iter()
+                .map(|o| &o.present.target)
+                .collect::<Vec<_>>()
+        );
+        // The found canary's path never carries the token: the differential, not reflected content,
+        // is the proof, so a handler that merely echoes the request cannot satisfy it.
+        assert!(
+            oracles
+                .iter()
+                .all(|o| !o.present_value.contains(&canary.token))
+        );
     }
 
     #[test]

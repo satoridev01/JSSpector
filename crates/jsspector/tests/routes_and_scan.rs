@@ -171,6 +171,34 @@ fn scan_links_a_route_to_a_sink_two_files_away() {
 }
 
 #[test]
+fn provider_resource_routes_use_the_deployed_metadata_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "apps/widget/metadata.json",
+        r#"{"name":"deployed-widget"}"#,
+    );
+    write(
+        dir.path(),
+        "apps/widget/server.js",
+        "const axios = require('axios');\n\
+         module.exports = (core, proc) => ({ init() {\n\
+           const { app } = core;\n\
+           app.post(proc.resource('/fetch'), async (req, res) => {\n\
+             res.send(await axios.get(req.body.url));\n\
+           });\n\
+         }});\n",
+    );
+    let root = dir.path().to_str().unwrap();
+    let routes = run(&["routes", "--json", root]);
+    assert_eq!(routes[0]["path"], "/apps/deployed-widget/fetch", "{routes}");
+
+    let report = run(&["scan", "--json", root]);
+    let finding = &report["findings"][0];
+    assert_eq!(finding["entry"], "POST /apps/deployed-widget/fetch");
+}
+
+#[test]
 fn nestjs_controllers_route_and_injected_services_are_followed() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

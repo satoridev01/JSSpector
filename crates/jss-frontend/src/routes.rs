@@ -6,6 +6,7 @@
 //! conventions (Next.js `app/**/route.ts`, `pages/api/**`) give the path of file routes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use jss_core::Auth;
 use serde::Serialize;
@@ -44,8 +45,8 @@ pub struct Route {
 /// function through the IR, the call graph is followed from the handlers, and every finding in a
 /// reached function gets the route (`entry`) and, when stronger, the route's authentication (an
 /// admin-only route lowers the severity one level).
-pub fn attach_entries(reports: &mut [ScanReport]) {
-    let (scoped, routes): (Vec<Route>, Vec<Route>) = inventory(reports)
+pub fn attach_entries(root: &Path, reports: &mut [ScanReport]) {
+    let (scoped, routes): (Vec<Route>, Vec<Route>) = inventory(root, reports)
         .into_iter()
         .partition(|r| r.lines.is_some());
     let modules: Vec<jss_core::ir::Module> = reports.iter().map(|r| r.module.clone()).collect();
@@ -156,7 +157,7 @@ fn raise_auth(finding: &mut jss_core::Finding, auth: Auth) {
 type RouterId = (String, String);
 
 /// Builds the inventory from scan reports.
-pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
+pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
     let by_file: BTreeMap<&str, &ScanReport> = reports
         .iter()
         .filter(|r| r.status == ScanStatus::Scanned)
@@ -209,9 +210,10 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
                 },
                 _ => entry.path.clone(),
             };
+            let provider = resource_prefix(root, file, entry.line).unwrap_or_default();
             for (prefix, mount_auth) in prefixes {
                 let full = if entry.kind == "http" || entry.kind == "file-route" {
-                    openapi_path(&join(&prefix, &path))
+                    openapi_path(&join(&prefix, &join(&provider, &path)))
                 } else {
                     path.clone()
                 };
@@ -245,6 +247,34 @@ pub fn inventory(reports: &[ScanReport]) -> Vec<Route> {
         }
     }
     routes.into_iter().collect()
+}
+
+/// OS.js-style provider modules register routes through `proc.resource(path)`, which prefixes the
+/// deployed path with `/apps/<metadata.name>`. Recover that prefix from the package's metadata so
+/// findings, verification requests and exported inventories all name the real endpoint.
+fn resource_prefix(root: &Path, file: &str, line: u32) -> Option<String> {
+    let source_path = root.join(file);
+    let source = std::fs::read_to_string(&source_path).ok()?;
+    let first = line.saturating_sub(2) as usize;
+    let uses_resource = source
+        .lines()
+        .skip(first)
+        .take(5)
+        .any(|text| text.contains(".resource("));
+    if !uses_resource {
+        return None;
+    }
+    let metadata = source_path.parent()?.join("metadata.json");
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(metadata).ok()?).ok()?;
+    let name = value.get("name")?.as_str()?;
+    if name.is_empty()
+        || name
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    {
+        return None;
+    }
+    Some(format!("/apps/{name}"))
 }
 
 /// The router a local name in `file` refers to: imported (followed to the exporting file) or local.

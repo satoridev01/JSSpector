@@ -381,7 +381,7 @@ fn analyze(
         .retain(|file| !excludes.matches(&file.rel_path));
     let selection = discovery.selection(include);
     let mut reports = pool.scan(&discovery.files, selection);
-    jss_frontend::attach_entries(&mut reports);
+    jss_frontend::attach_entries(&discovery.root, &mut reports);
     let mut analysis = Analysis {
         root: discovery.root.clone(),
         files_scanned: 0,
@@ -767,7 +767,7 @@ fn routes(args: &RoutesArgs) -> ExitCode {
     };
     let selection = discovery.selection(include);
     let reports = pool.scan(&discovery.files, selection);
-    let routes = jss_frontend::inventory(&reports);
+    let routes = jss_frontend::inventory(&discovery.root, &reports);
     let mut out = BufWriter::new(io::stdout().lock());
     let written = if args.openapi {
         let title = args

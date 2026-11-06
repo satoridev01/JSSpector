@@ -1128,6 +1128,18 @@ fn dockerfile(
     // as a substring. The token alone remains the signal; the quotes only let it survive a parse.
     let marker_files = canary.planted_files().join(" ");
     let install = install_command(pm);
+    // npm cannot resolve the `workspace:` protocol a monorepo uses to pin its sibling packages, and
+    // aborts the whole install the moment it parses one — so even unrelated registry dependencies
+    // (the app's real runtime deps) never install, and the app cannot start. When installing a
+    // single package with npm (no workspaces root in the image), drop only development-time sibling
+    // specifiers first so registry dependencies install. Runtime/optional/peer siblings are left
+    // intact: silently stubbing one could bypass security-relevant application behavior. yarn/pnpm
+    // understand the protocol and are left as is.
+    let workspace_fixup = if pm == PackageManager::Npm {
+        format!("RUN {NPM_WORKSPACE_FIXUP}\n")
+    } else {
+        String::new()
+    };
     let build = if has_build {
         format!("RUN {}\n", build_command(pm))
     } else {
@@ -1144,6 +1156,7 @@ fn dockerfile(
          WORKDIR /app\n\
          COPY . /app\n\
          WORKDIR {install_workdir}\n\
+         {workspace_fixup}\
          RUN {install}\n\
          WORKDIR {workdir}\n\
          RUN for example in .env.example .env.sample .env.template; do \
@@ -1157,6 +1170,7 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-launch-shim.js\n\
          RUN echo {} | base64 -d > /jss-plugin-host.mjs\n\
          RUN echo {} | base64 -d > /jss-express-host.mjs\n\
+         RUN echo {} | base64 -d > /jss-lifecycle-host.mjs\n\
          ENV NODE_EXTRA_CA_CERTS=/jss-marker.crt\n\
          ENV NODE_OPTIONS=--require=/jss-launch-shim.js\n\
          ENV PORT={port}\n\
@@ -1169,8 +1183,15 @@ fn dockerfile(
         base64(LAUNCH_SHIM_JS.as_bytes()),
         base64(PLUGIN_HOST_JS.as_bytes()),
         base64(EXPRESS_HOST_JS.as_bytes()),
+        base64(LIFECYCLE_HOST_JS.as_bytes()),
     )
 }
+
+/// Strips `workspace:`-protocol dependency specifiers from the install directory's `package.json`
+/// before an npm install, since npm cannot resolve that protocol and aborts the entire install on the
+/// first one it sees. Edits in place and tolerates a missing or malformed manifest. Dependencies
+/// removed here are development-only monorepo tools, never runtime dependencies.
+const NPM_WORKSPACE_FIXUP: &str = "node -e 'try{const fs=require(\"fs\");const j=JSON.parse(fs.readFileSync(\"package.json\",\"utf8\"));const o=j.devDependencies;if(o&&typeof o===\"object\")for(const k of Object.keys(o)){if(typeof o[k]===\"string\"&&o[k].indexOf(\"workspace:\")===0)delete o[k];}fs.writeFileSync(\"package.json\",JSON.stringify(j,null,2));}catch(e){}'";
 
 /// Standard base64 (no line wrapping): the only characters produced are `A-Za-z0-9+/=`, all
 /// shell-safe, so an embedded script survives the Dockerfile unchanged.
@@ -1340,7 +1361,10 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
     if is_express_router_module(&root.join(&file)) {
         return Some(express_host_command(&file));
     }
-    is_plugin_handler(&root.join(&file)).then(|| plugin_host_command(&file))
+    if is_plugin_handler(&root.join(&file)) {
+        return Some(plugin_host_command(&file));
+    }
+    is_lifecycle_server_module(&root.join(&file)).then(|| lifecycle_host_command(&file))
 }
 
 /// Whether the package manifest's only selectable launch is a CLI dispatcher `main` file. Mirrors
@@ -1406,6 +1430,46 @@ fn is_express_router_module(path: &std::path::Path) -> bool {
         return false;
     }
     src.contains("express") && src.contains(".Router(") && src.contains("export")
+}
+
+/// The launch command that mounts a lifecycle server module through the lifecycle host shim
+/// ([`LIFECYCLE_HOST_JS`]): the shim imports the module, calls its exported factory with a permissive
+/// host context whose `.app` is a minimal Express-compatible server, runs the returned object's
+/// lifecycle method(s) so its routes register, and serves them over HTTP on `PORT`.
+fn lifecycle_host_command(file: &str) -> String {
+    format!("[\"node\",\"/jss-lifecycle-host.mjs\",\"{file}\"]")
+}
+
+/// Whether a JavaScript file is a lifecycle server module in the OS.js/meeseOS provider shape: an
+/// exported factory `(core, proc) => ({ init, start, destroy })` that, run by the host, registers
+/// HTTP routes on a server object the host supplies (`core.app.post(proc.resource(path), handler)`)
+/// but never constructs or `.listen(`s a server of its own. Such a module publishes no server — the
+/// host application wires its routes into one at deploy time by calling the lifecycle method — so it
+/// is launched through the lifecycle host shim, which calls the factory and the lifecycle method on a
+/// mock host before serving the registered routes. A self-contained server (`.listen(`) and the
+/// Express-router / plug-in shapes are matched by their own paths before this one.
+fn is_lifecycle_server_module(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    // Namespaces its routes through the host's resource resolver (the provider convention), registers
+    // at least one HTTP route verb on the host-supplied server, and is a factory module the host runs.
+    let registers_route = [".get(", ".post(", ".put(", ".patch(", ".delete(", ".ws("]
+        .iter()
+        .any(|verb| src.contains(verb));
+    let namespaces = src.contains(".resource(");
+    let is_factory_module = src.contains("module.exports") || src.contains("export default");
+    namespaces && registers_route && is_factory_module
 }
 
 /// Whether a JavaScript file is a command-line dispatcher: it drives a CLI argument parser
@@ -1635,8 +1699,10 @@ pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::Pat
         return dir.clone();
     }
     // No launchable enclosing package: run the finding's own file in place when it is itself a
-    // self-contained server, so it does not need a manifest to be exercised.
-    if is_standalone_server(&root.join(file))
+    // self-contained server, or a lifecycle server module the host shim can launch, so it does not
+    // need a start script to be exercised. Its own directory is also where its dependencies are
+    // declared, so installing there resolves the module's `require(...)`.
+    if (is_standalone_server(&root.join(file)) || is_lifecycle_server_module(&root.join(file)))
         && let Some(parent) = file.parent()
     {
         return parent.to_path_buf();
@@ -2013,6 +2079,203 @@ app.use((req, res, next) => { express.urlencoded({ extended: true })(req, res, (
 for (const r of routers) { try { app.use(r); } catch (e) {} }
 console.error('[express-host] mounted ' + routers.length + ' router(s)');
 app.listen(port, '0.0.0.0', () => console.error('[express-host] listening on ' + port));
+"#;
+
+/// Mounts a lifecycle server module in the OS.js/meeseOS provider shape: a factory `(core, proc) =>
+/// ({ init, start })` that registers HTTP routes on a server object the host supplies (`const { app }
+/// = core; app.post(proc.resource(path), handler)`) but never listens itself. The shim imports the
+/// module, calls the factory with a permissive mock `core`/`proc` whose `core.app` is a minimal
+/// Express-compatible server and whose `proc.resource(p)` applies the deployed app prefix from
+/// `metadata.json`, runs the returned object's `init`/`start` so its routes register, then serves them
+/// over HTTP on `PORT`. It fabricates nothing: a verification still requires the real canary to flow
+/// through the module's own handler into the real sink. Dependency-free (core `http`); imports the
+/// target with dynamic `import()`, so it mounts ESM and CommonJS modules alike.
+const LIFECYCLE_HOST_JS: &str = r#"
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+const port = Number(process.env.PORT || 3000);
+const target = path.resolve(process.cwd(), process.argv[2] || '');
+let resourcePrefix = '';
+try {
+  const meta = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'metadata.json'), 'utf8'));
+  if (meta && typeof meta.name === 'string' && /^[A-Za-z0-9_.-]+$/.test(meta.name)) resourcePrefix = '/apps/' + meta.name;
+} catch (e) {}
+
+const routes = [];
+const middleware = [];
+function compile(p) {
+  const keys = [];
+  let pattern = (typeof p === 'string' && p) ? p : '/';
+  if (pattern.charAt(0) !== '/') pattern = '/' + pattern;
+  if (pattern.length > 1) pattern = pattern.replace(/\/+$/, '');
+  const parts = pattern.split('/').map((seg) => {
+    if (seg.charAt(0) === ':') { keys.push(seg.slice(1)); return '([^/]+)'; }
+    if (seg === '*') { keys.push('wild'); return '(.*)'; }
+    return seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  });
+  return { regex: new RegExp('^' + parts.join('/') + '/?$'), keys };
+}
+function add(method, p, handlers) {
+  const c = compile(p);
+  routes.push({ method, path: typeof p === 'string' ? p : '/', regex: c.regex, keys: c.keys, handlers });
+}
+
+const METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'all'];
+const app = function () { return app; };
+for (const m of METHODS) {
+  app[m] = (p, ...h) => { add(m === 'all' ? 'ALL' : m.toUpperCase(), p, h.flat().filter((f) => typeof f === 'function')); return app; };
+}
+app.use = (p, ...h) => {
+  let prefix = null;
+  let handlers = h;
+  if (typeof p === 'function') handlers = [p, ...h];
+  else if (typeof p === 'string') prefix = p === '/' ? null : p.replace(/\/+$/, '');
+  middleware.push({ prefix, handlers: handlers.flat().filter((f) => typeof f === 'function') });
+  return app;
+};
+app.ws = () => app;
+app.set = () => app;
+app.engine = () => app;
+app.param = () => app;
+app.enable = () => app;
+app.disable = () => app;
+app.listen = () => app;
+app.route = (p) => { const r = {}; for (const m of METHODS) r[m] = (...h) => { app[m](p, ...h); return r; }; return r; };
+
+function stub() {
+  const s = new Proxy(function () { return s; }, {
+    get(_t, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === Symbol.toPrimitive) return () => '';
+      if (prop === Symbol.iterator || prop === Symbol.asyncIterator) return undefined;
+      return s;
+    },
+    apply() { return s; },
+    construct() { return s; },
+  });
+  return s;
+}
+
+const core = new Proxy(function () { return core; }, {
+  get(_t, prop) {
+    if (prop === 'app') return app;
+    if (prop === 'config') return (_k, def) => def;
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return () => '';
+    return stub();
+  },
+  apply() { return core; },
+});
+
+const proc = new Proxy(function () { return proc; }, {
+  get(_t, prop) {
+    if (prop === 'resource') return (x) => { let s = (typeof x === 'string' && x) ? x : '/'; if (s.charAt(0) !== '/') s = '/' + s; return resourcePrefix + s; };
+    if (prop === 'metadata') return metadata;
+    if (prop === 'name') return metadata.name;
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return () => '';
+    return stub();
+  },
+  apply() { return proc; },
+});
+
+let metadata = { name: 'jss-app' };
+try {
+  const parsed = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'metadata.json'), 'utf8'));
+  if (parsed && typeof parsed === 'object') metadata = parsed;
+} catch (e) {}
+
+try {
+  const mod = await import(pathToFileURL(target).href);
+  const factory = (mod && typeof mod.default === 'function') ? mod.default : (typeof mod === 'function' ? mod : null);
+  let lifecycle = factory ? factory(core, proc) : null;
+  if (lifecycle && typeof lifecycle.then === 'function') lifecycle = await lifecycle;
+  for (const m of ['init', 'start']) {
+    if (lifecycle && typeof lifecycle[m] === 'function') {
+      try { await lifecycle[m](); } catch (e) { console.error('[lifecycle-host] ' + m + ' error: ' + (e && e.message)); }
+    }
+  }
+} catch (e) {
+  console.error('[lifecycle-host] load error: ' + (e && e.message));
+}
+
+function decorate(res) {
+  res.status = (c) => { res.statusCode = c; return res; };
+  res.set = res.header = (k, v) => {
+    if (k && typeof k === 'object') { for (const n in k) { try { res.setHeader(n, k[n]); } catch (e) {} } }
+    else { try { res.setHeader(k, v); } catch (e) {} }
+    return res;
+  };
+  res.type = (t) => { try { res.setHeader('Content-Type', t); } catch (e) {} return res; };
+  res.json = (obj) => { try { if (!res.headersSent) res.setHeader('Content-Type', 'application/json'); } catch (e) {} res.end(JSON.stringify(obj)); return res; };
+  res.send = (b) => {
+    if (b !== null && typeof b === 'object' && !Buffer.isBuffer(b)) return res.json(b);
+    res.end(b == null ? '' : (Buffer.isBuffer(b) ? b : String(b)));
+    return res;
+  };
+  res.sendStatus = (c) => { res.statusCode = c; res.end(String(c)); return res; };
+  res.redirect = (loc) => { res.statusCode = 302; try { res.setHeader('Location', loc); } catch (e) {} res.end(); return res; };
+  return res;
+}
+
+function parseBody(req, raw) {
+  if (!raw) return {};
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  try {
+    if (ct.indexOf('application/x-www-form-urlencoded') >= 0) return Object.fromEntries(new URLSearchParams(raw));
+    return JSON.parse(raw);
+  } catch (e) { return raw; }
+}
+
+function runChain(handlers, req, res) {
+  let i = 0;
+  function next(err) {
+    if (err) { try { if (!res.headersSent) res.statusCode = 500; res.end(); } catch (e) {} return; }
+    const h = handlers[i++];
+    if (!h) { try { if (!res.headersSent) { res.statusCode = 404; res.end(); } } catch (e) {} return; }
+    try { Promise.resolve(h(req, res, next)).catch(() => { try { if (!res.headersSent) { res.statusCode = 502; res.end(); } } catch (e) {} }); }
+    catch (e) { try { if (!res.headersSent) { res.statusCode = 502; res.end(); } } catch (x) {} }
+  }
+  next();
+}
+
+http.createServer((req, res) => {
+  decorate(res);
+  req.get = (h) => req.headers[String(h).toLowerCase()];
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch (e) { res.statusCode = 400; res.end(); return; }
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => { size += c.length; if (size <= 5 * 1024 * 1024) chunks.push(c); });
+  req.on('error', () => { try { res.statusCode = 400; res.end(); } catch (e) {} });
+  req.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    req.rawBody = raw;
+    req.body = parseBody(req, raw);
+    req.query = Object.fromEntries(u.searchParams);
+    req.path = u.pathname;
+    for (const r of routes) {
+      if (r.method !== 'ALL' && r.method !== req.method) continue;
+      const m = r.regex.exec(u.pathname);
+      if (!m) continue;
+      req.params = {};
+      r.keys.forEach((k, idx) => { try { req.params[k] = decodeURIComponent(m[idx + 1] || ''); } catch (e) { req.params[k] = m[idx + 1] || ''; } });
+      const before = [];
+      for (const group of middleware) {
+        if (group.prefix === null || u.pathname === group.prefix || u.pathname.startsWith(group.prefix + '/')) before.push(...group.handlers);
+      }
+      runChain([...before, ...r.handlers], req, res);
+      return;
+    }
+    res.statusCode = 404; res.end('no route');
+  });
+}).listen(port, '0.0.0.0', () => console.error('[lifecycle-host] listening on ' + port + ' routes=' + routes.map((r) => r.method + ' ' + r.path).join(',')));
 "#;
 
 /// Sends one request to the app on localhost and prints the response body. Reads its spec from
@@ -2834,6 +3097,87 @@ mod tests {
             Some(r#"["npm","start"]"#)
         );
         assert_eq!(manifest_start_command(&root.join("lib/util")), None);
+    }
+
+    #[test]
+    fn a_provider_lifecycle_module_is_launched_through_the_lifecycle_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An OS.js/meeseOS-style app package: a factory that registers routes on `core.app` through
+        // the host's `proc.resource` namespacing, with no launch script and no `main`, and
+        // `workspace:` sibling devDependencies npm cannot resolve. Its real runtime dependency is a
+        // plain registry package.
+        write(
+            root,
+            "apps/widget/package.json",
+            r#"{"name":"widget","scripts":{"build":"webpack"},"dependencies":{"axios":"^1"},"devDependencies":{"cfg":"workspace:*"}}"#,
+        );
+        write(
+            root,
+            "apps/widget/server.js",
+            "const axios = require(\"axios\");\n\
+             module.exports = (core, proc) => ({\n\
+               init: async () => {\n\
+                 const { app } = core;\n\
+                 app.post(proc.resource(\"/fetch\"), (req, res) => {\n\
+                   axios.get(req.body.target).then((r) => res.json(r.data));\n\
+                 });\n\
+               },\n\
+             });\n",
+        );
+        let path = std::path::Path::new;
+        // No launchable manifest, but the module is a provider-shaped server, so its own package
+        // directory (where its dependency is declared and installs) is the app.
+        assert!(is_lifecycle_server_module(
+            &root.join("apps/widget/server.js")
+        ));
+        assert_eq!(manifest_start_command(&root.join("apps/widget")), None);
+        assert_eq!(
+            app_dir(root, path("apps/widget/server.js")),
+            path("apps/widget")
+        );
+        assert_eq!(
+            start_command(&root.join("apps/widget"), Some(path("server.js"))).as_deref(),
+            Some(r#"["node","/jss-lifecycle-host.mjs","server.js"]"#)
+        );
+        // A plain module that registers no route and is not a provider server is not matched.
+        write(
+            root,
+            "apps/widget/util.js",
+            "module.exports = (a) => a + 1;\n",
+        );
+        assert!(!is_lifecycle_server_module(
+            &root.join("apps/widget/util.js")
+        ));
+
+        // Installing with npm neutralizes the `workspace:` specifiers first (npm aborts the whole
+        // install on them, so even the runtime dependency never installs), and the lifecycle host
+        // shim is planted in the image.
+        let canary = Canary::new("tok".to_owned());
+        let file = dockerfile(
+            "node:22-slim",
+            "/app/apps/widget",
+            "/app/apps/widget",
+            &canary,
+            r#"["node","/jss-lifecycle-host.mjs","server.js"]"#,
+            3000,
+            PackageManager::Npm,
+            true,
+        );
+        assert!(file.contains(NPM_WORKSPACE_FIXUP), "{file}");
+        assert!(file.contains("/jss-lifecycle-host.mjs"), "{file}");
+        // yarn understands `workspace:`, so the fixup is not applied there.
+        let yarn = dockerfile(
+            "node:22-slim",
+            "/app/apps/widget",
+            "/app/apps/widget",
+            &canary,
+            r#"["node","/jss-lifecycle-host.mjs","server.js"]"#,
+            3000,
+            PackageManager::Yarn,
+            true,
+        );
+        assert!(!yarn.contains(NPM_WORKSPACE_FIXUP), "{yarn}");
     }
 
     #[test]

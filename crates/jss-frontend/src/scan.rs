@@ -888,14 +888,14 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
     }
 }
 
-/// Fills in each finding's line-independent key and fingerprint, then sorts the findings for
-/// output (severity first).
+/// Removes exact duplicate witnesses, fills in each remaining finding's line-independent key and
+/// fingerprint, then sorts the findings for output (severity first).
 ///
 /// The key is `class|file|function|sink api|source expr|ordinal`; the ordinal tells apart
 /// findings that share the rest, counted in source order (sink position, then source position).
 /// Severity plays no part, so call this on every finding before filtering by severity: a key
 /// then never depends on the filters or on how a finding was rated.
-pub fn finalize(findings: &mut [Finding]) {
+pub fn finalize(findings: &mut Vec<Finding>) {
     fn identity(f: &Finding) -> (jss_core::VulnClass, &str, &str, &str, &str) {
         (f.class, &f.file, &f.function, &f.sink.api, &f.source.expr)
     }
@@ -914,6 +914,9 @@ pub fn finalize(findings: &mut [Finding]) {
             .then_with(|| position(a).cmp(&position(b)))
             .then_with(|| a.cmp(b))
     });
+    // Linking can discover the same cross-file witness through equivalent summary paths. They
+    // describe one vulnerability and must not consume separate ordinals/fingerprints.
+    findings.dedup();
     let mut previous: Option<String> = None;
     let mut ordinal = 0u32;
     for finding in findings.iter_mut() {
@@ -953,4 +956,69 @@ pub fn finalize(findings: &mut [Finding]) {
             ))
             .then_with(|| a.key.cmp(&b.key))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jss_core::{Auth, Severity, VulnClass};
+
+    fn finding() -> Finding {
+        Finding {
+            file: "route.js".to_owned(),
+            sink: SinkLoc {
+                file: Some("db.js".to_owned()),
+                api: "db.query".to_owned(),
+                arg: "sql".to_owned(),
+                line: 20,
+                col: 3,
+            },
+            class: VulnClass::SqlInjection,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "handler".to_owned(),
+            entry: Some("POST /run".to_owned()),
+            entry_at: None,
+            source: SourceLoc {
+                kind: "http",
+                expr: "req.body".to_owned(),
+                line: 4,
+                col: 15,
+            },
+            trace: vec![TraceStep {
+                file: Some("db.js".to_owned()),
+                line: 18,
+                col: 9,
+                note: "interpolated into a template".to_owned(),
+            }],
+            key: String::new(),
+            fingerprint: String::new(),
+        }
+    }
+
+    #[test]
+    fn exact_duplicate_witnesses_share_one_finding() {
+        let item = finding();
+        let mut findings = vec![item.clone(), item];
+
+        finalize(&mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].key.ends_with("|0"));
+        assert_eq!(findings[0].fingerprint.len(), 16);
+    }
+
+    #[test]
+    fn distinct_sink_witnesses_keep_distinct_ordinals() {
+        let first = finding();
+        let mut second = first.clone();
+        second.sink.line = 21;
+        let mut findings = vec![second, first];
+
+        finalize(&mut findings);
+
+        assert_eq!(findings.len(), 2);
+        assert_ne!(findings[0].fingerprint, findings[1].fingerprint);
+    }
 }

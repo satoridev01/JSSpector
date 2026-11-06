@@ -4,7 +4,7 @@
 //! planted marker file, write a marker file, or call a marker service — so a hit is unambiguous
 //! and leaves nothing behind but the marker.
 
-use super::plan::{DocEnvelope, Entry, Envelope, Probe};
+use super::plan::{DocEnvelope, Entry, Envelope, Method, Probe};
 use jss_core::VulnClass;
 
 /// The harmless value every non-payload envelope member is filled with, so a handler's early
@@ -764,8 +764,18 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
             headers.extend(sibling_headers(probe, name));
         }
         Entry::Url => {
-            // The payload is the path. Keep a single leading slash.
-            target = format!("/{}", value.trim_start_matches('/'));
+            let rest = value.trim_start_matches('/');
+            if probe.method == Method::Use {
+                // A middleware mounted at a path prefix (`app.use('/clients', ...)`) only runs for
+                // requests whose path begins with that prefix, and reads the full `req.originalUrl`
+                // (prefix included). Place the payload *under* the mount so the request reaches the
+                // handler and the traversal rides on the original URL.
+                let prefix = probe.path.trim_end_matches('/');
+                target = format!("{prefix}/{rest}");
+            } else {
+                // The payload is the path. Keep a single leading slash.
+                target = format!("/{rest}");
+            }
         }
     }
     // Any unfilled `{param}` slot gets its guard-pinned value, or a placeholder, so the route matches.
@@ -1417,6 +1427,27 @@ mod tests {
             4,
         );
         assert!(traversal.iter().all(|x| x.target.starts_with('/')));
+    }
+
+    #[test]
+    fn a_use_mount_traversal_places_the_payload_under_the_mount_path() {
+        // A middleware mounted at `/clients` only runs for requests under that prefix and reads the
+        // full original URL, so the climbing payload must ride beneath the mount, not at the root.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(VulnClass::PathTraversal, "/clients", Entry::Url);
+        p.method = Method::Use;
+        let a = attempts(&p, &canary, 1);
+        assert!(a.iter().all(|x| x.verb == "GET"));
+        assert!(
+            a.iter().all(|x| x.target.starts_with("/clients/")),
+            "every payload rides under the mount: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
+        assert!(
+            a.iter().any(|x| x.target == "/clients/../../../etc/passwd"),
+            "a climbing payload reaches outside the mount: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
     }
 
     #[test]

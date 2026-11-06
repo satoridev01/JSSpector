@@ -392,6 +392,10 @@ pub enum Method {
     Patch,
     Delete,
     Any,
+    /// A middleware mounted at a path prefix (`app.use('/clients', handler)`). It runs for every
+    /// method on any request whose path begins with the mount prefix, so it is driven like `Any`
+    /// but the payload is placed *under* the mount path rather than at the root.
+    Use,
     /// An HTTP upgrade (WebSocket) entry: `server.on('upgrade', ...)`. Driven as a GET carrying
     /// the upgrade handshake headers, so it reaches the upgrade handler rather than the request one.
     Upgrade,
@@ -406,6 +410,7 @@ impl Method {
             "PATCH" => Self::Patch,
             "DELETE" => Self::Delete,
             "ANY" => Self::Any,
+            "USE" => Self::Use,
             "UPGRADE" => Self::Upgrade,
             _ => return None,
         })
@@ -419,8 +424,8 @@ impl Method {
             Self::Put => "PUT",
             Self::Patch => "PATCH",
             Self::Delete => "DELETE",
-            Self::Any if matches!(entry, Entry::Body(_)) => "POST",
-            Self::Any | Self::Upgrade => "GET",
+            Self::Any | Self::Use if matches!(entry, Entry::Body(_)) => "POST",
+            Self::Any | Self::Use | Self::Upgrade => "GET",
         }
     }
 
@@ -3830,6 +3835,23 @@ mod tests {
         assert_eq!(probe.method.verb(&probe.entry), "GET");
         assert_eq!(probe.entry, Entry::Url);
         assert!(!Method::Any.is_upgrade());
+    }
+
+    #[test]
+    fn a_use_mount_entry_is_a_routable_get_under_the_mount_path() {
+        // `app.use('/clients', handler)` mounts a middleware at a path prefix that reads
+        // `req.originalUrl`; it is driven as a GET whose payload rides under the mount.
+        let probe = Probe::from_finding(&finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("USE /clients"),
+            "req.originalUrl",
+        ))
+        .unwrap();
+        assert_eq!(probe.method, Method::Use);
+        assert_eq!(probe.method.verb(&probe.entry), "GET");
+        assert_eq!(probe.entry, Entry::Url);
+        assert_eq!(probe.path, "/clients");
     }
 
     #[test]

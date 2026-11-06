@@ -53,6 +53,15 @@ pub struct Session {
     port: u16,
     /// Bumped per probe, so one probe's write/service marker never confirms another's.
     nonce: u32,
+    /// For an app that drops root at startup (`process.setuid`/`setgid` to a uid/gid read from the
+    /// environment), the non-root `uid:gid` to run the container as, so that privilege drop is a
+    /// genuine no-op to the identity the process already holds — it ends up as the unprivileged user
+    /// it meant to become, with nothing bypassed. `None` when the app performs no privilege drop.
+    run_as: Option<(u32, u32)>,
+    /// Environment the app's deployment supplies that the sandbox must reproduce for startup to
+    /// succeed honestly (the uid/gid/port variables a privilege-dropping app reads). Seeded into
+    /// every launch attempt.
+    base_env: Vec<RequiredEnv>,
     torn_down: bool,
 }
 
@@ -121,6 +130,14 @@ impl Session {
         docker(&["network", "create", "--internal", &network])
             .map_err(|e| format!("could not create the private network: {e}"))?;
 
+        // An app that drops root at startup needs a matching runtime user and the uid/gid/port
+        // variables its deployment supplies; discover them from its own source so the privilege drop
+        // runs honestly in the sandbox instead of crashing on an unset/undroppable id.
+        let (run_as, base_env) = match privilege_drop_fixture(&app_root, port) {
+            Some(fixture) => (Some(fixture.run_as), fixture.env),
+            None => (None, Vec::new()),
+        };
+
         let mut session = Self {
             tag,
             network,
@@ -131,6 +148,8 @@ impl Session {
             canary,
             port,
             nonce: 0,
+            run_as,
+            base_env,
             torn_down: false,
         };
         if let Err(err) = session.boot() {
@@ -173,7 +192,7 @@ impl Session {
         // An app that refuses to start without an environment variable its deployment supplies
         // (`NOOBOT_WORKSPACE_ROOT is required`) is started again with it set to a neutral value
         // (see [`required_env`]), a few times at most.
-        let mut env: Vec<RequiredEnv> = Vec::new();
+        let mut env: Vec<RequiredEnv> = self.base_env.clone();
         let mut stub_missing_modules = false;
         for _ in 0..5 {
             self.run_app(&env, stub_missing_modules)?;
@@ -233,6 +252,13 @@ impl Session {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+        // An app that drops root at startup is run as the very uid/gid it drops to, so its
+        // `setuid`/`setgid` are legal no-ops to the identity it already holds: the process ends up
+        // unprivileged exactly as designed, with no capability added and nothing suppressed.
+        if let Some((uid, gid)) = self.run_as {
+            args.push("--user".to_owned());
+            args.push(format!("{uid}:{gid}"));
+        }
         if stub_missing_modules {
             args.push("-e".to_owned());
             args.push("NODE_OPTIONS=--require=/jss-launch-shim.js".to_owned());
@@ -1359,6 +1385,157 @@ fn required_env(log: &str) -> Vec<RequiredEnv> {
     out
 }
 
+/// A non-root uid/gid to run a privilege-dropping app as. Any fixed non-zero pair works: the app's
+/// `setuid`/`setgid` drop to this same identity, a legal no-op, and the pair clears the app's own
+/// `uid === 0 || gid === 0` refusal. 10001 is high enough to avoid clashing with image accounts.
+const SANDBOX_RUN_UID: u32 = 10001;
+const SANDBOX_RUN_GID: u32 = 10001;
+
+/// A runtime-user precondition discovered from an app's own source: the non-root identity to run as
+/// plus the environment its deployment supplies for the privilege drop to succeed.
+struct PrivilegeDrop {
+    run_as: (u32, u32),
+    env: Vec<RequiredEnv>,
+}
+
+/// Whether the app drops root at startup, and if so the runtime user and environment that lets it do
+/// so honestly in the sandbox. An app that calls `process.setuid`/`process.setgid` with a uid/gid it
+/// reads from the environment is a deployment that starts as root and sheds privilege to a service
+/// account its operator configures. The sandbox reproduces that precondition truthfully: it runs the
+/// container as a fixed non-root user and points the uid/gid variables the app reads at that same
+/// identity, so the drop is a no-op to who the process already is — it genuinely ends unprivileged,
+/// nothing is monkeypatched, suppressed, or left holding privilege. Any port variable the app reads
+/// is pinned to the sandbox port too, since a non-root process cannot bind the privileged default
+/// (80) such apps often fall back to. Returns `None` when no privilege drop is present.
+fn privilege_drop_fixture(app_root: &std::path::Path, port: u16) -> Option<PrivilegeDrop> {
+    let sources = app_source_files(app_root);
+    let drops_root = sources
+        .iter()
+        .any(|src| src.contains("process.setuid(") || src.contains("process.setgid("));
+    if !drops_root {
+        return None;
+    }
+    let mut env: Vec<RequiredEnv> = Vec::new();
+    for src in &sources {
+        for name in env_var_names(src) {
+            let upper = name.to_ascii_uppercase();
+            let value = if upper.contains("UID") {
+                SANDBOX_RUN_UID.to_string()
+            } else if upper.contains("GID") {
+                SANDBOX_RUN_GID.to_string()
+            } else if upper.contains("PORT") {
+                port.to_string()
+            } else {
+                continue;
+            };
+            if env.iter().all(|existing| existing.name != name) {
+                env.push(RequiredEnv {
+                    name,
+                    value,
+                    directory: false,
+                });
+            }
+        }
+    }
+    Some(PrivilegeDrop {
+        run_as: (SANDBOX_RUN_UID, SANDBOX_RUN_GID),
+        env,
+    })
+}
+
+/// The app's own JavaScript source (never `node_modules` or build output), bounded in breadth and
+/// depth so scanning a large repo stays cheap. Used only to recognize a startup privilege drop and
+/// the environment variables it reads.
+fn app_source_files(app_root: &std::path::Path) -> Vec<String> {
+    const SKIP_DIRS: [&str; 7] = [
+        "node_modules",
+        ".git",
+        "build",
+        "dist",
+        "coverage",
+        ".next",
+        "public",
+    ];
+    let mut out = Vec::new();
+    let mut stack = vec![(app_root.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 4 || out.len() >= 400 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref()) {
+                    stack.push((path, depth + 1));
+                }
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"))
+                && std::fs::metadata(&path).is_ok_and(|meta| meta.len() <= 512 * 1024)
+                && let Ok(src) = std::fs::read_to_string(&path)
+            {
+                out.push(src);
+            }
+        }
+    }
+    out
+}
+
+/// Every environment variable name read in `src` via `process.env.NAME`, `process.env['NAME']` or
+/// `process.env["NAME"]`. Deliberately simple textual extraction — only variable *names* are needed.
+fn env_var_names(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let needle = "process.env";
+    let bytes = src.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(needle) {
+        let mut i = from + rel + needle.len();
+        let name = if bytes.get(i) == Some(&b'.') {
+            i += 1;
+            let start = i;
+            while bytes
+                .get(i)
+                .copied()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                i += 1;
+            }
+            src.get(start..i).filter(|n| !n.is_empty())
+        } else if bytes.get(i) == Some(&b'[') {
+            let quote = bytes.get(i + 1).copied();
+            if matches!(quote, Some(b'\'') | Some(b'"')) {
+                let start = i + 2;
+                src[start..]
+                    .find(quote.unwrap() as char)
+                    .map(|end| &src[start..start + end])
+                    .filter(|n| {
+                        !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(name) = name {
+            if !out.contains(&name.to_owned()) {
+                out.push(name.to_owned());
+            }
+        }
+        from += rel + needle.len();
+    }
+    out
+}
+
 /// A Node script, run inside the app container, that prints the port the app answers on and
 /// exits 0, else exits 1. The port asked for via `PORT` when the app listens there; otherwise,
 /// for an app that fixes its own port (`server.listen(8000)`), the one TCP port the container
@@ -1397,6 +1574,18 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
             && is_express_router_module(&root.join(&file))
         {
             return Some(express_host_command(&file));
+        }
+        // A manifest whose only launch is a front-end dev/build server (`react-scripts start`,
+        // `vite`, `vue-cli-service serve`, …) compiles and serves the client bundle, never the
+        // HTTP backend where the finding's sink lives. When the finding's own file is a
+        // self-contained server (it constructs a listener and calls `.listen`), run that file
+        // directly so the backend route under test is actually served.
+        if manifest_launch_is_frontend(root)
+            && let Some(rel) = entry.and_then(|path| path.to_str())
+            && let Some(file) = package_file(root, rel)
+            && is_standalone_server(&root.join(&file))
+        {
+            return Some(format!("[\"node\",\"{file}\"]"));
         }
         return Some(command);
     }
@@ -1447,6 +1636,43 @@ fn manifest_launch_is_cli(root: &std::path::Path) -> bool {
         .and_then(serde_json::Value::as_str)
         .and_then(|main| package_file(root, main))
         .is_some_and(|main| is_cli_dispatcher(&root.join(&main)))
+}
+
+/// Whether the package manifest's selected launch is a front-end dev/build server rather than an
+/// HTTP backend. Such a command (`react-scripts`, `vite`, `vue-cli-service`, `@angular/cli`,
+/// `gatsby`, `parcel`, `snowpack`, `webpack-dev-server`) compiles and serves the client bundle and
+/// answers every path with the SPA shell, so a backend route can never be exercised through it.
+/// Mirrors [`manifest_start_command`]'s script precedence (`start`, then `serve`/`server`/`app`).
+fn manifest_launch_is_frontend(root: &std::path::Path) -> bool {
+    const FRONTEND_TOOLS: [&str; 9] = [
+        "react-scripts",
+        "vue-cli-service",
+        "ng serve",
+        "gatsby develop",
+        "webpack-dev-server",
+        "webpack serve",
+        "parcel ",
+        "snowpack ",
+        "vite",
+    ];
+    let Ok(manifest) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return false;
+    };
+    let Some(scripts) = json.get("scripts").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let selected = ["start", "serve", "server", "app"]
+        .into_iter()
+        .find_map(|name| {
+            scripts
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+        });
+    selected.is_some_and(|command| FRONTEND_TOOLS.iter().any(|tool| command.contains(tool)))
 }
 
 /// The launch command that mounts an Express router module through the Express host shim
@@ -3257,6 +3483,104 @@ mod tests {
             Some(r#"["npm","start"]"#)
         );
         assert_eq!(manifest_start_command(&root.join("lib/util")), None);
+    }
+
+    #[test]
+    fn a_frontend_manifest_launches_the_findings_own_backend_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A create-react-app repo: the only launch is the front-end dev server, but the vulnerable
+        // route lives in a self-contained Express backend started separately in production.
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"react-scripts start","build":"react-scripts build"}}"#,
+        );
+        write(
+            root,
+            "server.mjs",
+            "import express from 'express';\n\
+             const app = express();\n\
+             app.use('/clients', (req, res) => {});\n\
+             app.listen(80);\n",
+        );
+        let path = std::path::Path::new;
+        assert!(manifest_launch_is_frontend(root));
+        // The front-end launch is bypassed in favour of running the standalone backend directly.
+        assert_eq!(
+            start_command(root, Some(path("server.mjs"))).as_deref(),
+            Some(r#"["node","server.mjs"]"#)
+        );
+        // With no standalone backend to run, the manifest launch still wins.
+        write(root, "notaserver.mjs", "console.log('hi');\n");
+        assert_eq!(
+            start_command(root, Some(path("notaserver.mjs"))).as_deref(),
+            Some(r#"["npm","start"]"#)
+        );
+    }
+
+    #[test]
+    fn a_privilege_dropping_app_runs_as_the_identity_it_drops_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An app that reads its uid/gid/port from the environment and drops root at startup.
+        write(
+            root,
+            "server.mjs",
+            "const port = parseInt(process.env.ASYMPTOTE_PORT);\n\
+             app.listen(port);\n",
+        );
+        write(
+            root,
+            "util.mjs",
+            "export function dropRootPermission() {\n\
+               const uid = parseInt(process.env.ASYMPTOTE_UID);\n\
+               const gid = parseInt(process.env.ASYMPTOTE_GID);\n\
+               process.setgid(gid);\n\
+               process.setuid(uid);\n\
+             }\n",
+        );
+        let fixture = privilege_drop_fixture(root, 3000).expect("a privilege drop is detected");
+        assert_eq!(fixture.run_as, (SANDBOX_RUN_UID, SANDBOX_RUN_GID));
+        let value = |name: &str| {
+            fixture
+                .env
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.value.as_str())
+        };
+        // uid/gid variables point at the runtime identity, so the drop is a legal no-op; the port
+        // variable is pinned to the sandbox port a non-root process can bind.
+        assert_eq!(
+            value("ASYMPTOTE_UID"),
+            Some(SANDBOX_RUN_UID.to_string().as_str())
+        );
+        assert_eq!(
+            value("ASYMPTOTE_GID"),
+            Some(SANDBOX_RUN_GID.to_string().as_str())
+        );
+        assert_eq!(value("ASYMPTOTE_PORT"), Some("3000"));
+
+        // An app that never drops privileges gets no forced runtime user.
+        let plain = tempfile::tempdir().unwrap();
+        write(
+            plain.path(),
+            "server.mjs",
+            "app.listen(process.env.PORT);\n",
+        );
+        assert!(privilege_drop_fixture(plain.path(), 3000).is_none());
+    }
+
+    #[test]
+    fn env_var_names_reads_dot_and_bracket_accessors() {
+        let names = env_var_names(
+            "a=process.env.FOO; b=process.env['BAR']; c=process.env[\"BAZ\"]; d=process.env[k];",
+        );
+        assert!(names.contains(&"FOO".to_owned()));
+        assert!(names.contains(&"BAR".to_owned()));
+        assert!(names.contains(&"BAZ".to_owned()));
+        // A dynamic (non-literal) key is not a name.
+        assert!(!names.iter().any(|n| n == "k"));
     }
 
     #[test]

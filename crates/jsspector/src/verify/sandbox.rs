@@ -11,6 +11,10 @@ use serde::Deserialize;
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A monotonic request counter, used to give every driven request a distinct `X-Forwarded-For` so a
+/// per-IP rate limiter never throttles the scanner's own probe volume (see [`request_spec`]).
+static REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const BASE_IMAGE: &str = "node:22-slim";
 const DEFAULT_NODE_MAJOR: u32 = 22;
 
@@ -92,10 +96,20 @@ impl Session {
             .ok_or_else(|| "no launchable script or `main` file in package.json".to_owned())?;
         let workdir = container_dir(app_path)
             .ok_or_else(|| format!("unsupported app directory `{}`", app_path.display()))?;
+        // Install dependencies where they are declared: the nearest manifest ancestor of the launch
+        // directory. A standalone server launched from a manifest-less subdirectory draws its
+        // dependencies from an ancestor package, so installing in the launch directory alone would
+        // leave `require(...)` unresolved.
+        let install_rel = install_path(root, app_path);
+        let install_root = root.join(&install_rel);
+        let install_workdir = container_dir(&install_rel)
+            .ok_or_else(|| format!("unsupported install directory `{}`", install_rel.display()))?;
 
         build_image(
             root,
             &app_root,
+            &install_root,
+            &install_workdir,
             &workdir,
             &tag,
             &canary,
@@ -328,6 +342,46 @@ impl Session {
         if probe.class == jss_core::VulnClass::NosqlInjection {
             return self.exercise_nosql(probe);
         }
+        // A traversal sink that deletes its argument cannot be proved by reflected content — a
+        // successful delete echoes nothing — and the generic climbing attempts would consume the
+        // planted canary before any differential ran. Prove it directly: plant a file outside the
+        // base directory, drive the handler to remove it by traversal, and confirm it disappeared
+        // while a sibling control file planted alongside it survived.
+        if probe.class == jss_core::VulnClass::PathTraversal && probe.removes {
+            return match self.verify_delete_oracle(probe) {
+                Some(poc) => Outcome::Verified {
+                    how: format!("{} {}", poc.method, poc.target),
+                    poc,
+                },
+                None => Outcome::NotReproduced { tried: 1 },
+            };
+        }
+        // A traversal *read* sink that appends a fixed segment after the tainted input reads
+        // `<tainted-dir>/<suffix>`. Plant the canary file at that location so the climbing payloads,
+        // completed by the handler's own appended segment, resolve to a real token file. A listing
+        // sink is handled below: it needs a directory, not a file, at the appended segment.
+        if probe.class == jss_core::VulnClass::PathTraversal
+            && !probe.lists_dir
+            && let Some(suffix) = &probe.read_suffix
+        {
+            self.plant_suffix_canary(suffix);
+        }
+        // A directory-listing traversal proves itself by a planted file name appearing in the
+        // returned listing. Plant a token-named file inside the directory the handler enumerates:
+        // under each accepted sibling value it appends from the route (`path.join(base, kind)`), so a
+        // climb completed by an accepted slot value lands on a real planted directory; otherwise
+        // directly in the climbed-to directory. The fixed-segment (`read_suffix`) case is planted as
+        // a file above, only for a byte read — a listing sink reaches a planted value directory here.
+        if probe.class == jss_core::VulnClass::PathTraversal && probe.lists_dir {
+            match &probe.appended_param {
+                Some(ap) => {
+                    for value in &ap.values {
+                        self.plant_listing_canary(value, self.nonce);
+                    }
+                }
+                None => self.plant_listing_canary("", self.nonce),
+            }
+        }
         let attempts = payload::attempts(probe, &self.canary, self.nonce);
         let tried = attempts.len();
         for attempt in &attempts {
@@ -338,7 +392,144 @@ impl Session {
                 };
             }
         }
+        // Fallback for a read sink that consumes the planted file but never echoes it (the handler
+        // reads it and then crashes or renders without reflecting its bytes): prove the traversal by
+        // a differential file-found/not-found oracle instead of by content in the response.
+        if let Some(poc) = self.verify_read_oracle(probe) {
+            return Outcome::Verified {
+                how: format!("{} {}", poc.method, poc.target),
+                poc,
+            };
+        }
         Outcome::NotReproduced { tried }
+    }
+
+    /// Confirms a path-traversal read whose content is not reflected, by a differential oracle: a
+    /// canary planted only outside the base directory makes the handler take its file-found branch,
+    /// while two equivalent unplanted out-of-base paths take its not-found branch. URL reflection
+    /// (a not-found page echoing the requested id) is neutralized before comparing, and the two
+    /// unplanted responses must agree, so a handler that confines the path — reaching none of the
+    /// three — yields no signal.
+    fn verify_read_oracle(&self, probe: &Probe) -> Option<Reproduction> {
+        let oracle = payload::read_oracle(probe, &self.canary, self.nonce)?;
+        let present = self.fetch(&oracle.present)?;
+        let absent = self.fetch(&oracle.absent)?;
+        let absent_sub = self.fetch(&oracle.absent_sub)?;
+        if present.trim().is_empty() {
+            return None;
+        }
+        let present_n = strip_request_echo(&present, &oracle.present.target, &oracle.present_value);
+        let absent_n = strip_request_echo(&absent, &oracle.absent.target, &oracle.absent_value);
+        let absent_sub_n = strip_request_echo(
+            &absent_sub,
+            &oracle.absent_sub.target,
+            &oracle.absent_sub_value,
+        );
+        if present_n == absent_n || present_n == absent_sub_n || absent_n != absent_sub_n {
+            return None;
+        }
+        Some(Reproduction {
+            command: curl_command(&oracle.present, self.port),
+            method: oracle.present.verb.to_owned(),
+            target: oracle.present.target.clone(),
+            headers: Vec::new(),
+            body: None,
+            evidence: "a canary file planted only outside the application's base directory was \
+                reached by traversal: the handler took its file-found path for the planted path but \
+                its not-found path for an equivalent unplanted path, proving the read opened the \
+                attacker-controlled path outside the base directory"
+                .to_owned(),
+            response: present.trim().chars().take(400).collect(),
+        })
+    }
+
+    /// Confirms a path-traversal removal (`fs.unlink`, `fs.rm`, …) by a destructive differential: a
+    /// `target` file is planted outside the application's base directory, and a `control` file is
+    /// planted alongside it that the request never names. The present request climbs to `target` and
+    /// asks the handler to remove it. A vulnerable handler opens the attacker-controlled path and
+    /// removes `target` (it disappears) while `control` survives; a handler that confines the path
+    /// reaches neither. The planting and the request both stay inside the isolated app container.
+    fn verify_delete_oracle(&self, probe: &Probe) -> Option<Reproduction> {
+        let oracle = payload::delete_oracle(probe, &self.canary, self.nonce)?;
+        let parent = match oracle.target_path.rfind('/') {
+            Some(at) => &oracle.target_path[..at],
+            None => oracle.dir.as_str(),
+        };
+        let plant = format!(
+            "mkdir -p '{parent}' '{dir}' && : > '{target}' && : > '{control}'",
+            dir = oracle.dir,
+            target = oracle.target_path,
+            control = oracle.control_path,
+        );
+        let _ = self.exec(&self.app, &["sh", "-c", &plant]);
+        // Both planted files must exist before the request, or the differential proves nothing.
+        if !self.file_exists(&oracle.target_path) || !self.file_exists(&oracle.control_path) {
+            return None;
+        }
+        let _ = self.fetch(&oracle.present);
+        // The target must be gone (the traversal reached it) and the control must survive (the
+        // removal was directed by the attacker-controlled path, not an indiscriminate wipe).
+        if self.file_exists(&oracle.target_path) || !self.file_exists(&oracle.control_path) {
+            return None;
+        }
+        Some(Reproduction {
+            command: curl_command(&oracle.present, self.port),
+            method: oracle.present.verb.to_owned(),
+            target: oracle.present.target.clone(),
+            headers: Vec::new(),
+            body: oracle.present.body.clone(),
+            evidence:
+                "a canary file planted outside the application's base directory was removed by \
+                the traversal request while a sibling control file planted alongside it survived, \
+                proving the removal opened the attacker-controlled path outside the base directory"
+                    .to_owned(),
+            response: String::new(),
+        })
+    }
+
+    /// Whether a path exists inside the running app container. Used by the removal oracle to observe,
+    /// out of band from the HTTP response, that a planted file was deleted by a traversal request.
+    fn file_exists(&self, path: &str) -> bool {
+        self.exec(
+            &self.app,
+            &["sh", "-c", &format!("test -e '{path}' && echo Y || echo N")],
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains('Y'))
+    }
+
+    /// Writes the canary document at `<planted_dir>/<suffix>` inside the running app container, so a
+    /// traversal that climbs to the planted directory — with the handler's own fixed segment appended
+    /// — reads a real token file. `suffix` is already validated filesystem-safe by the planner. The
+    /// write stays inside the isolated container; nothing about the proof is weakened.
+    fn plant_suffix_canary(&self, suffix: &str) {
+        let dir = self.canary.planted_dir();
+        let file = format!("{dir}/{suffix}");
+        let parent = match file.rfind('/') {
+            Some(at) => &file[..at],
+            None => dir.as_str(),
+        };
+        let document = base64(self.canary.planted_dir_document().as_bytes());
+        let script = format!("mkdir -p '{parent}' && echo {document} | base64 -d > '{file}'");
+        let _ = self.exec(&self.app, &["sh", "-c", &script]);
+    }
+
+    /// Creates a canary directory (under the appended sibling value `subdir`, when the handler appends
+    /// one) holding a single token-named file inside the running app container, so a directory-listing
+    /// traversal that climbs to it enumerates an entry name carrying the token. `subdir` is already
+    /// validated filesystem-safe by the planner; the token is alphanumeric. The write stays inside the
+    /// isolated container, and the proof is the token name surfacing, nothing weaker.
+    fn plant_listing_canary(&self, subdir: &str, nonce: u32) {
+        let base = self.canary.planted_dir();
+        let dir = if subdir.is_empty() {
+            base
+        } else {
+            format!("{base}/{subdir}")
+        };
+        let file = format!("{dir}/{}", self.canary.listing_token(nonce));
+        let script = format!("mkdir -p '{dir}' && : > '{file}'");
+        let _ = self.exec(&self.app, &["sh", "-c", &script]);
     }
 
     fn exercise_nosql(&self, probe: &Probe) -> Outcome {
@@ -677,9 +868,12 @@ impl Drop for Session {
 /// Builds the verify image: the repo copied in, dependencies installed, the marker file planted,
 /// the driver and marker scripts added, and the app's start command set. The install step is the
 /// only one with network access.
+#[allow(clippy::too_many_arguments)]
 fn build_image(
     root: &std::path::Path,
     app_root: &std::path::Path,
+    install_root: &std::path::Path,
+    install_workdir: &str,
     workdir: &str,
     tag: &str,
     canary: &Canary,
@@ -689,12 +883,46 @@ fn build_image(
     let context = root
         .to_str()
         .ok_or_else(|| "the repository path is not valid UTF-8".to_owned())?;
-    let image = base_image(app_root);
-    let pm = package_manager(app_root);
+    // Dependencies are declared and locked in the install directory (the nearest manifest ancestor
+    // of the launch directory), so the package manager and base image are chosen from there. The
+    // build script, by contrast, belongs to the app actually launched: a standalone server run from
+    // a manifest-less subdirectory needs its ancestor's dependencies, not its ancestor's build.
+    let image = base_image(install_root);
+    let pm = package_manager(install_root);
     let has_build = std::fs::read_to_string(app_root.join("package.json"))
         .is_ok_and(|manifest| has_build_script(&manifest));
-    let dockerfile = dockerfile(&image, workdir, canary, start_command, port, pm, has_build);
+    let dockerfile = dockerfile(
+        &image,
+        install_workdir,
+        workdir,
+        canary,
+        start_command,
+        port,
+        pm,
+        has_build,
+    );
     build_from_dockerfile(&dockerfile, tag, context)
+}
+
+/// The directory whose manifest and lockfile declare the dependencies to install for a launch
+/// directory: the nearest ancestor of `app_path` (inclusive, relative to `root`) that holds a
+/// `package.json`. A self-contained server launched from a directory with no manifest of its own
+/// (`src/web/dashboard.js`) still has its dependencies declared by an ancestor package; installing
+/// there — not in the manifest-less launch directory — is what makes `require('express')` resolve
+/// at run time. Falls back to the launch directory when no ancestor manifest exists.
+fn install_path(root: &std::path::Path, app_path: &std::path::Path) -> std::path::PathBuf {
+    let mut dir = Some(app_path);
+    while let Some(current) = dir {
+        if root.join(current).join("package.json").is_file() {
+            return current.to_path_buf();
+        }
+        dir = if current.as_os_str().is_empty() {
+            None
+        } else {
+            Some(current.parent().unwrap_or_else(|| std::path::Path::new("")))
+        };
+    }
+    app_path.to_path_buf()
 }
 
 fn db_service(app_root: &std::path::Path) -> bool {
@@ -786,7 +1014,10 @@ fn install_command(pm: PackageManager) -> &'static str {
             "corepack enable && (yarn install --frozen-lockfile || yarn install) || true"
         }
         PackageManager::Pnpm => {
-            "corepack enable && (pnpm install --frozen-lockfile || pnpm install) || true"
+            // The plain fallback must relax the frozen lockfile: under `CI=true` pnpm freezes by
+            // default, so a lockfile that no longer matches the manifest (a stale `overrides`,
+            // added dependency) can only be installed with `--no-frozen-lockfile`.
+            "corepack enable && (pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile) || true"
         }
     }
 }
@@ -877,8 +1108,10 @@ fn tail_logs(name: &str) -> String {
 /// The generated Dockerfile. `npm ci` when a lockfile is present (reproducible), else `npm
 /// install`; both tolerate the absence of a build script. The marker file and the two helper
 /// scripts are written through base64 so no shell or printf escaping can corrupt them.
+#[allow(clippy::too_many_arguments)]
 fn dockerfile(
     image: &str,
+    install_workdir: &str,
     workdir: &str,
     canary: &Canary,
     start_command: &str,
@@ -887,7 +1120,12 @@ fn dockerfile(
     has_build: bool,
 ) -> String {
     let token = &canary.token;
-    // Plant the canary under every path it may be read through in one pass.
+    // Plant the canary under every path it may be read through in one pass. The content is a JSON
+    // string literal (`"<token>"`, the token being hex so always valid JSON), not the bare token:
+    // a read handler that parses the file before returning it — `res.json(JSON.parse(readFile(p)))`,
+    // the common shape for a sink that reads a `.json` data file — then reflects the token instead
+    // of throwing on invalid JSON, while a handler that serves the bytes raw still echoes the token
+    // as a substring. The token alone remains the signal; the quotes only let it survive a parse.
     let marker_files = canary.planted_files().join(" ");
     let install = install_command(pm);
     let build = if has_build {
@@ -895,23 +1133,32 @@ fn dockerfile(
     } else {
         String::new()
     };
+    // Install and build in the directory that owns the manifest and lockfile, then move to the
+    // launch directory so the app's `.env` seeding and `CMD` run with its own working directory.
+    // When they coincide (an app launched from its own package) this is one directory throughout.
     format!(
         "FROM {image}\n\
          ENV CI=true\n\
          ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n\
+         ENV TS_NODE_TRANSPILE_ONLY=true\n\
          WORKDIR /app\n\
          COPY . /app\n\
-         WORKDIR {workdir}\n\
+         WORKDIR {install_workdir}\n\
          RUN {install}\n\
+         WORKDIR {workdir}\n\
          RUN for example in .env.example .env.sample .env.template; do \
          if [ ! -e .env ] && [ -f \"$example\" ]; then cp \"$example\" .env; fi; done\n\
          {build}\
-         RUN for f in {marker_files}; do printf '%s' '{token}' > \"$f\"; done\n\
+         RUN for f in {marker_files}; do printf '\"%s\"' '{token}' > \"$f\"; done\n\
          RUN echo {} | base64 -d > /jss-driver.js\n\
          RUN echo {} | base64 -d > /jss-marker.js\n\
          RUN echo {} | base64 -d > /jss-marker.crt\n\
          RUN echo {} | base64 -d > /jss-marker.key\n\
+         RUN echo {} | base64 -d > /jss-launch-shim.js\n\
+         RUN echo {} | base64 -d > /jss-plugin-host.mjs\n\
+         RUN echo {} | base64 -d > /jss-express-host.mjs\n\
          ENV NODE_EXTRA_CA_CERTS=/jss-marker.crt\n\
+         ENV NODE_OPTIONS=--require=/jss-launch-shim.js\n\
          ENV PORT={port}\n\
          ENV HOST=0.0.0.0\n\
          CMD {start_command}\n",
@@ -919,6 +1166,9 @@ fn dockerfile(
         base64(MARKER_JS.as_bytes()),
         base64(MARKER_CERT.as_bytes()),
         base64(MARKER_KEY.as_bytes()),
+        base64(LAUNCH_SHIM_JS.as_bytes()),
+        base64(PLUGIN_HOST_JS.as_bytes()),
+        base64(EXPRESS_HOST_JS.as_bytes()),
     )
 }
 
@@ -1056,7 +1306,9 @@ fn listening_probe(wanted: u16) -> String {
          if(c[3]==='0A'&&p&&(/^0+$/.test(a)||a==='0100007F'||a==='00000000000000000000000001000000'))ports.add(parseInt(p,16))}}}}\
          const list=[...ports];const port=ports.has({wanted})||!list.length?{wanted}:(list.length===1?list[0]:0);\
          if(!port)process.exit(1);\
-         net.connect({{port,host:'127.0.0.1'}}).on('connect',()=>{{console.log(port);process.exit(0)}}).on('error',()=>process.exit(1));"
+         const hosts=['127.0.0.1','::1'];let hi=0;\
+         (function go(){{if(hi>=hosts.length)process.exit(1);\
+         net.connect({{port,host:hosts[hi++]}}).on('connect',()=>{{console.log(port);process.exit(0)}}).on('error',()=>go());}})();"
     )
 }
 
@@ -1067,11 +1319,117 @@ fn listening_probe(wanted: u16) -> String {
 /// `package.json` still be exercised.
 fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Option<String> {
     if let Some(command) = manifest_start_command(root) {
+        // A manifest whose only launch is a CLI dispatcher (commander/yargs) prints its usage and
+        // exits without ever binding a port, so the route under test is never served. When the
+        // finding's own file is a mountable Express router module, host that router on a throwaway
+        // server instead; otherwise fall back to the manifest command.
+        if manifest_launch_is_cli(root)
+            && let Some(rel) = entry.and_then(|path| path.to_str())
+            && let Some(file) = package_file(root, rel)
+            && is_express_router_module(&root.join(&file))
+        {
+            return Some(express_host_command(&file));
+        }
         return Some(command);
     }
     let rel = entry?.to_str()?;
     let file = package_file(root, rel)?;
-    is_standalone_server(&root.join(&file)).then(|| format!("[\"node\",\"{file}\"]"))
+    if is_standalone_server(&root.join(&file)) {
+        return Some(format!("[\"node\",\"{file}\"]"));
+    }
+    if is_express_router_module(&root.join(&file)) {
+        return Some(express_host_command(&file));
+    }
+    is_plugin_handler(&root.join(&file)).then(|| plugin_host_command(&file))
+}
+
+/// Whether the package manifest's only selectable launch is a CLI dispatcher `main` file. Mirrors
+/// the precedence in [`manifest_start_command`]: a `start`, `serve`, `server`, or `app` script is a
+/// real launch, not a CLI, so those short-circuit to `false`. Otherwise the decision rests on the
+/// `main` file being a command-line dispatcher ([`is_cli_dispatcher`]) — one that parses argv and
+/// prints usage rather than listening.
+fn manifest_launch_is_cli(root: &std::path::Path) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    if has_start_script(&manifest) {
+        return false;
+    }
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return false;
+    };
+    let has_alias = json
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            ["serve", "server", "app"].iter().any(|name| {
+                scripts
+                    .get(*name)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|command| !command.trim().is_empty())
+            })
+        });
+    if has_alias {
+        return false;
+    }
+    json.get("main")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|main| package_file(root, main))
+        .is_some_and(|main| is_cli_dispatcher(&root.join(&main)))
+}
+
+/// The launch command that mounts an Express router module through the Express host shim
+/// ([`EXPRESS_HOST_JS`]): the shim imports the module, collects the router(s)/app(s) it exports (or
+/// that its exported factories return), mounts them on a fresh Express app, and serves it on `PORT`.
+fn express_host_command(file: &str) -> String {
+    format!("[\"node\",\"/jss-express-host.mjs\",\"{file}\"]")
+}
+
+/// Whether a JavaScript file is a mountable Express router module: it pulls in Express and builds a
+/// `express.Router()` (directly, or via an exported factory) but never calls `.listen(` itself. Such
+/// a module publishes routes without a server of its own — the application wires it into one at
+/// runtime (often behind a CLI subcommand) — so it is launched through the Express host shim rather
+/// than run directly, which would only evaluate and exit. A self-contained server (which does
+/// `.listen(`) is left to the normal launch path.
+fn is_express_router_module(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    src.contains("express") && src.contains(".Router(") && src.contains("export")
+}
+
+/// Whether a JavaScript file is a command-line dispatcher: it drives a CLI argument parser
+/// (`commander` or `yargs`) and calls `.parse(`/`.parseAsync(`, but never `.listen(`. Run bare it
+/// prints usage for the available subcommands and exits, so the server a subcommand would have
+/// started is never reached. Used to decide that a manifest `main` of this shape is not a launchable
+/// server.
+fn is_cli_dispatcher(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    let uses_framework = src.contains("commander") || src.contains("yargs");
+    let parses = src.contains(".parse(") || src.contains(".parseAsync(");
+    uses_framework && parses
 }
 
 /// A launch command read from the package manifest. Prefer the conventional `start` script, then
@@ -1110,7 +1468,47 @@ fn manifest_start_command(root: &std::path::Path) -> Option<String> {
         return Some(format!("[\"npm\",\"run\",\"{script}\"]"));
     }
     let main = json?.get("main")?.as_str()?.to_owned();
-    package_file(root, &main).map(|main| format!("[\"node\",\"{main}\"]"))
+    let main = package_file(root, &main)?;
+    // A `main` that is a plug-in handler module — it registers an HTTP request handler on a
+    // host-provided web-server service but never listens itself — would just evaluate and exit under
+    // `node <main>`, never binding a port. Mount its registered handler(s) on a throwaway server
+    // instead, so a genuinely reachable sink is still exercised.
+    if is_plugin_handler(&root.join(&main)) {
+        return Some(plugin_host_command(&main));
+    }
+    Some(format!("[\"node\",\"{main}\"]"))
+}
+
+/// The launch command that mounts a plug-in handler module through the plug-in host shim
+/// ([`PLUGIN_HOST_JS`]): the shim imports the module, captures the request handler it registers on a
+/// mock host context, and serves it over HTTP on `PORT`.
+fn plugin_host_command(file: &str) -> String {
+    format!("[\"node\",\"/jss-plugin-host.mjs\",\"{file}\"]")
+}
+
+/// Whether a JavaScript file is a plug-in handler module: one that registers an HTTP request handler
+/// on a host-provided service (`ctx`/`app`/`server`.`register`/`route`/`addRoute`, with a `handler`)
+/// from inside a plug-in `apply`, and never calls `.listen(` itself. Such a module publishes no
+/// server of its own — the host it plugs into supplies one at deploy time — so it is launched through
+/// the plug-in host shim rather than run directly. A self-contained server (which does `.listen(`) is
+/// left to the normal launch path.
+fn is_plugin_handler(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    let registers =
+        src.contains(".register(") || src.contains(".route(") || src.contains(".addRoute(");
+    registers && src.contains("handler") && src.contains("apply")
 }
 
 /// Whether a JavaScript file is a self-contained server: one that both constructs a listener
@@ -1246,6 +1644,25 @@ pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::Pat
     std::path::PathBuf::new()
 }
 
+/// The identity of the server process that serves a finding's route, used to decide when two
+/// findings share one running app. Findings launched from a package manifest share one server, so
+/// the launch directory identifies it. But a directory with no launchable manifest of its own runs
+/// each finding's standalone server file directly (`node <file>`), so two such servers in one
+/// directory (`src/web/server.js` and `src/web/dashboard.js`) are two different processes serving
+/// different routes: each needs its own session keyed by its own entry file, or the second's route
+/// is probed against the first's server and never reproduces.
+pub fn session_key(
+    root: &std::path::Path,
+    app_path: &std::path::Path,
+    entry_file: &std::path::Path,
+) -> std::path::PathBuf {
+    if manifest_start_command(&root.join(app_path)).is_some() {
+        app_path.to_path_buf()
+    } else {
+        entry_file.to_path_buf()
+    }
+}
+
 /// The image working directory for an app directory relative to the repo: `/app` for the repo
 /// root, `/app/<dir>` otherwise. `None` for a path that cannot appear safely in a Dockerfile.
 fn container_dir(app: &std::path::Path) -> Option<String> {
@@ -1269,8 +1686,29 @@ fn container_dir(app: &std::path::Path) -> Option<String> {
 
 /// The request the driver sends, as a compact JSON spec on one argv slot.
 fn request_spec(attempt: &Attempt, port: u16) -> String {
-    let headers = attempt
-        .headers
+    let mut pairs: Vec<(String, String)> = attempt.headers.clone();
+    // Give each driven request a distinct client address. A per-IP rate limiter buckets requests by
+    // `X-Forwarded-For` (or a shared default when absent), so the scanner's own probe volume would
+    // otherwise be counted as one client and throttled before the sink is reached — masking a real
+    // finding behind the verifier's own traffic. A genuine single exploit request is never
+    // throttled; spoofing an address does not neutralize the input or grant any access. Left alone
+    // when a payload deliberately sets the header itself.
+    if !pairs
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+    {
+        let seq = REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pairs.push((
+            "X-Forwarded-For".to_owned(),
+            format!(
+                "10.{}.{}.{}",
+                (seq >> 16) & 0xff,
+                (seq >> 8) & 0xff,
+                seq & 0xff
+            ),
+        ));
+    }
+    let headers = pairs
         .iter()
         .map(|(k, v)| format!("\"{}\":\"{}\"", esc(k), esc(v)))
         .collect::<Vec<_>>()
@@ -1296,6 +1734,20 @@ fn esc(text: &str) -> String {
             other => vec![other],
         })
         .collect()
+}
+
+/// Removes a request's own path and raw value from a response body, so the read oracle compares
+/// the *structure* of two responses (a file-found page versus a not-found page) rather than the
+/// requested identifier a not-found page reflects back. Both the request target and the decoded
+/// traversal value are stripped, since a handler may echo either form.
+fn strip_request_echo(body: &str, target: &str, value: &str) -> String {
+    let mut out = body.to_owned();
+    for needle in [target, value] {
+        if !needle.is_empty() {
+            out = out.replace(needle, "");
+        }
+    }
+    out
 }
 
 fn tail(text: &str, lines: usize) -> String {
@@ -1364,23 +1816,232 @@ fn short_rand() -> String {
     format!("{:x}{:x}", addr & 0xffff_ffff, pid)
 }
 
+/// A Node `--require` preload that lets an application boot when it `require`s a *bare* module the
+/// repository never declared (so `npm install` never fetched it). Such a dependency is almost always
+/// unrelated to the route under test — a real-time/analytics/optional add-on — yet an unresolved
+/// top-level `require` aborts the whole process before it can `listen`, which would otherwise leave
+/// a genuinely reachable sink un-exercised. Only bare specifiers that fail to resolve are replaced
+/// with an inert stub; a missing *relative* file, or any specifier that resolves normally, is left
+/// exactly as Node handles it. The stub cannot manufacture a result: a verification still requires
+/// the real canary to flow through the real sink into the response.
+const LAUNCH_SHIM_JS: &str = r#"
+'use strict';
+const Module = require('module');
+const origLoad = Module._load;
+const handler = {
+  get: function (target, prop) {
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return function () { return ''; };
+    if (prop === Symbol.iterator || prop === Symbol.asyncIterator) return undefined;
+    return stub;
+  },
+  apply: function () { return stub; },
+  construct: function () { return stub; },
+};
+const stub = new Proxy(function () {}, handler);
+Module._load = function (request, parent, isMain) {
+  try {
+    return origLoad.apply(this, arguments);
+  } catch (err) {
+    if (
+      err && err.code === 'MODULE_NOT_FOUND' &&
+      typeof request === 'string' &&
+      request.length > 0 &&
+      request[0] !== '.' && request[0] !== '/' &&
+      request.slice(0, 5) !== 'node:'
+    ) {
+      return stub;
+    }
+    throw err;
+  }
+};
+"#;
+
+/// Mounts a plug-in handler module that registers an HTTP request handler on a host-provided service
+/// but never listens itself (a cordis/koishi-style `apply(ctx)` that calls `webServer.register({
+/// path, handler })`). The shim imports the module, runs its `apply` against a permissive mock host
+/// context whose service `register`/`route` calls capture the request handler, then serves the
+/// captured handler(s) over HTTP on `PORT`. It fabricates nothing: a verification still requires the
+/// real canary to flow through the module's own handler into the real sink. Dependency-free (core
+/// `http`); imports the target with dynamic `import()`, so it mounts ESM and CommonJS modules alike.
+const PLUGIN_HOST_JS: &str = r#"
+import http from 'node:http';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+const port = Number(process.env.PORT || 3000);
+const target = path.resolve(process.cwd(), process.argv[2] || '');
+const routes = [];
+
+function capture(args) {
+  for (const a of args) {
+    if (a && typeof a === 'object' && typeof a.handler === 'function') {
+      routes.push({ path: typeof a.path === 'string' ? a.path : '/', kind: a.kind, handler: a.handler });
+      return;
+    }
+  }
+  const strs = args.filter((a) => typeof a === 'string');
+  const fns = args.filter((a) => typeof a === 'function');
+  if (fns.length) routes.push({ path: strs.length ? strs[strs.length - 1] : '/', handler: fns[fns.length - 1] });
+}
+
+const REGISTER = new Set(['register', 'route', 'addRoute', 'use', 'get', 'post', 'put', 'patch', 'delete', 'all', 'any']);
+
+function service() {
+  const self = function () { return self; };
+  return new Proxy(self, {
+    get(_t, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === Symbol.toPrimitive) return () => '';
+      if (prop === 'getOrigin' || prop === 'getUrl' || prop === 'origin') return () => 'http://127.0.0.1:' + port;
+      if (typeof prop === 'string' && REGISTER.has(prop)) return (...a) => { capture(a); return () => {}; };
+      return service();
+    },
+    apply() { return service(); },
+  });
+}
+
+function context() {
+  const ctx = new Proxy(function () {}, {
+    get(_t, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === Symbol.toPrimitive) return () => '';
+      if (prop === 'inject') return (_deps, cb) => { if (typeof cb === 'function') return cb(ctx); };
+      if (prop === 'effect' || prop === 'defer' || prop === 'collect') return (fn) => { if (typeof fn === 'function') { try { return fn(); } catch (e) {} } };
+      if (prop === 'on' || prop === 'once' || prop === 'plugin' || prop === 'using' || prop === 'command') return () => ctx;
+      return service();
+    },
+    apply() { return ctx; },
+  });
+  return ctx;
+}
+
+try {
+  const mod = await import(pathToFileURL(target).href);
+  const plugin = (mod && mod.default != null) ? mod.default : mod;
+  const ctx = context();
+  if (typeof plugin === 'function') plugin(ctx, {});
+  else if (plugin && typeof plugin.apply === 'function') plugin.apply(ctx, {});
+} catch (e) {
+  console.error('[plugin-host] load error: ' + (e && e.message));
+}
+console.error('[plugin-host] routes: ' + routes.map((r) => (r.kind || 'exact') + ' ' + r.path).join(', '));
+
+function match(r, url) {
+  const p = url.split('?')[0].split('#')[0];
+  if (r.kind === 'prefix') { const base = r.path.replace(/\/+$/, ''); return p === base || p.startsWith(base + '/'); }
+  return p === r.path;
+}
+
+http.createServer((req, res) => {
+  for (const r of routes) {
+    if (match(r, req.url)) {
+      try { Promise.resolve(r.handler(req, res)).catch(() => { try { if (!res.headersSent) res.writeHead(502); res.end(); } catch (e) {} }); }
+      catch (e) { try { if (!res.headersSent) res.writeHead(502); res.end(); } catch (x) {} }
+      return;
+    }
+  }
+  res.writeHead(404); res.end('no route');
+}).listen(port, '0.0.0.0', () => console.error('[plugin-host] listening on ' + port));
+"#;
+
+/// Mounts an Express router module that publishes routes but never listens itself (`export function
+/// apiRouter(ws) { const r = express.Router(); …; return r; }`, wired into a server behind a CLI
+/// subcommand the bare launch never reaches). The shim imports the target, collects every Express
+/// router/app it exports — or that its exported factories return when called with a scratch base
+/// directory — mounts them all on a fresh Express app, and serves it over HTTP on `PORT`. It
+/// fabricates nothing: a verification still requires the real canary to flow through the module's own
+/// route into the real sink. Loaded with dynamic `import()`, so it mounts ESM and CommonJS alike.
+const EXPRESS_HOST_JS: &str = r#"
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+// This shim lives at the filesystem root, so a bare `import express` would resolve against `/`,
+// not the app's own `node_modules`. Resolve Express the way the app itself does: through a
+// `require` rooted in the launch directory (the app's working directory).
+const appRequire = createRequire(path.join(process.cwd(), 'jss-express-host.cjs'));
+const express = appRequire('express');
+
+const port = Number(process.env.PORT || 3000);
+const target = path.resolve(process.cwd(), process.argv[2] || '');
+
+// A writable scratch workspace for router factories that take a base directory as their argument.
+const ws = path.join(os.tmpdir(), 'jss-ws');
+try { fs.mkdirSync(ws, { recursive: true }); } catch (e) {}
+
+// An Express Router and an Express app are both callable with a `.handle` method; a Router also
+// carries a `.stack`, an app a `.use`. Either can be mounted with `app.use(...)`.
+function mountable(v) {
+  return typeof v === 'function' && typeof v.handle === 'function' &&
+    (Array.isArray(v.stack) || typeof v.use === 'function');
+}
+
+const routers = [];
+function consider(v) {
+  if (mountable(v)) { routers.push(v); return; }
+  if (typeof v !== 'function') return;
+  for (const args of [[ws], [], [ws, {}], [{}]]) {
+    try {
+      const r = v(...args);
+      if (mountable(r)) { routers.push(r); return; }
+    } catch (e) {}
+  }
+}
+
+try {
+  const mod = await import(pathToFileURL(target).href);
+  consider(mod && mod.default);
+  for (const k of Object.keys(mod || {})) {
+    if (k !== 'default') consider(mod[k]);
+  }
+} catch (e) {
+  console.error('[express-host] load error: ' + (e && e.message));
+}
+
+const app = express();
+app.use((req, res, next) => { express.json({ limit: '5mb' })(req, res, () => next()); });
+app.use((req, res, next) => { express.urlencoded({ extended: true })(req, res, () => next()); });
+for (const r of routers) { try { app.use(r); } catch (e) {} }
+console.error('[express-host] mounted ' + routers.length + ' router(s)');
+app.listen(port, '0.0.0.0', () => console.error('[express-host] listening on ' + port));
+"#;
+
 /// Sends one request to the app on localhost and prints the response body. Reads its spec from
 /// argv[2]. Kept tiny and dependency-free (core `http`).
 const DRIVER_JS: &str = r#"
 const http = require('http');
 const spec = JSON.parse(process.argv[2]);
-const req = http.request({host:'127.0.0.1',port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:10000},(res)=>{
-  let data='';
-  res.on('data',(c)=>{data+=c; if(data.length>65536){res.destroy();}});
-  res.on('end',()=>{process.stdout.write(data);process.exit(0);});
-});
-// An upgrade request completes with an 'upgrade' event instead of a response; the out-of-band
-// marker signal is what confirms it, so just end the request once it is answered either way.
-req.on('upgrade',(res,socket)=>{try{socket.destroy();}catch(e){}process.exit(0);});
-req.on('error',()=>process.exit(0));
-req.on('timeout',()=>{req.destroy();process.exit(0);});
-if(spec.body){req.write(spec.body);}
-req.end();
+// An app that binds `localhost` listens on a single loopback address, which may be IPv6 (`::1`)
+// rather than IPv4. Try each loopback family in turn so the request reaches the server however it
+// bound; a connection error (nothing listening on that family) falls through to the next.
+const hosts = ['127.0.0.1','::1'];
+let hi = 0;
+function attempt(){
+  if(hi>=hosts.length){process.exit(0);}
+  const host = hosts[hi++];
+  const req = http.request({host,port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:10000},(res)=>{
+    let data='';
+    res.on('data',(c)=>{data+=c; if(data.length>65536){res.destroy();}});
+    res.on('end',()=>{process.stdout.write(data);process.exit(0);});
+  });
+  // An upgrade request completes with an 'upgrade' event instead of a response; the out-of-band
+  // marker signal is what confirms it, so just end the request once it is answered either way.
+  req.on('upgrade',(res,socket)=>{try{socket.destroy();}catch(e){}process.exit(0);});
+  req.on('error',()=>attempt());
+  req.on('timeout',()=>{req.destroy();process.exit(0);});
+  if(spec.body){req.write(spec.body);}
+  req.end();
+}
+attempt();
 "#;
 
 /// Records the path of every request it receives, on stdout, so a marker hit shows in the
@@ -2109,6 +2770,7 @@ mod tests {
         let file = dockerfile(
             "node:22-slim",
             "/app",
+            "/app",
             &canary,
             r#"["npm","start"]"#,
             3000,
@@ -2123,6 +2785,7 @@ mod tests {
         // No build step emitted for a package without one.
         let no_build = dockerfile(
             "node:22-slim",
+            "/app",
             "/app",
             &canary,
             r#"["npm","start"]"#,
@@ -2256,6 +2919,198 @@ mod tests {
     }
 
     #[test]
+    fn an_express_router_behind_a_cli_main_is_hosted_not_run_as_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        // A manifest whose only launch is a commander CLI: run bare it prints usage and exits
+        // without binding a port, so the route under test would never be served.
+        write(
+            root,
+            "package.json",
+            r#"{"type":"module","main":"src/cli/index.js"}"#,
+        );
+        write(
+            root,
+            "src/cli/index.js",
+            "import { Command } from 'commander';\n\
+             const program = new Command();\n\
+             program.command('serve').action(() => {});\n\
+             program.parse(process.argv);\n",
+        );
+        // The finding's own file publishes routes on an express.Router but never listens itself.
+        write(
+            root,
+            "src/server/api.js",
+            "import express from 'express';\n\
+             export function apiRouter(ws) {\n\
+               const router = express.Router();\n\
+               router.get('/x', (req, res) => res.end('ok'));\n\
+               return router;\n\
+             }\n",
+        );
+
+        assert!(is_cli_dispatcher(&root.join("src/cli/index.js")));
+        assert!(!is_cli_dispatcher(&root.join("src/server/api.js")));
+        assert!(is_express_router_module(&root.join("src/server/api.js")));
+        assert!(!is_express_router_module(&root.join("src/cli/index.js")));
+        assert!(manifest_launch_is_cli(root));
+
+        // The router is mounted through the Express host shim rather than launched as the CLI.
+        assert_eq!(
+            start_command(root, Some(path("src/server/api.js"))).as_deref(),
+            Some(r#"["node","/jss-express-host.mjs","src/server/api.js"]"#)
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_launches_a_real_server_is_kept_over_hosting_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        // A manifest `main` that is itself a listening server is launched directly; the entry's
+        // router module is not hosted in its place.
+        write(
+            root,
+            "package.json",
+            r#"{"type":"module","main":"server.js"}"#,
+        );
+        write(
+            root,
+            "server.js",
+            "const express = require('express');\n\
+             const app = express();\n\
+             app.listen(3000);\n",
+        );
+        write(
+            root,
+            "routes/api.js",
+            "import express from 'express';\n\
+             export const apiRouter = () => express.Router();\n",
+        );
+        assert!(!manifest_launch_is_cli(root));
+        assert_eq!(
+            start_command(root, Some(path("routes/api.js"))).as_deref(),
+            Some(r#"["node","server.js"]"#)
+        );
+    }
+
+    #[test]
+    fn two_standalone_servers_in_one_directory_get_separate_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        let server = "const http=require('http');\n\
+             http.createServer((req,res)=>res.end('ok')).listen(3000);\n";
+        // Two self-contained servers in the same manifest-less directory: `node <file>` runs each
+        // as its own process serving its own routes.
+        write(root, "src/web/server.js", server);
+        write(root, "src/web/dashboard.js", server);
+
+        // Both resolve to the same launch directory, so keying a session by directory alone would
+        // probe the second server's route against the first. The entry file must distinguish them.
+        let one = app_dir(root, path("src/web/server.js"));
+        let two = app_dir(root, path("src/web/dashboard.js"));
+        assert_eq!(one, path("src/web"));
+        assert_eq!(two, path("src/web"));
+        assert_ne!(
+            session_key(root, &one, path("src/web/server.js")),
+            session_key(root, &two, path("src/web/dashboard.js")),
+        );
+
+        // Findings launched from a shared package manifest keep sharing one session: the directory
+        // identifies the single server, and the entry file does not split it.
+        write(
+            root,
+            "svc/package.json",
+            r#"{"scripts":{"start":"node a.js"}}"#,
+        );
+        write(root, "svc/a.js", server);
+        write(root, "svc/b.js", server);
+        let svc = path("svc");
+        assert_eq!(
+            session_key(root, svc, path("svc/a.js")),
+            session_key(root, svc, path("svc/b.js")),
+        );
+    }
+
+    #[test]
+    fn dependencies_install_in_the_nearest_manifest_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        // A standalone server in a manifest-less subdirectory whose dependencies are declared and
+        // locked only at the repo root.
+        write(root, "package.json", r#"{"dependencies":{"express":"4"}}"#);
+        write(root, "pnpm-lock.yaml", "");
+        write(
+            root,
+            "src/web/dashboard.js",
+            "const express=require('express');\n\
+             express().listen(3000);\n",
+        );
+
+        // The launch directory has no manifest, so install must climb to the root that owns one;
+        // a directory that is itself a package installs in place.
+        assert_eq!(install_path(root, path("src/web")), path(""));
+        assert_eq!(install_path(root, path("")), path(""));
+        write(root, "svc/package.json", r#"{"name":"svc"}"#);
+        assert_eq!(install_path(root, path("svc")), path("svc"));
+
+        // The Dockerfile installs with the root's package manager in the root workdir, then moves
+        // to the launch workdir for the app, so `require('express')` resolves at run time.
+        let canary = Canary::new("deadbeef".to_owned());
+        let file = dockerfile(
+            "node:22-slim",
+            "/app",
+            "/app/src/web",
+            &canary,
+            r#"["node","dashboard.js"]"#,
+            3000,
+            PackageManager::Pnpm,
+            false,
+        );
+        let install = file.find("pnpm install").unwrap();
+        let run_workdir = file.find("WORKDIR /app/src/web\n").unwrap();
+        assert!(file.find("WORKDIR /app\n").unwrap() < install, "{file}");
+        assert!(install < run_workdir, "{file}");
+    }
+
+    #[test]
+    fn a_stale_pnpm_lockfile_is_recovered_without_the_frozen_requirement() {
+        // Under `CI=true` pnpm freezes the lockfile by default, so the plain fallback must opt out
+        // explicitly or a lockfile that no longer matches the manifest can never be installed.
+        let install = install_command(PackageManager::Pnpm);
+        assert!(
+            install.contains("pnpm install --frozen-lockfile"),
+            "{install}"
+        );
+        assert!(
+            install.contains("pnpm install --no-frozen-lockfile"),
+            "{install}"
+        );
+    }
+
+    #[test]
+    fn the_canary_is_planted_as_valid_json_so_it_survives_a_parse() {
+        // A read sink that parses its file before returning it (`res.json(JSON.parse(readFile(p)))`)
+        // throws on a bare token; a JSON string literal round-trips, and still echoes the token
+        // verbatim for a handler that serves the bytes raw.
+        let canary = Canary::new("cafed00d".to_owned());
+        let file = dockerfile(
+            "node:22-slim",
+            "/app",
+            "/app",
+            &canary,
+            r#"["npm","start"]"#,
+            3000,
+            PackageManager::Npm,
+            false,
+        );
+        assert!(file.contains(r#"printf '"%s"' 'cafed00d'"#), "{file}");
+    }
+
+    #[test]
     fn a_server_alias_is_used_when_start_and_main_are_absent() {
         let dir = tempfile::tempdir().unwrap();
         write(
@@ -2334,6 +3189,7 @@ mod tests {
         let canary = Canary::new("tok".to_owned());
         let file = dockerfile(
             "node:22-slim",
+            "/app/svc",
             "/app/svc",
             &canary,
             r#"["node","index.js"]"#,
@@ -2431,6 +3287,13 @@ http.createServer((req, res) => {
             class: VulnClass::PathTraversal,
             siblings: Vec::new(),
             gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            lists_dir: false,
+            removes: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
         };
         let confined = Probe {
             method: Method::Get,
@@ -2439,6 +3302,13 @@ http.createServer((req, res) => {
             class: VulnClass::PathTraversal,
             siblings: Vec::new(),
             gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            lists_dir: false,
+            removes: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
         };
         let command = Probe {
             method: Method::Get,
@@ -2447,6 +3317,13 @@ http.createServer((req, res) => {
             class: VulnClass::CommandInjection,
             siblings: Vec::new(),
             gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            lists_dir: false,
+            removes: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
         };
         let ssrf = Probe {
             method: Method::Get,
@@ -2455,6 +3332,13 @@ http.createServer((req, res) => {
             class: VulnClass::Ssrf,
             siblings: Vec::new(),
             gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            lists_dir: false,
+            removes: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

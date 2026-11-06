@@ -87,16 +87,23 @@ pub fn run(
     let owned: Vec<Finding> = findings
         .iter()
         .map(|finding| {
-            if finding.entry.is_none()
-                && finding.source.kind == "http"
-                && let Some(entry) = plan::derive_http_entry(finding)
-            {
-                let mut derived = finding.clone();
-                derived.entry = Some(entry);
-                derived
-            } else {
-                finding.clone()
+            if finding.entry.is_none() && finding.source.kind == "http" {
+                // A conventional routing directory, or — failing that — a route the module registers
+                // on a host-provided web-server service (`webServer.register({ path, handler })`), for
+                // a plug-in that publishes no inventory entry. Either only creates a request
+                // candidate; a wrong guess can still only fail to reproduce.
+                let entry = plan::derive_http_entry(finding).or_else(|| {
+                    std::fs::read_to_string(root.join(&finding.file))
+                        .ok()
+                        .and_then(|source| plan::registered_route_entry(&source))
+                });
+                if let Some(entry) = entry {
+                    let mut derived = finding.clone();
+                    derived.entry = Some(entry);
+                    return derived;
+                }
             }
+            finding.clone()
         })
         .collect();
     let findings = owned.as_slice();
@@ -132,18 +139,47 @@ pub fn run(
             && let Some((part, target)) = probe.entry_part().map(|(p, t)| (p, t.to_owned()))
             && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
         {
-            probe.siblings = plan::required_siblings(&source, part, &target);
+            let mut siblings = plan::required_siblings(&source, part, &target);
+            // A handler may reach its sink only on a guarded branch (`else if (agentKey)`,
+            // `if (mode === 'raw')`); the member that gates it must be present, or the request takes
+            // a different branch and never reaches the sink. Add any such field of the same part.
+            for (name, value) in
+                plan::guard_required_fields(&source, part, &target, finding.sink.line)
+            {
+                if siblings.iter().all(|(k, _)| *k != name) {
+                    siblings.push((name, value));
+                }
+            }
+            probe.siblings = siblings;
         }
     }
-    // An upgrade entry that forwards the request URL (SSRF) often reaches its sink only for paths
-    // it recognizes. Mine those gate paths from the handler source so the upgrade request can be
-    // sent under one the handler accepts.
+    // A route often reaches the sink on only one value of a non-payload path segment
+    // (`if (platform === 'truuze')`), or rejects unknown segments outright; fill those slots with the
+    // literal a guard enclosing the sink pins them to, instead of the generic placeholder.
     for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
         if let Ok(plan::Plan::Http(probe)) = planned
-            && probe.method.is_upgrade()
             && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
         {
-            probe.gate_paths = plan::gate_paths(&source);
+            probe.path_fillers =
+                plan::path_slot_fillers(&source, &probe.path, &probe.entry, finding.sink.line);
+        }
+    }
+    // An entry that forwards the request URL (SSRF) often reaches its sink only for paths the handler
+    // recognizes, and may choose the outbound host from a query parameter of the parsed URL. Mine the
+    // gate paths (for an upgrade entry or a URL-sourced forward proxy) and, for the URL-sourced case,
+    // the query parameters, so the marker request can be sent the way the handler actually reads it.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned {
+            let url_ssrf =
+                probe.class == jss_core::VulnClass::Ssrf && probe.entry == plan::Entry::Url;
+            if (probe.method.is_upgrade() || url_ssrf)
+                && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+            {
+                probe.gate_paths = plan::gate_paths(&source);
+                if url_ssrf {
+                    probe.url_query_params = plan::url_search_params(&source);
+                }
+            }
         }
     }
 
@@ -186,8 +222,8 @@ pub fn run(
     // Build the sessions the plans need. A build failure for one phase skips only that phase's
     // findings, with the failure as the reason.
     // An HTTP finding runs against the package that serves its route: a repo can hold several
-    // apps (a web front end and a separate API or worker service). One session per app, started
-    // on first use and reused.
+    // apps (a web front end and a separate API or worker service). One session per launched
+    // server (see `session_key`), started on first use and reused.
     let mut http: Vec<(std::path::PathBuf, Result<sandbox::Session, String>)> = Vec::new();
     let mut browser = needs_browser.then(|| sandbox::BrowserSession::start(root));
 
@@ -206,11 +242,12 @@ pub fn run(
                         .map_or(&finding.file, |at| &at.file);
                     let declared = std::path::Path::new(declared);
                     let app = sandbox::app_dir(root, declared);
-                    let index = match http.iter().position(|(dir, _)| *dir == app) {
+                    let key = sandbox::session_key(root, &app, declared);
+                    let index = match http.iter().position(|(existing, _)| *existing == key) {
                         Some(index) => index,
                         None => {
                             let session = sandbox::Session::start_in(root, &app, Some(declared));
-                            http.push((app, session));
+                            http.push((key, session));
                             http.len() - 1
                         }
                     };

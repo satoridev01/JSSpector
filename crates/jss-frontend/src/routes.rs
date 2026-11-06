@@ -163,6 +163,7 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
         .filter(|r| r.status == ScanStatus::Scanned)
         .map(|r| (r.rel_path.as_str(), r))
         .collect();
+    let next_middleware = next_middleware_policies(root, reports);
 
     // Mount edges: child router -> (parent router, prefix).
     let mut parents: BTreeMap<RouterId, Vec<(RouterId, String, Auth)>> = BTreeMap::new();
@@ -217,6 +218,11 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
                 } else {
                     path.clone()
                 };
+                let middleware_auth =
+                    matches!(entry.kind.as_str(), "file-route" | "default-export")
+                        .then(|| next_middleware_auth(&next_middleware, file, &full))
+                        .unwrap_or_default();
+                let auth = entry.auth.max(mount_auth).max(middleware_auth);
                 routes.insert(Route {
                     method: entry.method.clone(),
                     path: full,
@@ -230,7 +236,7 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
                         .and_then(|r| r.split_once('#'))
                         .map_or_else(|| entry.handler.clone(), |(_, name)| name.to_owned()),
                     handler_ref: entry.handler.clone(),
-                    auth: entry.auth.max(mount_auth),
+                    auth,
                     kind: if entry.kind == "default-export" || entry.kind == "file-route" {
                         "http".to_owned()
                     } else {
@@ -247,6 +253,113 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
         }
     }
     routes.into_iter().collect()
+}
+
+#[derive(Debug)]
+struct NextMiddleware {
+    scope: String,
+    exclusions: Vec<String>,
+}
+
+/// Authentication enforced by a Next.js `middleware.ts` before file-system routes run.
+///
+/// Middleware is project-wide and therefore cannot be attached while scanning one route file.
+/// Recover the conservative, common shape here: a cookie/session/authorization check that returns
+/// a `NextResponse.redirect` (or a 401/403 response), with either no matcher or a negative-lookahead
+/// matcher whose literal public prefixes can be honored exactly.
+fn next_middleware_policies(root: &Path, reports: &[ScanReport]) -> Vec<NextMiddleware> {
+    reports
+        .iter()
+        .filter(|report| report.status == ScanStatus::Scanned)
+        .filter_map(|report| {
+            let path = Path::new(&report.rel_path);
+            let name = path.file_name()?.to_str()?;
+            if !matches!(name, "middleware.js" | "middleware.ts") {
+                return None;
+            }
+            let source = std::fs::read_to_string(root.join(path)).ok()?;
+            let lower = source.to_ascii_lowercase();
+            let reads_identity = [
+                "authorization",
+                "accesstoken",
+                "access_token",
+                "idtoken",
+                "id_token",
+                "session",
+                "currentuser",
+                "current_user",
+                "gettoken(",
+                "get_token(",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker));
+            let rejects = lower.contains("nextresponse.redirect")
+                || lower.contains("status: 401")
+                || lower.contains("status:401")
+                || lower.contains("status: 403")
+                || lower.contains("status:403");
+            if !reads_identity || !rejects {
+                return None;
+            }
+            let exclusions = next_matcher_exclusions(&source)?;
+            let parent = path.parent()?;
+            let scope = if parent.file_name().and_then(|part| part.to_str()) == Some("src") {
+                parent.parent().unwrap_or_else(|| Path::new(""))
+            } else {
+                parent
+            };
+            Some(NextMiddleware {
+                scope: scope.to_string_lossy().trim_matches('/').to_owned(),
+                exclusions,
+            })
+        })
+        .collect()
+}
+
+/// Literal public prefixes in `/((?!api/auth|_next/static|...).*)`; an unfamiliar explicit
+/// matcher is left unclassified rather than claiming authentication outside its scope.
+fn next_matcher_exclusions(source: &str) -> Option<Vec<String>> {
+    if !source.contains("matcher") {
+        return Some(Vec::new());
+    }
+    let after = source.split_once("(?!")?.1;
+    let group = after.split_once(')')?.0;
+    let exclusions: Vec<String> = group
+        .split('|')
+        .map(|part| part.trim().trim_start_matches('^').trim_start_matches('/'))
+        .filter(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
+        })
+        .map(str::to_owned)
+        .collect();
+    (!exclusions.is_empty()).then_some(exclusions)
+}
+
+fn next_middleware_auth(policies: &[NextMiddleware], file: &str, route: &str) -> Auth {
+    let route = route.trim_start_matches('/');
+    policies
+        .iter()
+        .filter(|policy| {
+            policy.scope.is_empty()
+                || file == policy.scope
+                || file
+                    .strip_prefix(&policy.scope)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .filter(|policy| {
+            !policy.exclusions.iter().any(|public| {
+                route == public
+                    || route
+                        .strip_prefix(public)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
+        .map(|_| Auth::User)
+        .max()
+        .unwrap_or_default()
 }
 
 /// OS.js-style provider modules register routes through `proc.resource(path)`, which prefixes the

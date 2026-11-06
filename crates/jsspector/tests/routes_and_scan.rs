@@ -1061,6 +1061,92 @@ fn router_factories_and_next_export_forms_are_routes() {
 }
 
 #[test]
+fn next_middleware_auth_guards_file_routes_and_honors_public_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "web/src/middleware.ts",
+        "import { NextResponse } from 'next/server';\n\
+         export const config = { matcher: ['/((?!api/auth|_next/static|favicon.ico).*)'] };\n\
+         export function middleware(request) {\n\
+           const session = request.cookies.get('session');\n\
+           if (!session?.value) return NextResponse.redirect(new URL('/api/auth/login', request.url));\n\
+           return NextResponse.next();\n\
+         }\n",
+    );
+    write(
+        root,
+        "web/src/app/api/fetch/route.ts",
+        "export async function GET(request) {\n\
+           const url = new URL(request.url).searchParams.get('url');\n\
+           return Response.json(await (await fetch(url)).text());\n\
+         }\n",
+    );
+    write(
+        root,
+        "web/src/app/api/auth/proxy/route.ts",
+        "export async function GET(request) {\n\
+           const url = new URL(request.url).searchParams.get('url');\n\
+           return Response.json(await (await fetch(url)).text());\n\
+         }\n",
+    );
+    write(
+        root,
+        "web/src/server.ts",
+        "const app = require('express')();\n\
+         app.get('/express', (req, res) => res.send(req.query.value));\n",
+    );
+    write(
+        root,
+        "locale/src/middleware.ts",
+        "import { NextResponse } from 'next/server';\n\
+         export function middleware(request) {\n\
+           const locale = request.cookies.get('locale')?.value || 'en';\n\
+           return NextResponse.redirect(new URL('/' + locale + request.nextUrl.pathname, request.url));\n\
+         }\n",
+    );
+    write(
+        root,
+        "locale/src/app/api/translate/route.ts",
+        "export async function GET(request) {\n\
+           const url = new URL(request.url).searchParams.get('url');\n\
+           return Response.json(await (await fetch(url)).text());\n\
+         }\n",
+    );
+
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let auth = |path: &str| {
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|route| route["path"] == path)
+            .unwrap()["auth"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(auth("/api/fetch"), "user");
+    assert_eq!(auth("/api/auth/proxy"), "none-detected");
+    assert_eq!(auth("/express"), "none-detected");
+    assert_eq!(auth("/api/translate"), "none-detected");
+
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = report["findings"].as_array().unwrap();
+    let protected = findings
+        .iter()
+        .find(|finding| finding["entry"] == "GET /api/fetch")
+        .unwrap();
+    let public = findings
+        .iter()
+        .find(|finding| finding["entry"] == "GET /api/auth/proxy")
+        .unwrap();
+    assert_eq!(protected["auth"], "user");
+    assert_eq!(public["auth"], "none-detected");
+}
+
+#[test]
 fn route_shapes_array_paths_verb_first_chains_and_prefixes() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

@@ -4,7 +4,7 @@
 //! planted marker file, write a marker file, or call a marker service — so a hit is unambiguous
 //! and leaves nothing behind but the marker.
 
-use super::plan::{Entry, Envelope, Probe};
+use super::plan::{DocEnvelope, Entry, Envelope, Probe};
 use jss_core::VulnClass;
 
 /// The harmless value every non-payload envelope member is filled with, so a handler's early
@@ -190,6 +190,16 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
     if let Some(env) = &probe.envelope {
         for (value, _) in payloads.iter_mut() {
             *value = envelope_encode(env, value);
+        }
+    }
+    // The tainted body field is a structured document a parse function turns into an object before
+    // the sink reads one of its members, so the raw payload never reaches the sink on its own. Wrap
+    // each payload into that document — under the JSON key that maps to the sink member, inside the
+    // literal scaffold the parse function's extraction requires, with the other members the handler
+    // reads filled by a placeholder so a presence/validity guard passes.
+    if let Some(doc) = &probe.doc_envelope {
+        for (value, _) in payloads.iter_mut() {
+            *value = doc_encode(doc, value);
         }
     }
     let rest: Vec<Attempt> = payloads
@@ -878,6 +888,27 @@ fn envelope_encode(env: &Envelope, value: &str) -> String {
     base64(obj.as_bytes(), env.url_safe)
 }
 
+/// Packs `value` into the structured document the handler's parse function will accept: a JSON object
+/// with `value` under the sink-reaching key and a harmless placeholder under every other member the
+/// handler reads (so a presence/validity guard passes), wrapped in the literal scaffold the extraction
+/// regexes require (frontmatter delimiters, a `metadata:` label).
+fn doc_encode(doc: &DocEnvelope, value: &str) -> String {
+    let mut obj = format!(
+        "{{\"{}\":\"{}\"",
+        json_escape(&doc.sink_key),
+        json_escape(value)
+    );
+    for key in &doc.filler_keys {
+        obj.push_str(&format!(
+            ",\"{}\":\"{}\"",
+            json_escape(key),
+            ENVELOPE_PLACEHOLDER
+        ));
+    }
+    obj.push('}');
+    format!("{}{}{}", doc.prefix, obj, doc.suffix)
+}
+
 /// Base64-encodes bytes, in the URL-safe alphabet (`-_`, no padding) when `url_safe`, otherwise
 /// standard (`+/`, padded). Node's `Buffer.from` decodes either form, so the encoder matches the
 /// handler's declared encoding exactly.
@@ -947,6 +978,7 @@ mod tests {
             url_query_params: Vec::new(),
             read_suffix: None,
             envelope: None,
+            doc_envelope: None,
             lists_dir: false,
             removes: false,
             appended_param: None,

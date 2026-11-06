@@ -59,6 +59,15 @@ pub struct Probe {
     /// base64-encoded before it enters the request. `None` for the common case where the input
     /// reaches the sink directly. Mined from the handler source only.
     pub envelope: Option<Envelope>,
+    /// When set, the tainted body field is not the raw payload but a structured text *document* that a
+    /// parse function (`parseDocument(body)`) extracts an embedded JSON object from, and the
+    /// sink consumes one member of the parsed result (`parsed.apiBase`). The payload value is placed
+    /// under the JSON key that maps to that member, inside the literal scaffold the parse function's
+    /// extraction requires (frontmatter delimiters, a `metadata:` label), with the other members the
+    /// handler reads filled by a placeholder so an early presence/validity guard passes. `None` for the
+    /// common case where the body field reaches the sink directly. Mined from the handler and the parse
+    /// function's own source only.
+    pub doc_envelope: Option<DocEnvelope>,
     /// When the sink enumerates a directory (`fs.readdirSync`, `fs.opendirSync`) rather than reading
     /// a file's bytes, the traversal proof is a planted file *name* that appears in the returned
     /// listing. The canary is then planted as a file *inside* the climbed-to directory, and a hit is
@@ -104,6 +113,22 @@ pub struct Envelope {
     pub field: String,
     pub siblings: Vec<String>,
     pub url_safe: bool,
+}
+
+/// A structured-document body field a parse function turns into an object before the sink reads one
+/// of its members. `prefix`/`suffix` are the literal scaffold the parse function's extraction regexes
+/// require around an embedded JSON object (so a `---`-fenced frontmatter block carrying a
+/// `metadata: {...}` label is reconstructed); `sink_key` is the JSON key whose value becomes the
+/// member that reaches the sink, and `filler_keys` are the other JSON keys the handler reads off the
+/// parsed result (filled with a harmless placeholder so a presence/validity guard passes). The
+/// payload is `prefix` + `{ "<sink_key>": <value>, "<filler>": "<placeholder>", ... }` + `suffix`.
+/// Mined from the handler and the parse function's source only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocEnvelope {
+    pub prefix: String,
+    pub suffix: String,
+    pub sink_key: String,
+    pub filler_keys: Vec<String>,
 }
 
 impl Probe {
@@ -392,6 +417,7 @@ impl Probe {
             url_query_params: Vec::new(),
             read_suffix,
             envelope,
+            doc_envelope: None,
             lists_dir,
             removes,
             appended_param,
@@ -665,6 +691,556 @@ fn json_envelope(source: &str, names: &[String], sink_arg: &str) -> Option<Envel
         });
     }
     None
+}
+
+/// The name of the parse function a tainted body field is passed to, when its result feeds the sink
+/// (`const parsed = parseDocument(body)`). Used by the caller to resolve the module the
+/// function is defined in. `None` when the tainted input is not consumed by such a call. Mined from
+/// the handler source only.
+pub fn parse_transform_fn(finding: &Finding, entry: &Entry, handler: &str) -> Option<String> {
+    let tainted = tainted_identifiers(finding, entry);
+    transform_call(handler, &tainted).map(|(name, _)| name)
+}
+
+/// Whether `source` defines a function named `name` (so the parse function is local, not imported).
+pub fn defines_function(source: &str, name: &str) -> bool {
+    function_body(source, name).is_some()
+}
+
+/// The module specifier a named import of `name` comes from (`import { name } from '<path>'` ->
+/// `<path>`). Used to locate a parse function defined in another module. Mined from the import
+/// statements only.
+pub fn import_source_path(source: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("import") {
+        let at = from + rel;
+        from = at + "import".len();
+        if at > 0 && source.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
+            continue;
+        }
+        let end = source[at..]
+            .find(';')
+            .map(|i| at + i)
+            .unwrap_or_else(|| source.len().min(at + 400));
+        let stmt = &source[at..end];
+        if !contains_word(stmt, name) {
+            continue;
+        }
+        if let Some(fpos) = stmt.find(" from ") {
+            let tail = stmt[fpos + " from ".len()..].trim_start();
+            if let Some(path) = string_literal_arg(tail) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Recognizes a handler that passes a tainted body field to a parse function and reads one member of
+/// the parsed result in the sink (`const parsed = parseDocument(body); const url =
+/// parsed.endpoint || ...; fetch(`${url}/...`)`). `module_src` is the source of the module the parse
+/// function is defined in (the handler's own source when it is local). Returns the [`DocEnvelope`]
+/// that packs the payload into the structured document the parse function will accept: the JSON key
+/// that reaches the sink, the other members the handler reads (filled with a placeholder so a
+/// presence/validity guard passes), and the literal scaffold the extraction regexes require. Mined
+/// from the handler and parse-function source only; `None` when the body field is not consumed this
+/// way.
+pub fn doc_envelope(
+    finding: &Finding,
+    entry: &Entry,
+    handler: &str,
+    module_src: &str,
+) -> Option<DocEnvelope> {
+    let tainted = tainted_identifiers(finding, entry);
+    let (fn_name, result_var) = transform_call(handler, &tainted)?;
+    let fn_body = function_body(module_src, &fn_name)?;
+
+    // The members the handler reads off the parsed result. One reaches the sink (carries the canary);
+    // the rest are presence/validity guards (filled with a placeholder).
+    let members = object_members(handler, &result_var);
+    if members.is_empty() {
+        return None;
+    }
+    let sink_member = sink_result_member(handler, &result_var, &members, &tainted)?;
+
+    // How the parse function names the embedded JSON keys behind each returned member
+    // (`apiBase: metadata.api_base`): map returned member -> JSON key.
+    let key_map = parsed_member_json_keys(&fn_body)?;
+    let sink_key = key_map
+        .iter()
+        .find(|(member, _)| *member == sink_member)
+        .map(|(_, key)| key.clone())?;
+    let filler_keys: Vec<String> = members
+        .iter()
+        .filter(|member| **member != sink_member)
+        .filter_map(|member| {
+            key_map
+                .iter()
+                .find(|(returned, _)| returned == member)
+                .map(|(_, key)| key.clone())
+        })
+        .collect();
+
+    // The literal scaffold the parse function's extraction regexes require around the JSON object.
+    let (prefix, suffix) = extraction_scaffold(&fn_body)?;
+
+    Some(DocEnvelope {
+        prefix,
+        suffix,
+        sink_key,
+        filler_keys,
+    })
+}
+
+/// A `const|let|var <var> = <ident>(<args>)` binding whose callee is a bare function identifier and
+/// one of whose arguments is a tainted identifier: the parse call and the local it binds. `await` is
+/// tolerated. Returns `(callee, var)`. Mined from the handler source only.
+fn transform_call(source: &str, tainted: &[String]) -> Option<(String, String)> {
+    for kw in ["const ", "let ", "var "] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(kw) {
+            let at = from + rel;
+            from = at + kw.len();
+            if at > 0 && source.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
+                continue;
+            }
+            let after_kw = &source[at + kw.len()..];
+            let name: String = after_kw
+                .bytes()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let rhs = after_kw[name.len()..].trim_start();
+            let Some(rhs) = rhs.strip_prefix('=') else {
+                continue;
+            };
+            let mut rhs = rhs.trim_start();
+            if let Some(stripped) = rhs.strip_prefix("await ") {
+                rhs = stripped.trim_start();
+            }
+            let Some(open_rel) = rhs.find('(') else {
+                continue;
+            };
+            let callee = rhs[..open_rel].trim_end();
+            if callee.is_empty() || !callee.bytes().all(is_ident) {
+                continue;
+            }
+            let Some(arglist) = balanced_arg(&rhs[open_rel + 1..]) else {
+                continue;
+            };
+            if split_top_level_commas(arglist)
+                .iter()
+                .any(|arg| tainted.iter().any(|t| t == arg.trim()))
+            {
+                return Some((callee.to_owned(), name));
+            }
+        }
+    }
+    None
+}
+
+/// The body (between the outermost braces) of a function named `name` defined in `source`: a
+/// `function name(...) { ... }` declaration or a `const name = (...) => { ... }` / `name =
+/// function(...) { ... }` binding. Brace matching is naive (does not skip strings), which is adequate
+/// for the balanced bodies these parse helpers have. `None` when no such definition is found.
+fn function_body(source: &str, name: &str) -> Option<String> {
+    let markers = [
+        format!("function {name}"),
+        format!("function* {name}"),
+        format!("const {name}"),
+        format!("let {name}"),
+        format!("var {name}"),
+        format!("{name} ="),
+    ];
+    for marker in &markers {
+        if let Some(body) = body_after_marker(source, marker) {
+            return Some(body);
+        }
+    }
+    None
+}
+
+/// The brace-balanced block that opens at the first `{` after a whole-word occurrence of `marker`.
+fn body_after_marker(source: &str, marker: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(marker) {
+        let at = from + rel;
+        from = at + marker.len();
+        if at > 0 && source.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
+            continue;
+        }
+        let after = &source[at + marker.len()..];
+        if marker.bytes().last().is_some_and(is_ident) && after.bytes().next().is_some_and(is_ident)
+        {
+            continue;
+        }
+        if let Some(open) = after.find('{')
+            && let Some(body) = balanced_braces(&after[open + 1..])
+        {
+            return Some(body.to_owned());
+        }
+    }
+    None
+}
+
+/// The brace-balanced slice up to the matching `}` for a block already entered (depth 1). Naive: does
+/// not skip strings or comments.
+fn balanced_braces(after: &str) -> Option<&str> {
+    let mut depth = 1usize;
+    for (i, c) in after.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&after[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The member of the parsed-result object that reaches the sink: the one read on the right-hand side
+/// of an assignment to a tainted local (`const url = parsed.apiBase || ...`). Falls back to a member
+/// whose name reads like a URL/host. `None` when none qualifies.
+fn sink_result_member(
+    handler: &str,
+    var: &str,
+    members: &[String],
+    tainted: &[String],
+) -> Option<String> {
+    for member in members {
+        let full = format!("{var}.{member}");
+        let mut from = 0;
+        while let Some(rel) = handler[from..].find(&full) {
+            let at = from + rel;
+            from = at + full.len();
+            if handler
+                .as_bytes()
+                .get(at + full.len())
+                .is_some_and(|b| is_ident(*b))
+            {
+                continue;
+            }
+            if let Some(lhs) = assigned_lhs_ident(handler, at)
+                && tainted.contains(&lhs)
+            {
+                return Some(member.clone());
+            }
+        }
+    }
+    const URLISH: [&str; 9] = [
+        "url", "uri", "href", "endpoint", "target", "callback", "host", "hostname", "link",
+    ];
+    members
+        .iter()
+        .find(|member| {
+            let lower = member.to_ascii_lowercase();
+            URLISH.iter().any(|u| lower.contains(u))
+        })
+        .cloned()
+}
+
+/// The identifier assigned on the statement containing byte offset `pos` (`const url = ...` -> `url`).
+/// Reads back to the statement start (a `;`, `{`, `}` or newline) and takes the name before the `=`.
+fn assigned_lhs_ident(source: &str, pos: usize) -> Option<String> {
+    let start = source[..pos]
+        .rfind([';', '{', '}', '\n'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let stmt = source[start..pos].trim_start();
+    let stmt = stmt
+        .strip_prefix("const ")
+        .or_else(|| stmt.strip_prefix("let "))
+        .or_else(|| stmt.strip_prefix("var "))
+        .unwrap_or(stmt);
+    let eq = stmt.find('=')?;
+    let lhs = stmt[..eq].trim();
+    (!lhs.is_empty() && lhs.bytes().all(is_ident)).then(|| lhs.to_owned())
+}
+
+/// Maps each member a parse function returns to the embedded JSON key it reads: for `const metadata =
+/// JSON.parse(...); return { apiBase: metadata.api_base, ... }`, returns `[("apiBase", "api_base"),
+/// ...]`. `None` when the function has no `JSON.parse` result or no such return object.
+fn parsed_member_json_keys(fn_body: &str) -> Option<Vec<(String, String)>> {
+    let js_start = fn_body.find("JSON.parse(")?;
+    let json_var = assigned_target(fn_body, js_start)?;
+    let object = return_object_literal(fn_body)?;
+    let member_prefix = format!("{json_var}.");
+    let mut out = Vec::new();
+    for entry in split_top_level_commas(&object) {
+        let entry = entry.trim();
+        let Some((member, value)) = entry.split_once(':') else {
+            continue;
+        };
+        let member = member.trim();
+        if member.is_empty() || !member.bytes().all(is_ident) {
+            continue;
+        }
+        if let Some(pos) = value.find(&member_prefix) {
+            let json_key: String = value[pos + member_prefix.len()..]
+                .bytes()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect();
+            if !json_key.is_empty() {
+                out.push((member.to_owned(), json_key));
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The first `return { ... }` object literal in `source`.
+fn return_object_literal(source: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("return") {
+        let at = from + rel;
+        from = at + "return".len();
+        if at > 0 && source.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
+            continue;
+        }
+        let rest = source[at + "return".len()..].trim_start();
+        if let Some(inner) = rest.strip_prefix('{')
+            && let Some(object) = balanced_braces(inner)
+        {
+            return Some(object.to_owned());
+        }
+    }
+    None
+}
+
+/// The literal `(prefix, suffix)` the extraction regexes in a parse function require around the
+/// embedded JSON object. Collects the `.match`/`.exec` regexes that run before the `JSON.parse`, in
+/// source order (outer extraction first), and nests their capture-group scaffolds so the payload sits
+/// in the innermost capture. `None` when no capturing extraction regex is found.
+fn extraction_scaffold(fn_body: &str) -> Option<(String, String)> {
+    let parse_at = fn_body.find("JSON.parse(").unwrap_or(fn_body.len());
+    let mut regexes: Vec<(usize, String)> = Vec::new();
+    for op in [".match(", ".exec(", ".matchAll("] {
+        let mut from = 0;
+        while let Some(rel) = fn_body[from..].find(op) {
+            let at = from + rel;
+            from = at + op.len();
+            if at >= parse_at {
+                continue;
+            }
+            if let Some(arg) = balanced_arg(&fn_body[at + op.len()..])
+                && let Some(pattern) = regex_pattern(arg.trim())
+            {
+                regexes.push((at, pattern));
+            }
+        }
+    }
+    regexes.sort_by_key(|(at, _)| *at);
+    let mut prefix = String::new();
+    let mut suffix = String::new();
+    let mut any = false;
+    for (_, pattern) in &regexes {
+        if let Some((pre, suf)) = regex_scaffold(pattern) {
+            prefix.push_str(&pre);
+            suffix = format!("{suf}{suffix}");
+            any = true;
+        }
+    }
+    any.then_some((prefix, suffix))
+}
+
+/// The pattern body of a regex literal argument (`/^---\n(...)/m` -> `^---\n(...)`), stopping at the
+/// first unescaped `/` outside a character class. `None` when the argument is not a regex literal.
+fn regex_pattern(arg: &str) -> Option<String> {
+    let rest = arg.strip_prefix('/')?;
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'/' if !in_class => return rest.get(..i).map(str::to_owned),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The literal `(prefix, suffix)` around the first capturing group of a regex pattern: the literal
+/// text the pattern requires before and after the capture the payload fills. `None` when the pattern
+/// has no capturing group.
+fn regex_scaffold(pattern: &str) -> Option<(String, String)> {
+    let (open, close) = first_capture_group(pattern)?;
+    let before = decode_regex_literal(&pattern[..open]);
+    let after = decode_regex_literal(&pattern[close + 1..]);
+    Some((before, after))
+}
+
+/// The byte range `(open, close)` of the first capturing group in a regex pattern, skipping escaped
+/// characters, character classes and non-capturing `(?...)` groups.
+fn first_capture_group(pattern: &str) -> Option<(usize, usize)> {
+    let b = pattern.as_bytes();
+    let mut i = 0;
+    let mut in_class = false;
+    while let Some(&c) = b.get(i) {
+        match c {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'(' if !in_class && b.get(i + 1) != Some(&b'?') => {
+                let open = i;
+                let mut depth = 1usize;
+                let mut j = i + 1;
+                let mut inner_class = false;
+                while let Some(&d) = b.get(j) {
+                    match d {
+                        b'\\' => {
+                            j += 2;
+                            continue;
+                        }
+                        b'[' => inner_class = true,
+                        b']' => inner_class = false,
+                        b'(' if !inner_class => depth += 1,
+                        b')' if !inner_class => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some((open, j));
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                return None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A minimal literal string that satisfies a regex fragment with no capture: literal characters and
+/// common escapes are emitted, anchors are dropped, `\s*`/`\s?`/`[...]*` become empty, `\s+` becomes
+/// one space, and a quantified literal keeps a single occurrence. Non-literal classes it cannot
+/// satisfy are dropped. Used to rebuild the scaffold around an extracted JSON object.
+fn decode_regex_literal(fragment: &str) -> String {
+    let b = fragment.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        match c {
+            b'^' | b'$' => i += 1,
+            b'\\' => match b.get(i + 1).copied() {
+                Some(b'n') => {
+                    out.push('\n');
+                    i += 2;
+                }
+                Some(b't') => {
+                    out.push('\t');
+                    i += 2;
+                }
+                Some(b'r') => {
+                    out.push('\r');
+                    i += 2;
+                }
+                Some(c @ (b's' | b'S' | b'w' | b'W' | b'd' | b'D' | b'b' | b'B')) => {
+                    match b.get(i + 2).copied() {
+                        Some(b'*') | Some(b'?') => i += 3,
+                        Some(b'+') => {
+                            if c == b's' {
+                                out.push(' ');
+                            }
+                            i += 3;
+                        }
+                        _ => {
+                            if c == b's' {
+                                out.push(' ');
+                            }
+                            i += 2;
+                        }
+                    }
+                }
+                Some(c) => {
+                    out.push(c as char);
+                    i += 2;
+                }
+                None => i += 1,
+            },
+            b'[' => {
+                let mut j = i + 1;
+                let mut open = true;
+                while open {
+                    match b.get(j).copied() {
+                        Some(b'\\') => {
+                            j += 2;
+                            continue;
+                        }
+                        Some(b']') => {
+                            open = false;
+                            j += 1;
+                        }
+                        Some(_) => j += 1,
+                        None => break,
+                    }
+                }
+                match b.get(j).copied() {
+                    Some(b'*') | Some(b'?') | Some(b'+') => i = j + 1,
+                    _ => i = j,
+                }
+            }
+            b'(' | b')' | b'*' | b'+' | b'?' => i += 1,
+            b'.' => match b.get(i + 1).copied() {
+                Some(b'*') | Some(b'?') => i += 2,
+                Some(b'+') => {
+                    out.push('x');
+                    i += 2;
+                }
+                _ => {
+                    out.push('x');
+                    i += 1;
+                }
+            },
+            other => match b.get(i + 1).copied() {
+                Some(b'*') | Some(b'?') | Some(b'+') => {
+                    out.push(other as char);
+                    i += 2;
+                }
+                _ => {
+                    out.push(other as char);
+                    i += 1;
+                }
+            },
+        }
+    }
+    out
+}
+
+/// Whether `text` contains `word` bounded by non-identifier characters.
+fn contains_word(text: &str, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(word) {
+        let at = from + rel;
+        from = at + word.len();
+        let before_ok = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident(*b));
+        let after_ok = bytes.get(at + word.len()).is_none_or(|b| !is_ident(*b));
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether an expression base64-decodes one of the tainted identifiers, and if so whether as
@@ -2596,6 +3172,7 @@ mod tests {
             url_query_params: Vec::new(),
             read_suffix: None,
             envelope: None,
+            doc_envelope: None,
             lists_dir: false,
             removes: false,
             appended_param: None,
@@ -3267,5 +3844,58 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_parsed_document_body_field_is_packed_into_the_scaffold_the_parser_requires() {
+        // A handler passes a tainted body field to a parse function defined in another module, then
+        // chooses the outbound host from one member of the parsed result and guards on another. The
+        // planner must recover, from the handler and the parser's own source, which JSON key reaches
+        // the sink, which other members to fill, and the literal frontmatter scaffold the parser's
+        // extraction regexes require around the embedded JSON object.
+        let handler = r#"
+          router.post('/connect', async (req, res) => {
+            const { blob } = req.body;
+            const parsed = parseDoc(blob);
+            if (!parsed) return res.status(400).json({ error: 'bad' });
+            const dest = parsed.endpoint || 'https://default';
+            if (!parsed.ticket) return res.status(400).json({ error: 'no ticket' });
+            const resp = await fetch(`${dest}/go`, { method: 'POST' });
+          });
+        "#;
+        let module = r#"
+          export function parseDoc(content) {
+            if (!content) return null;
+            const fm = content.match(/^===\s*\n([\s\S]*?)\n===/);
+            if (!fm) return null;
+            const m = fm[1].match(/meta:\s*(\{[\s\S]*?\})\s*$/m);
+            if (!m) return null;
+            try {
+              const obj = JSON.parse(m[1]);
+              return { endpoint: obj.host_url, ticket: obj.token };
+            } catch { return null; }
+          }
+        "#;
+        let mut f = finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("POST /connect"),
+            "req.body",
+        );
+        f.sink.api = "fetch".to_owned();
+        f.sink.arg = "dest".to_owned();
+        f.trace = vec![TraceStep {
+            file: None,
+            line: 1,
+            col: 1,
+            note: "assigned to `dest`".to_owned(),
+        }];
+
+        let entry = Entry::Body(Some("blob".to_owned()));
+        let doc = doc_envelope(&f, &entry, handler, module).expect("document envelope recognized");
+        assert_eq!(doc.sink_key, "host_url");
+        assert_eq!(doc.filler_keys, vec!["token".to_owned()]);
+        assert_eq!(doc.prefix, "===\nmeta:");
+        assert_eq!(doc.suffix, "\n===");
     }
 }

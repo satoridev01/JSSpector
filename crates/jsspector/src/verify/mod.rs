@@ -190,6 +190,24 @@ pub fn run(
         }
     }
 
+    // An SSRF whose tainted body field is a structured document a parse function turns into an object
+    // before the sink reads one of its members (`const parsed = parseDocument(body); fetch(
+    // `${parsed.endpoint}/...`)`) never reaches the sink with a raw URL: the input must be a document
+    // the parser accepts. Mine the document scaffold and the member->JSON-key mapping from the handler
+    // and the parse function's own source (resolving an import when the function lives in another
+    // module), so the payload can be packed the way the handler actually reads it.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.class == jss_core::VulnClass::Ssrf
+            && matches!(probe.entry, plan::Entry::Body(Some(_)))
+            && let Ok(handler) = std::fs::read_to_string(root.join(&finding.file))
+            && let Some(fn_name) = plan::parse_transform_fn(finding, &probe.entry, &handler)
+            && let Some(module_src) = resolve_module_source(root, &finding.file, &handler, &fn_name)
+        {
+            probe.doc_envelope = plan::doc_envelope(finding, &probe.entry, &handler, &module_src);
+        }
+    }
+
     let needs_http = plans.iter().any(|p| matches!(p, Ok(plan::Plan::Http(_))));
     let needs_browser = plans
         .iter()
@@ -293,6 +311,48 @@ pub fn run(
     Ok(verdicts)
 }
 
+/// The source of the module that defines `fn_name`, for a parse function the handler consumes: the
+/// handler's own source when the function is local, otherwise the imported module resolved relative to
+/// the handler file (trying the common JavaScript module file names). `None` when it cannot be found.
+fn resolve_module_source(
+    root: &std::path::Path,
+    handler_file: &str,
+    handler: &str,
+    fn_name: &str,
+) -> Option<String> {
+    if plan::defines_function(handler, fn_name) {
+        return Some(handler.to_owned());
+    }
+    let spec = plan::import_source_path(handler, fn_name)?;
+    // Only resolve relative specifiers; a bare package import is not part of the app tree.
+    if !spec.starts_with('.') {
+        return None;
+    }
+    let dir = std::path::Path::new(handler_file).parent()?;
+    let base = dir.join(&spec);
+    let canonical_root = root.canonicalize().ok()?;
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if base.extension().is_some() {
+        candidates.push(base.clone());
+    }
+    for ext in ["js", "mjs", "cjs", "ts", "jsx", "tsx"] {
+        candidates.push(base.with_extension(ext));
+        candidates.push(base.join(format!("index.{ext}")));
+    }
+    for candidate in candidates {
+        let Ok(candidate) = canonical_root.join(candidate).canonicalize() else {
+            continue;
+        };
+        if !candidate.starts_with(&canonical_root) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(candidate) {
+            return Some(text);
+        }
+    }
+    None
+}
+
 fn verdict(finding: &Finding, outcome: Outcome) -> Verdict {
     Verdict {
         fingerprint: finding.fingerprint.clone(),
@@ -346,4 +406,35 @@ pub fn write_text(
         "  {dim}verified {verified}, not reproduced {not_reproduced}, skipped {skipped}{reset}"
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_module_source;
+
+    #[test]
+    fn imported_transform_modules_cannot_escape_the_scan_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("parser.js"), "export function parseDoc() {}").unwrap();
+        std::fs::write(parent.path().join("outside.js"), "outside").unwrap();
+
+        let internal = "import { parseDoc } from '../parser.js';";
+        assert_eq!(
+            resolve_module_source(&root, "src/server.js", internal, "parseDoc").as_deref(),
+            Some("export function parseDoc() {}")
+        );
+
+        let escaping = "import { parseDoc } from '../../outside.js';";
+        assert!(resolve_module_source(&root, "src/server.js", escaping, "parseDoc").is_none());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(parent.path().join("outside.js"), root.join("linked.js"))
+                .unwrap();
+            let linked = "import { parseDoc } from '../linked.js';";
+            assert!(resolve_module_source(&root, "src/server.js", linked, "parseDoc").is_none());
+        }
+    }
 }

@@ -3027,6 +3027,39 @@ fn wrapper_auth(expr: &Expression<'_>) -> Auth {
     }
 }
 
+/// Authentication required by a route's middleware argument. Besides Express-style positional
+/// middleware, Fastify accepts lifecycle hooks in an options object:
+/// `{ onRequest: [fastify.authenticate] }`.
+fn route_middleware_auth(expr: &Expression<'_>) -> Option<Auth> {
+    match expr.get_inner_expression() {
+        Expression::ArrayExpression(list) => list
+            .elements
+            .iter()
+            .filter_map(ArrayExpressionElement::as_expression)
+            .filter_map(route_middleware_auth)
+            .max(),
+        Expression::ObjectExpression(object) => object
+            .properties
+            .iter()
+            .filter_map(|property| {
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    return None;
+                };
+                matches!(
+                    prop_name(&property.key).as_deref(),
+                    Some("onRequest" | "preValidation" | "preHandler")
+                )
+                .then(|| route_middleware_auth(&property.value))
+                .flatten()
+            })
+            .max(),
+        _ if !is_controller_action(expr) => callee_name(expr)
+            .and_then(|name| m().auth_of(&name))
+            .or_else(|| inline_guard_auth(expr)),
+        _ => None,
+    }
+}
+
 /// `require('x')` → `x`.
 fn require_spec(expr: &Expression<'_>) -> Option<String> {
     let Expression::CallExpression(call) = expr.get_inner_expression() else {
@@ -8282,19 +8315,7 @@ impl Walker<'_> {
             .iter()
             .take(last)
             .filter_map(Argument::as_expression)
-            // `app.post(path, [validate, requireRole('admin')], handler)`
-            .flat_map(|e| match e.get_inner_expression() {
-                Expression::ArrayExpression(list) => list
-                    .elements
-                    .iter()
-                    .filter_map(ArrayExpressionElement::as_expression)
-                    .collect::<Vec<_>>(),
-                other => vec![other],
-            })
-            // `authorization.get`: a controller action, not a guard, whatever its name says.
-            .filter(|e| !is_controller_action(e))
-            .filter_map(callee_name)
-            .filter_map(|name| m().auth_of(&name))
+            .filter_map(route_middleware_auth)
             .max()
             .unwrap_or_default();
         // What earlier `use(...)` calls on this router require under this route's path.
@@ -14515,6 +14536,12 @@ mod tests {
         assert_eq!(
             auth_of(
                 "app.get('/p', (req, res) => { if (!req.user) { return res.sendStatus(401); } exec('ping ' + req.query.h); });"
+            ),
+            vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "fastify.post('/p', { onRequest: [fastify.authenticate] }, async req => { exec('ping ' + req.body.h); });"
             ),
             vec![(Auth::User, Severity::Critical)]
         );

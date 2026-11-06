@@ -22,6 +22,8 @@ const VERIFY_RUN_LABEL_KEY: &str = "ci.satori.jsspector.verify-run";
 const DB_IMAGE: &str = "mongo:6";
 const DB_ALIASES: [&str; 4] = ["mongo", "mongodb", "db", "database"];
 const DB_NAME: &str = "jssverifydb";
+const REDIS_IMAGE: &str = "redis:7-alpine";
+const REDIS_ALIASES: [&str; 2] = ["redis", "cache"];
 
 /// Whether a Docker daemon is reachable. The CLI on some platforms exits 0 even when it cannot
 /// connect, so this checks that `docker info` actually printed a server version, not an error.
@@ -47,6 +49,8 @@ pub struct Session {
     marker: String,
     db: Option<String>,
     db_env: Vec<(String, String)>,
+    redis: Option<String>,
+    redis_env: Vec<(String, String)>,
     canary: Canary,
     /// The container port the app listens on: the one we ask for via `PORT`, or, for an app that
     /// fixes its own, the one port it is found listening on (see [`listening_probe`]).
@@ -67,6 +71,8 @@ pub struct Session {
     /// `node_modules` so the module's bare `require(...)` resolves — the same resolution the real app
     /// sets up for its bundled code. `None` when dependencies install in the launch directory itself.
     node_path: Option<String>,
+    /// Host repo root, used to map startup stack frames under `/app` back to app source.
+    root: std::path::PathBuf,
     torn_down: bool,
 }
 
@@ -106,6 +112,12 @@ impl Session {
         let db = db_service(&app_root).then(|| format!("jss-verify-db-{id}"));
         let db_env = if db.is_some() {
             db_connection_env()
+        } else {
+            Vec::new()
+        };
+        let redis = redis_service(&app_root).then(|| format!("jss-verify-redis-{id}"));
+        let redis_env = if redis.is_some() {
+            redis_connection_env()
         } else {
             Vec::new()
         };
@@ -177,12 +189,15 @@ impl Session {
             marker,
             db,
             db_env,
+            redis,
+            redis_env,
             canary,
             port,
             nonce: 0,
             run_as,
             base_env,
             node_path,
+            root: root.to_path_buf(),
             torn_down: false,
         };
         if let Err(err) = session.boot() {
@@ -221,6 +236,9 @@ impl Session {
         if self.db.is_some() {
             self.start_db()?;
         }
+        if self.redis.is_some() {
+            self.start_redis()?;
+        }
 
         // An app that refuses to start without an environment variable its deployment supplies
         // (`NOOBOT_WORKSPACE_ROOT is required`) is started again with it set to a neutral value
@@ -240,10 +258,17 @@ impl Session {
                 }
                 Err(err) => err,
             };
-            let missing: Vec<RequiredEnv> = required_env(&err)
+            let mut missing: Vec<RequiredEnv> = Vec::new();
+            for wanted in required_env(&err)
                 .into_iter()
-                .filter(|wanted| env.iter().all(|have| have.name != wanted.name))
-                .collect();
+                .chain(config_env(&err, &self.root))
+            {
+                if env.iter().all(|have| have.name != wanted.name)
+                    && missing.iter().all(|have| have.name != wanted.name)
+                {
+                    missing.push(wanted);
+                }
+            }
             let enable_module_stub = !stub_missing_modules && missing_bare_module(&err);
             let new_dir = missing_write_dir(&err).filter(|dir| !scratch_dirs.contains(dir));
             if missing.is_empty() && !enable_module_stub && new_dir.is_none() {
@@ -336,6 +361,10 @@ impl Session {
             args.push("-e".to_owned());
             args.push(format!("{name}={value}"));
         }
+        for (name, value) in &self.redis_env {
+            args.push("-e".to_owned());
+            args.push(format!("{name}={value}"));
+        }
         args.push(self.tag.clone());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         docker(&args).map_err(|e| format!("could not start the app: {e}"))?;
@@ -374,6 +403,37 @@ impl Session {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
         Err("the database sidecar did not become ready within 40s".to_owned())
+    }
+
+    fn start_redis(&self) -> Result<(), String> {
+        let Some(redis) = self.redis.as_deref() else {
+            return Ok(());
+        };
+        let mut args = vec!["run", "-d", "--name", redis, "--network", &self.network];
+        for alias in REDIS_ALIASES {
+            args.push("--network-alias");
+            args.push(alias);
+        }
+        args.push(REDIS_IMAGE);
+        docker(&args).map_err(|error| format!("could not start the Redis sidecar: {error}"))?;
+        for _ in 0..40 {
+            let ping = self.exec(redis, &["redis-cli", "ping"]);
+            if ping
+                .ok()
+                .filter(|output| output.status.success())
+                .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "PONG")
+            {
+                return Ok(());
+            }
+            if !self.container_running(redis) {
+                return Err(format!(
+                    "the Redis sidecar exited before it was ready:\n{}",
+                    self.tail_logs(redis)
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Err("the Redis sidecar did not become ready within 40s".to_owned())
     }
 
     fn seed_db(&self) {
@@ -956,6 +1016,9 @@ impl Session {
         if let Some(db) = &self.db {
             let _ = docker(&["rm", "-f", db]);
         }
+        if let Some(redis) = &self.redis {
+            let _ = docker(&["rm", "-f", redis]);
+        }
         let _ = docker(&["network", "rm", &self.network]);
         let _ = docker(&["rmi", "-f", &self.tag]);
     }
@@ -1334,6 +1397,38 @@ fn db_connection_env() -> Vec<(String, String)> {
         ("MONGO_URL", url.clone()),
         ("MONGO_URI", url.clone()),
         ("DATABASE_URL", url),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value))
+    .collect()
+}
+
+fn redis_service(app_root: &std::path::Path) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(app_root.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .filter_map(|section| json.get(section).and_then(serde_json::Value::as_object))
+        .any(|dependencies| {
+            dependencies.contains_key("redis")
+                || dependencies.contains_key("ioredis")
+                || dependencies.contains_key("rate-limit-redis")
+        })
+}
+
+fn redis_connection_env() -> Vec<(String, String)> {
+    let host = REDIS_ALIASES[0];
+    let url = format!("redis://{host}:6379");
+    [
+        ("REDIS_HOST", host.to_owned()),
+        ("REDIS_PORT", "6379".to_owned()),
+        ("REDIS_URL", url.clone()),
+        ("CACHE_REDIS_URL", url.clone()),
+        ("RATE_LIMIT_REDIS_URL", url),
     ]
     .into_iter()
     .map(|(name, value)| (name.to_owned(), value))
@@ -1812,25 +1907,111 @@ fn required_env(log: &str) -> Vec<RequiredEnv> {
             let demanded = AFTER.iter().any(|p| after.starts_with(p))
                 || BEFORE.iter().any(|p| before.ends_with(p));
             if demanded && out.iter().all(|e| e.name != word) {
-                let last = word.rsplit('_').next().unwrap_or(word);
-                let (value, directory) = match last {
-                    "ROOT" | "DIR" | "DIRECTORY" | "PATH" | "HOME" | "FOLDER" => {
-                        (format!("/jss-env/{}", word.to_ascii_lowercase()), true)
-                    }
-                    "URL" | "URI" => ("http://jss-filler.test/".to_owned(), false),
-                    "SECRET" | "SECRETS" | "KEY" | "KEYS" | "TOKEN" | "PASSWORD" | "PASS"
-                    | "PASSPHRASE" | "SALT" | "SEED" | "NONCE" | "PEPPER" | "SIGNATURE"
-                    | "CREDENTIAL" | "CREDENTIALS" | "PRIVATEKEY" | "SIGNINGKEY" => {
-                        (STRONG_FILLER_SECRET.to_owned(), false)
-                    }
-                    _ => ("jsspector".to_owned(), false),
-                };
+                let (value, directory) =
+                    typed_env_value(word).unwrap_or_else(|| ("jsspector".to_owned(), false));
                 out.push(RequiredEnv {
                     name: word.to_owned(),
                     value,
                     directory,
                 });
             }
+        }
+    }
+    out
+}
+
+/// A neutral value matching the kind encoded in an environment variable's name.
+fn typed_env_value(name: &str) -> Option<(String, bool)> {
+    let last = name.rsplit('_').next().unwrap_or(name).to_ascii_uppercase();
+    match last.as_str() {
+        "ROOT" | "DIR" | "DIRECTORY" | "PATH" | "HOME" | "FOLDER" => {
+            Some((format!("/jss-env/{}", name.to_ascii_lowercase()), true))
+        }
+        "URL" | "URI" => Some(("http://jss-filler.test/".to_owned(), false)),
+        "SECRET" | "SECRETS" | "KEY" | "KEYS" | "TOKEN" | "PASSWORD" | "PASS" | "PASSPHRASE"
+        | "SALT" | "SEED" | "NONCE" | "PEPPER" | "SIGNATURE" | "CREDENTIAL" | "CREDENTIALS"
+        | "PRIVATEKEY" | "SIGNINGKEY" => Some((STRONG_FILLER_SECRET.to_owned(), false)),
+        _ => None,
+    }
+}
+
+/// Credential/resource variables read by the app file at the top of a startup crash stack.
+fn config_env(log: &str, root: &std::path::Path) -> Vec<RequiredEnv> {
+    let mut out: Vec<RequiredEnv> = Vec::new();
+    for rel in stack_app_files(log) {
+        let path = root.join(&rel);
+        if !std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= 512 * 1024) {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for name in env_var_names(&src) {
+            if fillable_config_name(&name)
+                && out.iter().all(|existing| existing.name != name)
+                && let Some((value, directory)) = typed_env_value(&name)
+            {
+                out.push(RequiredEnv {
+                    name,
+                    value,
+                    directory,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn fillable_config_name(name: &str) -> bool {
+    if !(name.len() <= 64
+        && name.contains('_')
+        && name.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'))
+    {
+        return false;
+    }
+    if name.starts_with("NODE_") || name.starts_with("NPM_") || name.starts_with("ERR_") {
+        return false;
+    }
+    if matches!(name, "PORT" | "HOST" | "NODE_ENV" | "CI") {
+        return false;
+    }
+    db_connection_env()
+        .iter()
+        .all(|(db_name, _)| db_name != name)
+}
+
+/// App-owned JavaScript files named by Node stack frames under the image's `/app` root.
+fn stack_app_files(log: &str) -> Vec<String> {
+    const PREFIX: &str = "/app/";
+    let bytes = log.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = log[from..].find(PREFIX) {
+        let start = from + rel + PREFIX.len();
+        let mut end = start;
+        while bytes.get(end).is_some_and(|byte| {
+            !matches!(
+                byte,
+                b':' | b')' | b'(' | b'\'' | b'"' | b' ' | b'\n' | b'\r' | b'\t'
+            )
+        }) {
+            end += 1;
+        }
+        from = start;
+        let Some(path) = log.get(start..end) else {
+            continue;
+        };
+        if (path.ends_with(".js") || path.ends_with(".mjs") || path.ends_with(".cjs"))
+            && !path.starts_with("node_modules/")
+            && !path.contains("/node_modules/")
+            && !path.split('/').any(|segment| segment == "..")
+            && out.len() < 64
+            && out.iter().all(|existing| existing != path)
+        {
+            out.push(path.to_owned());
         }
     }
     out
@@ -3973,6 +4154,25 @@ mod tests {
     }
 
     #[test]
+    fn startup_stack_config_fills_only_typed_variables_from_the_crashing_app_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config/razorpay.js",
+            "new Razorpay({key_id:process.env.RAZORPAY_KEY,\
+             key_secret:process.env.RAZORPAY_SECRET});\
+             if(process.env.ENABLE_PAYMENTS) start();",
+        );
+        let env = config_env(
+            "Error: `key_id` is mandatory\n    at /app/config/razorpay.js:1:1",
+            dir.path(),
+        );
+        let names: Vec<&str> = env.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["RAZORPAY_KEY", "RAZORPAY_SECRET"]);
+        assert!(env.iter().all(|item| item.value == STRONG_FILLER_SECRET));
+    }
+
+    #[test]
     fn the_esm_missing_module_hook_is_valid_and_only_handles_missing_bare_packages() {
         assert!(LAUNCH_ESM_HOOK_JS.contains("error.code !== 'ERR_MODULE_NOT_FOUND'"));
         assert!(LAUNCH_ESM_HOOK_JS.contains("!isBare(specifier)"));
@@ -4204,6 +4404,28 @@ mod tests {
         assert!(env.iter().any(|(name, value)| {
             name == "MONGODB_URI" && value == "mongodb://mongo:27017/jssverifydb"
         }));
+    }
+
+    #[test]
+    fn redis_sidecar_is_selected_from_declared_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"dependencies":{"ioredis":"5"}}"#,
+        );
+        assert!(redis_service(dir.path()));
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"dependencies":{"express":"5"}}"#,
+        );
+        assert!(!redis_service(dir.path()));
+        let env = redis_connection_env();
+        assert!(
+            env.iter()
+                .any(|(name, value)| name == "REDIS_URL" && value == "redis://redis:6379")
+        );
     }
 
     fn write(root: &std::path::Path, rel: &str, text: &str) {

@@ -657,10 +657,9 @@ const NOSQL_FIELDS: [&str; 15] = [
 ];
 
 pub fn nosql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<NosqlCase> {
-    let verb = probe.method.verb(&Entry::Body(None));
-    let absent = format!("jssnomatch{}{nonce}", canary.token);
+    let absent = nosql_absent_token(canary, nonce);
     let primary = match &probe.entry {
-        Entry::Body(Some(name)) => Some(name.clone()),
+        Entry::Query(name) | Entry::Body(Some(name)) => Some(name.clone()),
         _ => None,
     };
     let mut fields = Vec::new();
@@ -674,42 +673,96 @@ pub fn nosql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<NosqlCase>
     }
     fields
         .iter()
-        .map(|field| {
-            let body = |operator: String| {
-                let mut members = probe.siblings.clone();
-                if let Some(name) = &primary
-                    && name != field
-                    && members.iter().all(|(key, _)| key != name)
-                {
-                    members.push((name.clone(), ENVELOPE_PLACEHOLDER.to_owned()));
-                }
-                members.retain(|(key, _)| key != field);
-                let mut obj = format!("{{\"{}\":{operator}", json_escape(field));
-                for (key, value) in &members {
-                    obj.push_str(&format!(
-                        ",\"{}\":\"{}\"",
-                        json_escape(key),
-                        json_escape(value)
-                    ));
-                }
-                obj.push('}');
-                Attempt {
-                    verb,
-                    target: fill_remaining(&probe.path, &probe.path_fillers),
-                    body: Some(obj),
-                    headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
-                    signal: Signal::InResponse,
-                }
-            };
-            NosqlCase {
-                field: field.clone(),
-                match_all: body(format!("{{\"$ne\":\"{}\"}}", json_escape(&absent))),
-                match_none_eq: body(format!("{{\"$eq\":\"{}\"}}", json_escape(&absent))),
-                match_none_in: body("{\"$in\":[]}".to_owned()),
-                absent: absent.clone(),
-            }
+        .map(|field| match &probe.entry {
+            Entry::Query(_) => nosql_query_case(probe, field, &absent),
+            _ => nosql_body_case(probe, &primary, field, &absent),
         })
         .collect()
+}
+
+/// A per-probe 24-hex value that casts as a MongoDB ObjectId but does not match seeded data.
+fn nosql_absent_token(canary: &Canary, nonce: u32) -> String {
+    let mut hex: String = canary
+        .token
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .flat_map(char::to_lowercase)
+        .collect();
+    hex.push_str(&format!("{nonce:08x}"));
+    let mut out: String = hex.chars().take(24).collect();
+    while out.len() < 24 {
+        out.push('0');
+    }
+    out
+}
+
+fn nosql_body_case(
+    probe: &Probe,
+    primary: &Option<String>,
+    field: &str,
+    absent: &str,
+) -> NosqlCase {
+    let verb = probe.method.verb(&Entry::Body(None));
+    let body = |operator: String| {
+        let mut members = probe.siblings.clone();
+        if let Some(name) = primary
+            && name != field
+            && members.iter().all(|(key, _)| key != name)
+        {
+            members.push((name.clone(), ENVELOPE_PLACEHOLDER.to_owned()));
+        }
+        members.retain(|(key, _)| key != field);
+        let mut obj = format!("{{\"{}\":{operator}", json_escape(field));
+        for (key, value) in &members {
+            obj.push_str(&format!(
+                ",\"{}\":\"{}\"",
+                json_escape(key),
+                json_escape(value)
+            ));
+        }
+        obj.push('}');
+        Attempt {
+            verb,
+            target: fill_remaining(&probe.path, &probe.path_fillers),
+            body: Some(obj),
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            signal: Signal::InResponse,
+        }
+    };
+    NosqlCase {
+        field: field.to_owned(),
+        match_all: body(format!("{{\"$ne\":\"{}\"}}", json_escape(absent))),
+        match_none_eq: body(format!("{{\"$eq\":\"{}\"}}", json_escape(absent))),
+        match_none_in: body("{\"$in\":[]}".to_owned()),
+        absent: absent.to_owned(),
+    }
+}
+
+/// Place MongoDB operators in the query parameter actually consumed by a query-sourced sink.
+fn nosql_query_case(probe: &Probe, field: &str, absent: &str) -> NosqlCase {
+    let verb = probe.method.verb(&Entry::Query(field.to_owned()));
+    let attempt = |operator: String| {
+        let mut target = fill_remaining(&probe.path, &probe.path_fillers);
+        let sep = if target.contains('?') { '&' } else { '?' };
+        target.push_str(&format!("{sep}{}{operator}", encode(field)));
+        for (key, value) in &probe.siblings {
+            target.push_str(&format!("&{}={}", encode(key), encode(value)));
+        }
+        Attempt {
+            verb,
+            target,
+            body: None,
+            headers: Vec::new(),
+            signal: Signal::InResponse,
+        }
+    };
+    NosqlCase {
+        field: field.to_owned(),
+        match_all: attempt(format!("[$ne]={}", encode(absent))),
+        match_none_eq: attempt(format!("[$eq]={}", encode(absent))),
+        match_none_in: attempt(format!("[$in][]={}", encode(absent))),
+        absent: absent.to_owned(),
+    }
 }
 
 /// Whether the three responses prove the object was interpreted as a database operator. Operator
@@ -1671,21 +1724,24 @@ mod tests {
 
     #[test]
     fn nosql_cases_place_matching_operators_in_the_body() {
-        let canary = Canary::new("tok".to_owned());
+        let canary = Canary::new("abc123".to_owned());
         let cases = nosql_cases(
             &probe(VulnClass::NosqlInjection, "/api/user", Entry::Body(None)),
             &canary,
             1,
         );
         assert_eq!(cases.len(), NOSQL_FIELDS.len());
+        let absent = nosql_absent_token(&canary, 1);
+        assert_eq!(absent.len(), 24);
+        assert!(absent.bytes().all(|b| b.is_ascii_hexdigit()));
         let id = cases.iter().find(|case| case.field == "id").unwrap();
         assert_eq!(
             id.match_all.body.as_deref(),
-            Some("{\"id\":{\"$ne\":\"jssnomatchtok1\"}}")
+            Some(format!("{{\"id\":{{\"$ne\":\"{absent}\"}}}}").as_str())
         );
         assert_eq!(
             id.match_none_eq.body.as_deref(),
-            Some("{\"id\":{\"$eq\":\"jssnomatchtok1\"}}")
+            Some(format!("{{\"id\":{{\"$eq\":\"{absent}\"}}}}").as_str())
         );
         assert_eq!(
             id.match_none_in.body.as_deref(),
@@ -1701,13 +1757,43 @@ mod tests {
             ("name".to_owned(), "jsspector".to_owned()),
             ("password".to_owned(), "Valid1!x".to_owned()),
         ];
+        let absent2 = nosql_absent_token(&canary, 2);
         let targeted = nosql_cases(&targeted, &canary, 2);
         assert_eq!(targeted[0].field, "email");
         assert_eq!(
             targeted[0].match_all.body.as_deref(),
             Some(
-                "{\"email\":{\"$ne\":\"jssnomatchtok2\"},\"name\":\"jsspector\",\"password\":\"Valid1!x\"}"
+                format!("{{\"email\":{{\"$ne\":\"{absent2}\"}},\"name\":\"jsspector\",\"password\":\"Valid1!x\"}}")
+                    .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn nosql_cases_place_operators_in_the_query_for_a_query_sourced_sink() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::NosqlInjection,
+            "/api/v1/course/getCategoryPageDetail",
+            Entry::Query("categoryId".to_owned()),
+        );
+        p.method = Method::Get;
+        let cases = nosql_cases(&p, &canary, 1);
+        let absent = nosql_absent_token(&canary, 1);
+        assert_eq!(cases[0].field, "categoryId");
+        assert_eq!(cases[0].match_all.verb, "GET");
+        assert!(cases[0].match_all.body.is_none());
+        assert_eq!(
+            cases[0].match_all.target,
+            format!("/api/v1/course/getCategoryPageDetail?categoryId[$ne]={absent}")
+        );
+        assert_eq!(
+            cases[0].match_none_eq.target,
+            format!("/api/v1/course/getCategoryPageDetail?categoryId[$eq]={absent}")
+        );
+        assert_eq!(
+            cases[0].match_none_in.target,
+            format!("/api/v1/course/getCategoryPageDetail?categoryId[$in][]={absent}")
         );
     }
 

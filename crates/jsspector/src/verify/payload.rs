@@ -18,9 +18,12 @@ pub const MARKER_HOST: &str = "jss-marker";
 /// Extensions commonly appended to a tainted file path before the read, plus the empty string for
 /// the raw name. The canary is planted under each so a traversal through a handler that appends one
 /// of these still reads the token. Not tied to any one target: these are the ordinary extensions a
-/// content/download handler suffixes.
+/// content/download handler suffixes. `.gz` covers the widespread precompressed-asset pattern, where
+/// a handler serves `<name>.gz` when a client asks for the bare `<name>` (`express-static-gzip`,
+/// webpack `.gz` emits, `nginx gzip_static`): the request names the bare file and the handler appends
+/// `.gz`, so the canary must exist under `.gz` for either read oracle to observe the found branch.
 pub const PLANTED_SUFFIXES: &[&str] = &[
-    "", ".md", ".json", ".html", ".htm", ".txt", ".js", ".yml", ".yaml", ".xml", ".csv",
+    "", ".md", ".json", ".html", ".htm", ".txt", ".js", ".yml", ".yaml", ".xml", ".csv", ".gz",
 ];
 
 /// The name of the canary *directory* planted for a traversal whose sink appends a fixed segment
@@ -2531,6 +2534,25 @@ mod tests {
             oracles
                 .iter()
                 .all(|o| !o.present_value.contains(&canary.token))
+        );
+    }
+
+    #[test]
+    fn canary_is_planted_under_the_gz_precompressed_suffix() {
+        // A precompressed-asset handler serves `<name>.gz` when the client asks for the bare
+        // `<name>` (`express-static-gzip`, webpack `.gz` emits). The read oracles request the bare
+        // canary name and rely on the handler appending the suffix, so the canary must exist under
+        // `.gz` for the found branch to be observable.
+        let canary = Canary::new("abc123".to_owned());
+        let planted = canary.planted_files();
+        assert!(
+            planted.iter().any(|p| p == "/jss-canary-read.gz"),
+            "{planted:?}"
+        );
+        // The bare-name read is still planted, so a handler that does not append a suffix is covered.
+        assert!(
+            planted.iter().any(|p| p == "/jss-canary-read"),
+            "{planted:?}"
         );
     }
 

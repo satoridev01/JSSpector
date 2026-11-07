@@ -2564,6 +2564,7 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-express-host.mjs\n\
          RUN echo {} | base64 -d > /jss-lifecycle-host.mjs\n\
          RUN echo {} | base64 -d > /jss-route-host.mjs\n\
+         RUN echo {} | base64 -d > /jss-node-red-host.mjs\n\
          ENV NODE_EXTRA_CA_CERTS=/jss-marker.crt\n\
          ENV PORT={port}\n\
          ENV HOST=0.0.0.0\n\
@@ -2578,6 +2579,7 @@ fn dockerfile(
         base64(EXPRESS_HOST_JS.as_bytes()),
         base64(LIFECYCLE_HOST_JS.as_bytes()),
         base64(ROUTE_HOST_JS.as_bytes()),
+        base64(NODE_RED_HOST_JS.as_bytes()),
     )
 }
 
@@ -2744,27 +2746,28 @@ fn credential_env(gating_sources: &[String]) -> Vec<RequiredEnv> {
 
 /// Whether an environment variable name denotes an external-service credential the sandbox may set
 /// to a filler to satisfy a configuration precondition: an `_`-delimited segment of `TOKEN`, `PAT`,
-/// `SECRET`, `PASSWORD`, `CREDENTIAL`, `CREDENTIALS`, `KEY` or `APIKEY` (so `GITHUB_TOKEN`/
-/// `GH_TOKEN`/`GITHUB_PAT`/`GEMINI_API_KEY`/`OPENAI_API_KEY` qualify but `PATH` does not). An API
-/// key is the credential an external-service integration is gated on exactly like a token, so a
-/// random filler enables the "a credential is configured" branch without matching a real secret or
-/// relaxing authentication. Never a variable the sandbox owns.
+/// `SECRET`, `PASSWORD`, `CREDENTIAL`, `CREDENTIALS` or `APIKEY`, plus the adjacent segments
+/// `API_KEY` (so `GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_PAT`/`GEMINI_API_KEY`/`OPENAI_API_KEY` qualify but
+/// `PATH` does not). A generic `*_KEY` is deliberately excluded: cryptographic key pairs such as
+/// VAPID public/private keys have strict encodings and an arbitrary filler prevents the application
+/// from starting. Never a variable the sandbox owns.
 fn credential_name(name: &str) -> bool {
-    const KINDS: [&str; 8] = [
+    const KINDS: [&str; 7] = [
         "TOKEN",
         "PAT",
         "SECRET",
         "PASSWORD",
         "CREDENTIAL",
         "CREDENTIALS",
-        "KEY",
         "APIKEY",
     ];
     let upper = name.to_ascii_uppercase();
     if upper.starts_with("NODE_") || upper.starts_with("NPM_") {
         return false;
     }
-    upper.split('_').any(|segment| KINDS.contains(&segment))
+    let segments = upper.split('_').collect::<Vec<_>>();
+    segments.iter().any(|segment| KINDS.contains(segment))
+        || segments.windows(2).any(|pair| pair == ["API", "KEY"])
 }
 
 /// A non-secret value long enough to satisfy startup checks for secret-like environment variables.
@@ -3166,6 +3169,9 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
     if is_lifecycle_server_module(&root.join(&file)) {
         return Some(lifecycle_host_command(&file));
     }
+    if is_node_red_node_module(&root.join(&file)) {
+        return Some(node_red_host_command(&file));
+    }
     is_route_handler_module(&root.join(&file)).then(|| route_host_command(&file))
 }
 
@@ -3317,6 +3323,48 @@ fn is_lifecycle_server_module(path: &std::path::Path) -> bool {
 /// `PORT`.
 fn route_host_command(file: &str) -> String {
     format!("[\"node\",\"/jss-route-host.mjs\",\"{file}\"]")
+}
+
+/// The launch command that mounts a Node-RED node module through the Node-RED host shim
+/// ([`NODE_RED_HOST_JS`]): the shim imports the module, calls its exported `function (RED)` factory
+/// with a minimal mock Node-RED runtime whose `RED.httpAdmin`/`RED.httpNode` are Express-compatible
+/// route collectors, so the admin/node HTTP routes the module registers at load time serve over
+/// `PORT`.
+fn node_red_host_command(file: &str) -> String {
+    format!("[\"node\",\"/jss-node-red-host.mjs\",\"{file}\"]")
+}
+
+/// Whether a JavaScript file is a Node-RED node module that exposes HTTP routes: the Node-RED runtime
+/// loads every node module by calling `module.exports = function (RED) { ... }`, passing the `RED`
+/// object through which a node registers admin/editor routes (`RED.httpAdmin.post('/x/:id', ...)`) or
+/// node HTTP endpoints (`RED.httpNode.get(...)`). Such a module publishes no server of its own (no
+/// `.listen(`) — the Node-RED runtime hosts it — so it is launched through the Node-RED host shim,
+/// which reconstructs that runtime contract and serves the routes. Matched after the self-contained
+/// server, Express-router, plug-in and lifecycle shapes; a module that registers no `httpAdmin`/
+/// `httpNode` route exposes no HTTP entry point and is not selected.
+fn is_node_red_node_module(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    // A node module is a factory the runtime calls with `RED`; it registers at least one HTTP route on
+    // one of the two routers the runtime exposes. The textual markers mirror the runtime's own API.
+    let is_factory_module = src.contains("module.exports") || src.contains("export default");
+    let registers_route = ["RED.httpAdmin", "RED.httpNode"].iter().any(|router| {
+        [".get(", ".post(", ".put(", ".patch(", ".delete("]
+            .iter()
+            .any(|verb| src.contains(&format!("{router}{verb}")))
+    });
+    is_factory_module && registers_route
 }
 
 /// HTTP method names a convention-based file-system router uses as the route file's own name.
@@ -4553,6 +4601,229 @@ http.createServer((req, res) => {
 }).listen(port, '0.0.0.0', () => console.error('[route-host] listening on ' + port));
 "#;
 
+/// Mounts a Node-RED node module. The Node-RED runtime loads a node by calling
+/// `module.exports = function (RED) { ... }`, passing a `RED` object through which the node registers
+/// admin/editor routes on `RED.httpAdmin` and node HTTP endpoints on `RED.httpNode` (both Express
+/// routers in a real deployment), looks up node definitions, reads settings, and logs. The shim
+/// imports the target, calls its factory with a minimal mock `RED` whose `httpAdmin`/`httpNode` are
+/// Express-compatible route collectors and whose other members are permissive stubs, then serves the
+/// routes the node registered over HTTP on `PORT`.
+///
+/// `RED.auth.needsPermission(perm)` returns a passthrough middleware that calls `next()`: that is
+/// Node-RED's own behavior when `adminAuth` is not configured in `settings.js` (the default), so the
+/// admin HTTP API is served open — the shim reproduces the default deployment faithfully, it does not
+/// weaken a check that would otherwise run. It fabricates nothing else: a verification still requires
+/// the real canary to flow through the node's own handler into the real sink. Dependency-free (core
+/// `http`); imports the target with dynamic `import()`, so it mounts CommonJS and ESM node modules
+/// alike.
+const NODE_RED_HOST_JS: &str = r#"
+import http from 'node:http';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+const port = Number(process.env.PORT || 3000);
+const target = path.resolve(process.cwd(), process.argv[2] || '');
+
+const routes = [];
+const middleware = [];
+function compile(p) {
+  const keys = [];
+  let pattern = (typeof p === 'string' && p) ? p : '/';
+  if (pattern.charAt(0) !== '/') pattern = '/' + pattern;
+  if (pattern.length > 1) pattern = pattern.replace(/\/+$/, '');
+  const parts = pattern.split('/').map((seg) => {
+    if (seg.charAt(0) === ':') { keys.push(seg.slice(1)); return '([^/]+)'; }
+    if (seg === '*') { keys.push('wild'); return '(.*)'; }
+    return seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  });
+  return { regex: new RegExp('^' + parts.join('/') + '/?$'), keys };
+}
+function add(method, p, handlers) {
+  const c = compile(p);
+  routes.push({ method, path: typeof p === 'string' ? p : '/', regex: c.regex, keys: c.keys, handlers });
+}
+
+const METHODS = ['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'all'];
+function makeRouter() {
+  const router = function () { return router; };
+  for (const m of METHODS) {
+    router[m] = (p, ...h) => { add(m === 'all' ? 'ALL' : m.toUpperCase(), p, h.flat().filter((f) => typeof f === 'function')); return router; };
+  }
+  router.use = (p, ...h) => {
+    let prefix = null;
+    let handlers = h;
+    if (typeof p === 'function') handlers = [p, ...h];
+    else if (typeof p === 'string') prefix = p === '/' ? null : p.replace(/\/+$/, '');
+    middleware.push({ prefix, handlers: handlers.flat().filter((f) => typeof f === 'function') });
+    return router;
+  };
+  router.set = () => router;
+  router.engine = () => router;
+  router.param = () => router;
+  router.enable = () => router;
+  router.disable = () => router;
+  router.listen = () => router;
+  router.route = (p) => { const r = {}; for (const m of METHODS) r[m] = (...h) => { router[m](p, ...h); return r; }; return r; };
+  return router;
+}
+const httpAdmin = makeRouter();
+const httpNode = makeRouter();
+
+function stub() {
+  const s = new Proxy(function () { return s; }, {
+    get(_t, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === Symbol.toPrimitive) return () => '';
+      if (prop === Symbol.iterator || prop === Symbol.asyncIterator) return undefined;
+      return s;
+    },
+    apply() { return s; },
+    construct() { return s; },
+  });
+  return s;
+}
+
+// `RED.auth.needsPermission(perm)` is a passthrough when `adminAuth` is unset (Node-RED's default):
+// it returns middleware that immediately calls `next()`. Anything else on `RED.auth` is a stub.
+const auth = new Proxy(function () { return auth; }, {
+  get(_t, prop) {
+    if (prop === 'needsPermission') return () => (req, res, next) => { if (typeof next === 'function') next(); };
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return () => '';
+    return stub();
+  },
+  apply() { return auth; },
+});
+
+// `RED.nodes`: node-registration and lookup API. `registerType`/`createNode` are no-ops at load;
+// `getNode` returns null (no flow is deployed), so a node constructor that guards on it bails cleanly.
+const nodes = new Proxy(function () { return nodes; }, {
+  get(_t, prop) {
+    if (prop === 'getNode') return () => null;
+    if (prop === 'eachNode' || prop === 'eachConfig' || prop === 'eachSubflow') return () => {};
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return () => '';
+    return () => undefined;
+  },
+  apply() { return nodes; },
+});
+
+// `RED.settings`: a permissive read-only view. Unknown settings read as `undefined` (falsy), so a
+// node takes its default branch rather than a configured one.
+const settings = new Proxy({}, {
+  get(_t, prop) {
+    if (prop === 'available') return () => false;
+    if (prop === 'get') return (_k, def) => def;
+    if (prop === 'then') return undefined;
+    return undefined;
+  },
+});
+
+const RED = new Proxy(function () { return RED; }, {
+  get(_t, prop) {
+    if (prop === 'httpAdmin') return httpAdmin;
+    if (prop === 'httpNode') return httpNode;
+    if (prop === 'auth') return auth;
+    if (prop === 'nodes') return nodes;
+    if (prop === 'settings') return settings;
+    if (prop === '_') return (k) => k;
+    if (prop === 'version') return () => '4.0.0';
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return () => '';
+    return stub();
+  },
+  apply() { return RED; },
+});
+
+try {
+  const mod = await import(pathToFileURL(target).href);
+  const factory = (mod && typeof mod.default === 'function') ? mod.default : (typeof mod === 'function' ? mod : null);
+  if (factory) {
+    let out = factory(RED);
+    if (out && typeof out.then === 'function') await out;
+  } else {
+    console.error('[node-red-host] no RED factory export found');
+  }
+} catch (e) {
+  console.error('[node-red-host] load error: ' + (e && e.message));
+}
+
+function decorate(res) {
+  res.status = (c) => { res.statusCode = c; return res; };
+  res.set = res.header = (k, v) => {
+    if (k && typeof k === 'object') { for (const n in k) { try { res.setHeader(n, k[n]); } catch (e) {} } }
+    else { try { res.setHeader(k, v); } catch (e) {} }
+    return res;
+  };
+  res.type = (t) => { try { res.setHeader('Content-Type', t); } catch (e) {} return res; };
+  res.json = (obj) => { try { if (!res.headersSent) res.setHeader('Content-Type', 'application/json'); } catch (e) {} res.end(JSON.stringify(obj)); return res; };
+  res.send = (b) => {
+    if (b !== null && typeof b === 'object' && !Buffer.isBuffer(b)) return res.json(b);
+    res.end(b == null ? '' : (Buffer.isBuffer(b) ? b : String(b)));
+    return res;
+  };
+  res.sendStatus = (c) => { res.statusCode = c; res.end(String(c)); return res; };
+  res.redirect = (loc) => { res.statusCode = 302; try { res.setHeader('Location', loc); } catch (e) {} res.end(); return res; };
+  return res;
+}
+
+function parseBody(req, raw) {
+  if (!raw) return {};
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  try {
+    if (ct.indexOf('application/x-www-form-urlencoded') >= 0) return Object.fromEntries(new URLSearchParams(raw));
+    return JSON.parse(raw);
+  } catch (e) { return raw; }
+}
+
+function runChain(handlers, req, res) {
+  let i = 0;
+  function next(err) {
+    if (err) { try { if (!res.headersSent) res.statusCode = 500; res.end(); } catch (e) {} return; }
+    const h = handlers[i++];
+    if (!h) { try { if (!res.headersSent) { res.statusCode = 404; res.end(); } } catch (e) {} return; }
+    try { Promise.resolve(h(req, res, next)).catch(() => { try { if (!res.headersSent) { res.statusCode = 502; res.end(); } } catch (e) {} }); }
+    catch (e) { try { if (!res.headersSent) { res.statusCode = 502; res.end(); } } catch (x) {} }
+  }
+  next();
+}
+
+http.createServer((req, res) => {
+  decorate(res);
+  req.get = req.header = (h) => req.headers[String(h).toLowerCase()];
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch (e) { res.statusCode = 400; res.end(); return; }
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => { size += c.length; if (size <= 5 * 1024 * 1024) chunks.push(c); });
+  req.on('error', () => { try { res.statusCode = 400; res.end(); } catch (e) {} });
+  req.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    req.rawBody = raw;
+    req.body = parseBody(req, raw);
+    req.query = Object.fromEntries(u.searchParams);
+    req.path = u.pathname;
+    for (const r of routes) {
+      if (r.method !== 'ALL' && r.method !== req.method) continue;
+      const m = r.regex.exec(u.pathname);
+      if (!m) continue;
+      req.params = {};
+      r.keys.forEach((k, idx) => { try { req.params[k] = decodeURIComponent(m[idx + 1] || ''); } catch (e) { req.params[k] = m[idx + 1] || ''; } });
+      const before = [];
+      for (const group of middleware) {
+        if (group.prefix === null || u.pathname === group.prefix || u.pathname.startsWith(group.prefix + '/')) before.push(...group.handlers);
+      }
+      runChain([...before, ...r.handlers], req, res);
+      return;
+    }
+    res.statusCode = 404; res.end('no route');
+  });
+}).listen(port, '0.0.0.0', () => console.error('[node-red-host] listening on ' + port + ' routes=' + routes.map((r) => r.method + ' ' + r.path).join(',')));
+"#;
+
 /// Sends one request to the app on localhost and prints the response body. Reads its spec from
 /// argv[2]. Kept tiny and dependency-free (core `http`).
 const DRIVER_JS: &str = r#"
@@ -5133,6 +5404,8 @@ mod tests {
         assert!(credential_name("OPENAI_API_KEY"));
         assert!(credential_name("STRIPE_SECRET_KEY"));
         assert!(credential_name("SENDGRID_APIKEY"));
+        assert!(!credential_name("VAPID_PUBLIC_KEY"));
+        assert!(!credential_name("VAPID_PRIVATE_KEY"));
         assert!(!credential_name("PATH"));
         assert!(!credential_name("DATABASE_URL"));
         assert!(!credential_name("NODE_OPTIONS"));
@@ -5761,6 +6034,56 @@ mod tests {
             false,
         );
         assert!(!yarn.contains(NPM_WORKSPACE_FIXUP), "{yarn}");
+    }
+
+    #[test]
+    fn a_node_red_node_module_is_launched_through_the_node_red_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A Node-RED node module: the runtime loads it by calling `module.exports = function (RED)`,
+        // and it registers an admin HTTP route on `RED.httpAdmin`. Its manifest has no launch script
+        // and a `main` that does not resolve to a file, so only the node-red host can serve it.
+        write(
+            root,
+            "package.json",
+            r#"{"name":"node-red-contrib-x","main":"node","dependencies":{"debug":"^4"}}"#,
+        );
+        write(
+            root,
+            "src/x.js",
+            "module.exports = function (RED) {\n\
+               RED.nodes.registerType('x', function () {});\n\
+               RED.httpAdmin.post('/x/:id', RED.auth.needsPermission('x.read'), function (req, res) {\n\
+                 const fs = require('fs');\n\
+                 fs.readFile(req.body.mapPath, (e, d) => res.status(200).json(String(d)));\n\
+               });\n\
+             };\n",
+        );
+        let path = std::path::Path::new;
+        assert!(is_node_red_node_module(&root.join("src/x.js")));
+        // No launchable manifest, so the node-red host shim is selected for the node's own file.
+        assert_eq!(manifest_start_command(root), None);
+        assert_eq!(
+            start_command(root, Some(path("src/x.js"))).as_deref(),
+            Some(r#"["node","/jss-node-red-host.mjs","src/x.js"]"#)
+        );
+        // A plain helper that registers no `httpAdmin`/`httpNode` route exposes no HTTP entry point.
+        write(root, "src/util.js", "module.exports = (a) => a + 1;\n");
+        assert!(!is_node_red_node_module(&root.join("src/util.js")));
+        // The node-red host shim is planted in the image.
+        let canary = Canary::new("tok".to_owned());
+        let file = dockerfile(
+            "node:22-slim",
+            "/app",
+            "/app",
+            &canary,
+            r#"["node","/jss-node-red-host.mjs","src/x.js"]"#,
+            3000,
+            PackageManager::Npm,
+            false,
+            false,
+        );
+        assert!(file.contains("/jss-node-red-host.mjs"), "{file}");
     }
 
     #[test]

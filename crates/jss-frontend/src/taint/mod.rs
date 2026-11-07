@@ -3086,11 +3086,27 @@ fn route_middleware_auth(expr: &Expression<'_>) -> Option<Auth> {
                 .flatten()
             })
             .max(),
+        // Node-RED's `RED.auth.needsPermission(...)` guard is a no-op passthrough unless the
+        // operator has configured `adminAuth` in settings.js, which is not the default: the admin
+        // HTTP API ships open. Treating it as unconditional authentication would overstate the
+        // default deployment's posture, so it adds no requirement of its own.
+        _ if is_conditional_permission_guard(expr) => None,
         _ if !is_controller_action(expr) => callee_name(expr)
             .and_then(|name| m().auth_of(&name))
             .or_else(|| inline_guard_auth(expr)),
         _ => None,
     }
+}
+
+/// Whether `expr` is a framework permission guard that is disabled by default: Node-RED's
+/// `RED.auth.needsPermission(...)` returns an empty `(req, res, next) => next()` middleware unless
+/// `adminAuth` is configured in settings.js (off by default), so by itself it enforces nothing.
+fn is_conditional_permission_guard(expr: &Expression<'_>) -> bool {
+    let Expression::CallExpression(call) = expr.get_inner_expression() else {
+        return false;
+    };
+    callee_name(&call.callee)
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".auth.needspermission"))
 }
 
 /// Authentication named in a convention-router middleware declaration. Unlike positional route
@@ -8188,8 +8204,11 @@ impl Walker<'_> {
                                 self.this_field_class(field.property.name.as_str())
                             }
                             // `FastifyWorker.fastify.all('/x', h)`, `this.app.get(..)` on a router
-                            // held in a field.
-                            other => member_path(other).filter(|path| self.routers.contains(path)),
+                            // held in a field, or a framework router read off a host object
+                            // (`RED.httpAdmin.post(...)`): keep the member path when it names a
+                            // router so the registration is attributed to it.
+                            other => member_path(other)
+                                .filter(|path| self.routers.contains(path) || self.is_router(path)),
                         };
                         // `Buffer.from`, `JSON.parse`, `Object.keys`, `Object.assign` as globals.
                         if let Some(object) = &object_name {

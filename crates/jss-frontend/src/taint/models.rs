@@ -63,7 +63,20 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
         "multipart",
         include_str!("../../../../packs/multipart.yaml"),
     ),
+    ("node-red", NODE_RED_PACK),
 ];
+
+/// Node-RED exposes two Express routers to every node module through the `RED` object the runtime
+/// passes to `module.exports = function (RED) { ... }`: `RED.httpAdmin` (the admin/editor API) and
+/// `RED.httpNode` (the node HTTP endpoints). A node registers routes on them exactly like Express
+/// (`RED.httpAdmin.post('/x/:id', RED.auth.needsPermission('p'), handler)`), using the request/sink
+/// shapes the Express pack already models. Naming both routers lets those registrations be recognized
+/// as HTTP entry points across the whole Node-RED ecosystem.
+const NODE_RED_PACK: &str = r#"
+name: node-red
+routes:
+  names: [red.httpadmin, red.httpnode]
+"#;
 
 /// One pack file, as written.
 #[derive(Debug, Default, Deserialize)]

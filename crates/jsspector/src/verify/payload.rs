@@ -1283,6 +1283,20 @@ fn payloads(class: VulnClass, canary: &Canary, nonce: u32) -> Vec<(String, Signa
                     Signal::InResponse,
                 ));
             }
+            // Some read handlers require the attacker-controlled path to carry a specific file
+            // extension before opening it (`if (!p.endsWith('.json')) reject`, or an allow-list of
+            // extensions). The canary is planted under each common extension (see
+            // [`PLANTED_SUFFIXES`]) with valid-JSON token content, so a climb whose value *ends* in
+            // one of those extensions satisfies such a guard and still reads a real out-of-base
+            // token file. Additive: a handler with no extension guard is already covered by the
+            // bare-name payloads above.
+            for ext in PLANTED_SUFFIXES.iter().filter(|ext| !ext.is_empty()) {
+                out.push((format!("/{name}{ext}"), Signal::InResponse));
+                for depth in [1usize, 3, 6, 10] {
+                    let up = "../".repeat(depth);
+                    out.push((format!("{up}{name}{ext}"), Signal::InResponse));
+                }
+            }
             out
         }
         VulnClass::CommandInjection => {
@@ -1996,6 +2010,41 @@ mod tests {
         // The canary secret is content only. Echoing a requested URL cannot verify the read.
         assert!(a.iter().all(|x| !x.target.contains("abc123")));
         assert!(a.len() >= 4);
+    }
+
+    #[test]
+    fn a_traversal_read_offers_extension_suffixed_payloads_for_an_extension_gated_sink() {
+        let canary = Canary::new("abc123".to_owned());
+        let a = attempts(
+            &probe(
+                VulnClass::PathTraversal,
+                "/modbus/fc/1",
+                Entry::Body(Some("mapPath".to_owned())),
+            ),
+            &canary,
+            0,
+        );
+        let name = canary.planted_file();
+        let name = name.trim_start_matches('/');
+        // A handler that requires the path to end in `.json` before opening it is still reached: a
+        // climbing payload whose value ends in `.json` points at the planted canary (planted under
+        // each common extension), and its content read is the proof.
+        assert!(
+            a.iter().any(|x| {
+                x.body
+                    .as_deref()
+                    .is_some_and(|b| b.contains(&format!("{name}.json")))
+                    && x.signal == Signal::InResponse
+            }),
+            "no .json-suffixed traversal attempt: {a:?}"
+        );
+        // The bare-name payloads (no extension guard) remain, so a sink with no extension check is
+        // still covered.
+        assert!(a.iter().any(|x| {
+            x.body
+                .as_deref()
+                .is_some_and(|b| b.contains(name) && !b.contains(&format!("{name}.")))
+        }));
     }
 
     #[test]

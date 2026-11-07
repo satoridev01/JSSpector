@@ -176,6 +176,12 @@ pub struct SqlPlan {
     /// The request body fields the handler reads (`const { id } = req.body`), filled with the sentinel
     /// so the bound parameters the sink supplies match the sub-select's filter columns.
     pub body_fields: Vec<String>,
+    /// When the tainted value reaches the sink as a *named* member of the request body (`const { type }
+    /// = req.body` interpolated as `UPDATE ${type}`), the name of that member. The injection must enter
+    /// through this exact field; a whole-body source (`req.body`) otherwise leaves the entry as
+    /// `Body(None)`, which would place the sub-select in a generic default field the sink never uses as
+    /// the table identifier. `None` when the tainted identifier is not a plain body member.
+    pub identifier_field: Option<String>,
 }
 
 impl Probe {
@@ -3956,10 +3962,55 @@ pub fn sql_identifier_plan(source: &str, tainted: &[String]) -> Option<SqlPlan> 
             body_fields.push(field);
         }
     }
+    // The tainted identifier interpolated in the table position is a plain body member exactly when it
+    // is one of the names destructured from `req.body`; then the injection must enter through that
+    // field rather than a generic default.
+    let identifier_field = table_identifier_name(source, tainted).filter(|name| {
+        destructured_fields(source, "body")
+            .iter()
+            .any(|f| f == name)
+    });
     Some(SqlPlan {
         columns,
         body_fields,
+        identifier_field,
     })
+}
+
+/// The first tainted identifier interpolated in a table-identifier position (`FROM`/`JOIN`/`INTO`/
+/// `UPDATE`/`TABLE` `${x}`). This is the request field whose value becomes the SQL table name, so an
+/// injection has to enter through it; the surrounding statements' columns are mined separately. Shares
+/// the scan shape of [`identifier_interpolating_statements`], returning the matched identifier rather
+/// than the statements. `None` when no tainted identifier sits in such a position.
+fn table_identifier_name(source: &str, tainted: &[String]) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("${") {
+        let at = from + rel;
+        from = at + 2;
+        let Some(close) = source[at + 2..].find('}').map(|c| at + 2 + c) else {
+            continue;
+        };
+        let inner = source[at + 2..close].trim();
+        if !tainted.iter().any(|name| name == inner) {
+            continue;
+        }
+        let pre = source[..at].trim_end();
+        let last_word: String = pre
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if matches!(
+            last_word.to_ascii_lowercase().as_str(),
+            "from" | "join" | "into" | "update" | "table"
+        ) {
+            return Some(inner.to_owned());
+        }
+    }
+    None
 }
 
 /// Each SQL statement in `source` that interpolates one of the tainted identifiers in a

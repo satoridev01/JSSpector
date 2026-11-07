@@ -6,7 +6,7 @@
 
 use super::payload::{self, Attempt, Canary, Signal};
 use super::plan::Probe;
-use super::{Outcome, Reproduction};
+use super::{ControlObservation, Outcome, Reproduction};
 use serde::Deserialize;
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,16 +29,6 @@ const REDIS_IMAGE: &str = "redis:7-alpine";
 const ENABLE_PROFILING_SCRIPT: &str = "db.getMongo().getDBNames().forEach(function(n){\
     if(['admin','local','config'].indexOf(n)>=0)return;\
     try{db.getSiblingDB(n).setProfilingLevel(2);}catch(e){}\
-  });";
-
-/// Clear prior profiler entries and enable full profiling on every application database. Used by the
-/// NoSQL out-of-band oracle so each request is matched only against commands it caused.
-const RESET_PROFILING_SCRIPT: &str = "db.getMongo().getDBNames().forEach(function(n){\
-    if(['admin','local','config'].indexOf(n)>=0)return;\
-    var d=db.getSiblingDB(n);\
-    try{d.setProfilingLevel(0);}catch(e){}\
-    try{d.getCollection('system.profile').drop();}catch(e){}\
-    try{d.setProfilingLevel(2);}catch(e){}\
   });";
 
 /// Read the profiler log, seed one document into every (otherwise empty) collection a profiled command
@@ -779,6 +769,7 @@ impl Session {
                 attacker-controlled path outside the base directory"
                 .to_owned(),
             response: response_excerpt(&present),
+            controls: Vec::new(),
         })
     }
 
@@ -841,6 +832,7 @@ impl Session {
                  directory"
             ),
             response: String::new(),
+            controls: Vec::new(),
         })
     }
 
@@ -896,6 +888,7 @@ impl Session {
                 outside the base directory"
                     .to_owned(),
             response: String::new(),
+            controls: Vec::new(),
         })
     }
 
@@ -996,6 +989,7 @@ impl Session {
                 describe(&control),
             ),
             response: response_excerpt(&after),
+            controls: Vec::new(),
         })
     }
 
@@ -1107,6 +1101,7 @@ impl Session {
                         case.computed
                     ),
                     response: positive.trim().to_owned(),
+                    controls: Vec::new(),
                 },
             };
         }
@@ -1146,6 +1141,7 @@ impl Session {
                         )
                         .to_owned(),
                         response: truthy.trim().to_owned(),
+                        controls: Vec::new(),
                     },
                 };
             }
@@ -1219,6 +1215,7 @@ impl Session {
                     meaning rather than being bound as a parameter"
                         .to_owned(),
                 response: String::new(),
+                controls: Vec::new(),
             });
         }
         None
@@ -1308,99 +1305,28 @@ impl Session {
                             .map(|(name, value)| format!("{name}: {value}"))
                             .collect(),
                         body: attempt.body.clone(),
-                        evidence: format!(
-                            concat!(
-                                "a match-all operator (`{}: {{$ne}}`) returned a record that the ",
-                                "match-none operators (`$eq`, `$in: []`) did not, proving the ",
-                                "object was interpreted as a MongoDB query operator rather than ",
-                                "a scalar"
+                        evidence: nosql_differential_evidence(
+                            &case.field,
+                            probe.body_query_override.is_some(),
+                        ),
+                        response: response_excerpt(&match_all),
+                        controls: vec![
+                            control_observation(
+                                "match-none $eq",
+                                &case.match_none_eq,
+                                &match_none_eq,
                             ),
-                            case.field
-                        ),
-                        response: match_all.trim().to_owned(),
-                    },
-                };
-            }
-            // A write/upsert endpoint can deliberately return the same success response for every
-            // filter, so no HTTP differential exists even though MongoDB interpreted the operator.
-            // Fall back to the isolated database profiler: each request must produce a command in
-            // which the exact field carries the exact operator and per-probe token. Three independent
-            // shapes rule out matching an unrelated background command or a reflected request.
-            if self.nosql_profiled_case(case) {
-                let attempt = &case.match_all;
-                return Outcome::Verified {
-                    how: format!("{} {} ({}[$ne])", attempt.verb, attempt.target, case.field),
-                    poc: Reproduction {
-                        command: curl_command(attempt, self.port),
-                        method: attempt.verb.to_owned(),
-                        target: attempt.target.clone(),
-                        headers: attempt
-                            .headers
-                            .iter()
-                            .map(|(name, value)| format!("{name}: {value}"))
-                            .collect(),
-                        body: attempt.body.clone(),
-                        evidence: format!(
-                            "the isolated MongoDB profiler recorded `{}` as `$ne`, `$eq`, and `$in` operator objects carrying the probe token, proving the application sent the attacker-controlled object as a query operator even though the endpoint returned the same response for every filter",
-                            case.field
-                        ),
-                        response: match_all.trim().to_owned(),
+                            control_observation(
+                                "match-none $in: []",
+                                &case.match_none_in,
+                                &match_none_in,
+                            ),
+                        ],
                     },
                 };
             }
         }
         Outcome::NotReproduced { tried }
-    }
-
-    /// Whether all three NoSQL control requests reached MongoDB as their corresponding operator
-    /// objects. Each leg starts from an empty profiler, sends one request, and searches recursively
-    /// through the recorded command for the exact field/operator/token tuple. This observes the DB
-    /// driver's command rather than application output, so constant-response writes and upserts are
-    /// still verifiable without accepting mere request echoing.
-    fn nosql_profiled_case(&self, case: &payload::NosqlCase) -> bool {
-        self.profiled_operator(&case.match_all, &case.field, "$ne", &case.absent)
-            && self.profiled_operator(&case.match_none_eq, &case.field, "$eq", &case.absent)
-            && self.profiled_operator(&case.match_none_in, &case.field, "$in", &case.absent)
-    }
-
-    fn profiled_operator(
-        &self,
-        attempt: &Attempt,
-        field: &str,
-        operator: &str,
-        token: &str,
-    ) -> bool {
-        let Some(db) = self.db.as_deref() else {
-            return false;
-        };
-        if self
-            .exec(
-                db,
-                &["mongosh", "--quiet", "--eval", RESET_PROFILING_SCRIPT],
-            )
-            .ok()
-            .is_none_or(|output| !output.status.success())
-        {
-            return false;
-        }
-        let _ = self.fetch(attempt);
-        let script = profiled_operator_script(field, operator, token);
-        let output = self.exec(db, &["mongosh", "--quiet", "--eval", &script]);
-        let hit = output
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .rev()
-                    .find(|line| matches!(line.trim(), "0" | "1"))
-                    .map(|line| line.trim() == "1")
-            })
-            .unwrap_or(false);
-        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
-            eprintln!("[verify] mongo-profile field={field:?} operator={operator:?} hit={hit}");
-        }
-        hit
     }
 
     fn fetch(&self, attempt: &Attempt) -> Option<String> {
@@ -1471,6 +1397,7 @@ impl Session {
             body: attempt.body.clone(),
             evidence: observed_evidence(&attempt.signal, self.canary.callback_host()),
             response: body.trim().to_owned(),
+            controls: Vec::new(),
         })
     }
 
@@ -2467,38 +2394,6 @@ fn js_string_array(files: &[String]) -> String {
         .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect();
     format!("[{}]", items.join(","))
-}
-
-/// A mongosh program that prints `1` when any application database's profiler contains a command
-/// whose recursively nested object maps `field` to an object with `operator`, and that operator's
-/// value carries the per-probe `token`. The strings are JSON-encoded before embedding, so source- or
-/// request-derived names cannot alter the program.
-fn profiled_operator_script(field: &str, operator: &str, token: &str) -> String {
-    let field = serde_json::to_string(field).unwrap_or_else(|_| "\"\"".to_owned());
-    let operator = serde_json::to_string(operator).unwrap_or_else(|_| "\"\"".to_owned());
-    let token = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
-    format!(
-        "const F={field}, O={operator}, T={token};\n\
-         let hit=0;\n\
-         function carries(value) {{ try {{ return EJSON.stringify(value).includes(T); }} catch(e) {{ return false; }} }}\n\
-         function visit(value) {{\n\
-           if(hit || value===null || typeof value!=='object') return;\n\
-           if(Object.prototype.hasOwnProperty.call(value,F)) {{\n\
-             const candidate=value[F];\n\
-             if(candidate && typeof candidate==='object' &&\n\
-                Object.prototype.hasOwnProperty.call(candidate,O) && carries(candidate[O])) hit=1;\n\
-           }}\n\
-           if(!hit) Object.keys(value).forEach(key => visit(value[key]));\n\
-         }}\n\
-         db.getMongo().getDBNames().forEach(function(n) {{\n\
-           if(hit || ['admin','local','config'].indexOf(n)>=0) return;\n\
-           const d=db.getSiblingDB(n);\n\
-           try {{ d.getCollection('system.profile').find({{}}).forEach(e => visit(e.command || {{}})); }} catch(e) {{}}\n\
-           try {{ d.setProfilingLevel(0); }} catch(e) {{}}\n\
-           try {{ d.getCollection('system.profile').drop(); }} catch(e) {{}}\n\
-         }});\n\
-         print(hit ? 1 : 0);"
-    )
 }
 
 /// A `node:sqlite` script that, in every candidate database file, (re)creates the oracle's two canary
@@ -4063,6 +3958,32 @@ fn response_excerpt(body: &str) -> String {
     }
 }
 
+fn control_observation(label: &str, attempt: &Attempt, response: &str) -> ControlObservation {
+    ControlObservation {
+        label: label.to_owned(),
+        method: attempt.verb.to_owned(),
+        target: attempt.target.clone(),
+        body: attempt.body.clone(),
+        response: response_excerpt(response),
+    }
+}
+
+fn nosql_differential_evidence(field: &str, body_query_override: bool) -> String {
+    let mut evidence = format!(
+        "a match-all operator (`{field}: {{$ne}}`) returned a record that the match-none operators \
+         (`$eq`, `$in: []`) did not, proving the object was interpreted as a MongoDB query operator \
+         rather than a scalar"
+    );
+    if body_query_override {
+        evidence.push_str(&format!(
+            "; the request kept a validator-compatible scalar `{field}` in the JSON body and sent \
+             the operator in the same-named query field, which the handler's ordered \
+             `{{ ...request.body, ...request.query }}` merge applies last"
+        ));
+    }
+    evidence
+}
+
 fn tail(text: &str, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
     all.get(all.len().saturating_sub(lines)..)
@@ -5248,6 +5169,7 @@ impl BrowserSession {
                             "the isolated marker service received callback token `{hit}`"
                         ),
                         response: String::new(),
+                        controls: Vec::new(),
                     },
                 };
             }
@@ -5497,6 +5419,31 @@ mod tests {
             response_excerpt("  readable response\n"),
             "readable response"
         );
+    }
+
+    #[test]
+    fn differential_controls_preserve_the_request_and_bounded_response() {
+        let attempt = Attempt {
+            verb: "POST",
+            target: "/users?email[$eq]=absent".to_owned(),
+            body: Some(r#"{"tenant":"airqo"}"#.to_owned()),
+            headers: Vec::new(),
+            signal: Signal::InResponse,
+        };
+        let control = control_observation("match-none $eq", &attempt, &"x".repeat(500));
+        assert_eq!(control.label, "match-none $eq");
+        assert_eq!(control.method, "POST");
+        assert_eq!(control.target, "/users?email[$eq]=absent");
+        assert_eq!(control.body.as_deref(), Some(r#"{"tenant":"airqo"}"#));
+        assert_eq!(control.response.len(), 400);
+    }
+
+    #[test]
+    fn nosql_body_query_override_is_explicit_in_the_evidence() {
+        let evidence = nosql_differential_evidence("user_id", true);
+        assert!(evidence.contains("validator-compatible scalar `user_id`"));
+        assert!(evidence.contains("{ ...request.body, ...request.query }"));
+        assert!(!nosql_differential_evidence("user_id", false).contains("JSON body"));
     }
 
     #[test]
@@ -6863,15 +6810,6 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foob"), "Zm9vYg==");
-    }
-
-    #[test]
-    fn mongo_profiler_oracle_matches_an_exact_field_operator_and_token() {
-        let script = profiled_operator_script("email", "$ne", "18e5deadbeef000000000001");
-        assert!(script.contains(r#"const F="email", O="$ne", T="18e5deadbeef000000000001";"#));
-        assert!(script.contains("Object.prototype.hasOwnProperty.call(value,F)"));
-        assert!(script.contains("Object.prototype.hasOwnProperty.call(candidate,O)"));
-        assert!(script.contains("system.profile"));
     }
 
     /// A zero-dependency Node server exercising each signal path: a vulnerable `/read?name=`

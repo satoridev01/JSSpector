@@ -15,6 +15,19 @@ mod sandbox;
 use jss_core::Finding;
 use serde::Serialize;
 
+/// A negative-control request and the response it produced. Differential verifiers attach these to
+/// the reproduction so a downstream reviewer can audit the claimed contrast instead of seeing only
+/// the successful leg.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlObservation {
+    pub label: String,
+    pub method: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub response: String,
+}
+
 /// What verification concluded about one finding.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
@@ -42,6 +55,8 @@ pub struct Reproduction {
     pub evidence: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub response: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<ControlObservation>,
 }
 
 impl Outcome {

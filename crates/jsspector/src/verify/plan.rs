@@ -3017,6 +3017,43 @@ pub fn url_search_params(source: &str) -> Vec<String> {
             push_param(&mut out, &member, MAX);
         }
     }
+    // A member read inline off the object form of the search parameters, with no intermediate
+    // variable (`Object.fromEntries(url.searchParams).url` -> `url`, or the bracket form
+    // `Object.fromEntries(url.searchParams)["url"]`). The variable-binding shape above misses this
+    // because the member is read directly on the `fromEntries` call. `Object.fromEntries` over
+    // `URLSearchParams` is the standard idiom for turning query parameters into a plain object, so
+    // nothing here is tied to one app.
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("fromEntries(") {
+        let open = from + rel + "fromEntries(".len();
+        from = open;
+        let Some(arg) = balanced_arg(&source[open..]) else {
+            continue;
+        };
+        if !arg.contains("searchParams") {
+            continue;
+        }
+        // `balanced_arg` stops just before the closing paren, so the member access follows it.
+        let Some(after) = source[open + arg.len()..].strip_prefix(')') else {
+            continue;
+        };
+        let after = after.trim_start();
+        if let Some(rest) = after.strip_prefix('.') {
+            let name: String = rest
+                .bytes()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect();
+            if !name.is_empty() {
+                push_param(&mut out, &name, MAX);
+            }
+        } else if after.starts_with('[')
+            && let Some(key) = bracket_key(after)
+            && !key.is_empty()
+        {
+            push_param(&mut out, &key, MAX);
+        }
+    }
     out
 }
 
@@ -5649,6 +5686,19 @@ module.exports = { healthScoreValidators };\n";
             super::registered_route_entry("thing.register({ path: '/x' })"),
             None
         );
+    }
+
+    #[test]
+    fn url_search_params_mines_an_inline_member_off_from_entries() {
+        // The handler reads the query parameter directly on the `Object.fromEntries` call, with no
+        // intermediate variable, so the variable-binding shape misses it. Both the dot and bracket
+        // member forms are mined.
+        let dot = "const requestUrl = new URL(req.url);\n\
+             const _url = Object.fromEntries(requestUrl.searchParams).url;\n";
+        assert_eq!(super::url_search_params(dot), vec!["url".to_owned()]);
+        let bracket =
+            "const _url = Object.fromEntries(new URL(req.url).searchParams)[\"target\"];\n";
+        assert_eq!(super::url_search_params(bracket), vec!["target".to_owned()]);
     }
 
     #[test]

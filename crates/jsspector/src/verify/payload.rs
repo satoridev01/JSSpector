@@ -1373,39 +1373,28 @@ fn payloads(class: VulnClass, canary: &Canary, nonce: u32) -> Vec<(String, Signa
             out
         }
         VulnClass::CommandInjection => {
-            // Prefer a read-only proof whose stdout is visible in the application response. The
-            // trailing shell comment prevents arguments appended by the vulnerable command from
-            // being passed to `id`. Keep the file marker variants as a fallback for blind command
-            // injection, where successful execution produces no response body we can inspect.
-            let mut out = ["x; id #", "x| id #", "x\nid #"]
-                .into_iter()
-                .map(|value| {
-                    (
-                        value.to_owned(),
-                        Signal::ResponseContains("uid=".to_owned()),
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            // A benign write of the marker file, reached through the metacharacters a shell
-            // honors: separators, a pipe, a subshell, a newline. This happens only in the
-            // disposable verifier container and is required to prove blind command execution.
-            let hit = canary.written_file(nonce);
-            let w = format!("touch {hit}");
-            let signal = Signal::FileWritten(hit);
-            out.extend(
-                [
-                    format!("x; {w}"),
-                    format!("x| {w}"),
-                    format!("x`{w}`"),
-                    format!("x$({w})"),
-                    format!("x\n{w}"),
-                    format!("$({w})"),
-                ]
-                .into_iter()
-                .map(|value| (value, signal.clone())),
-            );
-            out
+            // Use only the read-only `id` command. The forced-error variants write its output to
+            // stderr and make the shell command fail, so handlers that expose an execution error
+            // return the real process identity; the plain variants cover handlers that return
+            // stdout. The trailing comment prevents arguments appended by the vulnerable command
+            // from being passed to `id`. A blind endpoint with no observable output remains
+            // not-reproduced rather than being verified through a filesystem side effect.
+            [
+                "x; id >&2; false; #",
+                "x| id >&2; false; #",
+                "x\nid >&2; false; #",
+                "x; id #",
+                "x| id #",
+                "x\nid #",
+            ]
+            .into_iter()
+            .map(|value| {
+                (
+                    value.to_owned(),
+                    Signal::ResponseContains("uid=".to_owned()),
+                )
+            })
+            .collect()
         }
         VulnClass::CodeInjection => {
             // JavaScript that writes the marker file if the value is evaluated or required as a
@@ -2273,7 +2262,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_injection_prefers_id_and_falls_back_to_a_marker_file() {
+    fn command_injection_uses_only_read_only_id_proofs() {
         let canary = Canary::new("t".to_owned());
         let a = attempts(
             &probe(
@@ -2284,17 +2273,20 @@ mod tests {
             &canary,
             0,
         );
-        assert_eq!(a[0].target, "/run?host=x%3B%20id%20%23");
+        assert_eq!(
+            a[0].target,
+            "/run?host=x%3B%20id%20%3E%262%3B%20false%3B%20%23"
+        );
         assert!(matches!(
             &a[0].signal,
             Signal::ResponseContains(expected) if expected == "uid="
         ));
-        assert!(
-            a.iter().any(
-                |x| matches!(&x.signal, Signal::FileWritten(f) if f == &canary.written_file(0))
-            )
-        );
-        assert!(a.len() >= 7);
+        assert!(a.iter().all(|attempt| {
+            matches!(&attempt.signal, Signal::ResponseContains(expected) if expected == "uid=")
+                && attempt.target.contains("id")
+                && !attempt.target.contains("touch")
+        }));
+        assert_eq!(a.len(), 6);
     }
 
     #[test]
@@ -2480,11 +2472,13 @@ mod tests {
             "no query-param command-injection attempt: {:?}",
             a.iter().map(|x| &x.target).collect::<Vec<_>>()
         );
-        // A separator-bearing payload rides that parameter, percent-encoded so the query survives.
+        // A separator-bearing, read-only `id` payload rides that parameter, percent-encoded so the
+        // query survives. Command verification must never write a marker file.
         assert!(
             a.iter()
                 .any(|x| x.target.starts_with("/api/github/repos?owner=")
-                    && x.target.contains("touch")),
+                    && x.target.contains("id")
+                    && !x.target.contains("touch")),
             "the injected command never reaches the mined query parameter: {:?}",
             a.iter().map(|x| &x.target).collect::<Vec<_>>()
         );

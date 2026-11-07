@@ -1500,7 +1500,12 @@ fn observed_evidence(signal: &Signal, callback_host: Option<&str>) -> String {
     match signal {
         Signal::InResponse => "the canary token appeared in the application response".to_owned(),
         Signal::ResponseContains(expected) => {
-            format!("the application response contained known file content `{expected}`")
+            if expected == "uid=" {
+                "the application response contained the output of the read-only `id` command (`uid=`)"
+                    .to_owned()
+            } else {
+                format!("the application response contained known proof text `{expected}`")
+            }
         }
         Signal::FileWritten(path) => {
             format!("the application created the canary file `{path}`")
@@ -2910,6 +2915,12 @@ fn fillable_config_name(name: &str) -> bool {
         return false;
     }
     if matches!(name, "PORT" | "HOST" | "NODE_ENV" | "CI") {
+        return false;
+    }
+    // Encoded/asymmetric key material cannot be replaced with an arbitrary long secret. Apps often
+    // generate a valid pair when these variables are absent (VAPID is a common example), whereas a
+    // filler makes the crypto library reject startup before that fallback runs.
+    if name.ends_with("_PUBLIC_KEY") || name.ends_with("_PRIVATE_KEY") {
         return false;
     }
     db_connection_env()
@@ -5584,6 +5595,7 @@ mod tests {
             "config/razorpay.js",
             "new Razorpay({key_id:process.env.RAZORPAY_KEY,\
              key_secret:process.env.RAZORPAY_SECRET});\
+             configurePush(process.env.VAPID_PUBLIC_KEY,process.env.VAPID_PRIVATE_KEY);\
              if(process.env.ENABLE_PAYMENTS) start();",
         );
         let env = config_env(
@@ -6999,11 +7011,8 @@ http.createServer((req, res) => {
             other => panic!("command injection should verify, got {other:?}"),
         }
         match &injected {
-            Outcome::Verified { poc, .. } => {
-                assert!(poc.command.contains("touch%20"), "{}", poc.command);
-                assert!(poc.response.contains("done"), "{}", poc.response);
-            }
-            other => panic!("blind command injection should verify, got {other:?}"),
+            Outcome::NotReproduced { .. } => {}
+            other => panic!("blind command injection must not use a side effect, got {other:?}"),
         }
         assert!(
             matches!(forged, Outcome::Verified { .. }),

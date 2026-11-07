@@ -119,6 +119,14 @@ pub struct Probe {
     /// query filter. Mined from the handler source only; `false` for the common case where the field
     /// value reaches the sink directly.
     pub array_element: bool,
+    /// For a path-traversal sink, the request fields the handler appends *after* the tainted input as
+    /// further `path.join(...)` arguments (`path.join(base, type, id)` with `type` tainted -> `id`),
+    /// in order. Unlike [`Self::read_suffix`] these segments are themselves attacker-controlled (other
+    /// members of the same request part), so the exploit climbs with the tainted field and supplies the
+    /// terminal filename through these fields: the tainted value is a directory prefix, not the leaf.
+    /// Mined from the handler source only; empty for the common case where the tainted value ends the
+    /// path or only fixed literals follow it.
+    pub appended_fields: Vec<String>,
 }
 
 /// A sibling route parameter appended after the tainted one in a directory read path, constrained by
@@ -583,6 +591,17 @@ impl Probe {
         let read_suffix = (finding.class == VulnClass::PathTraversal)
             .then(|| source.and_then(|src| appended_path_suffix(src, &tainted)))
             .flatten();
+        // Request fields the handler appends after the tainted segment in the same `path.join(...)`
+        // (`path.join(base, type, id)`): other members of the same request part, so themselves
+        // attacker-controlled. The traversal then climbs with the tainted field and names the terminal
+        // leaf through these fields.
+        let appended_fields = if finding.class == VulnClass::PathTraversal {
+            source
+                .map(|src| appended_path_fields(src, &tainted, &entry))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let envelope = source.and_then(|src| json_envelope(src, &tainted, &finding.sink.arg));
         let lists_dir =
             finding.class == VulnClass::PathTraversal && sink_lists_directory(&finding.sink.api);
@@ -632,6 +651,7 @@ impl Probe {
             body_query_override,
             sql: None,
             array_element,
+            appended_fields,
         })
     }
 }
@@ -1002,6 +1022,121 @@ fn appended_path_suffix(source: &str, names: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// The request fields a handler appends after the tainted argument inside a `path.join(...)` call
+/// (`path.join(base, type, id)` with `type` tainted -> `["id"]`): the bare-identifier arguments that
+/// follow the tainted one and are themselves members of the same request part as `entry`, in order.
+/// Stops at the first argument that is neither such a field nor a plain string literal, so a
+/// server-computed local (`folderName`) is not mistaken for attacker-controlled input. The tainted
+/// argument itself is excluded even though it is a request field. Mined from the handler source only.
+fn appended_path_fields(source: &str, names: &[String], entry: &Entry) -> Vec<String> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let part = match entry {
+        Entry::Body(_) => "body",
+        Entry::Query(_) => "query",
+        _ => return Vec::new(),
+    };
+    let fields = request_part_fields(source, part);
+    let needle = ".join(";
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(needle) {
+        let open = from + rel + needle.len();
+        from = open;
+        let Some(arglist) = balanced_arg(&source[open..]) else {
+            continue;
+        };
+        let args = split_top_level_commas(arglist);
+        let Some(idx) = args
+            .iter()
+            .position(|arg| names.iter().any(|name| name == arg.trim()))
+        else {
+            continue;
+        };
+        let mut out: Vec<String> = Vec::new();
+        for arg in args.get(idx + 1..).unwrap_or_default() {
+            let arg = arg.trim();
+            // A plain string literal belongs to the fixed-suffix path, not here; keep scanning past it
+            // so a field after a literal is still recovered, but do not record the literal.
+            if string_literal_arg(arg).is_some() {
+                continue;
+            }
+            // A bare identifier that is a member of the request part is attacker-controlled; record it.
+            if arg.bytes().all(is_ident)
+                && !arg.is_empty()
+                && !names.iter().any(|name| name == arg)
+                && fields.iter().any(|f| f == arg)
+            {
+                if !out.contains(&arg.to_owned()) {
+                    out.push(arg.to_owned());
+                }
+                continue;
+            }
+            // Anything else (a server-computed local, a call, an expression) is not controllable: stop.
+            break;
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    Vec::new()
+}
+
+/// The field names a handler reads from a request part: members accessed directly
+/// (`req.body.id`) and the fields bound by destructuring the whole part (`const { id, type } =
+/// req.body`), the latter with any default-value (`type = "Anime"`) stripped. Covers the `req`,
+/// `request`, and `ctx` receivers. Mined from the handler source only.
+fn request_part_fields(source: &str, part: &str) -> Vec<String> {
+    let mut out = member_params(source, part);
+    for recv in ["req", "request", "ctx"] {
+        let needle = format!("{recv}.{part}");
+        let bytes = source.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            let before_ok = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident(*b));
+            let after_ok = bytes
+                .get(at + needle.len())
+                .is_none_or(|b| !is_ident(*b) && *b != b'.' && *b != b'[' && *b != b'(');
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let head = source[..at].trim_end();
+            let Some(head) = head.strip_suffix('=') else {
+                continue;
+            };
+            if head.ends_with(['=', '!', '<', '>']) {
+                continue;
+            }
+            let head = head.trim_end();
+            if !head.ends_with('}') {
+                continue;
+            }
+            let close = head.len() - 1;
+            let Some(open) = matching_open_brace(head, close) else {
+                continue;
+            };
+            for entry in split_top_level_commas(&head[open + 1..close]) {
+                let entry = entry.trim().trim_start_matches("...").trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                let field = match entry.split_once(':') {
+                    Some((k, _)) => k.trim(),
+                    None => entry.split('=').next().unwrap_or(entry).trim(),
+                };
+                if !field.is_empty() && field.bytes().all(is_ident) {
+                    out.push(field.to_owned());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Splits an argument list on commas that are not inside nested brackets, parentheses, or a string
@@ -4716,7 +4851,9 @@ fn request_field_assigned_to(source: &str, local: &str, part: &str, path: &str) 
 
 /// The right-hand sides of assignments whose target is the identifier `local`: `local = <rhs>`,
 /// with or without a `let`/`const`/`var` keyword, each cut at the end of its statement. A comparison
-/// (`==`, `===`) or an arrow (`=>`) is not an assignment and is skipped.
+/// (`==`, `===`) or an arrow (`=>`) is not an assignment and is skipped, and so is a default-value
+/// binding inside a destructuring pattern or parameter list (`const { id, type = "x" } = req.body`),
+/// where the `=` sets a default for a binding target rather than assigning to `local`.
 fn assignment_rhs<'a>(source: &'a str, local: &str) -> Vec<&'a str> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -4740,9 +4877,56 @@ fn assignment_rhs<'a>(source: &'a str, local: &str) -> Vec<&'a str> {
         let end = source[rhs_start..]
             .find(['\n', ';'])
             .map_or(source.len(), |e| rhs_start + e);
-        out.push(&source[rhs_start..end]);
+        let rhs = &source[rhs_start..end];
+        // A default-value binding inside a destructuring pattern or parameter list (`{ id, type =
+        // "x" } = req.body`) looks like `type = "x"` but is not an assignment to `type`: the `=` is a
+        // default, and the pattern's own `}`/`]`/`)` closes within the captured slice before any
+        // delimiter it opened. A genuine assignment's RHS never closes a delimiter it did not open,
+        // so an unbalanced closer marks this match as a binding default and it is skipped.
+        if closes_unopened_delimiter(rhs) {
+            continue;
+        }
+        out.push(rhs);
     }
     out
+}
+
+/// Whether `text` contains a `)`, `]`, or `}` that closes a delimiter never opened within `text`
+/// (depth goes negative). Quoted strings are skipped so a bracket inside a literal does not count.
+fn closes_unopened_delimiter(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut depth: i32 = 0;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(&b) = bytes.get(i) else {
+            break;
+        };
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'\'' | b'"' | b'`' => quote = Some(b),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return true;
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    false
 }
 
 /// The request-access paths inside an expression: `path.join(ROOT, req.query.name)` yields
@@ -5342,6 +5526,7 @@ module.exports = { healthScoreValidators };\n";
             body_query_override: None,
             sql: None,
             array_element: false,
+            appended_fields: Vec::new(),
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -5533,6 +5718,73 @@ module.exports = { healthScoreValidators };\n";
 
     use super::*;
     use jss_core::{SinkLoc, SourceLoc, TraceStep};
+
+    #[test]
+    fn a_destructuring_default_is_not_read_as_an_assignment_to_the_bound_field() {
+        // A later handler binds the same field with a default from the request part
+        // (`{ id, type = "x" } = req.body`). The payload field must still resolve to the specific
+        // body field, not be dragged back to the whole body by the trailing `req.body` of the default
+        // destructuring.
+        let source = r#"
+            router.post("/remove", async (req, res) => {
+              const { id, type } = req.body;
+              let typeDir = path.join(baseDir, type, id);
+              if (fs.existsSync(typeDir)) await fs.promises.rm(typeDir);
+            });
+            router.post("/other", async (req, res) => {
+              const { id, type = "Anime", numbers } = req.body;
+              doThing(type, id, numbers);
+            });
+        "#;
+        let mut f = finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("POST /remove"),
+            "req.body",
+        );
+        f.sink.api = "fs.rm".to_owned();
+        f.sink.arg = "typeDir".to_owned();
+        f.trace = vec![TraceStep {
+            file: None,
+            line: 3,
+            col: 17,
+            note: "assigned to `type`".to_owned(),
+        }];
+        assert_eq!(
+            best_entry(&f, "/remove", Some(source)),
+            Some(Entry::Body(Some("type".to_owned())))
+        );
+        // The default binding is a destructuring default, not an assignment to `type`.
+        assert!(assignment_rhs(source, "type").is_empty());
+    }
+
+    #[test]
+    fn a_path_join_names_an_appended_request_field_after_the_tainted_segment() {
+        // `path.join(base, type, id)`: `id` is another member of the same body destructuring, so it is
+        // attacker-controlled and recorded as an appended field. A server-computed local is not.
+        let source = r#"
+            const { id, type } = req.body;
+            let typeDir = path.join(baseDir, type, id);
+            let other = path.join(baseDir, type, folderName);
+        "#;
+        assert_eq!(
+            appended_path_fields(
+                source,
+                &["type".to_owned()],
+                &Entry::Body(Some("type".to_owned())),
+            ),
+            vec!["id".to_owned()]
+        );
+        // A query-derived field is picked up for a query entry; nothing for a path-param entry.
+        assert!(
+            appended_path_fields(
+                source,
+                &["type".to_owned()],
+                &Entry::PathParam("type".to_owned()),
+            )
+            .is_empty()
+        );
+    }
 
     fn finding(class: VulnClass, auth: Auth, entry: Option<&str>, expr: &str) -> Finding {
         Finding {

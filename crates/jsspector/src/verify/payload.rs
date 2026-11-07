@@ -605,24 +605,65 @@ pub fn delete_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Delet
     let unique = format!("jss-del-{}-{nonce}", canary.token);
     let dir = format!("/{PLANTED_DIR}/{unique}");
     let climb = "../".repeat(12);
-    let (present_value, target_path) = match &probe.read_suffix {
-        Some(suffix) => (
+    // When the handler appends further request fields after the tainted segment (`path.join(base,
+    // type, id)`), the tainted value is only a directory prefix: it climbs to the planted directory
+    // and the appended fields spell the terminal leaf. Pin each appended field to a fixed segment,
+    // the last to the planted `target`, and carry those values in the body so the join resolves to
+    // the planted file; a plain read-suffix literal (if any) follows them.
+    let (present_value, target_path, place_probe) = if !probe.appended_fields.is_empty() {
+        let mut probe = probe.clone();
+        let mut segments: Vec<String> = Vec::new();
+        let last = probe.appended_fields.len() - 1;
+        for (i, field) in probe.appended_fields.clone().into_iter().enumerate() {
+            let value = if i == last && probe.read_suffix.is_none() {
+                "target".to_owned()
+            } else {
+                format!("jssseg{i}")
+            };
+            set_sibling(&mut probe.siblings, &field, &value);
+            segments.push(value);
+        }
+        if let Some(suffix) = &probe.read_suffix {
+            segments.push(suffix.trim_start_matches('/').to_owned());
+        }
+        let suffix = segments.join("/");
+        (
             format!("{climb}{PLANTED_DIR}/{unique}"),
-            format!("{dir}/{}", suffix.trim_start_matches('/')),
-        ),
-        None => (
-            format!("{climb}{PLANTED_DIR}/{unique}/target"),
-            format!("{dir}/target"),
-        ),
+            format!("{dir}/{suffix}"),
+            probe,
+        )
+    } else {
+        match &probe.read_suffix {
+            Some(suffix) => (
+                format!("{climb}{PLANTED_DIR}/{unique}"),
+                format!("{dir}/{}", suffix.trim_start_matches('/')),
+                probe.clone(),
+            ),
+            None => (
+                format!("{climb}{PLANTED_DIR}/{unique}/target"),
+                format!("{dir}/target"),
+                probe.clone(),
+            ),
+        }
     };
     let control_path = format!("{dir}/jss-del-keep");
-    let present = place_traversal(probe, &present_value)?;
+    let present = place_traversal(&place_probe, &present_value)?;
     Some(DeleteOracle {
         present,
         dir,
         target_path,
         control_path,
     })
+}
+
+/// Sets `field` in a sibling list to `value`, overriding an existing entry or appending a new one, so
+/// a required sibling the handler reads from the request is driven to the value the oracle needs.
+fn set_sibling(siblings: &mut Vec<(String, String)>, field: &str, value: &str) {
+    if let Some(existing) = siblings.iter_mut().find(|(key, _)| key == field) {
+        existing.1 = value.to_owned();
+    } else {
+        siblings.push((field.to_owned(), value.to_owned()));
+    }
 }
 
 /// Places a traversal value into the probe's entry, as a single percent-encoded path segment when
@@ -1700,6 +1741,7 @@ mod tests {
             body_query_override: None,
             sql: None,
             array_element: false,
+            appended_fields: Vec::new(),
         }
     }
 
@@ -1769,6 +1811,35 @@ mod tests {
             .strip_prefix("/deploy/skills/")
             .expect("payload fills the route slot");
         assert!(seg.contains("..%2F") && !seg.contains('/'));
+    }
+
+    #[test]
+    fn a_delete_oracle_names_the_leaf_through_an_appended_body_field() {
+        let canary = Canary::new("tok".to_owned());
+        // A removal sink `path.join(base, type, id)`: the tainted body field `type` is only a
+        // directory prefix, and the attacker-controlled sibling `id` spells the terminal leaf.
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/api/local/tags/remove",
+            Entry::Body(Some("type".to_owned())),
+        );
+        p.removes = true;
+        p.siblings = vec![("id".to_owned(), "jsspector".to_owned())];
+        p.appended_fields = vec!["id".to_owned()];
+        let oracle =
+            delete_oracle(&p, &canary, 7).expect("an appended-field removal sink has an oracle");
+        // The planted target is the leaf named by the appended field, not the tainted directory.
+        assert!(oracle.target_path.starts_with(&format!("/{PLANTED_DIR}/")));
+        assert!(oracle.target_path.ends_with("/target"));
+        assert!(oracle.control_path.starts_with(&oracle.dir));
+        assert_ne!(oracle.target_path, oracle.control_path);
+        // The tainted field climbs only to the planted directory (it does not itself end the path),
+        // and the appended field carries the leaf name, so the join resolves to the planted target.
+        let body = oracle.present.body.expect("a body probe sends JSON");
+        assert!(body.contains("\"id\":\"target\""));
+        assert!(!body.contains("\"id\":\"jsspector\""));
+        assert!(body.contains(&format!("{PLANTED_DIR}/jss-del-tok-7\"")));
+        assert!(!body.contains("/target\""));
     }
 
     #[test]

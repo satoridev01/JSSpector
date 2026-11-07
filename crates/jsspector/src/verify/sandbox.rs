@@ -6238,6 +6238,7 @@ http.createServer((req, res) => {
             body_query_override: None,
             sql: None,
             array_element: false,
+            appended_fields: Vec::new(),
         };
         let confined = Probe {
             method: Method::Get,
@@ -6258,6 +6259,7 @@ http.createServer((req, res) => {
             body_query_override: None,
             sql: None,
             array_element: false,
+            appended_fields: Vec::new(),
         };
         let command = Probe {
             method: Method::Get,
@@ -6278,6 +6280,7 @@ http.createServer((req, res) => {
             body_query_override: None,
             sql: None,
             array_element: false,
+            appended_fields: Vec::new(),
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -6302,6 +6305,7 @@ http.createServer((req, res) => {
             body_query_override: None,
             sql: None,
             array_element: false,
+            appended_fields: Vec::new(),
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

@@ -153,6 +153,17 @@ pub fn run(
                     siblings.push((name, value));
                 }
             }
+            // A handler that dispatches on the raw request URL (`if (req.originalUrl.indexOf(
+            // "action=createdir") !== -1)`) reaches the sink only when the URL carries that fragment;
+            // add each such `key=value` gate as a query sibling so the request takes the branch the
+            // sink sits on. Empty for a handler with no raw-URL dispatch.
+            for (name, value) in
+                plan::url_substring_query_gates(&source, &plan::guard_anchor_lines(finding))
+            {
+                if siblings.iter().all(|(k, _)| *k != name) {
+                    siblings.push((name, value));
+                }
+            }
             probe.siblings = siblings;
         }
     }

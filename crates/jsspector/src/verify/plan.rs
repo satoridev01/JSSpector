@@ -78,6 +78,12 @@ pub struct Probe {
     /// file outside the base directory disappearing after the request while a sibling control file
     /// planted alongside it survives. Derived from the sink API only.
     pub removes: bool,
+    /// When the sink creates a filesystem entry (`fs.mkdir`, `fs.writeFile`, `fs.createWriteStream`,
+    /// a file-upload move) rather than reading one, the traversal cannot be proved by reflected
+    /// content either: the proof is a new entry appearing inside an attacker-named directory planted
+    /// *outside* the base directory while a sibling control directory planted alongside it stays
+    /// empty. Derived from the sink API only.
+    pub creates: bool,
     /// For a listing whose read path is `<tainted-dir>/<sibling>`, the sibling route parameter the
     /// handler appends after the tainted one and the fixed values it constrains that sibling to (an
     /// enum / whitelist guard). The canary directory is planted under each value and the sibling slot
@@ -636,6 +642,7 @@ impl Probe {
         let lists_dir =
             finding.class == VulnClass::PathTraversal && sink_lists_directory(&finding.sink.api);
         let removes = finding.class == VulnClass::PathTraversal && sink_removes(&finding.sink.api);
+        let creates = finding.class == VulnClass::PathTraversal && sink_creates(&finding.sink.api);
         // A listing whose read path is `<tainted-dir>/<sibling>` reaches a real directory only when
         // the sibling route parameter carries a value the handler accepts; recover it from the route
         // and the handler's own guard so the probe can drive it.
@@ -675,6 +682,7 @@ impl Probe {
             doc_envelope: None,
             lists_dir,
             removes,
+            creates,
             appended_param,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -729,6 +737,7 @@ impl Probe {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -3914,6 +3923,29 @@ fn sink_removes(api: &str) -> bool {
     )
 }
 
+/// Whether a sink API creates a filesystem entry (rather than reading or removing one): `fs.mkdir(Sync)`,
+/// `fs.writeFile(Sync)`, `fs.appendFile(Sync)`, `fs.createWriteStream`, `fs.copyFile(Sync)`, and a
+/// file-upload move (`.mv`). For these the traversal proof is a new entry appearing inside an
+/// attacker-named directory planted outside the base directory, not reflected content. Keyed on the
+/// standard filesystem API name alone, matched on the final `.`-segment so an unrelated method whose
+/// name merely contains one of these is not mistaken for it. Framework-agnostic.
+fn sink_creates(api: &str) -> bool {
+    let name = api.rsplit('.').next().unwrap_or(api).to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "mkdir"
+            | "mkdirsync"
+            | "writefile"
+            | "writefilesync"
+            | "appendfile"
+            | "appendfilesync"
+            | "createwritestream"
+            | "copyfile"
+            | "copyfilesync"
+            | "mv"
+    )
+}
+
 /// A Hono request accessor call (`<ctx>.req.<method>(<arg?>)`): the method and its string-literal
 /// argument, if any. `c.req.param('id')` -> `("param", Some("id"))`; `c.req.param()` -> `("param",
 /// None)`; a bare `req.query('q')` is accepted too. `None` when the expression is not a `.req.`
@@ -4372,6 +4404,145 @@ pub fn guard_required_fields(
         }
     }
     out
+}
+
+/// Query-string `key=value` fragments that a substring guard on the request URL requires present
+/// before the sink is reached: a handler that dispatches on the raw URL rather than a parsed field
+/// (`const url = req.originalUrl; if (url.indexOf("action=createdir") !== -1) fs.mkdirSync(filepath)`)
+/// never reaches the sink unless the URL carries that fragment. Scans every `if` block that encloses
+/// a flow anchor for a `<url>.indexOf("<lit>")` / `<url>.includes("<lit>")` test whose receiver
+/// derives from the request URL, and returns each `<lit>` that is a `key=value` pair as a query
+/// sibling to carry. Mined from the handler source only; empty when no such URL-substring guard gates
+/// the sink, so a handler with no raw-URL dispatch is unaffected.
+pub fn url_substring_query_gates(source: &str, anchors: &[u32]) -> Vec<(String, String)> {
+    let offsets: Vec<usize> = anchors
+        .iter()
+        .filter_map(|line| line_offset(source, *line as usize))
+        .collect();
+    if offsets.is_empty() {
+        return Vec::new();
+    }
+    let bytes = source.as_bytes();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= source.len() {
+        let at_boundary = i == 0 || bytes.get(i - 1).is_some_and(|byte| !is_ident(*byte));
+        if at_boundary
+            && bytes.get(i) == Some(&b'i')
+            && bytes.get(i + 1) == Some(&b'f')
+            && bytes.get(i + 2).is_none_or(|b| !is_ident(*b))
+            && let Some(popen) = source[i + 2..].find('(').map(|r| i + 2 + r)
+            && source[i + 2..popen].trim().is_empty()
+            && let Some(pclose) = matching_close_paren(source, popen)
+        {
+            let cond = &source[popen + 1..pclose];
+            let after = &source[pclose + 1..];
+            let ws = after.len() - after.trim_start().len();
+            if after[ws..].starts_with('{') {
+                let bopen = pclose + 1 + ws;
+                if let Some(bclose) = matching_close_brace(source, bopen)
+                    && offsets.iter().any(|&off| off > bopen && off < bclose)
+                {
+                    for (key, value) in url_substring_fragments(source, cond) {
+                        if out.iter().all(|(existing, _)| *existing != key) {
+                            out.push((key, value));
+                        }
+                    }
+                }
+            }
+            i = popen + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The `key=value` query fragments a condition tests the request URL for by substring (`url.indexOf(
+/// "action=createdir")`, `url.includes("mode=raw")`): the string-literal argument of each `.indexOf`
+/// / `.includes` whose receiver derives from the request URL, split on its first `=`. A literal with
+/// no `=` is skipped — only a query-pair fragment maps cleanly to a request the verifier can send.
+fn url_substring_fragments(source: &str, cond: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for method in [".indexOf(", ".includes("] {
+        let mut from = 0;
+        while let Some(rel) = cond[from..].find(method) {
+            let dot = from + rel;
+            let open = dot + method.len();
+            from = open;
+            // The receiver is the identifier (allowing member access) just before `.indexOf`/`.includes`.
+            let recv = cond[..dot]
+                .trim_end()
+                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .next()
+                .unwrap_or("")
+                .trim_matches('.');
+            if recv.is_empty() || !is_url_derived(source, recv) {
+                continue;
+            }
+            let Some(arglist) = balanced_arg(&cond[open..]) else {
+                continue;
+            };
+            let first = split_top_level_commas(arglist)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            let Some(lit) = string_literal_arg(first.trim()) else {
+                continue;
+            };
+            if let Some(eq) = lit.find('=') {
+                let key = lit[..eq].trim();
+                let value = lit[eq + 1..].trim();
+                if !key.is_empty() && key.bytes().all(is_ident) {
+                    out.push((key.to_owned(), value.to_owned()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `recv` holds (part of) the request URL: a `req.originalUrl`/`req.url` accessor itself, or a
+/// local bound from one (`const url = req.originalUrl`). Keeps the substring-gate miner from treating
+/// an unrelated `.indexOf` receiver as a URL dispatch.
+fn is_url_derived(source: &str, recv: &str) -> bool {
+    if recv.contains("originalUrl") || recv == "req.url" || recv == "request.url" {
+        return true;
+    }
+    for line in source.lines() {
+        let Some(eq) = assign_eq(line) else {
+            continue;
+        };
+        let (lhs, rhs) = line.split_at(eq);
+        if mentions(lhs, recv)
+            && (rhs.contains("originalUrl")
+                || rhs.contains("req.url")
+                || rhs.contains("request.url"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The byte index of a line's binding `=`, skipping `==`/`===`/`!=`/`<=`/`>=` and `=>`. `None` for a
+/// line with no plain assignment.
+fn assign_eq(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'=') {
+            let before = bytes.get(i.wrapping_sub(1)).copied();
+            let after = bytes.get(i + 1).copied();
+            let is_cmp = before.is_some_and(|b| matches!(b, b'!' | b'<' | b'>' | b'='))
+                || after.is_some_and(|b| matches!(b, b'=' | b'>'));
+            if !is_cmp {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Fields required by an early exit such as `if (!email || !name) return`: only pure top-level
@@ -5605,6 +5776,44 @@ module.exports = { healthScoreValidators };\n";
     }
 
     #[test]
+    fn create_sinks_are_recognized_by_their_api_name() {
+        use super::sink_creates;
+        assert!(sink_creates("fs.mkdirSync"));
+        assert!(sink_creates("fs.mkdir"));
+        assert!(sink_creates("fs.promises.mkdir"));
+        assert!(sink_creates("fs.writeFileSync"));
+        assert!(sink_creates("fs.appendFile"));
+        assert!(sink_creates("fs.createWriteStream"));
+        assert!(sink_creates("myFile.mv"));
+        // A read or removal sink is not a create, and an unrelated method is not mistaken for one.
+        assert!(!sink_creates("fs.readFileSync"));
+        assert!(!sink_creates("fs.unlinkSync"));
+        assert!(!sink_creates("fs.readdirSync"));
+    }
+
+    #[test]
+    fn url_substring_query_gate_is_mined_from_a_raw_url_dispatch() {
+        // A handler that binds the request URL to a local and reaches the sink only when the URL
+        // carries a `key=value` fragment (`if (url.indexOf("action=createdir") != -1) fs.mkdirSync`)
+        // must be driven with that query pair, or the branch the sink sits on is never taken.
+        let src = "app.all(\"/sdfiles\", function (req, res) {\n\
+            let url = req.originalUrl\n\
+            if (url.indexOf(\"action=createdir\") != -1) {\n\
+                fs.mkdirSync(filepath)\n\
+            }\n\
+        })\n";
+        let gates = super::url_substring_query_gates(src, &[4]);
+        assert_eq!(gates, vec![("action".to_owned(), "createdir".to_owned())]);
+        // A receiver that is not derived from the request URL is not treated as a URL dispatch.
+        let unrelated = "if (name.indexOf(\"action=createdir\") != -1) {\n\
+            fs.mkdirSync(p)\n\
+        }\n";
+        assert!(super::url_substring_query_gates(unrelated, &[2]).is_empty());
+        // A substring guard that does not enclose any anchor is ignored.
+        assert!(super::url_substring_query_gates(src, &[1]).is_empty());
+    }
+
+    #[test]
     fn nested_write_prototype_pollution_resolves_both_keys() {
         // `obj[req.params.bid][key]` with `const key = req.params.id`: the outer key is driven with
         // `__proto__`, the inner (resolved through the local binding) with the marker property.
@@ -5877,6 +6086,7 @@ module.exports = { healthScoreValidators };\n";
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),

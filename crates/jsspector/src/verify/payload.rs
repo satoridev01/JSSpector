@@ -670,6 +670,56 @@ pub fn delete_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Delet
     })
 }
 
+/// The requests and planted paths that prove a *create* sink (`fs.mkdir`, `fs.writeFile`, a file
+/// upload move) opens an attacker-controlled path outside the base directory: an empty `dir` planted
+/// outside the base that the request climbs into (so the handler's own appended leaf, or a leaf named
+/// by the climb, lands a new entry inside it), and an empty `control` directory planted alongside it
+/// that the request never names. A vulnerable handler leaves `dir` non-empty (an entry was created
+/// outside the base) while `control` stays empty; a handler that confines the path creates inside the
+/// base and leaves both empty.
+pub struct CreateOracle {
+    /// The requests to send, each climbing into the planted out-of-base directory. Several shapes
+    /// cover a handler that appends its own leaf after the tainted segment and one whose tainted value
+    /// ends the path.
+    pub present: Vec<Attempt>,
+    /// The out-of-base directory planted empty before the request; a new entry inside it proves the
+    /// create reached outside the base.
+    pub dir: String,
+    /// A sibling directory planted empty alongside `dir` but never named by the request; must stay
+    /// empty, ruling out an indiscriminate create.
+    pub control: String,
+}
+
+/// Builds the create oracle for a path-traversal probe whose sink creates its argument, or `None` for
+/// an entry with no placeable path segment. The planted directory sits outside the application's base
+/// directory (under the planted-canary root), reached by a deep `../` climb that path normalization
+/// resolves from any base depth. Two climb shapes are produced: one landing on the planted directory
+/// itself (so a handler that appends a terminal segment after the tainted input creates inside it) and
+/// one naming a fresh leaf under it (so a handler whose tainted value ends the path creates that leaf).
+pub fn create_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<CreateOracle> {
+    if probe.class != VulnClass::PathTraversal {
+        return None;
+    }
+    let unique = format!("jss-mk-{}-{nonce}", canary.token);
+    let dir = format!("/{PLANTED_DIR}/{unique}");
+    let control = format!("/{PLANTED_DIR}/{unique}-keep");
+    let climb = "../".repeat(12);
+    let to_dir = format!("{climb}{PLANTED_DIR}/{unique}");
+    let to_leaf = format!("{climb}{PLANTED_DIR}/{unique}/jss-mk-leaf");
+    let present: Vec<Attempt> = [to_dir, to_leaf]
+        .into_iter()
+        .filter_map(|value| place_traversal(probe, &value))
+        .collect();
+    if present.is_empty() {
+        return None;
+    }
+    Some(CreateOracle {
+        present,
+        dir,
+        control,
+    })
+}
+
 /// Sets `field` in a sibling list to `value`, overriding an existing entry or appending a new one, so
 /// a required sibling the handler reads from the request is driven to the value the oracle needs.
 fn set_sibling(siblings: &mut Vec<(String, String)>, field: &str, value: &str) {
@@ -1894,6 +1944,7 @@ mod tests {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),

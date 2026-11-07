@@ -661,6 +661,20 @@ impl Session {
                 None => Outcome::NotReproduced { tried: 1 },
             };
         }
+        // A traversal sink that creates its argument (`fs.mkdir`, `fs.writeFile`, an upload move)
+        // cannot be proved by reflected content either — a successful create echoes nothing. Prove it
+        // directly: plant an empty directory outside the base, drive the handler to create an entry
+        // inside it by traversal, and confirm the directory became non-empty while a sibling control
+        // directory planted alongside it stayed empty.
+        if probe.class == jss_core::VulnClass::PathTraversal && probe.creates {
+            return match self.verify_create_oracle(probe) {
+                Some(poc) => Outcome::Verified {
+                    how: format!("{} {}", poc.method, poc.target),
+                    poc,
+                },
+                None => Outcome::NotReproduced { tried: 1 },
+            };
+        }
         // A traversal *read* sink that appends a fixed segment after the tainted input reads
         // `<tainted-dir>/<suffix>`. Plant the canary file at that location so the climbing payloads,
         // completed by the handler's own appended segment, resolve to a real token file. A listing
@@ -810,6 +824,78 @@ impl Session {
                     .to_owned(),
             response: String::new(),
         })
+    }
+
+    /// Confirms a path-traversal create (`fs.mkdir`, `fs.writeFile`, an upload move) by a constructive
+    /// differential: an empty directory is planted outside the application's base directory, and an
+    /// empty `control` directory is planted alongside it that the request never names. The present
+    /// requests climb into the planted directory and ask the handler to create an entry there. A
+    /// vulnerable handler opens the attacker-controlled path and leaves the planted directory non-empty
+    /// (an entry was created outside the base) while `control` stays empty; a handler that confines the
+    /// path creates inside the base and leaves both empty. The planting and the requests both stay
+    /// inside the isolated app container.
+    fn verify_create_oracle(&self, probe: &Probe) -> Option<Reproduction> {
+        let oracle = payload::create_oracle(probe, &self.canary, self.nonce)?;
+        // The create runs as the app process, which may be a dropped non-root user; make the planted
+        // directories writable so a genuine traversal is not masked by a permission error.
+        let plant = format!(
+            "rm -rf '{dir}' '{control}' && mkdir -p '{dir}' '{control}' && chmod 777 '{dir}' '{control}'",
+            dir = oracle.dir,
+            control = oracle.control,
+        );
+        let _ = self.exec(&self.app, &["sh", "-c", &plant]);
+        // Both planted directories must exist and be empty before the request, or the differential
+        // proves nothing.
+        if !self.dir_empty(&oracle.dir) || !self.dir_empty(&oracle.control) {
+            return None;
+        }
+        // Stop at the exact request that creates the entry so the exported PoC independently
+        // reproduces the observed effect. Different sinks need different shapes: `mkdir` commonly
+        // needs the fresh leaf, while an upload move may populate the existing directory itself.
+        let witness = oracle.present.iter().find(|attempt| {
+            let _ = self.fetch(attempt);
+            !self.dir_empty(&oracle.dir) && self.dir_empty(&oracle.control)
+        });
+        let _ = self.exec(
+            &self.app,
+            &[
+                "sh",
+                "-c",
+                &format!("rm -rf '{}' '{}'", oracle.dir, oracle.control),
+            ],
+        );
+        let witness = witness?;
+        Some(Reproduction {
+            command: curl_command(witness, self.port),
+            method: witness.verb.to_owned(),
+            target: witness.target.clone(),
+            headers: Vec::new(),
+            body: witness.body.clone(),
+            evidence:
+                "an empty directory planted outside the application's base directory received a new \
+                entry created by the traversal request while a sibling control directory planted \
+                alongside it stayed empty, proving the create opened the attacker-controlled path \
+                outside the base directory"
+                    .to_owned(),
+            response: String::new(),
+        })
+    }
+
+    /// Whether a path exists, is a directory, and holds no entries inside the running app container.
+    /// Used by the create oracle to observe, out of band from the HTTP response, that a planted
+    /// directory went from empty to holding an entry created by a traversal request.
+    fn dir_empty(&self, path: &str) -> bool {
+        self.exec(
+            &self.app,
+            &[
+                "sh",
+                "-c",
+                &format!("[ -d '{path}' ] && [ -z \"$(ls -A '{path}')\" ] && echo Y || echo N"),
+            ],
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains('Y'))
     }
 
     /// Confirms a nested-write prototype-pollution sink (`obj[outer][inner] = v`) by reading the
@@ -3123,7 +3209,8 @@ fn listening_probe(wanted: u16) -> String {
          const [a,p]=(c[1]||'').split(':');\
          if(c[3]==='0A'&&p&&(/^0+$/.test(a)||a==='0100007F'||a==='00000000000000000000000001000000'))ports.add(parseInt(p,16))}}}}\
          const list=[...ports];const hosts=['127.0.0.1','::1'];\
-         const single=ports.has({wanted})||!list.length?{wanted}:(list.length===1?list[0]:0);\
+         const direct=ports.has({wanted})||!list.length;\
+         const single=direct?{wanted}:(list.length===1?list[0]:0);\
          function tcpOk(port,cb){{let hi=0;(function go(){{if(hi>=hosts.length)return cb(false);\
          net.connect({{port,host:hosts[hi++]}}).on('connect',function(){{this.destroy();cb(true)}}).on('error',()=>go());}})();}}\
          function httpOk(port,cb){{let hi=0;(function go(){{if(hi>=hosts.length)return cb(false);\
@@ -3134,7 +3221,8 @@ fn listening_probe(wanted: u16) -> String {
          s.on('data',(d)=>{{buf+=d;const m=/^HTTP\\/\\d\\.\\d (\\d{{3}})/.exec(buf.split('\\r\\n')[0]);\
          if(m)fin(m[1]!=='426')}});\
          s.on('timeout',()=>fin(false));s.on('error',()=>fin(false));s.on('close',()=>fin(false));}})();}}\
-         if(single){{tcpOk(single,ok=>{{if(ok){{console.log(single);process.exit(0)}}process.exit(1)}})}}\
+         if(single){{const ready=direct?tcpOk:httpOk;ready(single,ok=>{{\
+         if(ok){{console.log(single);process.exit(0)}}process.exit(1)}})}}\
          else{{const cands=list.slice().sort((a,b)=>a-b);let i=0;\
          (function next(){{if(i>=cands.length)process.exit(1);const port=cands[i++];\
          httpOk(port,ok=>{{if(ok){{console.log(port);process.exit(0)}}next()}});}})();}}"
@@ -5372,6 +5460,10 @@ mod tests {
             "skips a WebSocket-only endpoint that answers 426 Upgrade Required"
         );
         assert!(
+            s.contains("const ready=direct?tcpOk:httpOk"),
+            "requires HTTP on a discovered alternate port but retains the requested-port fallback"
+        );
+        assert!(
             s.contains("sort((a,b)=>a-b)"),
             "scans candidate ports in a deterministic order"
         );
@@ -6841,6 +6933,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -6863,6 +6956,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -6885,6 +6979,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -6911,6 +7006,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),

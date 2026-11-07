@@ -5708,19 +5708,31 @@ fn header_value_of_key(source: &str, key: &str) -> Option<String> {
 }
 
 /// `const { client_id } = request.query`: the source is the whole request part, and the sink
-/// argument is a variable the first trace step says was assigned from it. The parameter name is
+/// argument is a variable a trace step says was assigned from it. The parameter name is
 /// recovered from how that local is bound in the handler source. Two shapes both record the same
 /// `assigned to `name`` trace step: a destructuring bind (`const { file } = req.query`), where the
 /// local *is* the parameter name; and a member read (`let subtitlePath = req.query.file`), where the
 /// parameter is the member accessed, not the local it is stored in. The member read is resolved from
 /// the handler source so the real parameter name (`file`) is driven, not the local (`subtitlePath`).
+///
+/// The `assigned to` step is not necessarily the first trace step: a transform may precede it
+/// (`const u = req.body.queryURL.split("?")[0]` records `through .split()` before `assigned to
+/// `u``), so the assignment step is located wherever it appears among the in-file steps rather than
+/// assumed to lead the trace.
 fn destructured_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
     let part = strip_request_receiver(finding.source.expr.trim())?;
     if !matches!(part, "query" | "body" | "params") {
         return None;
     }
-    let step = finding.trace.first().filter(|s| s.file.is_none())?;
-    let name = step.note.strip_prefix("assigned to `")?.strip_suffix('`')?;
+    let name = finding
+        .trace
+        .iter()
+        .filter(|s| s.file.is_none())
+        .find_map(|s| {
+            s.note
+                .strip_prefix("assigned to `")
+                .and_then(|rest| rest.strip_suffix('`'))
+        })?;
     if name.is_empty() || !name.bytes().all(is_ident) {
         return None;
     }
@@ -7085,6 +7097,44 @@ module.exports = { healthScoreValidators };\n";
         .unwrap();
         assert_eq!(probe.method.verb(&probe.entry), "POST");
         assert_eq!(probe.entry, Entry::Body(Some("url".to_owned())));
+    }
+
+    #[test]
+    fn a_whole_body_ssrf_resolves_the_member_behind_a_transform_step() {
+        // The source is the coarse `req.body`; the tainted member is read, transformed, and stored
+        // in a local (`const scrapeURL = req.body.queryURL.split("?")[0]`). The trace records the
+        // transform (`through .split()`) before the assignment, so the `assigned to` step is not
+        // first. The specific body field `queryURL` must still be resolved, or the payload rides a
+        // generic field the handler never reads and the request throws before the sink.
+        let source = r#"
+          const handler = async (req, res) => {
+            const scrapeURL = req.body.queryURL.split("?")[0];
+            const response = await fetch(`${scrapeURL}`);
+          };
+        "#;
+        let mut f = finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("POST /api/works/questions"),
+            "req.body",
+        );
+        f.sink.arg = "`${scrapeURL}`".to_owned();
+        f.trace = vec![
+            TraceStep {
+                file: None,
+                line: 3,
+                col: 23,
+                note: "through .split()".to_owned(),
+            },
+            TraceStep {
+                file: None,
+                line: 3,
+                col: 11,
+                note: "assigned to `scrapeURL`".to_owned(),
+            },
+        ];
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::Body(Some("queryURL".to_owned())));
     }
 
     #[test]

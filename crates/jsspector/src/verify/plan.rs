@@ -5790,11 +5790,20 @@ fn assignment_rhs<'a>(source: &'a str, local: &str) -> Vec<&'a str> {
         if bytes.get(i) != Some(&b'=') || matches!(bytes.get(i + 1), Some(b'=' | b'>')) {
             continue;
         }
-        let rhs_start = i + 1;
-        let end = source[rhs_start..]
+        // The value may begin on a following line (`const scrapeURL =\n  req.body.queryURL...`): the
+        // characters right after `=` up to the first newline are only whitespace, so cutting the RHS at
+        // that newline yields an empty slice and the real value is missed. Skip leading whitespace,
+        // including newlines, so the captured RHS starts at the statement's actual value.
+        let value_start = i
+            + 1
+            + source[i + 1..]
+                .bytes()
+                .take_while(u8::is_ascii_whitespace)
+                .count();
+        let end = source[value_start..]
             .find(['\n', ';'])
-            .map_or(source.len(), |e| rhs_start + e);
-        let rhs = &source[rhs_start..end];
+            .map_or(source.len(), |e| value_start + e);
+        let rhs = &source[value_start..end];
         // A default-value binding inside a destructuring pattern or parameter list (`{ id, type =
         // "x" } = req.body`) looks like `type = "x"` but is not an assignment to `type`: the `=` is a
         // default, and the pattern's own `}`/`]`/`)` closes within the captured slice before any
@@ -7108,7 +7117,8 @@ module.exports = { healthScoreValidators };\n";
         // generic field the handler never reads and the request throws before the sink.
         let source = r#"
           const handler = async (req, res) => {
-            const scrapeURL = req.body.queryURL.split("?")[0];
+            const scrapeURL =
+              req.body.queryURL.split("?")[0];
             const response = await fetch(`${scrapeURL}`);
           };
         "#;

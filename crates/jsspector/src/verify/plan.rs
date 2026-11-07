@@ -2424,6 +2424,271 @@ pub fn validator_path_fillers(
     out
 }
 
+/// Type-valid fillers for required express-validator `query("name")` chains the route mounts, other
+/// than the payload-bearing field. A GET/query handler that enforces its validators (reading
+/// `validationResult`, e.g. `extractErrorsFromRequest`) rejects the request with a 400 before the
+/// sink unless every required query parameter is present and type-valid; carrying each one lets the
+/// tainted value reach the sink. Only the chain each middleware argument actually references is
+/// inspected — resolved through the middleware member expression (`validators.group.rule`) and the
+/// named sub-chains it is assembled from — so unrelated routes' query validators declared in the same
+/// module are never pulled in. Nothing here is tied to a specific application.
+pub fn validator_query_fillers(
+    route_source: &str,
+    route_line: u32,
+    payload_field: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for expr in route_middleware_exprs(route_source, route_line) {
+        let mut parts = expr.split('.');
+        let Some(root) = parts.next() else {
+            continue;
+        };
+        let Some(module) = resolve(root) else {
+            continue;
+        };
+        let leaf: Vec<&str> = parts.collect();
+        let chain = validator_chain_text(&module, root, &leaf);
+        for (field, value) in validator_query_requirements(&chain) {
+            if field == payload_field {
+                continue;
+            }
+            if out.iter().all(|(name, _)| *name != field) {
+                out.push((field, value));
+            }
+        }
+    }
+    out
+}
+
+/// The route registration's middleware arguments as full identifier/member expressions
+/// (`analyticsValidations.userEngagementValidators.getMetrics`, `pagination`), excluding the path
+/// string literal and any call expression. These name the express-validator chains the route mounts.
+pub fn route_middleware_exprs(source: &str, line: u32) -> Vec<String> {
+    let Some(start) = line_offset(source, line as usize) else {
+        return Vec::new();
+    };
+    let Some(prel) = source[start..].find('(') else {
+        return Vec::new();
+    };
+    let popen = start + prel;
+    let Some(pclose) = matching_close_paren(source, popen) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for arg in split_top_level_commas(&source[popen + 1..pclose]) {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        if arg.bytes().all(|byte| is_ident(byte) || byte == b'.')
+            && arg
+                .bytes()
+                .next()
+                .is_some_and(|byte| !byte.is_ascii_digit() && byte != b'.')
+            && !out.iter().any(|existing| existing == arg)
+        {
+            out.push(arg.to_owned());
+        }
+    }
+    out
+}
+
+/// The source text of the validator chain a middleware argument references, plus the definitions of
+/// the named sub-chains it is assembled from (`[validateUserEmail, ...validateYearMonth]`), resolved
+/// up to a few levels so the builder calls in the sub-chains are visible to [`chain_starts`]. `leaf`
+/// is the member path after the resolved module root (`["userEngagementValidators", "getMetrics"]`).
+fn validator_chain_text(module: &str, root: &str, leaf: &[&str]) -> String {
+    let seed = resolve_member_chain(module, root, leaf).unwrap_or_default();
+    let mut text = seed.clone();
+    let mut seen: Vec<String> = Vec::new();
+    let mut frontier: Vec<String> = referenced_idents(&seed);
+    let mut depth = 0;
+    while depth < 3 && !frontier.is_empty() {
+        let mut next: Vec<String> = Vec::new();
+        for ident in std::mem::take(&mut frontier) {
+            if seen.contains(&ident) {
+                continue;
+            }
+            seen.push(ident.clone());
+            if let Some(def) = const_definition_text(module, &ident) {
+                next.extend(referenced_idents(&def));
+                text.push('\n');
+                text.push_str(&def);
+            }
+        }
+        frontier = next;
+        depth += 1;
+    }
+    text
+}
+
+/// Resolves a middleware member expression within its module without confusing same-named leaves
+/// in unrelated validator groups. For `validators.userEngagement.getMetrics`, first narrow to the
+/// `userEngagement` binding/export, then look up `getMetrics` only inside that object.
+fn resolve_member_chain(module: &str, root: &str, leaf: &[&str]) -> Option<String> {
+    let Some((first, rest)) = leaf.split_first() else {
+        return const_definition_text(module, root);
+    };
+    let mut current =
+        const_definition_text(module, first).or_else(|| object_property_value(module, first))?;
+    for member in rest {
+        if current
+            .bytes()
+            .all(|byte| is_ident(byte) || byte.is_ascii_whitespace())
+            && let Some(binding) = const_definition_text(module, current.trim())
+        {
+            current = binding;
+        }
+        current = object_property_value(&current, member)?;
+    }
+    Some(current)
+}
+
+/// Required `query("field")` chains in `text` that are not `.optional()` and not conditional
+/// (`.if(...)`), each paired with a value satisfying the declared type.
+fn validator_query_requirements(text: &str) -> Vec<(String, String)> {
+    let starts = chain_starts(text);
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (idx, (pos, field, builder)) in starts.iter().enumerate() {
+        if builder != "query" {
+            continue;
+        }
+        let Some(field) = field else {
+            continue;
+        };
+        let end = starts.get(idx + 1).map(|s| s.0).unwrap_or(text.len());
+        let window = &text[*pos..end];
+        // `.optional()` lets the field be absent; `.if(...)` only requires it under another field's
+        // value — neither is unconditionally required, so sending it is not needed to reach the sink.
+        if window.contains(".optional(") || window.contains(".if(") {
+            continue;
+        }
+        if out.iter().all(|(name, _)| name != field) {
+            out.push((field.clone(), validator_filler(field, window)));
+        }
+    }
+    out
+}
+
+/// The initializer expression bound to `const <name> = ...` (`let`/`var` too): the array body of a
+/// chain list, or the chain/expression up to the statement terminator. `None` when `name` is not a
+/// module-level binding here.
+fn const_definition_text(module: &str, name: &str) -> Option<String> {
+    if let Some(body) = const_array_body(module, name) {
+        return Some(body);
+    }
+    for keyword in ["const ", "let ", "var "] {
+        let needle = format!("{keyword}{name}");
+        let mut from = 0;
+        while let Some(rel) = module[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            let after = &module[at + needle.len()..];
+            if after.bytes().next().is_some_and(is_ident) {
+                continue;
+            }
+            let Some(rest) = after.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let start = module.len() - rest.len();
+            let end = statement_end(module, start);
+            return Some(module[start..end].to_owned());
+        }
+    }
+    None
+}
+
+/// The value expression of an object property `name: <value>` (`getMetrics: [ ... ]`): the text after
+/// the colon up to the top-level `,` or `;` that ends it. `None` when no such standalone key exists.
+fn object_property_value(module: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(rel) = module[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        let before = at
+            .checked_sub(1)
+            .and_then(|i| module.as_bytes().get(i))
+            .copied();
+        if before.is_some_and(|byte| is_ident(byte) || byte == b'.') {
+            continue;
+        }
+        let after = &module[at + name.len()..];
+        if after.bytes().next().is_some_and(is_ident) {
+            continue;
+        }
+        let Some(rest) = after.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let start = module.len() - rest.len();
+        let end = statement_end(module, start);
+        return Some(module[start..end].to_owned());
+    }
+    None
+}
+
+/// The offset of the top-level `,` or `;` that terminates the expression starting at `start`,
+/// honoring `()`/`[]`/`{}` nesting; the end of `text` when none is found.
+fn statement_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = start;
+    while let Some(byte) = bytes.get(i).copied() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+            }
+            b',' | b';' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Bare identifier references in `text` (array elements, spread elements) that are not immediately a
+/// call (`query(` is a builder, not a referenced chain binding). Used to follow a chain assembled
+/// from named sub-chains to their definitions.
+fn referenced_idents(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while let Some(b) = bytes.get(i).copied() {
+        if is_ident(b) && !b.is_ascii_digit() {
+            let before = i.checked_sub(1).and_then(|j| bytes.get(j)).copied();
+            let start = i;
+            while bytes.get(i).copied().is_some_and(is_ident) {
+                i += 1;
+            }
+            // Skip member accesses (`a.b`) and call targets (`query(`): only standalone bindings.
+            // A spread element (`...validateYearMonth`) is a reference, not a member access, even
+            // though its leading `.` precedes the identifier.
+            let after = bytes.get(i).copied();
+            let is_spread = start
+                .checked_sub(3)
+                .and_then(|begin| bytes.get(begin..start))
+                .is_some_and(|prefix| prefix == b"...");
+            let is_member = before.is_some_and(|c| c == b'.' || is_ident(c)) && !is_spread;
+            let is_call = after == Some(b'(');
+            if !is_member && !is_call {
+                let ident = &text[start..i];
+                if !out.iter().any(|existing| existing == ident) {
+                    out.push(ident.to_owned());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Required `param("slot")` chains and values satisfying their declared type.
 fn validator_param_requirements(module: &str) -> Vec<(String, String)> {
     let starts = chain_starts(module);

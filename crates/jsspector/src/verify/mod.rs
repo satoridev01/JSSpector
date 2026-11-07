@@ -222,6 +222,37 @@ pub fn run(
             }
         }
     }
+    // A route whose express-validator middleware marks query parameters required
+    // (`query("year").isInt()`, `query("month").isInt({ min: 0, max: 11 })`) and whose handler
+    // enforces the result (`extractErrorsFromRequest`/`validationResult`) returns a 400 before the
+    // sink unless those parameters are present and type-valid. Mine them from the route's validator
+    // chain and carry a type-valid filler for each as a sibling query parameter, so the tainted value
+    // reaches the sink instead of the validation error. The payload-bearing query field is skipped so
+    // its operator object is never overwritten by a scalar filler.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some(at) = &finding.entry_at
+            && let Ok(route_src) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let payload_field = match &probe.entry {
+                plan::Entry::Query(name) => name.as_str(),
+                _ => "",
+            };
+            let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
+            let mined = plan::validator_query_fillers(&route_src, at.line, payload_field, &resolve);
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] validator-query at={}:{} payload={payload_field:?} mined={mined:?}",
+                    at.file, at.line
+                );
+            }
+            for (field, value) in mined {
+                if probe.siblings.iter().all(|(name, _)| *name != field) {
+                    probe.siblings.push((field, value));
+                }
+            }
+        }
+    }
     // A sink reached only past a guard on a body field the payload does not itself ride (the payload
     // enters through a path segment or query parameter, but `const { id } = req.body; if (!id) throw`
     // rejects the request first). Mine those required body fields so the request carries them and
@@ -815,6 +846,55 @@ module.exports = { healthScoreValidators };\n";
                 &resolve,
             ),
             vec![("email".to_owned(), "jss@jsspector.test".to_owned())]
+        );
+    }
+
+    #[test]
+    fn required_query_validators_are_mined_through_a_spread_subchain() {
+        // A GET route whose validator chain (resolved through a member expression and assembled from
+        // a spread sub-chain) requires `query("year")`/`query("month")`: both must be carried as
+        // type-valid siblings, while an `.optional()` query field and the payload field are not.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let route_file = "src/routes/analytics.routes.js";
+        let route = r#"const analyticsValidations = require("@validators/analytics.validators");
+router.get(
+  "/:email/engagement/metrics",
+  analyticsValidations.userEngagementValidators.getMetrics,
+  controller.getEngagementMetrics
+);
+module.exports = { router };
+"#;
+        let validator = "const validateUserEmail = param(\"email\").isEmail();\n\
+const validateYearMonth = [\n\
+  query(\"year\").isInt().withMessage(\"Invalid year\"),\n\
+  query(\"month\").isInt({ min: 0, max: 11 }).withMessage(\"Invalid month\"),\n\
+];\n\
+const validateTimeframe = query(\"timeframe\").optional().isIn([\"last30days\"]);\n\
+const unrelatedValidators = { getMetrics: [query(\"wrong\").isInt()] };\n\
+const userEngagementValidators = { getMetrics: [validateUserEmail, validateTimeframe, ...validateYearMonth] };\n\
+module.exports = { unrelatedValidators, userEngagementValidators };\n";
+        std::fs::create_dir_all(root.join("src/routes")).unwrap();
+        std::fs::create_dir_all(root.join("src/validators")).unwrap();
+        std::fs::write(
+            root.join("src/package.json"),
+            r#"{"_moduleAliases":{"@validators":"validators"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(route_file), route).unwrap();
+        std::fs::write(
+            root.join("src/validators/analytics.validators.js"),
+            validator,
+        )
+        .unwrap();
+
+        let resolve = |name: &str| resolve_middleware_source(root, route_file, route, name);
+        assert_eq!(
+            super::plan::validator_query_fillers(route, 2, "email", &resolve),
+            vec![
+                ("year".to_owned(), "1".to_owned()),
+                ("month".to_owned(), "1".to_owned()),
+            ]
         );
     }
 }

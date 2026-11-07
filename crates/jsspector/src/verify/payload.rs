@@ -1118,6 +1118,12 @@ fn nosql_query_case(probe: &Probe, field: &str, absent: &str) -> NosqlCase {
         let sep = if target.contains('?') { '&' } else { '?' };
         target.push_str(&format!("{sep}{}{operator}", encode(field)));
         for (key, value) in &probe.siblings {
+            // A sibling of the same name would turn the operator object into a mixed array/object and
+            // hide the operator; the probed field carries the operator, so skip any sibling colliding
+            // with it.
+            if key == field {
+                continue;
+            }
             target.push_str(&format!("&{}={}", encode(key), encode(value)));
         }
         Attempt {
@@ -2662,6 +2668,14 @@ mod tests {
             Entry::Query("categoryId".to_owned()),
         );
         p.method = Method::Get;
+        p.siblings = vec![
+            ("year".to_owned(), "2026".to_owned()),
+            (
+                "categoryId".to_owned(),
+                "scalar-must-not-override".to_owned(),
+            ),
+            ("month".to_owned(), "1".to_owned()),
+        ];
         let cases = nosql_cases(&p, &canary, 1);
         let absent = nosql_absent_token(&canary, 1);
         assert_eq!(cases[0].field, "categoryId");
@@ -2669,15 +2683,21 @@ mod tests {
         assert!(cases[0].match_all.body.is_none());
         assert_eq!(
             cases[0].match_all.target,
-            format!("/api/v1/course/getCategoryPageDetail?categoryId[$ne]={absent}")
+            format!(
+                "/api/v1/course/getCategoryPageDetail?categoryId[$ne]={absent}&year=2026&month=1"
+            )
         );
         assert_eq!(
             cases[0].match_none_eq.target,
-            format!("/api/v1/course/getCategoryPageDetail?categoryId[$eq]={absent}")
+            format!(
+                "/api/v1/course/getCategoryPageDetail?categoryId[$eq]={absent}&year=2026&month=1"
+            )
         );
         assert_eq!(
             cases[0].match_none_in.target,
-            format!("/api/v1/course/getCategoryPageDetail?categoryId[$in][]={absent}")
+            format!(
+                "/api/v1/course/getCategoryPageDetail?categoryId[$in][]={absent}&year=2026&month=1"
+            )
         );
     }
 

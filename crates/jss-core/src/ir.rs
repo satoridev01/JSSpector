@@ -8,6 +8,7 @@
 //! graph from it, and the entry-point inventory is computed from it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -222,6 +223,36 @@ pub fn resolve_reference(
         .map(|i| (i.local.as_str(), i))
         .collect();
     resolve_call(reference, &local, &imports, modules, file)
+        .or_else(|| resolve_conventional_namespace(modules, reference))
+}
+
+/// Resolve a namespaced controller loaded through a dynamic directory barrel. Applications often
+/// populate an object at runtime (`ctrl[filename] = new require(filename)`) and register handlers as
+/// `ctrl.Douban.delete`; no static import edge exists, but the class method and its same-named file
+/// make the target unambiguous.
+fn resolve_conventional_namespace(
+    modules: &BTreeMap<&str, &Module>,
+    reference: &str,
+) -> Option<FunctionId> {
+    let mut parts = reference.rsplit('.');
+    let method = parts.next()?;
+    let namespace = parts.next()?;
+    if method.is_empty() || namespace.is_empty() || parts.next().is_none() {
+        return None;
+    }
+    let function = format!("{namespace}.{method}");
+    let mut candidates = modules.values().filter(|module| {
+        Path::new(&module.file)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem == namespace)
+            && module.functions.iter().any(|item| item.name == function)
+    });
+    let candidate = candidates.next()?;
+    candidates
+        .next()
+        .is_none()
+        .then(|| (candidate.file.clone(), function))
 }
 
 /// Functions reachable from `roots` through the call graph, each with the index of the first
@@ -580,6 +611,46 @@ mod tests {
         assert_eq!(
             resolve_reference(&by_file, "app.js", "api.watch.readFile"),
             Some(("api/api.watch.js".to_owned(), "readFile".to_owned()))
+        );
+    }
+
+    #[test]
+    fn references_resolve_unique_dynamically_loaded_controller_namespaces() {
+        let routes = Module {
+            file: "routes.js".to_owned(),
+            imports: vec![Import {
+                local: "ctrl".to_owned(),
+                specifier: "./controller".to_owned(),
+                export: None,
+                resolved: Some("controller/index.js".to_owned()),
+            }],
+            ..Module::default()
+        };
+        let index = Module {
+            file: "controller/index.js".to_owned(),
+            ..Module::default()
+        };
+        let controller = Module {
+            file: "controller/Douban.js".to_owned(),
+            functions: vec![function("Douban.delete", &[])],
+            ..Module::default()
+        };
+        let modules = [routes, index, controller];
+        let by_file: BTreeMap<&str, &Module> = modules
+            .iter()
+            .map(|module| (module.file.as_str(), module))
+            .collect();
+
+        assert_eq!(
+            resolve_reference(&by_file, "routes.js", "ctrl.Douban.delete"),
+            Some((
+                "controller/Douban.js".to_owned(),
+                "Douban.delete".to_owned()
+            ))
+        );
+        assert_eq!(
+            resolve_reference(&by_file, "routes.js", "ctrl.Douban.missing"),
+            None
         );
     }
 

@@ -567,6 +567,46 @@ fn middleware_auth_follows_registration_order_and_router() {
     }
 }
 
+#[test]
+fn dynamically_loaded_controller_namespace_links_route_and_auth_to_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "routes.js",
+        "const express = require('express');\nconst app = express();\n\
+         const router = express.Router();\nconst ctrl = require('./controller');\n\
+         app.use(checkAuth);\nrouter.post('/subscribe/delete', ctrl.Douban.delete);\n\
+         app.use('/api', router);\n",
+    );
+    write(
+        root,
+        "controller/index.js",
+        "const fs = require('fs');\nconst path = require('path');\n\
+         for (const file of fs.readdirSync(__dirname)) {\n  if (file !== 'index.js') {\n\
+         const Ctrl = require(path.join(__dirname, file));\n\
+         module.exports[file.split('.')[0]] = new Ctrl();\n  }\n}\n",
+    );
+    write(
+        root,
+        "controller/Douban.js",
+        "const { execSync } = require('child_process');\n\
+         class Douban { delete(req, res) { execSync(req.body.command); res.end(); } }\n\
+         module.exports = Douban;\n",
+    );
+
+    let report = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let finding = &report["findings"].as_array().unwrap()[0];
+    assert_eq!(finding["entry"], "POST /api/subscribe/delete");
+    assert_eq!(finding["auth"], "user");
+}
+
 /// A helper reached from a public and an admin route is public; same-path inline handlers on two
 /// routers of one file stay apart.
 #[test]

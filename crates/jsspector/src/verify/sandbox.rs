@@ -23,6 +23,35 @@ const DB_IMAGE: &str = "mongo:6";
 const DB_ALIASES: [&str; 4] = ["mongo", "mongodb", "db", "database"];
 const DB_NAME: &str = "jssverifydb";
 const REDIS_IMAGE: &str = "redis:7-alpine";
+
+/// Enable full (level 2) profiling on every application database, so the server records the namespace
+/// of every command it receives. Used to discover which collection a read-only sink actually queries.
+const ENABLE_PROFILING_SCRIPT: &str = "db.getMongo().getDBNames().forEach(function(n){\
+    if(['admin','local','config'].indexOf(n)>=0)return;\
+    try{db.getSiblingDB(n).setProfilingLevel(2);}catch(e){}\
+  });";
+
+/// Read the profiler log, seed one document into every (otherwise empty) collection a profiled command
+/// targeted — resolving the collection from the command's own field first, falling back to the `ns` —
+/// then disable profiling and drop its capped log so only the seeded documents remain.
+const SEED_PROFILED_SCRIPT: &str = "db.getMongo().getDBNames().forEach(function(n){\
+    if(['admin','local','config'].indexOf(n)>=0)return;\
+    var d=db.getSiblingDB(n);\
+    var names={};\
+    try{d.getCollection('system.profile').find({}).forEach(function(e){\
+      var c=null;\
+      if(e.command){c=e.command.find||e.command.findAndModify||e.command.count||\
+        e.command.aggregate||e.command.distinct||e.command.update||e.command.delete;}\
+      if(!c&&e.ns){var p=e.ns.split('.');p.shift();c=p.join('.');}\
+      if(typeof c==='string'&&c.indexOf('system.')!==0)names[c]=1;\
+    });}catch(e){}\
+    Object.keys(names).forEach(function(c){\
+      try{if(d.getCollection(c).countDocuments({})===0)\
+        d.getCollection(c).insertOne({jss_seed:1});}catch(e){}\
+    });\
+    try{d.setProfilingLevel(0);}catch(e){}\
+    try{d.getCollection('system.profile').drop();}catch(e){}\
+  });";
 const REDIS_ALIASES: [&str; 2] = ["redis", "cache"];
 
 /// Whether a Docker daemon is reachable. The CLI on some platforms exits 0 even when it cannot
@@ -485,8 +514,54 @@ impl Session {
                 ),
                 Err(error) => (None, error),
             };
-            eprintln!("[verify] db seed -> {code:?} {message}");
+            let list = "db.getMongo().getDBNames().forEach(function(n){\
+                if(['admin','local','config'].indexOf(n)>=0)return;\
+                var d=db.getSiblingDB(n);\
+                d.getCollectionNames().forEach(function(c){\
+                  print(n+'.'+c+'='+d.getCollection(c).countDocuments({}));\
+                });\
+              });";
+            let listing = self
+                .exec(db, &["mongosh", "--quiet", "--eval", list])
+                .ok()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .replace('\n', " | ")
+                })
+                .unwrap_or_default();
+            eprintln!("[verify] db seed -> {code:?} {message} || state: {listing}");
         }
+    }
+
+    /// Turn on full operation profiling on every application database. A read-only query sink
+    /// (`Model.findOne(...)`) never creates its collection on a driver that does not auto-create on
+    /// read (Mongoose 5's `autoCreate` defaults off), so the startup seed cannot know the collection
+    /// exists and the match-all/match-none differential has no document to observe. Profiling records
+    /// the namespace of every command the server receives, so a single benign request reveals exactly
+    /// which collection(s) the sink reads — without guessing a name from the source. Enable it before
+    /// the benign probe request; [`Session::seed_profiled_collections`] consumes the log afterwards.
+    fn enable_db_profiling(&self) {
+        let Some(db) = self.db.as_deref() else {
+            return;
+        };
+        let _ = self.exec(
+            db,
+            &["mongosh", "--quiet", "--eval", ENABLE_PROFILING_SCRIPT],
+        );
+    }
+
+    /// Read the profiler log written since [`Session::enable_db_profiling`], and for every collection
+    /// a command targeted that is still empty, insert one seed document. This materializes exactly the
+    /// collections the sink's request actually queried — including a read-only sink's collection the
+    /// driver never auto-created — so a match-all operator (`{$ne}`) can return a record the match-none
+    /// controls (`$eq`, `$in: []`) do not. Profiling is then disabled and its capped log dropped so the
+    /// seeded documents are the only state the differential depends on.
+    fn seed_profiled_collections(&self) {
+        let Some(db) = self.db.as_deref() else {
+            return;
+        };
+        let _ = self.exec(db, &["mongosh", "--quiet", "--eval", SEED_PROFILED_SCRIPT]);
     }
 
     /// Polls from inside the app's own container until the app answers on a port, or the
@@ -790,6 +865,24 @@ impl Session {
     fn exercise_nosql(&self, probe: &Probe) -> Outcome {
         let cases = payload::nosql_cases(probe, &self.canary, self.nonce);
         let tried = cases.len();
+        // A match-all operator (`{$ne}`) only returns a record when the queried collection holds at
+        // least one document. A read-only query sink never creates its collection on a driver that does
+        // not auto-create on read (Mongoose 5's `autoCreate` defaults off), and a tenant-scoped factory
+        // (`useDb(...).model(...)`) registers the model only on first access during a request, so the
+        // startup seed never saw that collection. Turn on server profiling, send one benign request so
+        // the sink's query is recorded, then seed exactly the collections that request touched — found
+        // from the profiler log, not guessed from a name — so the now-materialized collection carries a
+        // document for the differential to observe. Fall back to a plain reseed for already-existing
+        // collections the app created lazily on write.
+        if self.db.is_some()
+            && let Some(first) = cases.first()
+        {
+            self.enable_db_profiling();
+            let _ = self.fetch(&first.match_none_eq);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            self.seed_profiled_collections();
+            self.seed_db();
+        }
         for case in &cases {
             let (Some(match_all), Some(match_none_eq), Some(match_none_in)) = (
                 self.fetch(&case.match_all),
@@ -4166,6 +4259,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profiled_seed_script_discovers_queried_collections_and_cleans_up() {
+        // The read-only NoSQL sink's collection is found from the profiler log, not guessed from a
+        // name: resolve it from the command's own collection field, fall back to the `ns`, skip the
+        // profiler's own collections, seed only empty ones, then turn profiling off and drop the log.
+        let s = SEED_PROFILED_SCRIPT;
+        assert!(s.contains("system.profile"), "reads the profiler log");
+        assert!(s.contains("e.command.find"), "resolves a find namespace");
+        assert!(
+            s.contains("e.ns") && s.contains("split('.')"),
+            "has an ns fallback"
+        );
+        assert!(
+            s.contains("indexOf('system.')!==0"),
+            "skips profiler/system collections"
+        );
+        assert!(
+            s.contains("countDocuments({})===0") && s.contains("insertOne({jss_seed:1})"),
+            "seeds only empty collections with the shared seed marker"
+        );
+        assert!(
+            s.contains("setProfilingLevel(0)")
+                && s.contains("system.profile').drop()")
+                && ENABLE_PROFILING_SCRIPT.contains("setProfilingLevel(2)"),
+            "enables then disables profiling and drops its log"
+        );
+    }
+
+    #[test]
     fn binary_oracle_responses_are_not_exposed_as_report_text() {
         assert_eq!(
             response_excerpt("\u{fffd}PNG\0binary"),
@@ -5432,6 +5553,7 @@ http.createServer((req, res) => {
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
             sql: None,
+            array_element: false,
         };
         let confined = Probe {
             method: Method::Get,
@@ -5450,6 +5572,7 @@ http.createServer((req, res) => {
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
             sql: None,
+            array_element: false,
         };
         let command = Probe {
             method: Method::Get,
@@ -5468,6 +5591,7 @@ http.createServer((req, res) => {
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
             sql: None,
+            array_element: false,
         };
         let ssrf = Probe {
             method: Method::Get,
@@ -5486,6 +5610,7 @@ http.createServer((req, res) => {
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
             sql: None,
+            array_element: false,
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

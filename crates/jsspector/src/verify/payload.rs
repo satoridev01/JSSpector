@@ -802,7 +802,17 @@ fn nosql_body_case(
     absent: &str,
 ) -> NosqlCase {
     let verb = probe.method.verb(&Entry::Body(None));
+    // When the handler iterates this field and queries each element (`for (const d of device_names)
+    // findOne({ name: d })`), the operator is the per-element filter and the field must stay an array
+    // (an `.isArray()` validator rejects a bare operator object outright). Ride the operator inside a
+    // one-element array for the iterated field only; other probed field names keep the direct form.
+    let wrap_array = probe.array_element && primary.as_deref() == Some(field);
     let body = |operator: String| {
+        let operator = if wrap_array {
+            format!("[{operator}]")
+        } else {
+            operator
+        };
         let mut members = probe.siblings.clone();
         if let Some(name) = primary
             && name != field
@@ -814,9 +824,9 @@ fn nosql_body_case(
         let mut obj = format!("{{\"{}\":{operator}", json_escape(field));
         for (key, value) in &members {
             obj.push_str(&format!(
-                ",\"{}\":\"{}\"",
+                ",\"{}\":{}",
                 json_escape(key),
-                json_escape(value)
+                json_member_value(value)
             ));
         }
         obj.push('}');
@@ -880,12 +890,83 @@ pub fn nosql_reproduced(
 }
 
 fn redact_nosql_echo(response: &str, absent: &str) -> String {
-    let redacted = redact_operator_objects(response);
+    let redacted = redact_timestamps(&redact_operator_objects(response));
     if absent.is_empty() {
         redacted
     } else {
         redacted.replace(absent, "<redacted>")
     }
+}
+
+/// Replaces ISO-8601 date/datetime substrings (`2026-11-07T07:18:35.245Z`, with or without a
+/// timezone offset) with a fixed placeholder. A handler often stamps its response with the current
+/// time (`refreshed_at: new Date()`); that value differs on every request and would otherwise make
+/// two otherwise-identical match-none responses compare unequal, hiding a genuine differential. The
+/// substitution removes only this non-semantic noise — it can make responses compare *more* equal,
+/// never manufacture a difference — so it cannot turn a non-reproduction into a false proof.
+fn redact_timestamps(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(len) = iso8601_len(&input[i..]) {
+            out.push_str("<ts>");
+            i += len;
+        } else {
+            // ASCII fast path; fall back to the char at `i` for any multibyte sequence.
+            let Some(ch) = input[i..].chars().next() else {
+                break;
+            };
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// The byte length of an ISO-8601 date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DDThh:mm:ss[.sss][Z|±hh:mm]`)
+/// at the start of `s`, or `None` when `s` does not begin with one.
+fn iso8601_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.len() < 10 {
+        return None;
+    }
+    let [
+        year0,
+        year1,
+        year2,
+        year3,
+        b'-',
+        month0,
+        month1,
+        b'-',
+        day0,
+        day1,
+        ..,
+    ] = b
+    else {
+        return None;
+    };
+    let date = [year0, year1, year2, year3, month0, month1, day0, day1]
+        .iter()
+        .all(|byte| byte.is_ascii_digit());
+    if !date {
+        return None;
+    }
+    let mut end = 10;
+    if b.get(10).is_some_and(|byte| matches!(byte, b'T' | b' ')) {
+        end = 11;
+        while b
+            .get(end)
+            .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b':' | b'.' | b'+' | b'-'))
+        {
+            end += 1;
+        }
+        if b.get(end) == Some(&b'Z') {
+            end += 1;
+        }
+    }
+    Some(end)
 }
 
 /// Replaces flat serialized Mongo operator objects while leaving their surrounding response intact.
@@ -1242,13 +1323,31 @@ fn json_object_fields(field: &str, value: &str, siblings: &[(String, String)]) -
     let mut out = base.trim_end_matches('}').to_owned();
     for (key, val) in extra {
         out.push_str(&format!(
-            ",\"{}\":\"{}\"",
+            ",\"{}\":{}",
             json_escape(key),
-            json_escape(val)
+            json_member_value(val)
         ));
     }
     out.push('}');
     out
+}
+
+/// A sibling value serialized as a JSON member value: a JSON literal (an array, object, number, or
+/// boolean, as a validator-mined `isArray`/`isInt`/`isBoolean` filler produces) is emitted verbatim,
+/// so an array filler stays an array; any other value is a string, quoted and escaped.
+fn json_member_value(value: &str) -> String {
+    let trimmed = value.trim();
+    let is_literal = matches!(trimmed, "true" | "false" | "null")
+        || ((trimmed.starts_with('[') || trimmed.starts_with('{'))
+            && serde_json::from_str::<serde_json::Value>(trimmed).is_ok())
+        || serde_json::from_str::<serde_json::Value>(trimmed)
+            .map(|v| v.is_number())
+            .unwrap_or(false);
+    if is_literal {
+        trimmed.to_owned()
+    } else {
+        format!("\"{}\"", json_escape(value))
+    }
 }
 
 fn json_object_with_field(field: &str, value: &str, other: &str, other_value: &str) -> String {
@@ -1378,6 +1477,7 @@ mod tests {
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
             sql: None,
+            array_element: false,
         }
     }
 
@@ -1893,6 +1993,58 @@ mod tests {
                     .as_str()
             )
         );
+    }
+
+    #[test]
+    fn nosql_array_element_wraps_the_operator_for_an_iterated_field() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::NosqlInjection,
+            "/api/v2/devices/activities/refresh-caches",
+            Entry::Body(Some("device_names".to_owned())),
+        );
+        // The handler iterates `device_names` and queries each element, so the operator rides inside
+        // a one-element array — which also satisfies the `.isArray()` body validator.
+        p.array_element = true;
+        let absent = nosql_absent_token(&canary, 1);
+        let cases = nosql_cases(&p, &canary, 1);
+        let primary = cases.iter().find(|c| c.field == "device_names").unwrap();
+        assert_eq!(
+            primary.match_all.body.as_deref(),
+            Some(format!("{{\"device_names\":[{{\"$ne\":\"{absent}\"}}]}}").as_str())
+        );
+        assert_eq!(
+            primary.match_none_eq.body.as_deref(),
+            Some(format!("{{\"device_names\":[{{\"$eq\":\"{absent}\"}}]}}").as_str())
+        );
+        assert_eq!(
+            primary.match_none_in.body.as_deref(),
+            Some("{\"device_names\":[{\"$in\":[]}]}")
+        );
+        // Other probed field names keep the direct (non-array) operator form.
+        let other = cases.iter().find(|c| c.field == "id").unwrap();
+        assert_eq!(
+            other.match_all.body.as_deref(),
+            Some(
+                format!("{{\"id\":{{\"$ne\":\"{absent}\"}},\"device_names\":\"jsspector\"}}")
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn nosql_reproduced_ignores_a_volatile_response_timestamp() {
+        let absent = "18e5b2212ed3fb801c5e4000";
+        let all = r#"{"devices_refreshed":1,"errors":0,"refreshed_at":"2026-11-07T07:18:35.161Z"}"#;
+        let none_eq =
+            r#"{"devices_refreshed":0,"errors":1,"refreshed_at":"2026-11-07T07:18:35.245Z"}"#;
+        let none_in =
+            r#"{"devices_refreshed":0,"errors":1,"refreshed_at":"2026-11-07T07:18:35.319Z"}"#;
+        // The match-none responses differ only by their timestamp; the match-all response differs
+        // in a semantic field, so the differential still proves operator interpretation.
+        assert!(nosql_reproduced(all, none_eq, none_in, absent));
+        // Responses that differ *only* by a timestamp are not a differential.
+        assert!(!nosql_reproduced(none_eq, none_eq, none_in, absent));
     }
 
     #[test]

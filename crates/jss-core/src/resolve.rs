@@ -33,6 +33,10 @@ pub struct Workspace {
     packages: BTreeMap<String, (String, Vec<String>)>,
     /// TypeScript configs: directory -> (base directory, `paths` patterns -> targets).
     tsconfigs: BTreeMap<String, TsConfig>,
+    /// `_moduleAliases` from `package.json` (the `module-alias` package): (declaring package
+    /// directory, alias, target root-relative). An alias maps itself and any `alias/sub` subpath
+    /// to `target` (and `target/sub`), the way `require('@utils/x')` resolves at runtime.
+    aliases: Vec<(String, String, String)>,
 }
 
 /// The module-resolution part of a `tsconfig.json` / `jsconfig.json`.
@@ -49,6 +53,7 @@ impl Workspace {
     pub fn load(root: &Path) -> Self {
         let mut packages: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
         let mut tsconfigs = BTreeMap::new();
+        let mut aliases: Vec<(String, String, String)> = Vec::new();
         // Sorted, so the result never depends on the file system's directory order.
         let walker = ignore::WalkBuilder::new(root)
             .standard_filters(false)
@@ -79,15 +84,30 @@ impl Workspace {
             let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
-            let Some(name) = json.get("name").and_then(|n| n.as_str()) else {
-                continue;
-            };
             let Some(dir) = entry
                 .path()
                 .parent()
                 .and_then(|d| d.strip_prefix(root).ok())
                 .map(|d| d.to_string_lossy().replace('\\', "/"))
             else {
+                continue;
+            };
+            // `module-alias`: targets are relative to the `package.json` directory.
+            if let Some(map) = json.get("_moduleAliases").and_then(|v| v.as_object()) {
+                for (alias, target) in map {
+                    let Some(target) = target.as_str() else {
+                        continue;
+                    };
+                    let target = target.trim_start_matches("./").trim_end_matches('/');
+                    let joined = if dir.is_empty() {
+                        target.to_owned()
+                    } else {
+                        format!("{dir}/{target}")
+                    };
+                    aliases.push((dir.clone(), alias.clone(), joined));
+                }
+            }
+            let Some(name) = json.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
             let mut entries = Vec::new();
@@ -110,7 +130,44 @@ impl Workspace {
         Self {
             packages,
             tsconfigs,
+            aliases,
         }
+    }
+
+    /// The file a bare specifier names through a `module-alias` `_moduleAliases` entry. An alias
+    /// declared in a `package.json` whose directory contains the importing file is preferred, so
+    /// the same alias used by two packages resolves against the nearest one.
+    pub fn resolve_alias(
+        &self,
+        from: &str,
+        spec: &str,
+        files: &BTreeSet<String>,
+    ) -> Option<String> {
+        let mut matches: Vec<(usize, String)> = Vec::new();
+        for (pkg_dir, alias, target) in &self.aliases {
+            let rest = if spec == alias {
+                Some("")
+            } else if let Some(rest) = spec.strip_prefix(alias) {
+                rest.strip_prefix('/')
+            } else {
+                None
+            };
+            let Some(rest) = rest else { continue };
+            let within =
+                pkg_dir.is_empty() || from == pkg_dir || from.starts_with(&format!("{pkg_dir}/"));
+            let score = if within { pkg_dir.len() + 1 } else { 0 };
+            let path = if rest.is_empty() {
+                target.clone()
+            } else {
+                format!("{target}/{rest}")
+            };
+            matches.push((score, path));
+        }
+        matches.sort_by_key(|item| std::cmp::Reverse(item.0));
+        matches.into_iter().find_map(|(_, path)| {
+            let path = normalize(&path)?;
+            candidates(&path).into_iter().find(|c| files.contains(c))
+        })
     }
 
     /// The file a bare specifier names through the nearest tsconfig's `paths` or `baseUrl`.
@@ -235,7 +292,7 @@ impl Workspace {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.packages.is_empty() && self.tsconfigs.is_empty()
+        self.packages.is_empty() && self.tsconfigs.is_empty() && self.aliases.is_empty()
     }
 }
 

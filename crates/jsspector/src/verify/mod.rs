@@ -190,6 +190,51 @@ pub fn run(
             );
         }
     }
+    // A route guarded by express-validator middleware (`body("device_names").exists().isArray(...)`)
+    // rejects the request with a 400 before the sink unless the body carries every field the chain
+    // requires. Mine those required fields from the validator arrays the route mounts — resolving the
+    // middleware through the route's imports/requires, including `module-alias` specifiers — and carry
+    // a type-valid filler for each, so a body-delivered payload (a whole-body NoSQL operator object or
+    // a named body field) reaches the sink instead of the validation error.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && matches!(probe.entry, plan::Entry::Body(_))
+            && let Some(at) = &finding.entry_at
+            && let Ok(route_src) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let payload_field = match &probe.entry {
+                plan::Entry::Body(Some(name)) => name.clone(),
+                _ => String::new(),
+            };
+            let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
+            let mined =
+                plan::validator_required_body_fields(&route_src, at.line, &payload_field, &resolve);
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                let idents = plan::route_middleware_idents(&route_src, at.line);
+                let resolved: Vec<(String, bool, bool)> = idents
+                    .iter()
+                    .map(|n| {
+                        let src = resolve(n);
+                        let has = src.is_some();
+                        let arr = src
+                            .as_deref()
+                            .map(|s| plan::defines_const_array(s, n))
+                            .unwrap_or(false);
+                        (n.clone(), has, arr)
+                    })
+                    .collect();
+                eprintln!(
+                    "[verify] validator-siblings entry={:?} at={}:{} payload={payload_field:?} idents={resolved:?} mined={mined:?}",
+                    probe.entry, at.file, at.line
+                );
+            }
+            for (field, value) in mined {
+                if probe.siblings.iter().all(|(k, _)| *k != field) {
+                    probe.siblings.push((field, value));
+                }
+            }
+        }
+    }
     // A SQL injection whose tainted value is interpolated in a table-identifier position
     // (`FROM ${tbl}`): mine the columns the statements interpolating that identifier reference and the
     // body fields the handler reads, so the probe can replace the table with a sub-select that both
@@ -431,13 +476,107 @@ fn resolve_relative_source(root: &std::path::Path, from_file: &str, spec: &str) 
     }
     let dir = std::path::Path::new(from_file).parent()?;
     let base = dir.join(spec);
+    let base_str = base.to_string_lossy().into_owned();
     let canonical_root = root.canonicalize().ok()?;
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if base.extension().is_some() {
-        candidates.push(base.clone());
-    }
+    // The specifier as written first (it may already name a file, extension and all).
+    candidates.push(base.clone());
     for ext in ["js", "mjs", "cjs", "ts", "jsx", "tsx"] {
-        candidates.push(base.with_extension(ext));
+        // Append the extension to the whole path (`./device.validators` -> `device.validators.js`)
+        // rather than replacing its last dotted segment, so a dotted module file name resolves.
+        candidates.push(std::path::PathBuf::from(format!("{base_str}.{ext}")));
+        candidates.push(base.join(format!("index.{ext}")));
+    }
+    for candidate in candidates {
+        let Ok(candidate) = canonical_root.join(candidate).canonicalize() else {
+            continue;
+        };
+        if !candidate.starts_with(&canonical_root) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(candidate) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// The source of the module that defines a route middleware `name`: the route file itself when it
+/// declares the middleware (a local `const name = [...]` validator array or function), else the
+/// module it imports/`require`s `name` from — resolved through a relative specifier or a
+/// `module-alias` `_moduleAliases` entry. Confined to the repository tree.
+fn resolve_middleware_source(
+    root: &std::path::Path,
+    route_file: &str,
+    route_src: &str,
+    name: &str,
+) -> Option<String> {
+    if plan::defines_const_array(route_src, name) || plan::defines_function(route_src, name) {
+        return Some(route_src.to_owned());
+    }
+    let spec = plan::import_or_require_source_path(route_src, name)?;
+    resolve_import_source(root, route_file, &spec)
+}
+
+/// The source a module specifier resolves to from `from_file`: a relative specifier through
+/// [`resolve_relative_source`], or a bare specifier through a `module-alias` `_moduleAliases` entry
+/// (`@validators/device.validators`). `None` for an unresolved or non-aliased package specifier.
+fn resolve_import_source(root: &std::path::Path, from_file: &str, spec: &str) -> Option<String> {
+    if spec.starts_with('.') {
+        return resolve_relative_source(root, from_file, spec);
+    }
+    let rooted = resolve_module_alias(root, from_file, spec)?;
+    resolve_rooted_source(root, &rooted)
+}
+
+/// A bare specifier rewritten through the nearest enclosing `package.json`'s `module-alias`
+/// `_moduleAliases` map (`@validators/x` with `"@validators": "validators"` declared in
+/// `src/app/package.json` -> `src/app/validators/x`), as a repository-root-relative path without an
+/// extension. `None` when no ancestor package declares the alias.
+fn resolve_module_alias(root: &std::path::Path, from_file: &str, spec: &str) -> Option<String> {
+    let (alias, rest) = match spec.split_once('/') {
+        Some((a, r)) => (a, Some(r)),
+        None => (spec, None),
+    };
+    let mut dir = std::path::Path::new(from_file).parent();
+    while let Some(d) = dir {
+        let pkg = root.join(d).join("package.json");
+        if let Ok(text) = std::fs::read_to_string(&pkg)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(target) = json
+                .get("_moduleAliases")
+                .and_then(|v| v.as_object())
+                .and_then(|m| m.get(alias))
+                .and_then(|v| v.as_str())
+        {
+            let target = target.trim_start_matches("./").trim_end_matches('/');
+            let mut path = d.to_path_buf();
+            if !target.is_empty() && target != "." {
+                path = path.join(target);
+            }
+            if let Some(rest) = rest {
+                path = path.join(rest);
+            }
+            return Some(path.to_string_lossy().into_owned());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The source text of a repository-root-relative module path (without extension), trying the common
+/// JavaScript file names and an `index.*`. Confined to the repository tree.
+fn resolve_rooted_source(root: &std::path::Path, rooted: &str) -> Option<String> {
+    let canonical_root = root.canonicalize().ok()?;
+    let base = std::path::Path::new(rooted);
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // Try the specifier as written first (it may already name a file, extension and all).
+    candidates.push(base.to_path_buf());
+    for ext in ["js", "mjs", "cjs", "ts", "jsx", "tsx"] {
+        // Append the extension to the whole specifier (`device.validators` -> `device.validators.js`)
+        // rather than replacing its last dotted segment, so a module whose file name itself contains a
+        // dot resolves correctly.
+        candidates.push(std::path::PathBuf::from(format!("{rooted}.{ext}")));
         candidates.push(base.join(format!("index.{ext}")));
     }
     for candidate in candidates {

@@ -89,12 +89,22 @@ pub fn attach_entries(root: &Path, reports: &mut [ScanReport]) {
         .map(|(auth, label, _, at)| (label, auth, at))
         .collect();
     let reached = jss_core::ir::reachable(&graph, &roots);
+    // For a request-sourced finding, prefer the route that actually forwards the request object
+    // into the function reading it. A route whose call graph reaches the function only by passing a
+    // freshly constructed object (a background job rebuilding `{ query, body }`) does not deliver the
+    // attacker's `req.query.<field>` there, so it is not a genuine HTTP entry; fall back to plain
+    // reachability when no route forwards a request (nothing is lost that was linked before).
+    let reached_fwd = jss_core::ir::reachable_forwarding(&modules, &roots);
     let model = crate::taint::models::model();
     for report in reports.iter_mut() {
         for finding in &mut report.findings {
             let id = (finding.file.clone(), finding.function.clone());
-            let Some((label, auth, at)) = reached.get(&id).and_then(|index| labels.get(*index))
-            else {
+            let index = if finding.source.kind == "http" {
+                reached_fwd.get(&id).or_else(|| reached.get(&id))
+            } else {
+                reached.get(&id)
+            };
+            let Some((label, auth, at)) = index.and_then(|index| labels.get(*index)) else {
                 // Browser-side data no route reaches: the page or the component it enters.
                 let kind: &str = finding.source.kind;
                 if model.page_kinds.iter().any(|k| k == kind) {

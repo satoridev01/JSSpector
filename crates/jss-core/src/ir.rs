@@ -248,6 +248,83 @@ pub fn reachable(graph: &CallGraph, roots: &[FunctionId]) -> BTreeMap<FunctionId
     seen
 }
 
+/// Like [`reachable`], but only follows a call that forwards an attacker-controlled request value
+/// into the callee: an argument that is a source (`Value::Source`, the request object or a value
+/// derived from it) or a parameter the caller itself received as a request-bearing argument
+/// (`Value::Param` of a request-bearing index). Each reached function carries the index of the
+/// first root, in order, that forwards a request to it.
+///
+/// This attributes an HTTP-sourced finding to the route that actually delivers the request object
+/// to the function reading it, not merely any route whose call graph happens to reach that
+/// function. A background job that rebuilds a synthetic `{ query, body }` object and passes it to
+/// the same helper (`helper({ query: { tenant }, body })`) passes a freshly constructed object
+/// (`Value::Other`), not the request, so it is not treated as a request entry — the attacker never
+/// controls that helper's `req.query.<field>` on the job path.
+pub fn reachable_forwarding(
+    modules: &[Module],
+    roots: &[FunctionId],
+) -> BTreeMap<FunctionId, usize> {
+    let by_file: BTreeMap<&str, &Module> = modules.iter().map(|m| (m.file.as_str(), m)).collect();
+    // caller -> each resolved callee with the arguments the call passes.
+    let mut calls: BTreeMap<FunctionId, Vec<(FunctionId, Vec<Value>)>> = BTreeMap::new();
+    for module in modules {
+        let local: BTreeSet<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+        let imports: BTreeMap<&str, &Import> = module
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i))
+            .collect();
+        for function in &module.functions {
+            let key = (module.file.clone(), function.name.clone());
+            for call in &function.calls {
+                if let Some(target) =
+                    resolve_call(&call.callee, &local, &imports, &by_file, &module.file)
+                {
+                    calls
+                        .entry(key.clone())
+                        .or_default()
+                        .push((target, call.args.clone()));
+                }
+            }
+        }
+    }
+    let mut seen: BTreeMap<FunctionId, usize> = BTreeMap::new();
+    for (index, root) in roots.iter().enumerate() {
+        // A route handler receives the request/context as its first parameter.
+        let mut stack: Vec<(FunctionId, BTreeSet<usize>)> =
+            vec![(root.clone(), BTreeSet::from([0]))];
+        let mut visited: BTreeSet<(FunctionId, Vec<usize>)> = BTreeSet::new();
+        while let Some((id, req_params)) = stack.pop() {
+            let visit_key = (id.clone(), req_params.iter().copied().collect::<Vec<_>>());
+            if !visited.insert(visit_key) || visited.len() > 200_000 {
+                continue;
+            }
+            seen.entry(id.clone()).or_insert(index);
+            let Some(callees) = calls.get(&id) else {
+                continue;
+            };
+            for (callee, args) in callees {
+                let forwarded: BTreeSet<usize> = args
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, arg)| {
+                        let carries = match arg {
+                            Value::Source(_) => true,
+                            Value::Param(i) => req_params.contains(i),
+                            Value::Literal(_) | Value::Other => false,
+                        };
+                        carries.then_some(j)
+                    })
+                    .collect();
+                if !forwarded.is_empty() {
+                    stack.push((callee.clone(), forwarded));
+                }
+            }
+        }
+    }
+    seen
+}
+
 /// How an export table names a namespace export: `users` -> `<namespace>:src/api/users.js`
 /// (`exports.users = require('./users')`, `export * as users from './users'`).
 pub const NAMESPACE: &str = "<namespace>:";

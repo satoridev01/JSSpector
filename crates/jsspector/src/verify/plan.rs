@@ -103,6 +103,15 @@ pub struct Probe {
     /// drive it (see [`SqlPlan`]). `None` for a non-SQL class or a value-position SQL injection that
     /// verify v1 does not yet drive. Mined from the handler source only.
     pub sql: Option<SqlPlan>,
+    /// For a NoSQL body injection whose tainted value reaches the sink as an *element* of the body
+    /// field rather than the field itself: the handler iterates the field (`for (const d of
+    /// device_names) ... findOne({ name: d })`, `field.forEach(d => ...)`) and queries each element, so
+    /// a bare operator object as the field value is both rejected by an `.isArray()` validator and
+    /// never queried. When set, the operator must ride inside a single-element array
+    /// (`{"device_names":[{"$ne":...}]}`), so it passes array validation and becomes the per-element
+    /// query filter. Mined from the handler source only; `false` for the common case where the field
+    /// value reaches the sink directly.
+    pub array_element: bool,
 }
 
 /// A sibling route parameter appended after the tainted one in a directory read path, constrained by
@@ -551,6 +560,15 @@ impl Probe {
             })
             .flatten()
             .map(|(name, values)| AppendedParam { name, values });
+        // A NoSQL body field the handler iterates and queries per element (`for (const d of
+        // device_names) findOne({ name: d })`): the operator must ride inside a one-element array.
+        let array_element = finding.class == VulnClass::NosqlInjection
+            && match (&entry, source) {
+                (Entry::Body(Some(field)), Some(src)) => {
+                    body_field_reaches_sink_as_element(src, field, &finding.sink.arg)
+                }
+                _ => false,
+            };
         Ok(Self {
             method,
             path,
@@ -568,8 +586,154 @@ impl Probe {
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
             sql: None,
+            array_element,
         })
     }
+}
+
+/// Whether the body `field` reaches the sink as an *element* of an iteration, so a NoSQL operator
+/// must ride inside an array (`{"field":[{"$ne":...}]}`) rather than as the field value itself. True
+/// when the handler iterates the field (`for (const e of field)`, `field.forEach(e => ...)`,
+/// `field.map(e => ...)`) binding an element identifier that the sink's own argument then reads. Mined
+/// from the handler source and the finding's sink argument only; nothing here is tied to a specific
+/// application.
+pub fn body_field_reaches_sink_as_element(source: &str, field: &str, sink_arg: &str) -> bool {
+    if field.is_empty() {
+        return false;
+    }
+    let sink_idents = identifier_tokens(sink_arg);
+    iteration_element_idents(source, field)
+        .iter()
+        .any(|elem| sink_idents.iter().any(|t| t == elem))
+}
+
+/// Element identifiers the handler binds when iterating `field`: a `for (const e of field)` loop
+/// variable, or the first callback parameter of a `field.forEach(e => ...)` / `.map` / `.filter` /
+/// similar array-iteration call. Mined from the handler source only.
+fn iteration_element_idents(source: &str, field: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = source.as_bytes();
+    // `for (const e of field)` / `for (let e of field)` / `for (e of field)`.
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("for") {
+        let at = from + rel;
+        from = at + 3;
+        if at
+            .checked_sub(1)
+            .and_then(|previous| bytes.get(previous))
+            .is_some_and(|byte| is_ident(*byte))
+        {
+            continue;
+        }
+        let after = source[at + 3..].trim_start();
+        if !after.starts_with('(') {
+            continue;
+        }
+        let popen = at + 3 + (source[at + 3..].len() - after.len());
+        let Some(pclose) = matching_close_paren(source, popen) else {
+            continue;
+        };
+        let header = &source[popen + 1..pclose];
+        if let Some((lhs, rhs)) = header.split_once(" of ")
+            && rhs.trim() == field
+            && let Some(id) = last_ident(lhs)
+        {
+            out.push(id);
+        }
+    }
+    // `field.forEach(e => ...)` and the other element-wise array iterators.
+    for method in [
+        "forEach", "map", "filter", "flatMap", "find", "some", "every", "reduce",
+    ] {
+        let needle = format!("{field}.{method}(");
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            if at
+                .checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                .is_some_and(|byte| is_ident(*byte) || *byte == b'.')
+            {
+                continue;
+            }
+            if let Some(id) = callback_first_param(&source[at + needle.len()..]) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// The first callback parameter named just after a `(` that an iterator call opened: `e => ...`,
+/// `(e) => ...`, `(e, i) => ...`, `function (e) { ... }`, `async (e) => ...`. `None` when the first
+/// parameter is a destructuring pattern or absent.
+fn callback_first_param(rest: &str) -> Option<String> {
+    let t = rest.trim_start();
+    let t = t.strip_prefix("async").map(str::trim_start).unwrap_or(t);
+    let inner = if let Some(f) = t.strip_prefix("function") {
+        let f = f.trim_start();
+        let open = f.find('(')?;
+        &f[open + 1..]
+    } else if let Some(p) = t.strip_prefix('(') {
+        p
+    } else {
+        return leading_ident(t);
+    };
+    let end = inner.find([',', ')'])?;
+    leading_ident(inner[..end].trim())
+}
+
+/// The last run of identifier characters in `s` (`const deviceName` -> `deviceName`), or `None` when
+/// `s` does not end in an identifier (a destructuring pattern `{ a, b }`).
+fn last_ident(s: &str) -> Option<String> {
+    let id: String = s
+        .trim_end()
+        .bytes()
+        .rev()
+        .take_while(|b| is_ident(*b))
+        .map(|b| b as char)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// The leading identifier of `s` (`e => ...` -> `e`), or `None` when `s` does not begin with one.
+fn leading_ident(s: &str) -> Option<String> {
+    let id: String = s
+        .bytes()
+        .take_while(|b| is_ident(*b))
+        .map(|b| b as char)
+        .collect();
+    id.as_bytes()
+        .first()
+        .is_some_and(|byte| !byte.is_ascii_digit())
+        .then_some(id)
+}
+
+/// Every identifier token in `text` (`{ name: deviceName }` -> `["name", "deviceName"]`), used to
+/// test whether an iteration's element variable is read by the sink's argument.
+fn identifier_tokens(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(&byte) = bytes.get(i) else {
+            break;
+        };
+        if is_ident(byte) && !byte.is_ascii_digit() {
+            let start = i;
+            while bytes.get(i).is_some_and(|byte| is_ident(*byte)) {
+                i += 1;
+            }
+            out.push(text[start..i].to_owned());
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Identifiers that carry the tainted value in the handler source: the request parameter's own
@@ -881,6 +1045,64 @@ pub fn import_source_path(source: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The module specifier a CommonJS binding of `name` comes from: `const name = require('<path>')`
+/// or `const { a, name, b } = require('<path>')` (with an optional `name: local` rename) ->
+/// `<path>`. Used to locate a middleware defined in another module the route `require`s. Mined from
+/// the require bindings only.
+pub fn require_source_path(source: &str, name: &str) -> Option<String> {
+    let needle = "require(";
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(needle) {
+        let at = from + rel;
+        from = at + needle.len();
+        // Only a `= require(...)` binding, not a nested `app.use(require(...))`.
+        let head = source[..at].trim_end();
+        let Some(before_eq) = head.strip_suffix('=') else {
+            continue;
+        };
+        // Exclude `==`, `!=`, `>=`, `<=`, `=>` which also end in `=`/precede a `=`.
+        if before_eq.ends_with(['=', '!', '<', '>']) {
+            continue;
+        }
+        let Some(spec) = leading_string(source[at + needle.len()..].trim_start()) else {
+            continue;
+        };
+        let lhs = before_eq.trim_end();
+        let bound = if lhs.ends_with('}') {
+            let close = lhs.len() - 1;
+            matching_open_brace(lhs, close).is_some_and(|open| {
+                split_top_level_commas(&lhs[open + 1..close])
+                    .iter()
+                    .any(|e| {
+                        let field = e.trim().split(':').next().unwrap_or("").trim();
+                        field == name
+                    })
+            })
+        } else {
+            let ident: String = lhs
+                .bytes()
+                .rev()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            ident == name
+        };
+        if bound {
+            return Some(spec);
+        }
+    }
+    None
+}
+
+/// The module specifier a named import *or* CommonJS require of `name` comes from: ES `import`
+/// first, then a `require` binding. Used to follow one module hop to where a middleware is defined.
+pub fn import_or_require_source_path(source: &str, name: &str) -> Option<String> {
+    import_source_path(source, name).or_else(|| require_source_path(source, name))
 }
 
 /// Every relative module specifier the source imports or requires (`import x from './a'`,
@@ -1594,6 +1816,198 @@ pub fn required_siblings(source: &str, part: &str, target: &str) -> Vec<(String,
         .collect()
 }
 
+/// Body fields an express-validator middleware chain attached to the route requires — a
+/// `body("name")`/`check("name")` chain without `.optional()` — other than the payload field, each
+/// paired with a value that satisfies the chain's declared type: a JSON array (`["jsspector"]`) for
+/// `.isArray(...)`, the first `.isIn([...])` alternative, a Mongo-id / email / number / boolean
+/// filler for the matching assertion, else the scalar `jsspector`. A value that is a JSON literal
+/// (array, object, number, boolean) is returned verbatim so the body builder emits it unquoted; a
+/// scalar is returned bare so the builder quotes it. `route_source` is the file registering the
+/// route, `route_line` the 1-based registration line, `resolve` maps a middleware identifier to the
+/// source of the module that defines it. Mined from the route registration and the validator array
+/// definitions only; nothing here is tied to a specific application.
+pub fn validator_required_body_fields(
+    route_source: &str,
+    route_line: u32,
+    payload_field: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for middleware in route_middleware_idents(route_source, route_line) {
+        let Some(module) = resolve(&middleware) else {
+            continue;
+        };
+        let Some(array) = const_array_body(&module, &middleware) else {
+            continue;
+        };
+        for (field, value) in validator_body_requirements(&array) {
+            if field == payload_field {
+                continue;
+            }
+            if out.iter().all(|(k, _)| *k != field) {
+                out.push((field, value));
+            }
+        }
+    }
+    out
+}
+
+/// The bare-identifier arguments of the route registration on `line` (`router.post("/x", mwA, mwB,
+/// controller)` -> `["mwA", "mwB"]`, skipping the path string and a `obj.method` controller). These
+/// are the middleware names the route mounts, among them any express-validator array.
+pub fn route_middleware_idents(source: &str, line: u32) -> Vec<String> {
+    let Some(start) = line_offset(source, line as usize) else {
+        return Vec::new();
+    };
+    let Some(prel) = source[start..].find('(') else {
+        return Vec::new();
+    };
+    let popen = start + prel;
+    let Some(pclose) = matching_close_paren(source, popen) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for arg in split_top_level_commas(&source[popen + 1..pclose]) {
+        let arg = arg.trim();
+        if !arg.is_empty() && arg.bytes().all(is_ident) {
+            out.push(arg.to_owned());
+        }
+    }
+    out
+}
+
+/// The text between the brackets of `const <name> = [ ... ]` (`let`/`var` too): the elements of a
+/// declared array, used to read an express-validator chain list. Boundary-checked so `name` is not a
+/// prefix of a longer identifier. `None` when `name` is not bound to an array literal here.
+fn const_array_body(source: &str, name: &str) -> Option<String> {
+    for keyword in ["const ", "let ", "var "] {
+        let needle = format!("{keyword}{name}");
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            let after = &source[at + needle.len()..];
+            // `name` must end here, not continue into a longer identifier.
+            if after.bytes().next().is_some_and(is_ident) {
+                continue;
+            }
+            let Some(rest) = after.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            if !rest.starts_with('[') {
+                continue;
+            }
+            let open = source.len() - rest.len();
+            let close = delimiter_close(source, open, b'[', b']')?;
+            return Some(source[open + 1..close].to_owned());
+        }
+    }
+    None
+}
+
+/// Whether `source` binds `name` to an array literal (`const name = [ ... ]`): a declared
+/// express-validator chain list lives in the module that owns it.
+pub fn defines_const_array(source: &str, name: &str) -> bool {
+    const_array_body(source, name).is_some()
+}
+
+/// The required body requirements of an express-validator array: for each `body("field")` /
+/// `check("field")` chain in `array` that is not `.optional()`, the field and a type-valid filler.
+fn validator_body_requirements(array: &str) -> Vec<(String, String)> {
+    let starts = chain_starts(array);
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (idx, (pos, field, builder)) in starts.iter().enumerate() {
+        if builder != "body" && builder != "check" {
+            continue;
+        }
+        let Some(field) = field else {
+            continue;
+        };
+        let end = starts.get(idx + 1).map(|s| s.0).unwrap_or(array.len());
+        let window = &array[*pos..end];
+        // `.optional()` lets the field be absent, so the request is not rejected without it.
+        if window.contains(".optional(") {
+            continue;
+        }
+        if out.iter().all(|(k, _)| k != field) {
+            out.push((field.clone(), validator_filler(field, window)));
+        }
+    }
+    out
+}
+
+/// Every express-validator chain builder call in `array` (`body("x")`, `query(...)`, `check(...)`,
+/// ...) as `(byte offset, first-string-literal argument, builder name)`, in source order. Used to
+/// carve each chain's own window of chained assertions.
+fn chain_starts(array: &str) -> Vec<(usize, Option<String>, String)> {
+    let mut out: Vec<(usize, Option<String>, String)> = Vec::new();
+    for builder in ["body", "check", "query", "param", "header", "cookie"] {
+        let needle = format!("{builder}(");
+        let mut from = 0;
+        while let Some(rel) = array[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            // Not a member call (`.body(`) and not the tail of a longer identifier (`somebody(`).
+            let before = at
+                .checked_sub(1)
+                .and_then(|i| array.as_bytes().get(i))
+                .copied();
+            if before.is_some_and(|b| is_ident(b) || b == b'.') {
+                continue;
+            }
+            let field = leading_string(array[at + needle.len()..].trim_start());
+            out.push((at, field, builder.to_owned()));
+        }
+    }
+    out.sort_by_key(|s| s.0);
+    out
+}
+
+/// A value that satisfies the type a validator chain declares for its field: a JSON array for
+/// `.isArray`, the first `.isIn` alternative, a Mongo-id / email / number / boolean / URL filler for
+/// the matching assertion, else the scalar `jsspector`. A JSON-literal return (array/number/boolean)
+/// is emitted unquoted by the body builder; a scalar is quoted.
+fn validator_filler(field: &str, window: &str) -> String {
+    if window.contains(".isArray(") {
+        return "[\"jsspector\"]".to_owned();
+    }
+    if window.contains(".isIn(")
+        && let Some(literal) = first_isin_literal(window)
+    {
+        return literal;
+    }
+    if window.contains(".isInt(")
+        || window.contains(".isNumeric(")
+        || window.contains(".isFloat(")
+        || window.contains(".isDecimal(")
+    {
+        return "1".to_owned();
+    }
+    if window.contains(".isBoolean(") {
+        return "true".to_owned();
+    }
+    if window.contains(".isMongoId(") {
+        return "18e5afe44388ba2819a79000".to_owned();
+    }
+    if window.contains(".isEmail(") {
+        return "jss@jsspector.test".to_owned();
+    }
+    if is_urlish(field) {
+        return "http://jss-filler.test/".to_owned();
+    }
+    "jsspector".to_owned()
+}
+
+/// The first string-literal alternative of an `.isIn(["a", "b"])` assertion (`a`), returned as a bare
+/// scalar. `None` when the argument is not a literal array of strings.
+fn first_isin_literal(window: &str) -> Option<String> {
+    let at = window.find(".isIn(")? + ".isIn(".len();
+    let after = window[at..].trim_start();
+    let open = after.find('[')?;
+    leading_string(after[open + 1..].trim_start())
+}
+
 /// Parameter names read by explicit member access on a request part (`request.query.name`,
 /// `req.body["name"]`): the parameters a handler names one by one.
 fn member_params(source: &str, part: &str) -> Vec<String> {
@@ -2141,10 +2555,11 @@ fn searchparam_var(source: &str, param: &str) -> Option<String> {
             // Walk back over the receiver chain (`url.searchParams` / `searchParams`) to its start,
             // then read the identifier it is assigned to.
             let mut i = at;
-            while i > 0 && {
-                let b = bytes[i - 1];
-                is_ident(b) || b == b'.'
-            } {
+            while i
+                .checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                .is_some_and(|byte| is_ident(*byte) || *byte == b'.')
+            {
                 i -= 1;
             }
             if let Some(var) = assigned_target(source, i) {
@@ -2174,7 +2589,12 @@ fn index_receivers(source: &str, ids: &[String]) -> Vec<String> {
                 .chars()
                 .rev()
                 .collect();
-            if !recv.is_empty() && !recv.as_bytes()[0].is_ascii_digit() && !out.contains(&recv) {
+            if recv
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| !byte.is_ascii_digit())
+                && !out.contains(&recv)
+            {
                 out.push(recv);
             }
         }
@@ -2468,6 +2888,12 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
     if let Some(entry) = params_sink_entry(finding, path, source) {
         return Some(entry);
     }
+    // A source the engine named by the bare request part (`query`) because the handler destructures
+    // the whole part off the request (`let { query, body } = req`), not through a `req.query` member
+    // access: resolve the specific field of that part that carries taint to the sink.
+    if let Some(entry) = bare_part_entry(finding, path, source) {
+        return Some(entry);
+    }
     let mut candidates: Vec<Entry> = Vec::new();
     for text in [finding.sink.arg.as_str(), finding.source.expr.as_str()] {
         for accessor in request_accessors(text) {
@@ -2495,6 +2921,101 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
         .or_else(|| destructured_entry(finding, path, source))
         .or_else(|| coarse_params_entry(finding, path, source))
         .or_else(|| source.and_then(|src| coarse_header_entry(finding, src)))
+}
+
+/// When the finding's source is a bare request part (`query`/`body`/`params`/`headers`) — the name
+/// a handler binds by destructuring the request object itself (`let { query, body } = req`) rather
+/// than through a `req.query` member access — the specific field of that part that carries taint to
+/// the sink. The field is read from the part by a further destructuring (`let { tenant, id } =
+/// query`); the finding's trace names the local it flows through (`id`), so among the part's
+/// destructured fields the one whose local is tainted is the attacker input. Returns the request
+/// entry for that field, or `None`. Mined from the handler source only.
+fn bare_part_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
+    let part = finding.source.expr.trim();
+    if !matches!(part, "query" | "body" | "params" | "headers") {
+        return None;
+    }
+    // Only when the source is the bare part; a source that already carries a receiver (`req.query`)
+    // is handled by the generic member-access logic.
+    if strip_request_receiver(part).is_some() {
+        return None;
+    }
+    let src = source?;
+    // The part must itself be destructured off the request object, so `query` here really is
+    // `req.query` and not an unrelated local that happens to share the name.
+    let from_request = ["req", "request", "ctx"].iter().any(|recv| {
+        destructured_fields_of(src, recv)
+            .iter()
+            .any(|(field, local)| field == part || local == part)
+    });
+    if !from_request {
+        return None;
+    }
+    let tainted = tainted_identifiers(finding, &Entry::Url);
+    for (field, local) in destructured_fields_of(src, part) {
+        if tainted.contains(&local)
+            && let Some(entry) = source_entry(&format!("request.{part}.{field}"), path)
+        {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// The `(field, local)` pairs a `const { a, b: c, ...rest } = <rhs>` destructuring binds, where
+/// `<rhs>` is exactly the identifier `rhs`: `{ a }` yields `("a", "a")`, `{ b: c }` yields
+/// `("b", "c")`. Boundary-checked so `query` does not also match `req.query`, `queryText` or a
+/// `.query` member tail. Mined from the handler source only.
+fn destructured_fields_of(source: &str, rhs: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(rhs) {
+        let at = from + rel;
+        from = at + rhs.len();
+        let before = at.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+        if before.is_some_and(|b| is_ident(b) || b == b'.') {
+            continue;
+        }
+        let after = bytes.get(at + rhs.len()).copied();
+        if after.is_some_and(|b| is_ident(b) || b == b'.' || b == b'[' || b == b'(') {
+            continue;
+        }
+        let head = source[..at].trim_end();
+        let Some(head) = head.strip_suffix('=') else {
+            continue;
+        };
+        if head.ends_with(['=', '!', '<', '>']) {
+            continue;
+        }
+        let head = head.trim_end();
+        if !head.ends_with('}') {
+            continue;
+        }
+        let close = head.len() - 1;
+        let Some(open) = matching_open_brace(head, close) else {
+            continue;
+        };
+        for entry in split_top_level_commas(&head[open + 1..close]) {
+            let entry = entry.trim().trim_start_matches("...").trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (field, local) = match entry.split_once(':') {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => (entry, entry),
+            };
+            let local = local.split('=').next().unwrap_or(local).trim();
+            if !field.is_empty()
+                && field.bytes().all(is_ident)
+                && !local.is_empty()
+                && local.bytes().all(is_ident)
+            {
+                out.push((field.to_owned(), local.to_owned()));
+            }
+        }
+    }
+    out
 }
 
 /// The tainted path parameter when the sink's own argument interpolates a route-slot identifier the
@@ -4091,6 +4612,77 @@ pub fn derive_http_entry(finding: &Finding) -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn body_field_reaches_sink_as_element_detects_per_element_query() {
+        // `for (const d of device_names) ... findOne({ name: d })`: the body field is iterated and
+        // each element is queried, so the operator must ride inside an array.
+        let src = "const { device_names } = request.body;\n\
+            for (const deviceName of device_names) {\n\
+              const device = await DeviceModel(tenant).findOne({ name: deviceName });\n\
+            }\n";
+        assert!(super::body_field_reaches_sink_as_element(
+            src,
+            "device_names",
+            "{ name: deviceName }"
+        ));
+        // `.forEach` with the element in the sink argument is the same shape.
+        let fe = "ids.forEach((id) => Model.findOne({ _id: id }));\n";
+        assert!(super::body_field_reaches_sink_as_element(
+            fe,
+            "ids",
+            "{ _id: id }"
+        ));
+        // The field reaching the sink directly (not via an element) is not array-wrapped.
+        let direct = "const { id } = request.body;\nModel.findOne({ _id: id });\n";
+        assert!(!super::body_field_reaches_sink_as_element(
+            direct,
+            "id",
+            "{ _id: id }"
+        ));
+        // A loop over a different field does not trigger wrapping of this field.
+        assert!(!super::body_field_reaches_sink_as_element(
+            src,
+            "site_ids",
+            "{ name: deviceName }"
+        ));
+    }
+
+    #[test]
+    fn validator_middleware_resolves_multiline_destructured_requires() {
+        let src = "const express = require(\"express\");\n\
+const {\n  headers, pagination, validate } = require(\"@validators/common\");\n\
+const {\n  validateTenant,\n  validateCreateShippingBatch,\n  validate2,\n} = require(\"@validators/device.validators\");\n";
+        assert_eq!(
+            super::require_source_path(src, "validate"),
+            Some("@validators/common".to_owned())
+        );
+        assert_eq!(
+            super::require_source_path(src, "validateCreateShippingBatch"),
+            Some("@validators/device.validators".to_owned())
+        );
+        let arr = "const validateCreateShippingBatch = [\n  body(\"device_names\").exists().bail().isArray({min:1}).custom(x=>true),\n  body(\"token_type\").optional().isIn([\"hex\",\"readable\"]),\n  body(\"batch_name\").exists().notEmpty(),\n];\n";
+        assert!(super::defines_const_array(
+            arr,
+            "validateCreateShippingBatch"
+        ));
+        let got = super::validator_required_body_fields(
+            "router.post(\n  \"/x\",\n  validateCreateShippingBatch,\n  validate,\n  c.h\n);\n",
+            1,
+            "batch_name",
+            &|name| {
+                if name == "validateCreateShippingBatch" {
+                    Some(arr.to_owned())
+                } else {
+                    None
+                }
+            },
+        );
+        assert_eq!(
+            got,
+            vec![("device_names".to_owned(), "[\"jsspector\"]".to_owned())]
+        );
+    }
+
+    #[test]
     fn removal_sinks_are_recognized_by_their_api_name() {
         use super::sink_removes;
         assert!(sink_removes("fs.unlinkSync"));
@@ -4334,6 +4926,7 @@ mod tests {
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
             sql: None,
+            array_element: false,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));

@@ -397,9 +397,11 @@ impl Linking<'_> {
         if spec.starts_with('.') {
             jss_core::resolve::resolve(self.file, spec, self.files)
         } else {
-            // tsconfig `paths` first, as tsc does, then the workspace's packages.
+            // tsconfig `paths` first, as tsc does, then `module-alias` aliases, then the
+            // workspace's packages.
             self.workspace
                 .resolve_typescript(self.file, spec, self.files)
+                .or_else(|| self.workspace.resolve_alias(self.file, spec, self.files))
                 .or_else(|| self.workspace.resolve(spec, self.files))
         }
     }
@@ -454,6 +456,7 @@ fn scan_file_program_inner(
         constants: BTreeMap::new(),
         last_returned_fields: None,
         route_templates: BTreeMap::new(),
+        require_wrappers: BTreeMap::new(),
         record_only: false,
         current_class: None,
         class_fields: BTreeMap::new(),
@@ -630,8 +633,22 @@ pub struct RouteTemplate {
     /// Else the parameter holding the handler (`router.get(name, middlewares, controller)`):
     /// each caller passes its own.
     pub handler_param: Option<usize>,
+    /// For a mount helper (`function mount(prefix, spec) { router.use(prefix, require(spec)) }`):
+    /// which module the `use` mounts, in terms of the helper's parameters. `None` for a route.
+    pub mount_module: Option<MountModule>,
     /// The file and line of the `router.get(...)` call the template was made from.
     pub at: Option<(String, u32)>,
+}
+
+/// The module a mount helper's `router.use(prefix, child)` mounts, in terms of its parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountModule {
+    /// `require('./sites.routes')` resolved to a file.
+    Spec(String),
+    /// `require(<the helper's Nth parameter>)` — the caller's Nth argument names the module.
+    RequireParam(usize),
+    /// The helper's Nth parameter itself (the caller passes a router or sub-app).
+    Param(usize),
 }
 
 /// A piece of a route path a helper builds: literal text, or one of its parameters.
@@ -734,6 +751,13 @@ struct Env {
     tables: std::rc::Rc<BTreeMap<String, Vec<BTreeMap<String, String>>>>,
     /// The row a table loop variable stands for in this walk: `r` -> fields.
     rows: BTreeMap<String, BTreeMap<String, String>>,
+    /// A route table row destructured in the loop head (`table.forEach(({ path, route }) => ...)`):
+    /// each destructured local bound to its field's literal text for this walk.
+    row_fields: BTreeMap<String, String>,
+    /// Locals bound to `require(<a parameter>)`, directly or through a require wrapper
+    /// (`const m = require(spec)`, `const m = load(spec)`): local -> that parameter's index. Used to
+    /// name the module a mount helper's `router.use(prefix, m)` mounts.
+    require_params: BTreeMap<String, usize>,
     /// Variables bound to an object literal: the taint of each field.
     fields: BTreeMap<String, BTreeMap<String, Origin>>,
     /// Access paths a guard validated: no longer tainted.
@@ -1126,6 +1150,8 @@ impl Env {
             params: Vec::new(),
             tables: std::rc::Rc::new(BTreeMap::new()),
             rows: BTreeMap::new(),
+            row_fields: BTreeMap::new(),
+            require_params: BTreeMap::new(),
             clean: BTreeSet::new(),
             scalars: BTreeSet::new(),
             partial: BTreeMap::new(),
@@ -1169,6 +1195,9 @@ impl Env {
             params: Vec::new(),
             tables: self.tables.clone(),
             rows: self.rows.clone(),
+            row_fields: self.row_fields.clone(),
+            // A nested function has its own parameters: require-of-parameter bindings do not carry in.
+            require_params: BTreeMap::new(),
             clean: self.clean.clone(),
             scalars: self.scalars.clone(),
             partial: self.partial.clone(),
@@ -1336,6 +1365,10 @@ struct Walker<'e> {
     last_returned_fields: Option<BTreeMap<String, Origin>>,
     /// Functions that register a route from their parameters: `add(path, handler)`.
     route_templates: BTreeMap<String, Vec<RouteTemplate>>,
+    /// Functions that return `require(<their Nth parameter>)` (a module-loading wrapper, often with
+    /// caching and a fallback): name -> that parameter's index. So `const m = load(spec)` names the
+    /// module `require(spec)`, the way a mount helper's `router.use(prefix, load(spec))` does.
+    require_wrappers: BTreeMap<String, usize>,
     /// Re-walking a route-table loop for one row: record routes, emit no findings.
     record_only: bool,
     /// The named class whose methods are being walked.
@@ -3092,6 +3125,25 @@ fn require_spec(expr: &Expression<'_>) -> Option<String> {
     }
 }
 
+/// `require(name)` with a bare identifier argument (not a string literal) → that identifier.
+fn require_arg_ident(expr: &Expression<'_>) -> Option<String> {
+    let Expression::CallExpression(call) = expr.get_inner_expression() else {
+        return None;
+    };
+    if !call.callee.is_specific_id("require") {
+        return None;
+    }
+    match call
+        .arguments
+        .first()?
+        .as_expression()?
+        .get_inner_expression()
+    {
+        Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+        _ => None,
+    }
+}
+
 /// `{ name: value }` → value, for the first of `names` present.
 fn object_prop<'a, 'e>(expr: &'e Expression<'a>, names: &[&str]) -> Option<&'e Expression<'a>> {
     let Expression::ObjectExpression(object) = expr.get_inner_expression() else {
@@ -3375,6 +3427,18 @@ impl Walker<'_> {
                             .returned_locals
                             .entry(env.function.clone())
                             .or_insert_with(|| id.name.as_str().to_owned());
+                    }
+                    // `return require(spec)` / `return routeModule` where `routeModule =
+                    // require(spec)`: a module-loading wrapper, keyed by the parameter it loads.
+                    if let Some(index) = self.require_of_param(argument, env).or_else(|| {
+                        match argument.get_inner_expression() {
+                            Expression::Identifier(id) => {
+                                env.require_params.get(id.name.as_str()).copied()
+                            }
+                            _ => None,
+                        }
+                    }) {
+                        self.require_wrappers.insert(env.function.clone(), index);
                     }
                 }
             }
@@ -3902,6 +3966,19 @@ impl Walker<'_> {
                 BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
                 _ => None,
             };
+            // `const m = require(spec)` / `const m = load(spec)` where `spec` is one of this
+            // function's parameters: `m` names the module `require(<that parameter>)`, so a later
+            // `router.use(prefix, m)` mounts the module the caller passes for that parameter.
+            if let Some(name) = &name_hint {
+                match self.require_of_param(init, env) {
+                    Some(index) => {
+                        env.require_params.insert(name.clone(), index);
+                    }
+                    None => {
+                        env.require_params.remove(name);
+                    }
+                }
+            }
             // `const api = axios.create()`, `const git = simpleGit().env(..)`, `new NodeSSH()`:
             // the family's client, whose methods are its sinks.
             if let Some(name) = &name_hint
@@ -4044,6 +4121,21 @@ impl Walker<'_> {
                 if !rows.is_empty() {
                     std::rc::Rc::make_mut(&mut env.tables).insert(name.clone(), rows);
                 }
+            }
+            // `const sortedRoutes = routes.sort(...)`: an array method that reorders or narrows the
+            // same element objects (never `.map`, which reshapes them) keeps the table's rows, so a
+            // loop over the result stands for the same rows.
+            if let (Some(name), Expression::CallExpression(c)) =
+                (&name_hint, init.get_inner_expression())
+                && let Expression::StaticMemberExpression(member) = c.callee.get_inner_expression()
+                && let Expression::Identifier(src) = member.object.get_inner_expression()
+                && matches!(
+                    member.property.name.as_str(),
+                    "sort" | "reverse" | "filter" | "slice" | "concat"
+                )
+                && let Some(rows) = env.tables.get(src.name.as_str()).cloned()
+            {
+                std::rc::Rc::make_mut(&mut env.tables).insert(name.clone(), rows);
             }
             // `const user = verifyToken(token)`, `const session = await getServerSession()`,
             // `const { user } = await auth()`: what an auth call returned.
@@ -4561,6 +4653,11 @@ impl Walker<'_> {
                 let taint =
                     taint.map(|o| o.step(id.span.start, format!("assigned to `{}`", id.name)));
                 env.bind(id.name.as_str(), taint);
+                // `const request = req`: the whole request object aliased under a new name is still
+                // the request, so its members stay sources and passing it on forwards the request.
+                if let Some((kind, _)) = request {
+                    env.requests.insert(id.name.as_str().to_owned(), kind);
+                }
             }
             BindingPattern::ObjectPattern(object) => {
                 for property in &object.properties {
@@ -7297,6 +7394,13 @@ impl Walker<'_> {
         for property in &object.properties {
             match property {
                 ObjectPropertyKind::ObjectProperty(p) => {
+                    // A method value (`{ list: async (req) => {...} }`) carries no data taint,
+                    // and the object's own walk already analyzes it under its property name;
+                    // re-walking it here as an anonymous function would only duplicate its
+                    // findings under the enclosing scope's owner.
+                    if is_function_value(&p.value) {
+                        continue;
+                    }
                     let mut probe = env.clone();
                     let Some(origin) = self.expr(&p.value, &mut probe) else {
                         continue;
@@ -8500,16 +8604,41 @@ impl Walker<'_> {
                     Expression::FunctionExpression(f) => Some(&f.params),
                     _ => None,
                 };
-                let var = params
-                    .and_then(|p| p.items.first())
-                    .and_then(|p| match &p.pattern {
-                        BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
-                        _ => None,
-                    });
-                if let Some(var) = var {
+                let pattern = params.and_then(|p| p.items.first()).map(|p| &p.pattern);
+                // `(r) => ...`: the row stands for `r`, fields read as `r.field`.
+                let var = pattern.and_then(|p| match p {
+                    BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_owned()),
+                    _ => None,
+                });
+                // `({ path, route }) => ...`: the row's fields are destructured into bare locals.
+                let destructured: Vec<(String, String)> = match pattern {
+                    Some(BindingPattern::ObjectPattern(object)) => object
+                        .properties
+                        .iter()
+                        .filter_map(|p| {
+                            let field = prop_name(&p.key)?;
+                            let local = match &p.value {
+                                BindingPattern::BindingIdentifier(id) => {
+                                    id.name.as_str().to_owned()
+                                }
+                                _ => return None,
+                            };
+                            Some((field, local))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if var.is_some() || !destructured.is_empty() {
                     for row in rows.into_iter().take(100) {
                         let mut inner = env.clone();
-                        inner.rows.insert(var.clone(), row);
+                        if let Some(var) = &var {
+                            inner.rows.insert(var.clone(), row.clone());
+                        }
+                        for (field, local) in &destructured {
+                            if let Some(value) = row.get(field) {
+                                inner.row_fields.insert(local.clone(), value.clone());
+                            }
+                        }
                         let saved = std::mem::replace(&mut self.record_only, true);
                         self.maybe_function(callback, &inner, None, Role::Plain);
                         self.record_only = saved;
@@ -8868,6 +8997,15 @@ impl Walker<'_> {
                                     .iter()
                                     .position(|p| p == id.name.as_str())
                                     .unwrap_or(0),
+                            )
+                        }
+                        // The request/context object itself passed on (`handler(req)`, or an alias
+                        // `const request = req; util(request)`): the callee receives the live request,
+                        // so this call forwards it. A bare request identifier carries no member taint,
+                        // so it would otherwise read as `Other` and hide a genuine forward.
+                        (Some(expr), _) if self.request_kind(expr, env).is_some() => {
+                            jss_core::ir::Value::Source(
+                                self.request_kind(expr, env).unwrap_or("http").to_owned(),
                             )
                         }
                         (_, Some(origin)) => jss_core::ir::Value::Source(origin.kind.to_owned()),
@@ -11250,6 +11388,11 @@ impl Walker<'_> {
                         .and_then(|e| self.route_handler_name(e))
                 }),
                 handler_param,
+                // A mount helper (`function mount(prefix, spec) { router.use(prefix, require(spec)) }`):
+                // which module the `use` mounts, in terms of this helper's parameters.
+                mount_module: has(&m().mount_methods, &method)
+                    .then(|| self.mount_module_source(last, env))
+                    .flatten(),
                 auth,
                 at: Some((self.linking.file.to_owned(), self.line_at(call.span.start))),
             };
@@ -11529,6 +11672,92 @@ impl Walker<'_> {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// If `expr` is `require(<p>)` or a require wrapper `load(<p>)` where `p` is one of the current
+    /// function's parameters, that parameter's index. So the module it loads is whichever module
+    /// specifier the caller passes for that parameter.
+    fn require_of_param(&self, expr: &Expression<'_>, env: &Env) -> Option<usize> {
+        if let Some(ident) = require_arg_ident(expr) {
+            return env.params.iter().position(|p| *p == ident);
+        }
+        if let Expression::CallExpression(call) = expr.get_inner_expression()
+            && let Expression::Identifier(f) = call.callee.get_inner_expression()
+            && let Some(&k) = self.require_wrappers.get(f.name.as_str())
+            && let Some(Expression::Identifier(arg)) = call
+                .arguments
+                .get(k)
+                .and_then(Argument::as_expression)
+                .map(Expression::get_inner_expression)
+        {
+            return env.params.iter().position(|p| *p == arg.name.as_str());
+        }
+        None
+    }
+
+    /// The module a mount helper's `router.use(prefix, child)` mounts, named in terms of the
+    /// helper's parameters: a `require('./literal')` file, `require(<param>)`/`wrapper(<param>)`
+    /// (the caller's argument names the module), or a parameter that holds a router.
+    fn mount_module_source(&self, expr: Option<&Expression<'_>>, env: &Env) -> Option<MountModule> {
+        let expr = expr?;
+        if let Some(spec) = require_spec(expr).or_else(|| {
+            // `require('./x')()` or `require('./x').router`.
+            match expr.get_inner_expression() {
+                Expression::CallExpression(c) => require_spec(&c.callee),
+                e => e
+                    .as_member_expression()
+                    .and_then(|m| require_spec(m.object())),
+            }
+        }) {
+            return self.linking.resolve(&spec).map(MountModule::Spec);
+        }
+        if let Some(index) = self.require_of_param(expr, env) {
+            return Some(MountModule::RequireParam(index));
+        }
+        if let Expression::Identifier(id) = expr.get_inner_expression() {
+            if let Some(&index) = env.require_params.get(id.name.as_str()) {
+                return Some(MountModule::RequireParam(index));
+            }
+            if let Some(index) = env.params.iter().position(|p| p == id.name.as_str()) {
+                return Some(MountModule::Param(index));
+            }
+        }
+        None
+    }
+
+    /// The router a mount helper's `mount_module` names, resolved at one call: `(target,
+    /// target_file, target_export)`, the way [`Self::mount_target`] names a direct mount argument.
+    /// `RequireParam(i)`/`Param(i)` read the caller's `i`th argument — a module specifier the loop
+    /// row supplies (`route: '@routes/v2/sites.routes'`), a `require('./x')`, or a router value.
+    fn resolve_mount(
+        &self,
+        mount: &MountModule,
+        call: &CallExpression<'_>,
+        env: &Env,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let arg = |index: usize| call.arguments.get(index).and_then(Argument::as_expression);
+        match mount {
+            MountModule::Spec(file) => (None, Some(file.clone()), None),
+            MountModule::RequireParam(index) => {
+                let Some(expr) = arg(*index) else {
+                    return (None, None, None);
+                };
+                // The argument is a module specifier (a string literal, or a loop-row field such as
+                // `route: '@routes/v2/sites.routes'`): resolve it to the mounted file.
+                if let Some(file) = self
+                    .resolve_text(expr, env)
+                    .and_then(|spec| self.linking.resolve(&spec))
+                {
+                    return (None, Some(file), None);
+                }
+                // Else the caller passes `require('./x')` (or a router value) directly.
+                self.mount_target(expr)
+            }
+            MountModule::Param(index) => match arg(*index) {
+                Some(expr) => self.mount_target(expr),
+                None => (None, None, None),
+            },
         }
     }
 
@@ -11834,6 +12063,9 @@ impl Walker<'_> {
                         }),
                     // Handed on by one of our parameters: our callers pass it.
                     handler_param: passed_handler.and_then(|e| param_of(Some(e))),
+                    // A mount is named in terms of this helper's own parameters, which the
+                    // derived template shares, so carry it through unchanged.
+                    mount_module: template.mount_module.clone(),
                     at: template.at.clone(),
                 };
                 let list = self
@@ -11854,6 +12086,23 @@ impl Walker<'_> {
             })
             .collect();
         let Ok(method) = method else { return };
+        // A mount helper instantiated here (`safeMountRoute('/sites', '@routes/v2/sites.routes')`
+        // whose body is `router.use(prefix, require(route))`): record the child module mounted under
+        // the resolved prefix, so its routes inherit it, rather than a bare `USE` route.
+        if let Some(mount) = &template.mount_module {
+            let (target, target_file, target_export) = self.resolve_mount(mount, call, env);
+            if target.is_some() || target_file.is_some() {
+                self.facts.mounts.push(MountFact {
+                    receiver: receiver.ok().flatten(),
+                    prefix: text,
+                    target,
+                    target_file,
+                    target_export,
+                    auth: template.auth.max(auth),
+                });
+            }
+            return;
+        }
         // Registered on a variable of the caller that is not a router: not a route.
         if let Ok(Some(receiver)) = &receiver
             && receiver_file.is_none()
@@ -11926,6 +12175,10 @@ impl Walker<'_> {
     fn resolve_text(&self, expr: &Expression<'_>, env: &Env) -> Option<String> {
         literal_path(expr).or_else(|| {
             let key = guards::path_key(expr)?;
+            // A loop row destructured in the loop head (`forEach(({ path }) => ...)`): the bare local.
+            if let Some(value) = env.row_fields.get(&key) {
+                return Some(value.clone());
+            }
             if let Some((var, field)) = key.split_once('.')
                 && let Some(value) = env.rows.get(var).and_then(|row| row.get(field))
             {

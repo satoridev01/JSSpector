@@ -650,21 +650,32 @@ fn resolve_rooted_source(root: &std::path::Path, rooted: &str) -> Option<String>
 /// token). Bounded to relative imports within the repository tree. Empty when the sink file cannot be
 /// read.
 fn gating_env_sources(root: &std::path::Path, finding: &Finding) -> Vec<String> {
+    // The credential gate that must be satisfied to reach the sink may sit either in the sink's own
+    // module (the branch directly around the call) or in the entry/handler module that calls into it
+    // (an integration the route requires configured before it forwards the request). Scan both files
+    // and their relative imports so a gate read anywhere along that path is reproduced.
     let sink_file = finding
         .sink
         .file
         .as_deref()
         .unwrap_or(finding.file.as_str());
-    let Ok(sink_src) = std::fs::read_to_string(root.join(sink_file)) else {
-        return Vec::new();
-    };
     let mut sources = Vec::new();
-    for spec in plan::relative_import_specifiers(&sink_src) {
-        if let Some(text) = resolve_relative_source(root, sink_file, &spec) {
-            sources.push(text);
+    let mut seen_files = Vec::new();
+    for file in [sink_file, finding.file.as_str()] {
+        if seen_files.iter().any(|f| f == file) {
+            continue;
         }
+        seen_files.push(file.to_owned());
+        let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        for spec in plan::relative_import_specifiers(&src) {
+            if let Some(text) = resolve_relative_source(root, file, &spec) {
+                sources.push(text);
+            }
+        }
+        sources.push(src);
     }
-    sources.push(sink_src);
     sources
 }
 

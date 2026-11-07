@@ -2744,16 +2744,21 @@ fn credential_env(gating_sources: &[String]) -> Vec<RequiredEnv> {
 
 /// Whether an environment variable name denotes an external-service credential the sandbox may set
 /// to a filler to satisfy a configuration precondition: an `_`-delimited segment of `TOKEN`, `PAT`,
-/// `SECRET`, `PASSWORD`, `CREDENTIAL` or `CREDENTIALS` (so `GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_PAT`
-/// qualify but `PATH` does not). Never a variable the sandbox owns.
+/// `SECRET`, `PASSWORD`, `CREDENTIAL`, `CREDENTIALS`, `KEY` or `APIKEY` (so `GITHUB_TOKEN`/
+/// `GH_TOKEN`/`GITHUB_PAT`/`GEMINI_API_KEY`/`OPENAI_API_KEY` qualify but `PATH` does not). An API
+/// key is the credential an external-service integration is gated on exactly like a token, so a
+/// random filler enables the "a credential is configured" branch without matching a real secret or
+/// relaxing authentication. Never a variable the sandbox owns.
 fn credential_name(name: &str) -> bool {
-    const KINDS: [&str; 6] = [
+    const KINDS: [&str; 8] = [
         "TOKEN",
         "PAT",
         "SECRET",
         "PASSWORD",
         "CREDENTIAL",
         "CREDENTIALS",
+        "KEY",
+        "APIKEY",
     ];
     let upper = name.to_ascii_uppercase();
     if upper.starts_with("NODE_") || upper.starts_with("NPM_") {
@@ -5123,6 +5128,11 @@ mod tests {
         assert!(credential_name("GITHUB_PAT"));
         assert!(credential_name("SESSION_SECRET"));
         assert!(credential_name("DB_PASSWORD"));
+        // An external-service API key gates an integration's forward branch exactly like a token.
+        assert!(credential_name("GEMINI_API_KEY"));
+        assert!(credential_name("OPENAI_API_KEY"));
+        assert!(credential_name("STRIPE_SECRET_KEY"));
+        assert!(credential_name("SENDGRID_APIKEY"));
         assert!(!credential_name("PATH"));
         assert!(!credential_name("DATABASE_URL"));
         assert!(!credential_name("NODE_OPTIONS"));

@@ -819,6 +819,77 @@ pub fn sql_blind_reproduced(
     t != fa && t != fb && fa == fb
 }
 
+/// A destructive table-identifier SQL-injection oracle (see [`SqlPlan::delete`]): canary table names
+/// to plant with a single row before the request, the row's unique key values (chosen distinct from
+/// anything the request binds, so the handler's own bound `WHERE` cannot match them), and two
+/// otherwise-identical requests. `benign` carries a plain identifier naming the target table, so the
+/// handler runs its real `DELETE` with its bound filter — which, not matching the planted row, must
+/// leave it. `breakout` closes the identifier's quote and appends `WHERE 1 = 1` (plus the exact
+/// placeholder count the statement binds, then a comment), forcing the filter true so every row of
+/// the named table is deleted. The injection is proved when the planted row survives `benign` but is
+/// gone after `breakout`, while a sibling canary table the request never names is untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlDeleteOracle {
+    /// The table named by both requests' identifier; planted with one row before the request.
+    pub table: String,
+    /// A second canary table the request never names; planted with one row as the directedness
+    /// control (it must survive the breakout, proving the delete was aimed by the injected name).
+    pub sibling: String,
+    /// Every column referenced by the destructive statement. The sandbox creates all of them in the
+    /// canary tables so the real statement can prepare and execute regardless of the application's
+    /// schema names.
+    pub columns: Vec<String>,
+    /// The value planted in every referenced column, chosen distinct from the request's sentinel
+    /// bindings so the handler's original `WHERE` cannot match the negative-control row.
+    pub planted_value: String,
+    /// A request carrying a plain identifier (the bare table name): the handler's real `DELETE` with
+    /// its bound filter, which must not match the planted row.
+    pub benign: Attempt,
+    /// A request whose identifier breaks out of the table position and forces the filter true.
+    pub breakout: Attempt,
+}
+
+/// The destructive-delete oracle for a table-identifier injection (see [`SqlDeleteOracle`]), or
+/// `None` when the finding is not a destructive identifier injection the planner mapped. The table
+/// and row tokens are all-lowercase and slash-free, so a handler that lowercases or path-splits the
+/// identifier before the sink does not alter the name the breakout targets. Nothing here is tied to a
+/// specific app: the quote, placeholder count and body fields are mined from the SQL plan.
+pub fn sql_delete_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<SqlDeleteOracle> {
+    let plan = probe.sql.as_ref()?;
+    let delete = plan.delete.as_ref()?;
+    let columns: Vec<String> = plan
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    if columns.is_empty() {
+        return None;
+    }
+    let table = format!("jssdt{}{nonce}", canary.token);
+    let sibling = format!("jssds{}{nonce}", canary.token);
+    let planted_value = format!("jssrow{}{nonce}", canary.token);
+    let sentinel = format!("jsssent{nonce}");
+    let close = match delete.quote {
+        Some('[') => "]",
+        Some('`') => "`",
+        Some('"') => "\"",
+        _ => "",
+    };
+    // One `? IS NULL` per bound placeholder keeps the effective statement's placeholder count equal
+    // to the number of values the handler binds, so `.run(...)` accepts the binding; `OR 1 = 1`
+    // dominates the filter, and `--` comments the statement's original tail.
+    let tail: String = (0..delete.placeholders).map(|_| " OR ? IS NULL").collect();
+    let breakout_value = format!("{table}{close} WHERE 1 = 1{tail} --");
+    Some(SqlDeleteOracle {
+        benign: place_sql(probe, &table, &plan.body_fields, &sentinel),
+        breakout: place_sql(probe, &breakout_value, &plan.body_fields, &sentinel),
+        table,
+        sibling,
+        columns,
+        planted_value,
+    })
+}
+
 /// Three otherwise-identical NoSQL requests: one match-all operator and two independent
 /// match-none controls. Only a database interpreting the object as an operator should make the
 /// first response differ while both controls agree.
@@ -1556,7 +1627,7 @@ fn json_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::plan::{AppendedParam, Entry, Method, Probe, SqlColumn, SqlPlan};
+    use super::super::plan::{AppendedParam, Entry, Method, Probe, SqlColumn, SqlDelete, SqlPlan};
     use super::*;
 
     fn probe(class: VulnClass, path: &str, entry: Entry) -> Probe {
@@ -2202,6 +2273,7 @@ mod tests {
             ],
             body_fields: vec!["id".to_owned()],
             identifier_field: None,
+            delete: None,
         });
 
         let case = sql_cases(&p, &canary, 7).expect("SQL plan produces a differential");
@@ -2238,6 +2310,7 @@ mod tests {
             ],
             body_fields: vec!["id".to_owned(), "type".to_owned()],
             identifier_field: Some("type".to_owned()),
+            delete: None,
         });
 
         let case = sql_blind_cases(&p, &canary, 1).expect("blind plan produces a differential");
@@ -2290,6 +2363,52 @@ mod tests {
             &case.volatile
         ));
         assert!(!sql_blind_reproduced(found, found, &miss_b, &case.volatile));
+    }
+
+    #[test]
+    fn sql_delete_oracle_breaks_out_of_the_quote_and_keeps_the_placeholder_count() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::SqlInjection,
+            "/api/items/remove",
+            Entry::Body(Some("bucket".to_owned())),
+        );
+        p.method = Method::Post;
+        p.sql = Some(SqlPlan {
+            columns: vec![
+                SqlColumn {
+                    name: "account_key".to_owned(),
+                    filter: true,
+                },
+                SqlColumn {
+                    name: "tenant_key".to_owned(),
+                    filter: true,
+                },
+            ],
+            body_fields: vec!["account_key".to_owned(), "bucket".to_owned()],
+            identifier_field: Some("bucket".to_owned()),
+            delete: Some(SqlDelete {
+                quote: Some('"'),
+                placeholders: 2,
+            }),
+        });
+
+        let oracle = sql_delete_oracle(&p, &canary, 1).expect("destructive oracle is produced");
+        // The benign leg names the bare table; its DELETE runs with the handler's bound filter.
+        let benign = oracle.benign.body.as_deref().unwrap();
+        assert!(benign.contains(&format!("\"bucket\":\"{}\"", oracle.table)));
+        // The breakout closes the identifier quote, forces the filter true, supplies exactly as many
+        // `?` as the statement binds, then comments the original tail.
+        let breakout = oracle.breakout.body.as_deref().unwrap();
+        assert!(breakout.contains(&format!(
+            "{}\\\" WHERE 1 = 1 OR ? IS NULL OR ? IS NULL --",
+            oracle.table
+        )));
+        // The schema comes from the statement rather than a repository-specific pair of columns, and
+        // its planted values differ from the request sentinel, so the benign filter cannot match.
+        assert_eq!(oracle.columns, ["account_key", "tenant_key"]);
+        assert_ne!(oracle.planted_value, "jsssent1");
+        assert_ne!(oracle.table, oracle.sibling);
     }
 
     #[test]

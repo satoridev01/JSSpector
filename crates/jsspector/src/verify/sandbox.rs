@@ -840,6 +840,24 @@ impl Session {
     /// injecting response but not the control's — a bound parameter can never introduce a computed
     /// column, so this is a genuine change to the statement's meaning, not mere taint reachability.
     fn exercise_sql(&self, probe: &Probe) -> Outcome {
+        // A destructive table-identifier injection (`DELETE FROM "<id>" WHERE ...`) cannot be proved
+        // by a reflected sub-select (a DELETE target is a table name, never a sub-query, and a quoted
+        // identifier is never evaluated) nor by a response differential (the delete echoes nothing).
+        // Prove it directly by a planted row disappearing under a quote-breakout.
+        if probe
+            .sql
+            .as_ref()
+            .and_then(|plan| plan.delete.as_ref())
+            .is_some()
+        {
+            return match self.verify_sql_destructive_oracle(probe) {
+                Some(poc) => Outcome::Verified {
+                    how: format!("{} {}", poc.method, poc.target),
+                    poc,
+                },
+                None => Outcome::NotReproduced { tried: 2 },
+            };
+        }
         let Some(case) = payload::sql_cases(probe, &self.canary, self.nonce) else {
             return Outcome::Skipped {
                 reason:
@@ -923,6 +941,117 @@ impl Session {
             return Outcome::NotReproduced { tried: 5 };
         }
         Outcome::NotReproduced { tried: 2 }
+    }
+
+    /// Confirms a destructive table-identifier SQL injection (`DELETE FROM "<id>" WHERE ...`) by a
+    /// DB-state differential, out of band from the HTTP response (which the handler never varies on
+    /// the delete). A canary row is planted in the table the identifier names and in a sibling table
+    /// the request never names. A `benign` request runs the handler's real `DELETE` with a plain
+    /// identifier — its bound `WHERE` does not match the planted row, so the row survives. An
+    /// otherwise-identical `breakout` request closes the identifier's quote and forces the filter
+    /// true, deleting every row of the named table while the sibling survives. The planted row
+    /// surviving the benign request but vanishing under the breakout — with the sibling intact —
+    /// proves the injected text changed the statement's meaning rather than being bound as a
+    /// parameter. All planting, requests and observation stay inside the isolated app container.
+    fn verify_sql_destructive_oracle(&self, probe: &Probe) -> Option<Reproduction> {
+        let oracle = payload::sql_delete_oracle(probe, &self.canary, self.nonce)?;
+        let files = self.discover_sqlite_files();
+        if files.is_empty() {
+            return None;
+        }
+        self.run_node(&plant_rows_js(&files, &oracle));
+        // Both canary tables must hold their planted row before the request, or the differential
+        // proves nothing.
+        let (t0, s0) = (
+            self.count_table_rows(&files, &oracle.table)?,
+            self.count_table_rows(&files, &oracle.sibling)?,
+        );
+        if t0 < 1 || s0 < 1 {
+            return None;
+        }
+        // Negative control: the handler's real DELETE, driven by a plain identifier, must leave both
+        // canary tables exactly as planted (its bound filter cannot match the planted row).
+        let _ = self.fetch(&oracle.benign);
+        let (t1, s1) = (
+            self.count_table_rows(&files, &oracle.table)?,
+            self.count_table_rows(&files, &oracle.sibling)?,
+        );
+        if t1 != t0 || s1 != s0 {
+            return None;
+        }
+        // Positive: the breakout must delete rows from the named table while the unnamed sibling
+        // table survives — a bound parameter could never name a table, and a plain identifier (the
+        // negative control) just left the row.
+        let _ = self.fetch(&oracle.breakout);
+        let (t2, s2) = (
+            self.count_table_rows(&files, &oracle.table)?,
+            self.count_table_rows(&files, &oracle.sibling)?,
+        );
+        if t2 < t1 && s2 == s1 {
+            let attempt = &oracle.breakout;
+            return Some(Reproduction {
+                command: curl_command(attempt, self.port),
+                method: attempt.verb.to_owned(),
+                target: attempt.target.clone(),
+                headers: attempt
+                    .headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect(),
+                body: attempt.body.clone(),
+                evidence:
+                    "a canary row planted in the table named by the tainted identifier survived a \
+                    request carrying a plain identifier (the handler's bound WHERE did not match it) \
+                    but was deleted by an otherwise-identical request whose identifier broke out of \
+                    the table position and forced the filter true, while a sibling canary table the \
+                    request never named survived — proving the injected text changed the DELETE's \
+                    meaning rather than being bound as a parameter"
+                        .to_owned(),
+                response: String::new(),
+            });
+        }
+        None
+    }
+
+    /// Every SQLite database file inside the running app container (by extension), excluding virtual
+    /// filesystems and vendored packages. The destructive-delete oracle plants its canary tables in
+    /// each, so whichever file the sink's connection owns carries the planted rows the request then
+    /// deletes; the others are untouched.
+    fn discover_sqlite_files(&self) -> Vec<String> {
+        let find = "find / -type f \\( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \\) \
+            -not -path '/proc/*' -not -path '/sys/*' -not -path '*/node_modules/*' 2>/dev/null \
+            | head -50";
+        let Ok(output) = self.exec(&self.app, &["sh", "-c", find]) else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Total rows of table `name` summed across every candidate database file (files without the
+    /// table contribute nothing). `None` only when the helper could not run at all.
+    fn count_table_rows(&self, files: &[String], name: &str) -> Option<i64> {
+        let out = self.run_node(&count_rows_js(files, name))?;
+        out.lines()
+            .rev()
+            .find_map(|line| line.trim().parse::<i64>().ok())
+    }
+
+    /// Runs a Node script (with `node:sqlite` enabled) inside the app container, passing it through a
+    /// base64 temp file so no shell escaping can corrupt it, mirroring how the image's helper scripts
+    /// are planted. `NODE_OPTIONS` is set to exactly the sqlite flag so a launch-time require shim is
+    /// not inherited. Returns the script's stdout.
+    fn run_node(&self, js: &str) -> Option<String> {
+        let b64 = base64(js.as_bytes());
+        let script = format!(
+            "f=$(mktemp) && echo {b64} | base64 -d > \"$f\" && \
+             NODE_OPTIONS=--experimental-sqlite node \"$f\"; rc=$?; rm -f \"$f\"; exit $rc"
+        );
+        let output = self.exec(&self.app, &["sh", "-c", &script]).ok()?;
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn exercise_nosql(&self, probe: &Probe) -> Outcome {
@@ -2002,6 +2131,75 @@ fn build_from_dockerfile(dockerfile: &str, tag: &str, context: &str) -> Result<(
 }
 
 /// `docker exec <container> <cmd...>`, capturing output.
+/// A JSON array literal of the file paths, each escaped for embedding in a JavaScript source string.
+fn js_string_array(files: &[String]) -> String {
+    let items: Vec<String> = files
+        .iter()
+        .map(|f| format!("\"{}\"", f.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// A `node:sqlite` script that, in every candidate database file, (re)creates the oracle's two canary
+/// tables and plants one known row in each. The columns are mined from the destructive statement and
+/// quoted as identifiers; row values are bound parameters. Files that cannot be opened or written are
+/// skipped.
+fn plant_rows_js(files: &[String], oracle: &payload::SqlDeleteOracle) -> String {
+    format!(
+        "const files = {files};\n\
+         const T = \"{table}\", S = \"{sibling}\", C = {columns}, V = \"{value}\";\n\
+         const qi = x => '\"' + String(x).replaceAll('\"', '\"\"') + '\"';\n\
+         let sqlite; try {{ sqlite = require(\"node:sqlite\"); }} catch (e) {{ process.exit(0); }}\n\
+         const {{ DatabaseSync }} = sqlite;\n\
+         for (const f of files) {{\n\
+           try {{\n\
+             const db = new DatabaseSync(f);\n\
+             try {{ db.exec(\"PRAGMA busy_timeout = 4000\"); }} catch (e) {{}}\n\
+             for (const name of [T, S]) {{\n\
+               const defs = C.map(column => qi(column) + ' TEXT').join(', ');\n\
+               const names = C.map(qi).join(', ');\n\
+               const marks = C.map(() => '?').join(', ');\n\
+               db.exec('CREATE TABLE IF NOT EXISTS ' + qi(name) + ' (' + defs + ')');\n\
+               db.exec('DELETE FROM ' + qi(name));\n\
+               db.prepare('INSERT INTO ' + qi(name) + ' (' + names + ') VALUES (' + marks + ')')\n\
+                 .run(...C.map(() => V));\n\
+             }}\n\
+             db.close();\n\
+           }} catch (e) {{}}\n\
+         }}\n",
+        files = js_string_array(files),
+        table = oracle.table,
+        sibling = oracle.sibling,
+        columns = js_string_array(&oracle.columns),
+        value = oracle.planted_value,
+    )
+}
+
+/// A `node:sqlite` script that prints the total number of rows of table `name` across every candidate
+/// database file. Files that lack the table (or cannot be opened) contribute nothing.
+fn count_rows_js(files: &[String], name: &str) -> String {
+    format!(
+        "const files = {files};\n\
+         const name = \"{name}\";\n\
+         const qi = x => '\"' + String(x).replaceAll('\"', '\"\"') + '\"';\n\
+         let sqlite; try {{ sqlite = require(\"node:sqlite\"); }} catch (e) {{ console.log(-1); process.exit(0); }}\n\
+         const {{ DatabaseSync }} = sqlite;\n\
+         let total = 0;\n\
+         for (const f of files) {{\n\
+           try {{\n\
+             const db = new DatabaseSync(f);\n\
+             try {{ db.exec(\"PRAGMA busy_timeout = 4000\"); }} catch (e) {{}}\n\
+             const r = db.prepare('SELECT count(*) AS c FROM ' + qi(name)).get();\n\
+             total += Number(r.c) || 0;\n\
+             db.close();\n\
+           }} catch (e) {{}}\n\
+         }}\n\
+         console.log(total);\n",
+        files = js_string_array(files),
+        name = name,
+    )
+}
+
 fn exec_in(container: &str, cmd: &[&str]) -> Result<Output, String> {
     let mut args = vec!["exec", container];
     args.extend_from_slice(cmd);
@@ -3052,16 +3250,69 @@ fn manifest_start_command(root: &std::path::Path) -> Option<String> {
     {
         return Some(format!("[\"npm\",\"run\",\"{script}\"]"));
     }
-    let main = json?.get("main")?.as_str()?.to_owned();
-    let main = package_file(root, &main)?;
-    // A `main` that is a plug-in handler module — it registers an HTTP request handler on a
-    // host-provided web-server service but never listens itself — would just evaluate and exit under
-    // `node <main>`, never binding a port. Mount its registered handler(s) on a throwaway server
-    // instead, so a genuinely reachable sink is still exercised.
-    if is_plugin_handler(&root.join(&main)) {
-        return Some(plugin_host_command(&main));
+    if let Some(main) = json
+        .as_ref()
+        .and_then(|value| value.get("main"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|main| package_file(root, main))
+    {
+        // A `main` that is a plug-in handler module — it registers an HTTP request handler on a
+        // host-provided web-server service but never listens itself — would just evaluate and exit
+        // under `node <main>`, never binding a port. Mount its registered handler(s) on a throwaway
+        // server instead, so a genuinely reachable sink is still exercised.
+        if is_plugin_handler(&root.join(&main)) {
+            return Some(plugin_host_command(&main));
+        }
+        return Some(format!("[\"node\",\"{main}\"]"));
     }
-    Some(format!("[\"node\",\"{main}\"]"))
+    // No start script and no `main`: a package may still document a conventional launcher entry file
+    // (`node src/index.js`) while reserving every npm script for tests or deployment. Launch that
+    // file directly so the route under test is served. The chosen file must itself bind a port, so
+    // running it starts the server rather than loading a library.
+    conventional_entry(root).map(|file| format!("[\"node\",\"{file}\"]"))
+}
+
+/// A conventional launcher entry file of the package, when its manifest names no launch. Node's own
+/// default entry (`index.js`) and the common server filenames (`server`, `app`, `main`) are tried at
+/// the package root and under `src/` and `bin/`, in that order. The chosen file must itself bind a
+/// port ([`is_launchable_entry`]) so that running it with `node <file>` starts the server rather than
+/// merely loading a library or exporting an unstarted app factory.
+fn conventional_entry(root: &std::path::Path) -> Option<String> {
+    const DIRS: [&str; 3] = ["", "src", "bin"];
+    const NAMES: [&str; 4] = ["index", "server", "app", "main"];
+    const EXTS: [&str; 3] = ["js", "cjs", "mjs"];
+    for dir in DIRS {
+        for name in NAMES {
+            for ext in EXTS {
+                let rel = if dir.is_empty() {
+                    format!("{name}.{ext}")
+                } else {
+                    format!("{dir}/{name}.{ext}")
+                };
+                if let Some(file) = package_file(root, &rel)
+                    && is_launchable_entry(&root.join(&file))
+                {
+                    return Some(file);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether a JavaScript file starts a server when run with `node <file>`: it binds a port (`.listen(`),
+/// whether it constructs the listener itself or imports an app factory and listens on the result. Used
+/// to select a conventional launcher entry when the manifest names no launch; a module that only
+/// exports an unstarted app (no `.listen(`) is not a launcher.
+fn is_launchable_entry(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    std::fs::read_to_string(path).is_ok_and(|src| src.contains(".listen("))
 }
 
 /// The launch command that mounts a plug-in handler module through the plug-in host shim
@@ -5614,6 +5865,54 @@ mod tests {
             false,
         );
         assert!(file.contains(r#"printf '"%s"' 'cafed00d'"#), "{file}");
+    }
+
+    #[test]
+    fn a_conventional_entry_is_launched_when_no_script_or_main_names_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A manifest that reserves every script for tests and declares no `main`, as a package
+        // documented to start with `node src/index.js` does.
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"test":"node --test"}}"#,
+        );
+        // The launcher binds a port by listening on an app factory it imports; it does not construct
+        // the listener itself.
+        write(
+            root,
+            "src/index.js",
+            "const { createApp } = require('./app');\n\
+             createApp().listen(Number(process.argv[2] || 8080));\n",
+        );
+        // The factory only exports an unstarted server; it is not itself a launcher.
+        write(
+            root,
+            "src/app.js",
+            "const http = require('http');\n\
+             exports.createApp = () => http.createServer((req, res) => res.end('ok'));\n",
+        );
+
+        assert!(is_launchable_entry(&root.join("src/index.js")));
+        assert!(!is_launchable_entry(&root.join("src/app.js")));
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["node","src/index.js"]"#)
+        );
+        // A package with no launcher-shaped entry stays unlaunchable.
+        let lib = tempfile::tempdir().unwrap();
+        write(
+            lib.path(),
+            "package.json",
+            r#"{"scripts":{"test":"node --test"}}"#,
+        );
+        write(
+            lib.path(),
+            "index.js",
+            "module.exports = { add: (a, b) => a + b };\n",
+        );
+        assert_eq!(manifest_start_command(lib.path()), None);
     }
 
     #[test]

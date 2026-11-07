@@ -182,6 +182,29 @@ pub struct SqlPlan {
     /// `Body(None)`, which would place the sub-select in a generic default field the sink never uses as
     /// the table identifier. `None` when the tainted identifier is not a plain body member.
     pub identifier_field: Option<String>,
+    /// When the tainted identifier is interpolated into the table position of a *row-destroying*
+    /// statement whose effect the handler never reflects (`DELETE FROM "<id>" WHERE ...`), how to
+    /// drive a quote-breakout that deletes every row of the named table. Such a sink cannot be
+    /// proved by a reflected sub-select (a `DELETE` target is a table name, never a sub-query, and a
+    /// quoted identifier is not evaluated) nor by a response differential (the delete echoes
+    /// nothing); it is proved instead by a planted row disappearing. `None` for a non-destructive
+    /// identifier injection (a `SELECT ... FROM <id>` the reflected/blind oracles already drive).
+    pub delete: Option<SqlDelete>,
+}
+
+/// How to drive a quote-breakout against a destructive table-identifier injection
+/// (`DELETE FROM "<id>" WHERE ... = ?`): the opening identifier quote (`"`, `` ` ``, `[`) if the
+/// position is quoted, so the breakout can close it, and the number of bound `?` placeholders the
+/// statement carries, so the injected tail supplies the same count and the handler's `.run(...)`
+/// binding succeeds. Mined from the handler source only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlDelete {
+    /// The identifier's opening quote character when the position is quoted (`"`, `` ` ``, `[`), or
+    /// `None` for a bare identifier. The breakout emits the matching closing quote (`]` for `[`).
+    pub quote: Option<char>,
+    /// The number of `?` placeholders in the statement, equal to the count of values the handler
+    /// binds; the injected tail reproduces exactly this many so the binding is accepted.
+    pub placeholders: usize,
 }
 
 impl Probe {
@@ -4067,7 +4090,59 @@ pub fn sql_identifier_plan(source: &str, tainted: &[String]) -> Option<SqlPlan> 
         columns,
         body_fields,
         identifier_field,
+        delete: sql_delete_identifier(source, tainted),
     })
+}
+
+/// For a tainted identifier interpolated into the table position of a `DELETE` statement, the
+/// quote-breakout parameters (see [`SqlDelete`]). Shares the quote-aware table-position scan of
+/// [`table_identifier_name`], but additionally requires the enclosing template literal to be a
+/// `DELETE` and records the opening identifier quote and the statement's `?` count. `None` when no
+/// such `DELETE` interpolates a tainted identifier. Mined from the handler source only.
+fn sql_delete_identifier(source: &str, tainted: &[String]) -> Option<SqlDelete> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("${") {
+        let at = from + rel;
+        from = at + 2;
+        let Some(close) = source[at + 2..].find('}').map(|c| at + 2 + c) else {
+            continue;
+        };
+        let inner = source[at + 2..close].trim();
+        if !tainted.iter().any(|name| name == inner) {
+            continue;
+        }
+        let pre_raw = source[..at].trim_end();
+        let quote = pre_raw
+            .chars()
+            .next_back()
+            .filter(|c| *c == '"' || *c == '`' || *c == '[');
+        let pre = match quote {
+            Some(_) => pre_raw[..pre_raw.len() - 1].trim_end(),
+            None => pre_raw,
+        };
+        let last_word: String = pre
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if !last_word.eq_ignore_ascii_case("from") {
+            continue;
+        }
+        let Some(stmt) = enclosing_template_literal(source, at) else {
+            continue;
+        };
+        if !stmt.trim_start().to_ascii_lowercase().starts_with("delete") {
+            continue;
+        }
+        return Some(SqlDelete {
+            quote,
+            placeholders: stmt.matches('?').count(),
+        });
+    }
+    None
 }
 
 /// The first tainted identifier interpolated in a table-identifier position (`FROM`/`JOIN`/`INTO`/
@@ -4087,7 +4162,15 @@ fn table_identifier_name(source: &str, tainted: &[String]) -> Option<String> {
         if !tainted.iter().any(|name| name == inner) {
             continue;
         }
+        // A quoted-identifier position (`FROM "${x}"`, `` FROM `${x}` ``, `FROM [${x}]`) puts the
+        // opening quote immediately before `${`; strip one such quote so the preceding SQL keyword is
+        // still recognized. A value-position quote (`'${x}'`) is not an identifier quote and is left
+        // in place, so a value injection is not misclassified as an identifier one.
         let pre = source[..at].trim_end();
+        let pre = pre
+            .strip_suffix(|c| c == '"' || c == '`' || c == '[')
+            .map(str::trim_end)
+            .unwrap_or(pre);
         let last_word: String = pre
             .chars()
             .rev()
@@ -4124,7 +4207,15 @@ fn identifier_interpolating_statements(source: &str, tainted: &[String]) -> Vec<
         if !tainted.iter().any(|name| name == inner) {
             continue;
         }
+        // A quoted-identifier position (`FROM "${x}"`, `` FROM `${x}` ``, `FROM [${x}]`) puts the
+        // opening quote immediately before `${`; strip one such quote so the preceding SQL keyword is
+        // still recognized. A value-position quote (`'${x}'`) is not an identifier quote and is left
+        // in place, so a value injection is not misclassified as an identifier one.
         let pre = source[..at].trim_end();
+        let pre = pre
+            .strip_suffix(|c| c == '"' || c == '`' || c == '[')
+            .map(str::trim_end)
+            .unwrap_or(pre);
         let last_word: String = pre
             .chars()
             .rev()
@@ -5990,5 +6081,52 @@ module.exports = { healthScoreValidators };\n";
 
         let value_position = "db.prepare(`SELECT * FROM items WHERE title = '${tableName}'`)";
         assert!(sql_identifier_plan(value_position, &["tableName".to_owned()]).is_none());
+    }
+
+    #[test]
+    fn quoted_delete_identifier_is_detected_as_a_destructive_injection() {
+        // A tainted identifier interpolated into a *double-quoted* table position of a DELETE is both
+        // recognized (the opening quote no longer hides the preceding `FROM`) and marked destructive,
+        // with the breakout parameters mined: the quote to close and the bound-placeholder count.
+        let source = r#"
+          router.post('/api/items/remove', async (req, res) => {
+            let { bucket, accountKey } = req.body;
+            const tableName = bucket;
+            await db.prepare(
+              `DELETE FROM "${tableName}" WHERE account_key = ? OR tenant_key = ?`
+            ).run(accountKey, "public");
+          });
+        "#;
+        let plan = sql_identifier_plan(source, &["tableName".to_owned()])
+            .expect("quoted table-identifier DELETE is driveable");
+        let delete = plan
+            .delete
+            .as_ref()
+            .expect("the DELETE is marked destructive");
+        assert_eq!(delete.quote, Some('"'));
+        assert_eq!(delete.placeholders, 2);
+        assert!(
+            plan.columns
+                .iter()
+                .any(|c| c.name == "account_key" && c.filter)
+        );
+        assert!(
+            plan.columns
+                .iter()
+                .any(|c| c.name == "tenant_key" && c.filter)
+        );
+
+        // A non-destructive SELECT in an identifier position carries no destructive plan.
+        let select = "db.prepare(`SELECT * FROM ${tableName} WHERE account_key = ?`).get(key)";
+        assert!(
+            sql_identifier_plan(select, &["tableName".to_owned()])
+                .expect("select identifier is driveable")
+                .delete
+                .is_none()
+        );
+
+        // A value-position quote is not an identifier quote: no destructive plan is produced.
+        let value = "db.prepare(`DELETE FROM items WHERE name = '${tableName}'`).run()";
+        assert!(sql_delete_identifier(value, &["tableName".to_owned()]).is_none());
     }
 }

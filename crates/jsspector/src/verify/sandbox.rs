@@ -3107,7 +3107,14 @@ fn env_var_names(src: &str) -> Vec<String> {
 /// for an app that fixes its own port (`server.listen(8000)`), the one TCP port the container
 /// listens on where the driver reaches it (from `/proc/net/tcp*`, bound to every address or to
 /// `127.0.0.1`/`::1`; Docker's own resolver on `127.0.0.11` is not the app, and nothing else
-/// runs there). Several candidates and none on `PORT` is ambiguous: not ready.
+/// runs there).
+///
+/// Several candidates and none on `PORT` is no longer ambiguous: an app that fixes its own port and
+/// also stands up a sidecar listener (a WebSocket server on its own port, `ws` / `express-ws`, is the
+/// common case) binds two ports, only one of which serves the HTTP routes the finding targets. Each
+/// candidate is probed with a plain `GET /`; the one that answers as a real HTTP server is chosen,
+/// skipping a WebSocket-only endpoint (standalone `ws` answers a non-upgrade request with
+/// `426 Upgrade Required`). The lowest such port wins when more than one serves HTTP.
 fn listening_probe(wanted: u16) -> String {
     format!(
         "const fs=require('fs'),net=require('net');const ports=new Set();\
@@ -3115,11 +3122,22 @@ fn listening_probe(wanted: u16) -> String {
          for(const l of t.split('\\n').slice(1)){{const c=l.trim().split(/\\s+/);\
          const [a,p]=(c[1]||'').split(':');\
          if(c[3]==='0A'&&p&&(/^0+$/.test(a)||a==='0100007F'||a==='00000000000000000000000001000000'))ports.add(parseInt(p,16))}}}}\
-         const list=[...ports];const port=ports.has({wanted})||!list.length?{wanted}:(list.length===1?list[0]:0);\
-         if(!port)process.exit(1);\
-         const hosts=['127.0.0.1','::1'];let hi=0;\
-         (function go(){{if(hi>=hosts.length)process.exit(1);\
-         net.connect({{port,host:hosts[hi++]}}).on('connect',()=>{{console.log(port);process.exit(0)}}).on('error',()=>go());}})();"
+         const list=[...ports];const hosts=['127.0.0.1','::1'];\
+         const single=ports.has({wanted})||!list.length?{wanted}:(list.length===1?list[0]:0);\
+         function tcpOk(port,cb){{let hi=0;(function go(){{if(hi>=hosts.length)return cb(false);\
+         net.connect({{port,host:hosts[hi++]}}).on('connect',function(){{this.destroy();cb(true)}}).on('error',()=>go());}})();}}\
+         function httpOk(port,cb){{let hi=0;(function go(){{if(hi>=hosts.length)return cb(false);\
+         const s=net.connect({{port,host:hosts[hi++]}});let buf='';let done=false;\
+         const fin=(v)=>{{if(done)return;done=true;try{{s.destroy()}}catch{{}}if(v)return cb(true);go()}};\
+         s.setTimeout(2000);\
+         s.on('connect',()=>s.write('GET / HTTP/1.0\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n'));\
+         s.on('data',(d)=>{{buf+=d;const m=/^HTTP\\/\\d\\.\\d (\\d{{3}})/.exec(buf.split('\\r\\n')[0]);\
+         if(m)fin(m[1]!=='426')}});\
+         s.on('timeout',()=>fin(false));s.on('error',()=>fin(false));s.on('close',()=>fin(false));}})();}}\
+         if(single){{tcpOk(single,ok=>{{if(ok){{console.log(single);process.exit(0)}}process.exit(1)}})}}\
+         else{{const cands=list.slice().sort((a,b)=>a-b);let i=0;\
+         (function next(){{if(i>=cands.length)process.exit(1);const port=cands[i++];\
+         httpOk(port,ok=>{{if(ok){{console.log(port);process.exit(0)}}next()}});}})();}}"
     )
 }
 
@@ -5332,6 +5350,30 @@ mod tests {
                 && s.contains("system.profile').drop()")
                 && ENABLE_PROFILING_SCRIPT.contains("setProfilingLevel(2)"),
             "enables then disables profiling and drops its log"
+        );
+    }
+
+    #[test]
+    fn listening_probe_disambiguates_multiple_bound_ports_over_http() {
+        // An app that fixes its own HTTP port and also stands up a WebSocket sidecar binds two ports;
+        // the probe must still become ready by choosing the one that serves plain HTTP, not give up as
+        // ambiguous. The requested `PORT` is still preferred when the app honors it.
+        let s = listening_probe(3000);
+        assert!(
+            s.contains("ports.has(3000)"),
+            "prefers the requested PORT when present"
+        );
+        assert!(
+            s.contains("GET / HTTP/1.0"),
+            "probes each candidate with a plain HTTP request"
+        );
+        assert!(
+            s.contains("'426'"),
+            "skips a WebSocket-only endpoint that answers 426 Upgrade Required"
+        );
+        assert!(
+            s.contains("sort((a,b)=>a-b)"),
+            "scans candidate ports in a deterministic order"
         );
     }
 

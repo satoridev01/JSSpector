@@ -522,7 +522,9 @@ impl Method {
             "PUT" => Self::Put,
             "PATCH" => Self::Patch,
             "DELETE" => Self::Delete,
-            "ANY" => Self::Any,
+            // `app.all(...)` / `router.all(...)` register one handler for every HTTP method, which
+            // is exactly what `Any` models; the engine uppercases the `all` verb to `ALL`.
+            "ANY" | "ALL" => Self::Any,
             "USE" => Self::Use,
             "UPGRADE" => Self::Upgrade,
             _ => return None,
@@ -5427,6 +5429,25 @@ pub fn derive_http_entry(finding: &Finding) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::Method;
+
+    #[test]
+    fn parse_entry_treats_express_all_as_any_method() {
+        // `app.all('/files', ...)` registers one handler for every HTTP method; the engine uppercases
+        // the `all` verb to `ALL`, which the planner must drive like `Any` (a routable HTTP path),
+        // not reject as unroutable.
+        let (method, path) = super::parse_entry("ALL /files").expect("ALL route is routable");
+        assert_eq!(method, Method::Any);
+        assert_eq!(path, "/files");
+        // The existing catch-all spelling still parses.
+        assert_eq!(
+            super::parse_entry("ANY /x").map(|(m, _)| m),
+            Some(Method::Any)
+        );
+        // A non-method verb (an event kind) is still not a routable HTTP path.
+        assert!(super::parse_entry("SOCKET /x").is_none());
+    }
+
     #[test]
     fn body_field_reaches_sink_as_element_detects_per_element_query() {
         // `for (const d of device_names) ... findOne({ name: d })`: the body field is iterated and

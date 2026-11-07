@@ -417,43 +417,57 @@ fn directory_listing_attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec
     if probe.class != VulnClass::PathTraversal || !probe.lists_dir {
         return Vec::new();
     }
-    let Entry::PathParam(tainted) = &probe.entry else {
-        return Vec::new();
-    };
     let verb = probe.method.verb(&probe.entry);
     let dir = canary.planted_dir();
     let dir = dir.trim_start_matches('/');
-    // The sibling values to drive the appended slot with; an empty name means no appended slot (the
-    // tainted value is itself the listed directory).
-    let sibling: Vec<(String, String)> = match &probe.appended_param {
-        Some(ap) => ap
-            .values
-            .iter()
-            .map(|v| (ap.name.clone(), v.clone()))
-            .collect(),
-        None => vec![(String::new(), String::new())],
-    };
-    let mut out = Vec::new();
-    for (sib_name, sib_value) in &sibling {
-        for depth in [1usize, 2, 3, 5, 7, 9, 12] {
-            let climb = format!("{}{dir}", "../".repeat(depth));
-            let mut target = probe
-                .path
-                .replace(&format!("{{{tainted}}}"), &encode_segment(&climb));
-            if !sib_name.is_empty() {
-                target = target.replace(&format!("{{{sib_name}}}"), &encode_path(sib_value));
+    let signal = Signal::ResponseContains(canary.listing_token(nonce));
+    let depths = [1usize, 2, 3, 5, 7, 9, 12];
+    // A route parameter the handler appends a fixed sibling segment after (`path.join(base, kind,
+    // {dir})`): climb the tainted parameter to the planted directory, and drive the appended slot with
+    // an accepted enum value so the completed path lands on a real planted subdirectory. An empty
+    // sibling name means no appended slot — the tainted value is itself the listed directory.
+    if let Entry::PathParam(tainted) = &probe.entry {
+        let sibling: Vec<(String, String)> = match &probe.appended_param {
+            Some(ap) => ap
+                .values
+                .iter()
+                .map(|v| (ap.name.clone(), v.clone()))
+                .collect(),
+            None => vec![(String::new(), String::new())],
+        };
+        let mut out = Vec::new();
+        for (sib_name, sib_value) in &sibling {
+            for depth in depths {
+                let climb = format!("{}{dir}", "../".repeat(depth));
+                let mut target = probe
+                    .path
+                    .replace(&format!("{{{tainted}}}"), &encode_segment(&climb));
+                if !sib_name.is_empty() {
+                    target = target.replace(&format!("{{{sib_name}}}"), &encode_path(sib_value));
+                }
+                target = fill_remaining(&target, &probe.path_fillers);
+                out.push(Attempt {
+                    verb,
+                    target,
+                    body: None,
+                    headers: Vec::new(),
+                    signal: signal.clone(),
+                });
             }
-            target = fill_remaining(&target, &probe.path_fillers);
-            out.push(Attempt {
-                verb,
-                target,
-                body: None,
-                headers: Vec::new(),
-                signal: Signal::ResponseContains(canary.listing_token(nonce)),
-            });
         }
+        return out;
     }
-    out
+    // The tainted input is a query/body field or the request URL (`req.query.path` reaching
+    // `fs.readdirSync`): climb that same input to the planted canary directory, placed in whichever
+    // request part the finding's source names. The handler enumerates the directory and the listing
+    // response carries the planted token-named entry.
+    depths
+        .into_iter()
+        .map(|depth| {
+            let climb = format!("{}{dir}", "../".repeat(depth));
+            place(probe, verb, &climb, signal.clone())
+        })
+        .collect()
 }
 
 /// The three requests of the path-traversal read oracle, used as a fallback when a read sink
@@ -1926,6 +1940,41 @@ mod tests {
         // base64url is a single clean path segment (no `/`, no `=` padding).
         assert!(!seg.contains('/') && !seg.contains('='));
         assert_eq!(a[0].signal, Signal::ServiceReached(canary.service_token(1)));
+    }
+
+    #[test]
+    fn a_query_directory_listing_climbs_to_the_planted_dir() {
+        let canary = Canary::new("tok".to_owned());
+        // `app.all('/files', ...)` reads `req.query.path` and lists it with `fs.readdirSync`; the
+        // tainted input is a query field, not a route parameter.
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/files",
+            Entry::Query("path".to_owned()),
+        );
+        p.lists_dir = true;
+        let a = attempts(&p, &canary, 3);
+        assert!(
+            !a.is_empty(),
+            "a query-sourced listing sink yields climbing attempts"
+        );
+        // Every attempt climbs the query field to the planted canary *directory*, and proves itself by
+        // the planted token-named entry surfacing in the listing response.
+        for attempt in &a {
+            assert!(attempt.target.starts_with("/files?path="));
+            let value = attempt
+                .target
+                .strip_prefix("/files?path=")
+                .and_then(|s| s.split('&').next())
+                .expect("the payload rides the query field");
+            assert!(value.contains("..") && value.ends_with(&encode(PLANTED_DIR)));
+            assert_eq!(
+                attempt.signal,
+                Signal::ResponseContains(canary.listing_token(3))
+            );
+        }
+        // The deepest climb reaches the filesystem root where the canary directory is planted.
+        assert!(a.iter().any(|at| at.target.contains(&"..%2F".repeat(12))));
     }
 
     #[test]

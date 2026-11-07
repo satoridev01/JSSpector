@@ -2350,8 +2350,16 @@ fn required_env(log: &str) -> Vec<RequiredEnv> {
             const QUOTES: [char; 5] = ['"', '\'', '`', ' ', ':'];
             let after = lower[at + word.len()..].trim_start_matches(QUOTES);
             let before = lower[..at].trim_end_matches(QUOTES);
+            let before = before.strip_suffix("(s)").unwrap_or(before);
+            let after_noun_demand = ["environment variable", "env var"].iter().any(|noun| {
+                after
+                    .strip_prefix(noun)
+                    .map(|rest| rest.trim_start_matches(QUOTES))
+                    .is_some_and(|rest| AFTER.iter().any(|phrase| rest.starts_with(phrase)))
+            });
             let demanded = AFTER.iter().any(|p| after.starts_with(p))
-                || BEFORE.iter().any(|p| before.ends_with(p));
+                || BEFORE.iter().any(|p| before.ends_with(p))
+                || after_noun_demand;
             if demanded && out.iter().all(|e| e.name != word) {
                 let (value, directory) =
                     typed_env_value(word).unwrap_or_else(|| ("jsspector".to_owned(), false));
@@ -4617,6 +4625,8 @@ mod tests {
             \x20 if (!value) throw new Error(`${WORKSPACE_ROOT_ENV} is required`);\n\
             Error: NOOBOT_WORKSPACE_ROOT is required\n\
             Missing required environment variable: DATABASE_URL\n\
+            Missing env var(s): REDIS_URL\n\
+            AIRQO_ENV environment variable not set\n\
             \"SESSION_SECRET\" must be set\n\
             Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'x' is missing\n\
             NODE_OPTIONS is not set\n\
@@ -4627,7 +4637,13 @@ mod tests {
         let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            ["NOOBOT_WORKSPACE_ROOT", "DATABASE_URL", "SESSION_SECRET"]
+            [
+                "NOOBOT_WORKSPACE_ROOT",
+                "DATABASE_URL",
+                "REDIS_URL",
+                "AIRQO_ENV",
+                "SESSION_SECRET"
+            ]
         );
         assert_eq!(
             env[0],
@@ -4639,7 +4655,9 @@ mod tests {
         );
         assert_eq!(env[1].value, "http://jss-filler.test/");
         assert!(!env[1].directory);
-        assert_eq!(env[2].value, STRONG_FILLER_SECRET);
+        assert_eq!(env[2].value, "http://jss-filler.test/");
+        assert_eq!(env[3].value, "jsspector");
+        assert_eq!(env[4].value, STRONG_FILLER_SECRET);
         assert!(STRONG_FILLER_SECRET.len() >= 64);
         assert!(required_env("the app did not listen within 90s").is_empty());
     }

@@ -1858,6 +1858,69 @@ pub fn validator_required_body_fields(
     out
 }
 
+/// Type-valid fillers for non-payload path slots constrained by required express-validator
+/// `param("slot")` chains attached to the route. Middleware member expressions are resolved through
+/// their root namespace (`validators.group.rule` -> `validators`).
+pub fn validator_path_fillers(
+    route_source: &str,
+    route_line: u32,
+    path: &str,
+    payload_slot: Option<&str>,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let slots = route_slots(path);
+    if slots.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for middleware in route_middleware_roots(route_source, route_line) {
+        let Some(module) = resolve(&middleware) else {
+            continue;
+        };
+        let requirements = validator_param_requirements(&module);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] validator-path-module root={middleware} requirements={requirements:?}"
+            );
+        }
+        for (slot, value) in requirements {
+            if Some(slot.as_str()) == payload_slot {
+                continue;
+            }
+            if slots.contains(&slot) && out.iter().all(|(name, _)| *name != slot) {
+                out.push((slot, value));
+            }
+        }
+    }
+    out
+}
+
+/// Required `param("slot")` chains and values satisfying their declared type.
+fn validator_param_requirements(module: &str) -> Vec<(String, String)> {
+    let starts = chain_starts(module);
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (idx, (pos, field, builder)) in starts.iter().enumerate() {
+        if builder != "param" {
+            continue;
+        }
+        let Some(field) = field else {
+            continue;
+        };
+        let end = starts
+            .get(idx + 1)
+            .map(|item| item.0)
+            .unwrap_or(module.len());
+        let window = &module[*pos..end];
+        if window.contains(".optional(") {
+            continue;
+        }
+        if out.iter().all(|(name, _)| name != field) {
+            out.push((field.clone(), validator_filler(field, window)));
+        }
+    }
+    out
+}
+
 /// The bare-identifier arguments of the route registration on `line` (`router.post("/x", mwA, mwB,
 /// controller)` -> `["mwA", "mwB"]`, skipping the path string and a `obj.method` controller). These
 /// are the middleware names the route mounts, among them any express-validator array.
@@ -1877,6 +1940,36 @@ pub fn route_middleware_idents(source: &str, line: u32) -> Vec<String> {
         let arg = arg.trim();
         if !arg.is_empty() && arg.bytes().all(is_ident) {
             out.push(arg.to_owned());
+        }
+    }
+    out
+}
+
+/// Root identifiers of the route's middleware arguments, including member expressions
+/// (`validators.group.rule` -> `validators`). The path string itself is ignored.
+pub fn route_middleware_roots(source: &str, line: u32) -> Vec<String> {
+    let Some(start) = line_offset(source, line as usize) else {
+        return Vec::new();
+    };
+    let Some(prel) = source[start..].find('(') else {
+        return Vec::new();
+    };
+    let popen = start + prel;
+    let Some(pclose) = matching_close_paren(source, popen) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for arg in split_top_level_commas(&source[popen + 1..pclose]) {
+        let root = arg.trim().split(['.', '(', '[', ' ']).next().unwrap_or("");
+        if !root.is_empty()
+            && root.bytes().all(is_ident)
+            && root
+                .bytes()
+                .next()
+                .is_some_and(|byte| !byte.is_ascii_digit())
+            && !out.iter().any(|existing| existing == root)
+        {
+            out.push(root.to_owned());
         }
     }
     out
@@ -4730,6 +4823,35 @@ const {\n  validateTenant,\n  validateCreateShippingBatch,\n  validate2,\n} = re
         assert_eq!(
             got,
             vec![("device_names".to_owned(), "[\"jsspector\"]".to_owned())]
+        );
+    }
+
+    #[test]
+    fn namespace_validator_supplies_a_typed_non_payload_path_slot() {
+        let route = "router.get(\n  \"/:email/health-score\",\n  analyticsValidations.healthScoreValidators.getHealthScore,\n  controller.getEngagementHealth\n);\n";
+        let validator = "const validateUserEmail = param(\"email\").isEmail();\n\
+const healthScoreValidators = {\n  getHealthScore: [validateUserEmail, query(\"includeFactors\").optional().isBoolean()]\n};\n\
+module.exports = { healthScoreValidators };\n";
+        let got = super::validator_path_fillers(
+            route,
+            1,
+            "/api/v2/users/analytics/{email}/health-score",
+            None,
+            &|name| (name == "analyticsValidations").then(|| validator.to_owned()),
+        );
+        assert_eq!(
+            got,
+            vec![("email".to_owned(), "jss@jsspector.test".to_owned())]
+        );
+        assert!(
+            super::validator_path_fillers(
+                route,
+                1,
+                "/api/v2/users/analytics/{email}/health-score",
+                Some("email"),
+                &|name| (name == "analyticsValidations").then(|| validator.to_owned()),
+            )
+            .is_empty()
         );
     }
 

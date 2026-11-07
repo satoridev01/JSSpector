@@ -171,6 +171,46 @@ pub fn run(
             );
         }
     }
+    // A route whose express-validator middleware constrains a non-payload path parameter
+    // (`param("email").isEmail()`, `param("id").isMongoId()`) rejects the generic `1` slot
+    // placeholder before the sink. Resolve the route's validator middleware and use a type-valid
+    // filler for every constrained path slot except the payload-bearing one.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.path.contains('{')
+            && let Some(at) = &finding.entry_at
+            && let Ok(route_src) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let payload_slot = match &probe.entry {
+                plan::Entry::PathParam(name) => Some(name.as_str()),
+                _ => None,
+            };
+            let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
+            let mined = plan::validator_path_fillers(
+                &route_src,
+                at.line,
+                &probe.path,
+                payload_slot,
+                &resolve,
+            );
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                let roots = plan::route_middleware_roots(&route_src, at.line);
+                let resolved = roots
+                    .iter()
+                    .map(|name| (name.clone(), resolve(name).is_some()))
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[verify] validator-path at={}:{} path={} roots={resolved:?} mined={mined:?}",
+                    at.file, at.line, probe.path
+                );
+            }
+            for (slot, value) in mined {
+                if probe.path_fillers.iter().all(|(name, _)| *name != slot) {
+                    probe.path_fillers.push((slot, value));
+                }
+            }
+        }
+    }
     // A sink reached only past a guard on a body field the payload does not itself ride (the payload
     // enters through a path segment or query parameter, but `const { id } = req.body; if (!id) throw`
     // rejects the request first). Mine those required body fields so the request carries them and
@@ -511,11 +551,17 @@ fn resolve_middleware_source(
     route_src: &str,
     name: &str,
 ) -> Option<String> {
+    // Resolve an explicit import/require binding before testing for a local function. The generic
+    // function-body recognizer deliberately accepts several assignment forms and can otherwise
+    // mistake `const name = require(...)` for a function when a later object literal supplies the
+    // first `{` after that binding.
+    if let Some(spec) = plan::import_or_require_source_path(route_src, name) {
+        return resolve_import_source(root, route_file, &spec);
+    }
     if plan::defines_const_array(route_src, name) || plan::defines_function(route_src, name) {
         return Some(route_src.to_owned());
     }
-    let spec = plan::import_or_require_source_path(route_src, name)?;
-    resolve_import_source(root, route_file, &spec)
+    None
 }
 
 /// The source a module specifier resolves to from `from_file`: a relative specifier through
@@ -673,7 +719,7 @@ pub fn write_text(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_module_source;
+    use super::{resolve_middleware_source, resolve_module_source};
 
     #[test]
     fn imported_transform_modules_cannot_escape_the_scan_root() {
@@ -699,5 +745,48 @@ mod tests {
             let linked = "import { parseDoc } from '../linked.js';";
             assert!(resolve_module_source(&root, "src/server.js", linked, "parseDoc").is_none());
         }
+    }
+
+    #[test]
+    fn module_alias_namespace_validator_resolves_for_path_fillers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let route_file = "src/routes/analytics.routes.js";
+        let route = r#"const analyticsValidations = require("@validators/analytics.validators");
+router.get(
+  "/:email/health-score",
+  analyticsValidations.healthScoreValidators.getHealthScore,
+  controller.getEngagementHealth
+);
+module.exports = { router };
+"#;
+        let validator = "const validateUserEmail = param(\"email\").isEmail();\n\
+const healthScoreValidators = { getHealthScore: [validateUserEmail] };\n\
+module.exports = { healthScoreValidators };\n";
+        std::fs::create_dir_all(root.join("src/routes")).unwrap();
+        std::fs::create_dir_all(root.join("src/validators")).unwrap();
+        std::fs::write(
+            root.join("src/package.json"),
+            r#"{"_moduleAliases":{"@validators":"validators"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(route_file), route).unwrap();
+        std::fs::write(
+            root.join("src/validators/analytics.validators.js"),
+            validator,
+        )
+        .unwrap();
+
+        let resolve = |name: &str| resolve_middleware_source(root, route_file, route, name);
+        assert_eq!(
+            super::plan::validator_path_fillers(
+                route,
+                2,
+                "/api/v2/users/analytics/{email}/health-score",
+                None,
+                &resolve,
+            ),
+            vec![("email".to_owned(), "jss@jsspector.test".to_owned())]
+        );
     }
 }

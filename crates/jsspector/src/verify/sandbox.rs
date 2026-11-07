@@ -77,6 +77,14 @@ pub struct Session {
     /// added only for apps that reference it, so it can never change the startup of an app that does
     /// not. Detected from the app's source (see [`uses_node_sqlite`]).
     node_sqlite: bool,
+    /// When set, the synthetic per-request `X-Forwarded-For` (which de-buckets a per-IP rate limiter,
+    /// see [`request_spec`]) is suppressed for the next requests. A genuine loopback request carries
+    /// no forwarding header; an app that derives trust from the proxy chain (a loopback-only admin
+    /// surface that treats any forwarding header as a remote proxy hop) would otherwise read the
+    /// verifier's own loopback request as remote and refuse it before the sink. Toggled on only for a
+    /// retry that represents the request's true loopback origin, never to grant access the request did
+    /// not already have — a real remote attacker still presents a non-loopback socket.
+    omit_forwarding: std::cell::Cell<bool>,
     /// Host repo root, used to map startup stack frames under `/app` back to app source.
     root: std::path::PathBuf,
     torn_down: bool,
@@ -204,6 +212,7 @@ impl Session {
             base_env,
             node_path,
             node_sqlite: uses_node_sqlite(root, &app_root),
+            omit_forwarding: std::cell::Cell::new(false),
             root: root.to_path_buf(),
             torn_down: false,
         };
@@ -559,14 +568,25 @@ impl Session {
         }
         let attempts = payload::attempts(probe, &self.canary, self.nonce);
         let tried = attempts.len();
-        for attempt in &attempts {
-            if let Some(poc) = self.send(attempt) {
-                return Outcome::Verified {
-                    how: format!("{} {}", attempt.verb, attempt.target),
-                    poc,
-                };
+        // First pass carries the synthetic forwarding header (rate-limit de-bucketing); if nothing
+        // reproduces, retry once representing the request's true loopback origin (no forwarding
+        // header). An app that gates its sink on genuine loopback trust — a management route that
+        // treats any forwarding header as a remote proxy hop — refuses the de-bucketed request before
+        // the sink, so the honest loopback request is the one that reaches it. The driver already
+        // connects from loopback; this never grants access a non-loopback peer would be denied.
+        for forward in [true, false] {
+            self.omit_forwarding.set(!forward);
+            for attempt in &attempts {
+                if let Some(poc) = self.send(attempt) {
+                    self.omit_forwarding.set(false);
+                    return Outcome::Verified {
+                        how: format!("{} {}", attempt.verb, attempt.target),
+                        poc,
+                    };
+                }
             }
         }
+        self.omit_forwarding.set(false);
         // Fallback for a read sink that consumes the planted file but never echoes it (the handler
         // reads it and then crashes or renders without reflecting its bytes): prove the traversal by
         // a differential file-found/not-found oracle instead of by content in the response.
@@ -810,7 +830,7 @@ impl Session {
     }
 
     fn fetch(&self, attempt: &Attempt) -> Option<String> {
-        let spec = request_spec(attempt, self.port);
+        let spec = request_spec(attempt, self.port, !self.omit_forwarding.get());
         let output = self
             .exec(&self.app, &["node", "/jss-driver.js", &spec])
             .ok()?;
@@ -830,7 +850,7 @@ impl Session {
 
     /// Sends one request from inside the app container and checks its signal.
     fn send(&self, attempt: &Attempt) -> Option<Reproduction> {
-        let spec = request_spec(attempt, self.port);
+        let spec = request_spec(attempt, self.port, !self.omit_forwarding.get());
         let output = match self.exec(&self.app, &["node", "/jss-driver.js", &spec]) {
             Ok(output) => output,
             Err(_) => return None,
@@ -2934,17 +2954,20 @@ fn container_dir(app: &std::path::Path) -> Option<String> {
 }
 
 /// The request the driver sends, as a compact JSON spec on one argv slot.
-fn request_spec(attempt: &Attempt, port: u16) -> String {
+fn request_spec(attempt: &Attempt, port: u16, forward: bool) -> String {
     let mut pairs: Vec<(String, String)> = attempt.headers.clone();
     // Give each driven request a distinct client address. A per-IP rate limiter buckets requests by
     // `X-Forwarded-For` (or a shared default when absent), so the scanner's own probe volume would
     // otherwise be counted as one client and throttled before the sink is reached — masking a real
     // finding behind the verifier's own traffic. A genuine single exploit request is never
     // throttled; spoofing an address does not neutralize the input or grant any access. Left alone
-    // when a payload deliberately sets the header itself.
-    if !pairs
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+    // when a payload deliberately sets the header itself, and suppressed entirely (`forward` false)
+    // on the loopback-origin retry — a forwarding header claims a reverse-proxy hop the verifier is
+    // not, which an app that trusts only genuine loopback peers reads as remote and refuses.
+    if forward
+        && !pairs
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
     {
         let seq = REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         pairs.push((
@@ -4447,13 +4470,19 @@ mod tests {
             headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
             signal: Signal::ServiceReached("t".to_owned()),
         };
-        let spec = request_spec(&attempt, 3000);
+        let spec = request_spec(&attempt, 3000, true);
         // Round-trips as JSON (the driver does the same parse).
         let value: serde_json::Value = serde_json::from_str(&spec).unwrap();
         assert_eq!(value["method"], "POST");
         assert_eq!(value["port"], 3000);
         assert_eq!(value["headers"]["Content-Type"], "application/json");
         assert_eq!(value["body"], "{\"url\":\"http://jss-marker/t\"}");
+        // The forwarding header de-buckets a rate limiter by default, but is suppressed on the
+        // loopback-origin retry so a genuine loopback request carries no forged proxy hop.
+        assert!(value["headers"].get("X-Forwarded-For").is_some());
+        let loopback = request_spec(&attempt, 3000, false);
+        let loopback_value: serde_json::Value = serde_json::from_str(&loopback).unwrap();
+        assert!(loopback_value["headers"].get("X-Forwarded-For").is_none());
     }
 
     #[test]

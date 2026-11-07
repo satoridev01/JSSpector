@@ -257,6 +257,31 @@ pub fn run(
         }
     }
 
+    // A URL-sourced forward proxy / file sink that reads several query parameters off the parsed
+    // request URL reaches its sink only when the parameters other than the payload carrier are also
+    // present and valid (`if (!url || !type) return`; `const filter = FILTERS[type]; if (!filter)
+    // return`). Mine a valid filler for each parameter so the payload-bearing request carries its
+    // required siblings instead of being rejected before the sink.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.entry == plan::Entry::Url
+            && probe.url_query_params.len() > 1
+            && matches!(
+                probe.class,
+                jss_core::VulnClass::Ssrf
+                    | jss_core::VulnClass::PathTraversal
+                    | jss_core::VulnClass::CommandInjection
+                    | jss_core::VulnClass::CodeInjection
+            )
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let params = probe.url_query_params.clone();
+            probe.siblings = plan::url_query_fillers(&source, &params, &|name| {
+                resolve_module_source(root, &finding.file, &source, name)
+            });
+        }
+    }
+
     // An SSRF whose tainted body field is a structured document a parse function turns into an object
     // before the sink reads one of its members (`const parsed = parseDocument(body); fetch(
     // `${parsed.endpoint}/...`)`) never reaches the sink with a raw URL: the input must be a document

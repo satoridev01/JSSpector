@@ -2074,6 +2074,204 @@ fn nth_param(source: &str, name: &str, pos: usize) -> Option<String> {
     Some(base.to_owned())
 }
 
+/// For a URL-sourced forward proxy / file sink that reads several query parameters off the parsed
+/// request URL, the value each parameter needs so the request reaches the sink instead of a guard's
+/// early return — each parameter paired with its filler. A parameter the handler only tests for
+/// presence (`if (!type) return`) gets a non-empty placeholder; one it pins to a value gets that
+/// value: a string literal it is compared against (`===`) or matched by (`/^(a|b)$/.test`), or, when
+/// it indexes an object the handler then requires (`const f = FILTERS[type]; if (!f) return`), a key
+/// of that object — resolved from an imported module (`resolve`) when the object is defined
+/// elsewhere. A URL-shaped name gets a syntactically valid non-marker URL. Mined from the handler and
+/// resolved module source only, so nothing here is tied to one app.
+pub fn url_query_fillers(
+    source: &str,
+    params: &[String],
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    params
+        .iter()
+        .map(|param| (param.clone(), query_filler_value(source, param, resolve)))
+        .collect()
+}
+
+fn query_filler_value(
+    source: &str,
+    param: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let mut ids = vec![param.to_owned()];
+    if let Some(var) = searchparam_var(source, param)
+        && var != param
+    {
+        ids.push(var);
+    }
+    for id in &ids {
+        if let Some(lit) = regex_literal(source, id).or_else(|| equality_literal(source, id)) {
+            return lit;
+        }
+    }
+    if let Some(key) = object_index_key(source, &ids, resolve) {
+        return key;
+    }
+    if is_urlish(param) {
+        return "http://jss-filler.test/".to_owned();
+    }
+    "jsspector".to_owned()
+}
+
+/// The local variable a handler binds a search parameter to
+/// (`const type = searchParams.get("type")` -> `type`), so a guard written against that variable can
+/// be found. `None` when the parameter is read inline without a binding, or not bound to a plain name.
+fn searchparam_var(source: &str, param: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    for needle in [".get(", ".getAll("] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            if !source[..at].trim_end().ends_with("searchParams") {
+                continue;
+            }
+            let Some(arg) = balanced_arg(&source[at + needle.len()..]) else {
+                continue;
+            };
+            if unquote(arg.trim()).as_deref() != Some(param) {
+                continue;
+            }
+            // Walk back over the receiver chain (`url.searchParams` / `searchParams`) to its start,
+            // then read the identifier it is assigned to.
+            let mut i = at;
+            while i > 0 && {
+                let b = bytes[i - 1];
+                is_ident(b) || b == b'.'
+            } {
+                i -= 1;
+            }
+            if let Some(var) = assigned_target(source, i) {
+                return Some(var);
+            }
+        }
+    }
+    None
+}
+
+/// Object identifiers a handler indexes by one of `ids` (`FILTERS[type]` -> `FILTERS`): the receiver
+/// immediately before `[<id>]`. First-seen and deduplicated.
+fn index_receivers(source: &str, ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        let pat = format!("[{id}]");
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&pat) {
+            let at = from + rel;
+            from = at + pat.len();
+            let recv: String = source[..at]
+                .bytes()
+                .rev()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if !recv.is_empty() && !recv.as_bytes()[0].is_ascii_digit() && !out.contains(&recv) {
+                out.push(recv);
+            }
+        }
+    }
+    out
+}
+
+/// A key of an object the handler indexes by a search parameter and then requires
+/// (`const f = FILTERS[type]; if (!f) return`): the object's first literal key, so the probe sends a
+/// value the lookup accepts. The object is read from this source, or — when imported — from the module
+/// `resolve` returns for its name. `None` when no such object/key is found.
+fn object_index_key(
+    source: &str,
+    ids: &[String],
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    for obj in index_receivers(source, ids) {
+        if let Some(key) = first_object_key(source, &obj) {
+            return Some(key);
+        }
+        if let Some(module) = resolve(&obj)
+            && let Some(key) = first_object_key(&module, &obj)
+        {
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// The first literal key of an object bound to `ident` (`const FILTERS = { "a-b": ..., c: ... }` ->
+/// `a-b`), skipping comments. `None` when `ident` is not bound to an object literal, or the object has
+/// no leading literal key.
+fn first_object_key(source: &str, ident: &str) -> Option<String> {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(ident) {
+        let at = from + rel;
+        from = at + ident.len();
+        let before_ok = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident(*b));
+        if !before_ok {
+            continue;
+        }
+        let after = &source[at + ident.len()..];
+        if after.chars().next().is_some_and(|c| is_ident(c as u8)) {
+            continue;
+        }
+        let Some(rest) = after.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        if rest.starts_with('=') {
+            continue;
+        }
+        let Some(body) = rest.trim_start().strip_prefix('{') else {
+            continue;
+        };
+        if let Some(key) = first_key_in_object(body) {
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// The first property key inside an object body (just past its `{`): a quoted key (`"a-b"`) or a
+/// bareword key (`foo`) followed by `:`. Line and block comments are skipped. `None` when the first
+/// token is not a plain key (an empty object, a spread, a computed key).
+fn first_key_in_object(body: &str) -> Option<String> {
+    let mut rest = body;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("//") {
+            rest = after.split_once('\n').map_or("", |(_, r)| r);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, r)| r);
+            continue;
+        }
+        break;
+    }
+    let first = rest.chars().next()?;
+    if matches!(first, '"' | '\'' | '`') {
+        let key = leading_string(rest)?;
+        let after = rest.get(1 + key.len() + 1..)?.trim_start();
+        return after.starts_with(':').then_some(key);
+    }
+    let key: String = rest
+        .bytes()
+        .take_while(|b| is_ident(*b))
+        .map(|b| b as char)
+        .collect();
+    if key.is_empty() {
+        return None;
+    }
+    let after = rest[key.len()..].trim_start();
+    after.starts_with(':').then_some(key)
+}
+
 /// The parenthesized parameter list of a function named `name` defined in `source`: the first `(`
 /// after a `function name` / `const name =` / `name =` marker (and before any `{`), read balanced.
 /// `None` when no such definition is found.
@@ -4029,6 +4227,40 @@ mod tests {
         assert!(mined.contains(&"coinName".to_owned()), "mined {mined:?}");
         // An object that is not forwarded anywhere yields nothing to resolve.
         assert!(super::forwarded_search_params(server, &|_| None).is_empty());
+    }
+
+    #[test]
+    fn url_query_fillers_satisfy_presence_and_object_key_guards() {
+        // A URL-sourced SSRF handler reads two query parameters and reaches `fetch(url)` only when
+        // both are present and `type` indexes an imported allow-list object. The payload rides `url`;
+        // the sibling `type` must carry a real key of that object, resolved from its own module.
+        let handler = "\
+            export async function GET(request) {\n\
+              const { searchParams } = new URL(request.url);\n\
+              const url = searchParams.get(\"url\");\n\
+              const type = searchParams.get(\"type\");\n\
+              if (!url || !type) return bad();\n\
+              const filter = FILTERS[type];\n\
+              if (!filter) return bad();\n\
+              const res = await fetch(url);\n\
+            }\n";
+        let module = "\
+            // free-model filters\n\
+            export const FILTERS = {\n\
+              \"openrouter-free\": (m) => m,\n\
+              \"opencode-free\": (m) => m,\n\
+            };\n";
+        let fillers =
+            super::url_query_fillers(handler, &["url".to_owned(), "type".to_owned()], &|name| {
+                (name == "FILTERS").then(|| module.to_owned())
+            });
+        assert_eq!(
+            fillers,
+            vec![
+                ("url".to_owned(), "http://jss-filler.test/".to_owned()),
+                ("type".to_owned(), "openrouter-free".to_owned()),
+            ]
+        );
     }
 
     #[test]

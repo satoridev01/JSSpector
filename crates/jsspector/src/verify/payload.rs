@@ -326,9 +326,18 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                 }
                 for gate in gates {
                     for param in &probe.url_query_params {
+                        // The handler may require the other query parameters present and valid before
+                        // the sink (`if (!url || !type)`, `FILTERS[type]`); carry each sibling with the
+                        // value its guard accepts so the payload-bearing request reaches the sink.
+                        let mut target = format!("{gate}?{}={}", encode(param), encode(&value));
+                        for (sib, sib_value) in &probe.siblings {
+                            if sib != param {
+                                target = format!("{target}&{}={}", encode(sib), encode(sib_value));
+                            }
+                        }
                         out.push(Attempt {
                             verb,
-                            target: format!("{gate}?{}={}", encode(param), encode(&value)),
+                            target,
                             body: None,
                             headers: Vec::new(),
                             signal: signal.clone(),

@@ -341,7 +341,7 @@ impl Session {
             if missing.is_empty() && !enable_module_stub && new_dir.is_none() {
                 return Err(err);
             }
-            let _ = docker(&["rm", "-f", &self.app]);
+            remove_container(&self.app);
             env.extend(missing);
             stub_missing_modules |= enable_module_stub;
             if let Some(dir) = new_dir {
@@ -1574,13 +1574,13 @@ impl Session {
             return;
         }
         self.torn_down = true;
-        let _ = docker(&["rm", "-f", &self.app]);
-        let _ = docker(&["rm", "-f", &self.marker]);
+        remove_container(&self.app);
+        remove_container(&self.marker);
         if let Some(db) = &self.db {
-            let _ = docker(&["rm", "-f", db]);
+            remove_container(db);
         }
         if let Some(redis) = &self.redis {
-            let _ = docker(&["rm", "-f", redis]);
+            remove_container(redis);
         }
         let _ = docker(&["network", "rm", &self.network]);
         let _ = docker(&["rmi", "-f", &self.tag]);
@@ -3958,6 +3958,12 @@ fn docker(args: &[&str]) -> Result<String, String> {
     }
 }
 
+fn remove_container(name: &str) {
+    // `-v` removes anonymous volumes declared by base images. Without it, every
+    // verification leaves those volumes behind after the container is removed.
+    let _ = docker(&["rm", "-f", "-v", name]);
+}
+
 fn docker_args(args: &[&str]) -> Vec<String> {
     let label = std::env::var("JSS_VERIFY_RUN_LABEL").ok();
     docker_args_with_label(args, label.as_deref())
@@ -5171,9 +5177,9 @@ impl BrowserSession {
             return;
         }
         self.torn_down = true;
-        let _ = docker(&["rm", "-f", &self.app]);
-        let _ = docker(&["rm", "-f", &self.marker]);
-        let _ = docker(&["rm", "-f", &self.browser]);
+        remove_container(&self.app);
+        remove_container(&self.marker);
+        remove_container(&self.browser);
         let _ = docker(&["network", "rm", &self.network]);
         let _ = docker(&["rmi", "-f", &self.tag]);
     }

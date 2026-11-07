@@ -127,6 +127,28 @@ pub struct Probe {
     /// Mined from the handler source only; empty for the common case where the tainted value ends the
     /// path or only fixed literals follow it.
     pub appended_fields: Vec<String>,
+    /// For a prototype-pollution finding whose sink is a nested object write `obj[k1][k2] = v` with
+    /// both keys attacker-controlled, how to drive it: the request input that chooses the *outer* key
+    /// (driven with `__proto__`, so `obj["__proto__"]` resolves to `Object.prototype`) and the one
+    /// that chooses the *inner* key (the polluted property name). `None` for a class other than
+    /// prototype-pollution, or a nested write whose two keys verify v1 cannot both map to request
+    /// inputs. Mined from the sink argument and handler source only.
+    pub proto_pollution: Option<ProtoPollution>,
+}
+
+/// How to drive a nested-write prototype-pollution sink (`obj[outer][inner] = v`). Both keys are
+/// attacker-controlled request inputs; the verifier drives the outer with `__proto__` (so the write
+/// lands on `Object.prototype`) and the inner with a fresh marker property name, then reads that same
+/// property back off a *different*, freshly created object through the handler itself to prove the
+/// whole-process prototype was polluted. Nothing here is tied to a specific app: it names only the two
+/// request inputs the sink's two keys come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtoPollution {
+    /// The request input that selects the outer object (`obj[outer]`): driven with `__proto__`.
+    pub outer: Entry,
+    /// The request input that selects the inner property (`obj[outer][inner]`): driven with a fresh
+    /// marker key, then read back off a fresh outer to confirm `Object.prototype` was polluted.
+    pub inner: Entry,
 }
 
 /// A sibling route parameter appended after the tainted one in a directory read path, constrained by
@@ -544,6 +566,12 @@ impl Probe {
     /// named request input (see [`plan_with_source`]).
     pub fn from_finding_with_source(finding: &Finding, source: Option<&str>) -> Result<Self, Skip> {
         let skip = |reason: &str| Err(Skip(reason.to_owned()));
+        // A nested-write prototype-pollution sink (`obj[k1][k2] = v`) is driven by its own dedicated
+        // read-back oracle, not the single-entry request machinery below (it needs two request inputs,
+        // not one). Resolve both keys to request inputs here, or skip with a reason.
+        if finding.class == VulnClass::PrototypePollution {
+            return Self::proto_pollution_probe(finding, source);
+        }
         if !matches!(
             finding.class,
             VulnClass::PathTraversal
@@ -652,8 +680,230 @@ impl Probe {
             sql: None,
             array_element,
             appended_fields,
+            proto_pollution: None,
         })
     }
+
+    /// Build the probe for a nested-write prototype-pollution finding (`obj[k1][k2] = v`). Both keys
+    /// must resolve to anonymous HTTP request inputs; the outer is driven with `__proto__` and the
+    /// inner with a marker property, then read back off a fresh outer (see the sandbox's read-back
+    /// oracle). Skips with a reason when the source is not an anonymous HTTP request, the entry is not
+    /// routable, or the two keys cannot both be mapped to request inputs.
+    fn proto_pollution_probe(finding: &Finding, source: Option<&str>) -> Result<Self, Skip> {
+        let skip = |reason: &str| Err(Skip(reason.to_owned()));
+        if finding.source.kind != "http" {
+            return skip(&format!(
+                "source is {}, not an HTTP request",
+                finding.source.kind
+            ));
+        }
+        if finding.auth != Auth::NoneDetected {
+            return skip(&format!(
+                "reaching it needs {} authentication, which verify v1 does not perform",
+                finding.auth.name()
+            ));
+        }
+        let Some(entry_point) = finding.entry.as_deref() else {
+            return skip("no entry point maps to this sink; nothing to send");
+        };
+        let (method, path) = parse_entry(entry_point)
+            .ok_or_else(|| Skip(format!("entry `{entry_point}` is not a routable HTTP path")))?;
+        let (outer, inner) = proto_pollution_keys(finding, &path, source).ok_or_else(|| {
+            Skip(format!(
+                "cannot map both keys of the nested write `{}` to request inputs",
+                finding.sink.arg
+            ))
+        })?;
+        Ok(Self {
+            method,
+            path,
+            entry: outer.clone(),
+            class: finding.class,
+            siblings: Vec::new(),
+            gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            doc_envelope: None,
+            lists_dir: false,
+            removes: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            body_query_override: None,
+            sql: None,
+            array_element: false,
+            appended_fields: Vec::new(),
+            proto_pollution: Some(ProtoPollution { outer, inner }),
+        })
+    }
+}
+
+/// The two request inputs the two keys of a nested write `obj[outer][inner] = v` come from, for a
+/// prototype-pollution sink. Reads the two bracketed index expressions out of the sink argument and
+/// resolves each to a request input — directly (`req.params.bid`, `req.query.k`), or by following a
+/// local binding in the handler source (`const key = req.params.id; ... obj[bid][key] =`). `None` when
+/// both cannot be mapped — the oracle then cannot drive it without guessing.
+fn proto_pollution_keys(
+    finding: &Finding,
+    path: &str,
+    source: Option<&str>,
+) -> Option<(Entry, Entry)> {
+    let (outer_expr, inner_expr) = nested_index_exprs(&finding.sink.arg)?;
+    let outer = resolve_request_entry(&outer_expr, path, source);
+    let inner = resolve_request_entry(&inner_expr, path, source);
+    match (outer, inner) {
+        (Some(outer), Some(inner)) if outer != inner => Some((outer, inner)),
+        _ => None,
+    }
+}
+
+/// The two outermost `[...]` index expressions of a nested member write `base[a][b]`, as source text
+/// (`req.params.bid`, `key`). `None` when the argument does not have at least two bracketed indices.
+/// Quoted strings inside an index are returned verbatim.
+fn nested_index_exprs(arg: &str) -> Option<(String, String)> {
+    let mut indices: Vec<String> = Vec::new();
+    let bytes = arg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && indices.len() < 2 {
+        if bytes.get(i) == Some(&b'[') {
+            let start = i + 1;
+            let mut depth = 1;
+            let mut j = start;
+            while let Some(&b) = bytes.get(j) {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return None;
+            }
+            indices.push(arg.get(start..j)?.trim().to_owned());
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    match indices.len() {
+        2 => Some((indices.remove(0), indices.remove(0))),
+        _ => None,
+    }
+}
+
+/// Resolve an index expression to the anonymous HTTP request input it reads, directly or through one
+/// hop of a local binding in the handler source. Direct forms: `req.params.NAME`, `req.query.NAME`,
+/// `req.body.NAME`, `req.headers.NAME` / `req.headers['NAME']` (any request receiver name). A bare
+/// identifier is looked up as `const/let/var NAME = <rhs>` in the source and resolved from its
+/// right-hand side. `None` when it is neither.
+fn resolve_request_entry(expr: &str, path: &str, source: Option<&str>) -> Option<Entry> {
+    let expr = expr.trim();
+    if let Some(entry) = request_member_entry(expr, path) {
+        return Some(entry);
+    }
+    // A plain identifier: resolve one binding hop (`const key = req.params.id`).
+    if expr
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        && !expr.is_empty()
+        && expr.chars().next().is_some_and(|c| !c.is_ascii_digit())
+    {
+        let rhs = source.and_then(|src| local_binding_rhs(src, expr))?;
+        return request_member_entry(rhs.trim(), path);
+    }
+    None
+}
+
+/// A request-member access (`<recv>.params.NAME`, `<recv>.query.NAME`, `<recv>.body.NAME`,
+/// `<recv>.headers.NAME` / `['NAME']`) resolved to the entry that places a value there. The receiver
+/// name is not fixed to `req`. A `params` member is only accepted when the route declares a slot for
+/// it.
+fn request_member_entry(expr: &str, path: &str) -> Option<Entry> {
+    let expr = expr.trim();
+    for part in ["params", "query", "body", "headers"] {
+        let dot = format!(".{part}.");
+        if let Some(pos) = expr.find(&dot) {
+            let rest = &expr[pos + dot.len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            return request_entry(part, &name, path);
+        }
+        // Bracketed member: `<recv>.headers['x']`, `<recv>.params["id"]`.
+        let bracket = format!(".{part}[");
+        if let Some(pos) = expr.find(&bracket) {
+            let rest = &expr[pos + bracket.len()..];
+            let name = rest
+                .trim_start()
+                .trim_start_matches(['\'', '"'])
+                .split(['\'', '"'])
+                .next()
+                .unwrap_or("");
+            if !name.is_empty() {
+                return request_entry(part, name, path);
+            }
+        }
+    }
+    None
+}
+
+/// Map a request part and member name to an [`Entry`]. A `params` member must correspond to a route
+/// slot; otherwise it cannot be placed in the URL.
+fn request_entry(part: &str, name: &str, path: &str) -> Option<Entry> {
+    match part {
+        "params" => path_param_slot(path, name).map(Entry::PathParam),
+        "query" => Some(Entry::Query(name.to_owned())),
+        "body" => Some(Entry::Body(Some(name.to_owned()))),
+        "headers" => Some(Entry::Header(name.to_owned())),
+        _ => None,
+    }
+}
+
+/// The right-hand side of the first `const`/`let`/`var NAME = <rhs>;` binding of `name` in `source`.
+/// Used to follow one hop from an index local to the request member it reads (`const key =
+/// req.params.id`). `None` when there is no such simple binding.
+fn local_binding_rhs(source: &str, name: &str) -> Option<String> {
+    for kw in ["const", "let", "var"] {
+        let needle = format!("{kw} {name}");
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            // Must be a whole-word match on both sides.
+            let before_ok = source[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '$');
+            let after = &source[at + needle.len()..];
+            let after_ok = after
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '$');
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let after = after.trim_start();
+            let Some(rest) = after.strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            if rest.starts_with('=') || rest.starts_with('>') {
+                continue; // `==`/`=>`, not an assignment.
+            }
+            let end = rest.find([';', '\n']).unwrap_or(rest.len());
+            return Some(rest[..end].trim().to_owned());
+        }
+    }
+    None
 }
 
 /// Whether `field` is destructured from an object literal in which a query object is spread after a
@@ -5297,6 +5547,42 @@ module.exports = { healthScoreValidators };\n";
     }
 
     #[test]
+    fn nested_write_prototype_pollution_resolves_both_keys() {
+        // `obj[req.params.bid][key]` with `const key = req.params.id`: the outer key is driven with
+        // `__proto__`, the inner (resolved through the local binding) with the marker property.
+        let mut f = finding(
+            VulnClass::PrototypePollution,
+            Auth::NoneDetected,
+            Some("USE /request-bank/{bid}/withdraw/{id}"),
+            "req.params",
+        );
+        f.sink.arg = "bank[req.params.bid][key]".to_owned();
+        let source = "app.use('/request-bank/:bid/withdraw/:id/', (req, res) => {\n\
+            const key = req.params.id;\n\
+            bank[req.params.bid][key] = callback;\n\
+        });";
+        let probe = match plan_with_source(&f, Some(source)) {
+            Ok(Plan::Http(probe)) => probe,
+            other => panic!("expected an HTTP probe, got {other:?}"),
+        };
+        let pp = probe
+            .proto_pollution
+            .expect("prototype-pollution probe carries a read-back descriptor");
+        assert_eq!(pp.outer, Entry::PathParam("bid".to_owned()));
+        assert_eq!(pp.inner, Entry::PathParam("id".to_owned()));
+    }
+
+    #[test]
+    fn nested_index_exprs_reads_the_two_keys() {
+        assert_eq!(
+            super::nested_index_exprs("bank[req.params.bid][key]"),
+            Some(("req.params.bid".to_owned(), "key".to_owned()))
+        );
+        // A single index is not a nested write.
+        assert_eq!(super::nested_index_exprs("bank[req.params.bid]"), None);
+    }
+
+    #[test]
     fn convention_based_http_entries_are_conservative() {
         let mut body = finding(
             VulnClass::NosqlInjection,
@@ -5527,6 +5813,7 @@ module.exports = { healthScoreValidators };\n";
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
+            proto_pollution: None,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));

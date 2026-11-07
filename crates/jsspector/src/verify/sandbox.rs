@@ -633,6 +633,20 @@ impl Session {
         if probe.class == jss_core::VulnClass::SqlInjection {
             return self.exercise_sql(probe);
         }
+        // A nested-write prototype-pollution sink cannot be proved by reflected content: the written
+        // value is the handler's own, not attacker data, so observing input in the write proves only
+        // reachability. Prove it instead by reading the injected property back off a *fresh* object
+        // through the handler — a property that object never had until `__proto__` was written — with
+        // the pre-pollution read and an unpolluted-key read as negative controls.
+        if probe.class == jss_core::VulnClass::PrototypePollution {
+            return match self.verify_proto_pollution(probe) {
+                Some(poc) => Outcome::Verified {
+                    how: format!("{} {}", poc.method, poc.target),
+                    poc,
+                },
+                None => Outcome::NotReproduced { tried: 1 },
+            };
+        }
         // A traversal sink that deletes its argument cannot be proved by reflected content — a
         // successful delete echoes nothing — and the generic climbing attempts would consume the
         // planted canary before any differential ran. Prove it directly: plant a file outside the
@@ -795,6 +809,89 @@ impl Session {
                 proving the removal opened the attacker-controlled path outside the base directory"
                     .to_owned(),
             response: String::new(),
+        })
+    }
+
+    /// Confirms a nested-write prototype-pollution sink (`obj[outer][inner] = v`) by reading the
+    /// injected property back off a freshly created object through the handler itself. Four requests
+    /// (see [`payload::ProtoOracle`]): a pre-pollution read of a fresh object for the marker key
+    /// (`baseline`), the `__proto__` write of that key (`pollute`), a post-pollution read of a
+    /// *different* fresh object for the same key (`probe`), and a read of a fresh object for an
+    /// unpolluted key (`control`). The sink genuinely polluted `Object.prototype` only if the
+    /// post-pollution read differs from both the pre-pollution read (same key, fresh object) and the
+    /// unpolluted-key read, while the two unpolluted reads agree — so a fresh object now carries a
+    /// property it was never given, and only the polluted key. A confining handler, or a pure-write
+    /// sink that never reads the property back, answers the reads alike and nothing is reproduced.
+    fn verify_proto_pollution(&self, probe: &Probe) -> Option<Reproduction> {
+        // The finding's entry may carry a mount prefix the isolated verifier drops (it mounts the
+        // handler's own router at the root). Try the full path and each router-relative variant; a
+        // wrong base only 404s identically for every request, so it cannot fabricate a reproduction.
+        for base in payload::proto_base_candidates(&probe.path) {
+            if let Some(poc) = self.try_proto_pollution(probe, &base) {
+                return Some(poc);
+            }
+        }
+        None
+    }
+
+    /// Run the read-back prototype-pollution differential for one candidate route base.
+    fn try_proto_pollution(&self, probe: &Probe, base: &str) -> Option<Reproduction> {
+        let oracle = payload::proto_pollution_oracle(probe, &self.canary, self.nonce, base)?;
+        let baseline = self.fetch(&oracle.baseline)?;
+        let _ = self.fetch(&oracle.pollute);
+        let after = self.fetch(&oracle.probe)?;
+        let control = self.fetch(&oracle.control)?;
+        let (a, b, c) = (after.trim(), baseline.trim(), control.trim());
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] proto-pollution base={base} baseline[{}] probe[{}] control[{}]",
+                b.chars().take(80).collect::<String>(),
+                a.chars().take(80).collect::<String>(),
+                c.chars().take(80).collect::<String>(),
+            );
+        }
+        // The post-pollution read of a fresh object must differ from both the pre-pollution read of
+        // the same key and the unpolluted-key read, and the two unpolluted reads must agree. An empty
+        // post-pollution response carries no observable branch, so it is not a reproduction.
+        if a.is_empty() || a == b || a == c || b != c {
+            return None;
+        }
+        let describe = |value: &str| {
+            let excerpt = response_excerpt(value);
+            if excerpt.trim().is_empty() {
+                "an empty body".to_owned()
+            } else {
+                format!("`{}`", excerpt.trim().replace('`', "'"))
+            }
+        };
+        Some(Reproduction {
+            // The read-back request proves the effect only after the `__proto__` write. Keep both
+            // requests in the copyable PoC, in the same order used by the verifier. The write-side
+            // handler may intentionally hold its response open, so bound only that request.
+            command: format!(
+                "{}\n{}",
+                curl_command(&oracle.pollute, self.port).replacen(
+                    "curl -i -sS",
+                    "curl -i -sS --max-time 2",
+                    1,
+                ),
+                curl_command(&oracle.probe, self.port),
+            ),
+            method: oracle.probe.verb.to_owned(),
+            target: oracle.probe.target.clone(),
+            headers: Vec::new(),
+            body: oracle.probe.body.clone(),
+            evidence: format!(
+                "before the `__proto__` write, reading the marker key from a fresh object returned \
+                {}; after the write, a different fresh object returned {}; an independent fresh \
+                object queried with a never-polluted key returned {}. The two negative controls \
+                agree and only the polluted key changes the handler's branch, proving the write \
+                reached Object.prototype rather than one ordinary object",
+                describe(&baseline),
+                describe(&after),
+                describe(&control),
+            ),
+            response: response_excerpt(&after),
         })
     }
 
@@ -6239,6 +6336,7 @@ http.createServer((req, res) => {
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
+            proto_pollution: None,
         };
         let confined = Probe {
             method: Method::Get,
@@ -6260,6 +6358,7 @@ http.createServer((req, res) => {
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
+            proto_pollution: None,
         };
         let command = Probe {
             method: Method::Get,
@@ -6281,6 +6380,7 @@ http.createServer((req, res) => {
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
+            proto_pollution: None,
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -6306,6 +6406,7 @@ http.createServer((req, res) => {
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
+            proto_pollution: None,
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

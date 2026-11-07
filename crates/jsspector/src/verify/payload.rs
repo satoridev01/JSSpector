@@ -4,7 +4,7 @@
 //! planted marker file, write a marker file, or call a marker service — so a hit is unambiguous
 //! and leaves nothing behind but the marker.
 
-use super::plan::{DocEnvelope, Entry, Envelope, Method, Probe};
+use super::plan::{DocEnvelope, Entry, Envelope, Method, Probe, ProtoPollution};
 use jss_core::VulnClass;
 
 /// The harmless value every non-payload envelope member is filled with, so a handler's early
@@ -1413,6 +1413,137 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
     }
 }
 
+/// The four requests that prove a nested-write prototype-pollution sink (`obj[outer][inner] = v`) by
+/// reading the injected property back off a *fresh* object through the handler itself:
+/// - `baseline`: a fresh outer object and the marker key, sent *before* pollution — the key is absent.
+/// - `pollute`: the outer key `__proto__` and the marker key, so the write lands on `Object.prototype`.
+/// - `probe`: a different fresh outer object and the same marker key, sent *after* pollution — the key
+///   is now inherited by every freshly created object, so the handler takes its key-present branch.
+/// - `control`: a third fresh outer object and a *different*, never-polluted key — still absent.
+///
+/// A handler whose sink genuinely pollutes `Object.prototype` answers `probe` differently from both
+/// `baseline` (same key, fresh object, pre-pollution) and `control` (fresh object, unpolluted key),
+/// while the two unpolluted reads agree. A handler that confines the keys, or one whose sink is a
+/// pure write that never reads the property back, answers all reads alike and nothing is reproduced.
+#[derive(Debug, Clone)]
+pub struct ProtoOracle {
+    pub baseline: Attempt,
+    pub pollute: Attempt,
+    pub probe: Attempt,
+    pub control: Attempt,
+}
+
+/// Build the read-back prototype-pollution oracle for a probe carrying a [`Probe::proto_pollution`]
+/// descriptor, driving the route at `base` (a candidate from [`proto_base_candidates`]). `None` for
+/// any other probe.
+pub fn proto_pollution_oracle(
+    probe: &Probe,
+    canary: &Canary,
+    nonce: u32,
+    base: &str,
+) -> Option<ProtoOracle> {
+    let pp = probe.proto_pollution.as_ref()?;
+    let verb = probe.method.verb(&probe.entry);
+    let tok: String = canary
+        .token
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    // Fresh outer-object selectors (never `__proto__`) and marker property names, all unique per run
+    // and per probe so one probe's state never satisfies another's.
+    let outer_a = format!("jssppoa{tok}{nonce}");
+    let outer_b = format!("jssppob{tok}{nonce}");
+    let outer_c = format!("jssppoc{tok}{nonce}");
+    let key_m = format!("jssppkm{tok}{nonce}");
+    let key_z = format!("jssppkz{tok}{nonce}");
+    let make = |outer: &str, inner: &str| proto_request(probe, pp, verb, base, outer, inner);
+    Some(ProtoOracle {
+        baseline: make(&outer_a, &key_m),
+        pollute: make("__proto__", &key_m),
+        probe: make(&outer_b, &key_m),
+        control: make(&outer_c, &key_z),
+    })
+}
+
+/// Candidate route bases to drive a prototype-pollution probe against, most specific first. The
+/// finding's entry path may carry a mount prefix (`/amp4test/...`) the parent app adds, but the
+/// isolated verifier mounts the handler's own router at the root, so the router-relative path is what
+/// actually matches there. Produce the full path and each variant with a leading *static* segment
+/// stripped (a mount prefix is always static), stopping at the first `{param}` segment; each with and
+/// without a trailing slash (an `app.use` mount is often declared with one). A wrong candidate only
+/// fails to reach the route and is answered identically for every request, so trying extra ones can
+/// never fabricate a reproduction.
+pub fn proto_base_candidates(path: &str) -> Vec<String> {
+    let mut bases: Vec<String> = Vec::new();
+    let mut current = path.trim_end_matches('/').to_owned();
+    loop {
+        if !current.is_empty() && !bases.contains(&current) {
+            bases.push(current.clone());
+        }
+        // Strip one leading static segment (`/amp4test`), if the next segment is static.
+        let rest = current.trim_start_matches('/');
+        let Some(slash) = rest.find('/') else { break };
+        let first = &rest[..slash];
+        if first.is_empty() || first.contains('{') {
+            break;
+        }
+        current = format!("/{}", &rest[slash + 1..]);
+    }
+    // For each base, offer a trailing-slash variant too.
+    let mut out: Vec<String> = Vec::new();
+    for base in bases {
+        out.push(base.clone());
+        out.push(format!("{base}/"));
+    }
+    out
+}
+
+/// One prototype-pollution request: the route `base` with the outer and inner keys placed in the two
+/// request inputs the sink's two indices come from. Each key rides a path segment, query parameter,
+/// body field or header, as its [`Entry`] says.
+fn proto_request(
+    probe: &Probe,
+    pp: &ProtoPollution,
+    verb: &'static str,
+    base: &str,
+    outer: &str,
+    inner: &str,
+) -> Attempt {
+    let mut target = base.to_owned();
+    let mut query: Vec<(String, String)> = Vec::new();
+    let mut body_fields: Vec<(String, String)> = Vec::new();
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for (slot, value) in [(&pp.outer, outer), (&pp.inner, inner)] {
+        match slot {
+            Entry::PathParam(name) => {
+                target = target.replace(&format!("{{{name}}}"), &encode_path(value));
+            }
+            Entry::Query(name) => query.push((name.clone(), value.to_owned())),
+            Entry::Body(Some(name)) => body_fields.push((name.clone(), value.to_owned())),
+            Entry::Body(None) | Entry::Url => {
+                target = format!("{}/{}", target.trim_end_matches('/'), encode_path(value))
+            }
+            Entry::Header(name) => headers.push((name.clone(), header_safe(value))),
+        }
+    }
+    for (key, val) in &query {
+        let sep = if target.contains('?') { '&' } else { '?' };
+        target = format!("{target}{sep}{}={}", encode(key), encode(val));
+    }
+    target = fill_remaining(&target, &probe.path_fillers);
+    let body = (!body_fields.is_empty()).then(|| json_fields(&body_fields));
+    if body.is_some() {
+        headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+    }
+    Attempt {
+        verb,
+        target,
+        body,
+        headers,
+        signal: Signal::InResponse,
+    }
+}
+
 /// A JSON object of `fields`. Empty object when there are none.
 fn json_fields(fields: &[(String, String)]) -> String {
     let mut out = String::from("{");
@@ -1742,6 +1873,7 @@ mod tests {
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
+            proto_pollution: None,
         }
     }
 

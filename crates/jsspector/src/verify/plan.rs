@@ -91,6 +91,18 @@ pub struct Probe {
     /// never arrives. Each pair is a slot name and the literal a guard enclosing the sink constrains
     /// it to. Mined from the handler source only; empty when no such guard pins a non-payload slot.
     pub path_fillers: Vec<(String, String)>,
+    /// JSON body fields the handler requires present before the sink is reached, when the payload
+    /// itself enters through a different part (a path segment or query parameter): a scalar body
+    /// member a guard clause rejects the request without (`const { id } = req.body; if (!id) throw`).
+    /// Each is a field name and a value that satisfies its guard — a pinned literal, or a non-empty
+    /// placeholder for a bare presence test. Sent as a JSON body alongside the payload so the request
+    /// passes the guard and reaches the sink. Mined from the handler source only; empty when the
+    /// handler requires no such body field, or the payload already rides the body.
+    pub body_requires: Vec<(String, String)>,
+    /// For a SQL injection whose tainted value is interpolated in a table-identifier position, how to
+    /// drive it (see [`SqlPlan`]). `None` for a non-SQL class or a value-position SQL injection that
+    /// verify v1 does not yet drive. Mined from the handler source only.
+    pub sql: Option<SqlPlan>,
 }
 
 /// A sibling route parameter appended after the tainted one in a directory read path, constrained by
@@ -129,6 +141,32 @@ pub struct DocEnvelope {
     pub suffix: String,
     pub sink_key: String,
     pub filler_keys: Vec<String>,
+}
+
+/// One column a SQL statement interpolating the tainted identifier references. `filter` is set when
+/// the column is matched by equality (`col = ?`, `LOWER(col) = LOWER(?)`): a request the probe drives
+/// reaches the sink only if that comparison is satisfied, so such a column must carry the sentinel the
+/// probe also binds. A column that only appears in a projection (`SELECT col`) carries the canary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlColumn {
+    pub name: String,
+    pub filter: bool,
+}
+
+/// How to drive a SQL injection whose tainted value is interpolated in an *identifier* position of a
+/// SQL statement (a table name after `FROM`/`JOIN`/`INTO`/`UPDATE`). Such an injection can never be a
+/// bound parameter: the probe replaces the table with a sub-select that both supplies every column the
+/// surrounding statements reference and returns a value the database must *compute* (a string
+/// concatenation whose result is absent from the request text), so that computed value surfacing in
+/// the response proves the statement's meaning changed. Mined from the handler source only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlPlan {
+    /// Every column any statement interpolating the tainted identifier references, each marked a
+    /// filter (equality-matched) or value (projected) column.
+    pub columns: Vec<SqlColumn>,
+    /// The request body fields the handler reads (`const { id } = req.body`), filled with the sentinel
+    /// so the bound parameters the sink supplies match the sub-select's filter columns.
+    pub body_fields: Vec<String>,
 }
 
 impl Probe {
@@ -460,9 +498,10 @@ impl Probe {
                 | VulnClass::CodeInjection
                 | VulnClass::Ssrf
                 | VulnClass::NosqlInjection
+                | VulnClass::SqlInjection
         ) {
             return skip(&format!(
-                "{} is not driven by verify v1 (HTTP path-traversal, command/code-injection, SSRF and NoSQL injection only)",
+                "{} is not driven by verify v1 (HTTP path-traversal, command/code-injection, SSRF, NoSQL and SQL injection only)",
                 finding.class.name()
             ));
         }
@@ -527,6 +566,8 @@ impl Probe {
             removes,
             appended_param,
             path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            sql: None,
         })
     }
 }
@@ -2221,6 +2262,14 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
     if let Some(entry) = file_route_path_param(finding, path, source) {
         return Some(entry);
     }
+    // A coarse `req.params` source whose specific tainted segment is the identifier the sink string
+    // interpolates (`FROM ${tableName}`): resolve it to that route slot when the handler binds the
+    // identifier from the request params (destructured or accessed) and the route declares the slot.
+    // Mirrors `coarse_params_entry` for the destructured shape, and disambiguates a handler that reads
+    // several path params by pinning the one that actually reaches the sink.
+    if let Some(entry) = params_sink_entry(finding, path, source) {
+        return Some(entry);
+    }
     let mut candidates: Vec<Entry> = Vec::new();
     for text in [finding.sink.arg.as_str(), finding.source.expr.as_str()] {
         for accessor in request_accessors(text) {
@@ -2248,6 +2297,116 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
         .or_else(|| destructured_entry(finding, path, source))
         .or_else(|| coarse_params_entry(finding, path, source))
         .or_else(|| source.and_then(|src| coarse_header_entry(finding, src)))
+}
+
+/// The tainted path parameter when the sink's own argument interpolates a route-slot identifier the
+/// handler binds from the request parameters. The finding's source must be a request parameter, the
+/// sink argument must interpolate an identifier (`${name}` in the query template, or `+ name +`
+/// concatenation) that the route declares a `{name}` slot for and the handler derives from
+/// `req.params` (destructured `const { name } = req.params`, accessed `req.params.name`, or recorded
+/// in the flow trace as `assigned to \`name\``). This pins the exact segment that reaches the sink,
+/// instead of the first params member the handler happens to read. `None` when nothing lines up.
+fn params_sink_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
+    let receiver = strip_request_receiver(finding.source.expr.trim());
+    if receiver != Some("params") && finding.source.expr.trim() != "params" {
+        return None;
+    }
+    let derived = params_derived_names(finding, source);
+    for name in interpolated_identifiers(&finding.sink.arg) {
+        if path.contains(&format!("{{{name}}}")) && derived.contains(&name) {
+            return Some(Entry::PathParam(name));
+        }
+    }
+    None
+}
+
+/// The identifiers a handler binds from the request params: locals destructured from `req.params`
+/// (`const { a, b } = req.params`), members read off it (`req.params.a`), and names the finding's
+/// flow trace records the params value being `assigned to`.
+fn params_derived_names(finding: &Finding, source: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for step in &finding.trace {
+        if let Some(rest) = step.note.strip_prefix("assigned to `")
+            && let Some(name) = rest.strip_suffix('`')
+            && !name.is_empty()
+            && name.bytes().all(is_ident)
+        {
+            out.push(name.to_owned());
+        }
+    }
+    if let Some(src) = source {
+        out.extend(destructured_fields(src, "params"));
+        for accessor in request_accessors(src) {
+            if let Some(rest) = strip_request_receiver(&accessor) {
+                let mut parts = rest.split('.');
+                if parts.next() == Some("params")
+                    && let Some(name) = parts.next()
+                    && !name.is_empty()
+                    && name.bytes().all(is_ident)
+                {
+                    out.push(name.to_owned());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The plain identifiers a string argument interpolates: each `${name}` template placeholder and each
+/// `+ name +` / `+ name` concatenation operand that is a bare identifier. Complex expressions
+/// (`${a.b}`, `${f(x)}`) are ignored — only a lone identifier names a single request value a route
+/// slot can carry. Used to find which tainted segment the sink's own text builds in.
+fn interpolated_identifiers(arg: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = arg.as_bytes();
+    // `${ identifier }` template placeholders.
+    let mut rest = arg;
+    while let Some(at) = rest.find("${") {
+        let after = &rest[at + 2..];
+        let end = after.find('}').unwrap_or(after.len());
+        let inner = after[..end].trim();
+        if !inner.is_empty() && inner.bytes().all(is_ident) {
+            out.push(inner.to_owned());
+        }
+        rest = &after[end.min(after.len())..];
+    }
+    // `+ identifier +` / `+ identifier` concatenation operands.
+    let mut i = 0;
+    while let Some(&byte) = bytes.get(i) {
+        if byte == b'+' {
+            let mut j = i + 1;
+            while bytes.get(j).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                j += 1;
+            }
+            let start = j;
+            while bytes.get(j).is_some_and(|byte| is_ident(*byte)) {
+                j += 1;
+            }
+            if j > start {
+                let name = &arg[start..j];
+                // Must be a lone operand: followed by whitespace then `+`, `)`, `,` or end.
+                let mut k = j;
+                while bytes.get(k).is_some_and(|byte| byte.is_ascii_whitespace()) {
+                    k += 1;
+                }
+                let boundary = bytes
+                    .get(k)
+                    .is_none_or(|byte| matches!(byte, b'+' | b')' | b',' | b';'));
+                let leads = start > 0 && bytes.get(start - 1).is_some_and(|byte| !is_ident(*byte));
+                if boundary && leads && !name.chars().next().unwrap_or('0').is_ascii_digit() {
+                    out.push(name.to_owned());
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// When the finding's source is the whole `req.params` object with no segment named, the path
@@ -3034,6 +3193,203 @@ fn destructured_fields(source: &str, part: &str) -> Vec<String> {
     out
 }
 
+/// The [`SqlPlan`] for a SQL-injection finding, resolving the tainted identifiers from the finding and
+/// its entry first. `None` for a non-SQL finding or a value-position injection. Mined from the handler
+/// source only.
+pub fn sql_plan_for(finding: &Finding, entry: &Entry, source: &str) -> Option<SqlPlan> {
+    if finding.class != VulnClass::SqlInjection {
+        return None;
+    }
+    let mut tainted = tainted_identifiers(finding, entry);
+    propagate_path_derived_taint(source, &mut tainted);
+    sql_identifier_plan(source, &tainted)
+}
+
+/// The plan to drive a SQL injection whose tainted value is interpolated in a table-identifier
+/// position (`FROM ${tbl}`, `JOIN ${tbl}`, `UPDATE ${tbl}`, `INTO ${tbl}`): every column the statements
+/// interpolating that identifier reference (classified filter/value) and the request body fields the
+/// handler reads. `None` when no statement interpolates a tainted identifier in such a position — a
+/// value-position injection (`'${x}'`) is not an identifier substitution and is driven differently.
+/// Mined from the handler source only; nothing here is tied to a specific app.
+pub fn sql_identifier_plan(source: &str, tainted: &[String]) -> Option<SqlPlan> {
+    let statements = identifier_interpolating_statements(source, tainted);
+    if statements.is_empty() {
+        return None;
+    }
+    let mut columns: Vec<SqlColumn> = Vec::new();
+    for stmt in &statements {
+        for (name, filter) in sql_statement_columns(stmt) {
+            match columns.iter_mut().find(|c| c.name == name) {
+                Some(existing) => existing.filter |= filter,
+                None => columns.push(SqlColumn { name, filter }),
+            }
+        }
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    let mut body_fields: Vec<String> = Vec::new();
+    for field in destructured_fields(source, "body")
+        .into_iter()
+        .chain(member_params(source, "body"))
+    {
+        if !body_fields.contains(&field) {
+            body_fields.push(field);
+        }
+    }
+    Some(SqlPlan {
+        columns,
+        body_fields,
+    })
+}
+
+/// Each SQL statement in `source` that interpolates one of the tainted identifiers in a
+/// table-identifier position: a template-literal whose `${tainted}` is immediately preceded by a
+/// `FROM`/`JOIN`/`INTO`/`UPDATE`/`TABLE` keyword. The literal is returned lowercased with every
+/// `${...}` replaced by a neutral placeholder, ready for column parsing. Mined textually; a template
+/// expression containing a backtick (never the case for a SQL string) would end the scan early.
+fn identifier_interpolating_statements(source: &str, tainted: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("${") {
+        let at = from + rel;
+        from = at + 2;
+        let Some(close) = source[at + 2..].find('}').map(|c| at + 2 + c) else {
+            continue;
+        };
+        let inner = source[at + 2..close].trim();
+        if !tainted.iter().any(|name| name == inner) {
+            continue;
+        }
+        let pre = source[..at].trim_end();
+        let last_word: String = pre
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if !matches!(
+            last_word.to_ascii_lowercase().as_str(),
+            "from" | "join" | "into" | "update" | "table"
+        ) {
+            continue;
+        }
+        if let Some(stmt) = enclosing_template_literal(source, at)
+            && !out.contains(&stmt)
+        {
+            out.push(stmt);
+        }
+    }
+    out
+}
+
+/// The template literal enclosing byte `offset`, in its original case, with each `${...}` replaced by
+/// a neutral placeholder identifier so only the fixed SQL text (keywords, column names) remains for
+/// parsing. The case is preserved because a column alias's case is the key the handler reads off the
+/// result row (`row.DisplayValue`), and JavaScript property access is case-sensitive.
+fn enclosing_template_literal(source: &str, offset: usize) -> Option<String> {
+    let open = source[..offset].rfind('`')?;
+    let rest = &source[open + 1..];
+    let close = rest.find('`')?;
+    let raw = &rest[..close];
+    let mut text = String::with_capacity(raw.len());
+    let mut remaining = raw;
+    while let Some(at) = remaining.find("${") {
+        text.push_str(&remaining[..at]);
+        text.push_str(" jsstbl ");
+        match remaining[at + 2..].find('}') {
+            Some(end) => remaining = &remaining[at + 2 + end + 1..],
+            None => {
+                remaining = "";
+                break;
+            }
+        }
+    }
+    text.push_str(remaining);
+    Some(text)
+}
+
+/// The columns a single (placeholder-substituted) SQL statement references, each marked a filter column
+/// when it is matched by equality (`col = ...`, `lower(col) = ...`) or a value column when it only
+/// appears in the `SELECT` projection. Column names keep their original case (the key the handler reads
+/// off the result row). Keywords are matched case-insensitively. Textual and deliberately conservative:
+/// a column it cannot classify is simply omitted, which at worst leaves a statement unproven.
+fn sql_statement_columns(stmt: &str) -> Vec<(String, bool)> {
+    let low = stmt.to_ascii_lowercase();
+    let mut cols: Vec<(String, bool)> = Vec::new();
+    let mut mark = |name: &str, filter: bool| {
+        if name.is_empty() || name.eq_ignore_ascii_case("jsstbl") || !name.bytes().all(is_ident) {
+            return;
+        }
+        if name
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            return;
+        }
+        match cols.iter_mut().find(|(n, _)| n == name) {
+            Some(existing) => existing.1 |= filter,
+            None => cols.push((name.to_owned(), filter)),
+        }
+    };
+    // Projection columns: everything between `select` and the first ` from ` (indices from the
+    // lowercased copy, slices from the original so names keep their case).
+    if let Some(sel) = low.find("select ") {
+        let after = sel + "select ".len();
+        if let Some(rel) = low[after..].find(" from ") {
+            for item in split_top_level_commas(&stmt[after..after + rel]) {
+                let main = match item.to_ascii_lowercase().find(" as ") {
+                    Some(at) => &item[..at],
+                    None => &item,
+                };
+                if let Some(name) = last_identifier(main.trim()) {
+                    mark(&name, false);
+                }
+            }
+        }
+    }
+    // Equality-matched columns: the identifier to the left of each `=` that is not `==`/`!=`/`<=`/`>=`.
+    let bytes = stmt.as_bytes();
+    for (i, _) in stmt.match_indices('=') {
+        if matches!(bytes.get(i + 1), Some(b'='))
+            || matches!(
+                bytes.get(i.wrapping_sub(1)),
+                Some(b'=' | b'!' | b'<' | b'>')
+            )
+        {
+            continue;
+        }
+        let left = stmt[..i].trim_end();
+        let column = if let Some(inner) = left.strip_suffix(')') {
+            // `lower(col) =` — the column is the last identifier inside the parentheses.
+            inner.rsplit('(').next().and_then(last_identifier)
+        } else {
+            last_identifier(left)
+        };
+        if let Some(name) = column {
+            mark(&name, true);
+        }
+    }
+    cols
+}
+
+/// The trailing identifier of a SQL expression fragment (`a.b` -> `b`, `lower(title` -> `title`,
+/// `customtag` -> `customtag`), or `None` when it ends in no identifier (`*`).
+fn last_identifier(fragment: &str) -> Option<String> {
+    let name: String = fragment
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 /// For a directory-listing path-traversal whose read path appends a sibling route parameter after
 /// the tainted one (`path.join(resolve(base, mod), kind)`), the sibling slot and the fixed values
 /// the handler constrains it to. Requires: another route slot besides the tainted one, that slot's
@@ -3744,6 +4100,8 @@ mod tests {
             removes: false,
             appended_param: None,
             path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            sql: None,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -4522,16 +4880,18 @@ mod tests {
         );
         dom.source.kind = "dom";
         assert!(Probe::from_finding(&dom).is_err());
-        // SQL injection is out of v1.
-        assert!(
-            Probe::from_finding(&finding(
-                VulnClass::SqlInjection,
-                Auth::NoneDetected,
-                Some("GET /x"),
-                "req.query.n"
-            ))
-            .is_err()
-        );
+        // SQL injection is HTTP-driveable, but without handler source the planner conservatively
+        // leaves its semantic differential absent; the sandbox will skip rather than claiming a
+        // token merely reached SQL text.
+        let sql = Probe::from_finding(&finding(
+            VulnClass::SqlInjection,
+            Auth::NoneDetected,
+            Some("GET /x"),
+            "req.query.n",
+        ))
+        .unwrap();
+        assert_eq!(sql.class, VulnClass::SqlInjection);
+        assert!(sql.sql.is_none());
         // No entry point.
         assert!(
             Probe::from_finding(&finding(
@@ -4595,5 +4955,42 @@ mod tests {
         assert_eq!(doc.filler_keys, vec!["token".to_owned()]);
         assert_eq!(doc.prefix, "===\nmeta:");
         assert_eq!(doc.suffix, "\n===");
+    }
+
+    #[test]
+    fn sql_identifier_plan_preserves_result_column_case_and_required_body_fields() {
+        let source = r#"
+          router.post('/api/info/:tableName/:provider', async (req, res) => {
+            const { tableName } = req.params;
+            const { id } = req.body;
+            const row = db.prepare(
+              `SELECT DisplayValue, provider FROM ${tableName}
+               WHERE MalID = ? AND LOWER(title) = LOWER(?)`
+            ).get(id, id);
+            res.json(row);
+          });
+        "#;
+
+        let plan = sql_identifier_plan(source, &["tableName".to_owned()])
+            .expect("table-identifier injection is driveable");
+        assert!(
+            plan.columns
+                .iter()
+                .any(|column| column.name == "DisplayValue" && !column.filter)
+        );
+        assert!(
+            plan.columns
+                .iter()
+                .any(|column| column.name == "MalID" && column.filter)
+        );
+        assert!(
+            plan.columns
+                .iter()
+                .any(|column| column.name == "title" && column.filter)
+        );
+        assert!(plan.body_fields.contains(&"id".to_owned()));
+
+        let value_position = "db.prepare(`SELECT * FROM items WHERE title = '${tableName}'`)";
+        assert!(sql_identifier_plan(value_position, &["tableName".to_owned()]).is_none());
     }
 }

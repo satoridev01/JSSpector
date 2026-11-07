@@ -71,6 +71,12 @@ pub struct Session {
     /// `node_modules` so the module's bare `require(...)` resolves — the same resolution the real app
     /// sets up for its bundled code. `None` when dependencies install in the launch directory itself.
     node_path: Option<String>,
+    /// Whether the app uses Node's built-in `node:sqlite`, which requires the `--experimental-sqlite`
+    /// runtime flag to load. When set, the flag is added to `NODE_OPTIONS` so the app's own database
+    /// initialization succeeds honestly instead of throwing on an unavailable module — the flag is
+    /// added only for apps that reference it, so it can never change the startup of an app that does
+    /// not. Detected from the app's source (see [`uses_node_sqlite`]).
+    node_sqlite: bool,
     /// Host repo root, used to map startup stack frames under `/app` back to app source.
     root: std::path::PathBuf,
     torn_down: bool,
@@ -197,6 +203,7 @@ impl Session {
             run_as,
             base_env,
             node_path,
+            node_sqlite: uses_node_sqlite(root, &app_root),
             root: root.to_path_buf(),
             torn_down: false,
         };
@@ -338,9 +345,21 @@ impl Session {
             args.push("--user".to_owned());
             args.push(format!("{uid}:{gid}"));
         }
+        // Node's built-in `node:sqlite` only loads with the `--experimental-sqlite` runtime flag; add
+        // it only for an app that references that module, so its own database initialization succeeds
+        // instead of throwing on an unavailable module. Adding it for an app that does not use the
+        // module changes nothing. The missing-module stub is added only on the launch attempt that
+        // needs it.
+        let mut node_options: Vec<String> = Vec::new();
+        if self.node_sqlite {
+            node_options.push("--experimental-sqlite".to_owned());
+        }
         if stub_missing_modules {
+            node_options.push("--require=/jss-launch-shim.js".to_owned());
+        }
+        if !node_options.is_empty() {
             args.push("-e".to_owned());
-            args.push("NODE_OPTIONS=--require=/jss-launch-shim.js".to_owned());
+            args.push(format!("NODE_OPTIONS={}", node_options.join(" ")));
         }
         for var in env {
             // A directory the app names by a variable: its own empty scratch space.
@@ -494,6 +513,9 @@ impl Session {
         self.nonce += 1;
         if probe.class == jss_core::VulnClass::NosqlInjection {
             return self.exercise_nosql(probe);
+        }
+        if probe.class == jss_core::VulnClass::SqlInjection {
+            return self.exercise_sql(probe);
         }
         // A traversal sink that deletes its argument cannot be proved by reflected content — a
         // successful delete echoes nothing — and the generic climbing attempts would consume the
@@ -692,6 +714,57 @@ impl Session {
         let file = format!("{dir}/{}", self.canary.listing_token(nonce));
         let script = format!("mkdir -p '{dir}' && : > '{file}'");
         let _ = self.exec(&self.app, &["sh", "-c", &script]);
+    }
+
+    /// Confirms a table-identifier SQL injection by a response differential: the tainted identifier is
+    /// replaced with a sub-select that the database must evaluate, returning a value it can only produce
+    /// by concatenating two string literals (absent from the request text). A plain-identifier control
+    /// request is sent too. The injection is proved only when the computed value surfaces in the
+    /// injecting response but not the control's — a bound parameter can never introduce a computed
+    /// column, so this is a genuine change to the statement's meaning, not mere taint reachability.
+    fn exercise_sql(&self, probe: &Probe) -> Outcome {
+        let Some(case) = payload::sql_cases(probe, &self.canary, self.nonce) else {
+            return Outcome::Skipped {
+                reason:
+                    "the tainted value is not interpolated in a SQL table-identifier position that \
+                    verify v1 drives"
+                        .to_owned(),
+            };
+        };
+        let (Some(positive), Some(negative)) =
+            (self.fetch(&case.positive), self.fetch(&case.negative))
+        else {
+            return Outcome::NotReproduced { tried: 2 };
+        };
+        if positive.contains(&case.computed) && !negative.contains(&case.computed) {
+            let attempt = &case.positive;
+            return Outcome::Verified {
+                how: format!("{} {}", attempt.verb, attempt.target),
+                poc: Reproduction {
+                    command: curl_command(attempt, self.port),
+                    method: attempt.verb.to_owned(),
+                    target: attempt.target.clone(),
+                    headers: attempt
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}"))
+                        .collect(),
+                    body: attempt.body.clone(),
+                    evidence: format!(
+                        concat!(
+                            "the tainted route identifier was replaced with a sub-select the database ",
+                            "evaluated: a value it can only produce by concatenating two string ",
+                            "literals (`{}`) appeared in the response, while a plain-identifier control ",
+                            "request did not — proving the injected text changed the statement's meaning ",
+                            "rather than being passed as a bound parameter"
+                        ),
+                        case.computed
+                    ),
+                    response: positive.trim().to_owned(),
+                },
+            };
+        }
+        Outcome::NotReproduced { tried: 2 }
     }
 
     fn exercise_nosql(&self, probe: &Probe) -> Outcome {
@@ -1088,6 +1161,47 @@ fn install_path(root: &std::path::Path, app_path: &std::path::Path) -> std::path
         };
     }
     app_path.to_path_buf()
+}
+
+/// Whether the app may load Node's built-in `node:sqlite` module, which only loads under the
+/// `--experimental-sqlite` runtime flag. A cheap, bounded textual scan of the repository's
+/// JavaScript/TypeScript sources for the `node:sqlite` specifier: a database helper the launched
+/// entry `require`s often lives outside the launch directory, so the scan is repository-wide, and
+/// the flag is a harmless no-op for an app that does not use the module. Skips `node_modules` and
+/// dot-directories, and caps the number of files read so a large repository cannot stall startup.
+fn uses_node_sqlite(root: &std::path::Path, _app_root: &std::path::Path) -> bool {
+    fn scan(dir: &std::path::Path, budget: &mut u32) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if *budget == 0 {
+                return false;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                if scan(&path, budget) {
+                    return true;
+                }
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx")
+            ) {
+                *budget -= 1;
+                if std::fs::read_to_string(&path).is_ok_and(|text| text.contains("node:sqlite")) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut budget = 5000u32;
+    scan(root, &mut budget)
 }
 
 /// Node's built-in modules, by the root segment that appears in an import specifier (`fs/promises`
@@ -5287,6 +5401,8 @@ http.createServer((req, res) => {
             removes: false,
             appended_param: None,
             path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            sql: None,
         };
         let confined = Probe {
             method: Method::Get,
@@ -5303,6 +5419,8 @@ http.createServer((req, res) => {
             removes: false,
             appended_param: None,
             path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            sql: None,
         };
         let command = Probe {
             method: Method::Get,
@@ -5319,6 +5437,8 @@ http.createServer((req, res) => {
             removes: false,
             appended_param: None,
             path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            sql: None,
         };
         let ssrf = Probe {
             method: Method::Get,
@@ -5335,6 +5455,8 @@ http.createServer((req, res) => {
             removes: false,
             appended_param: None,
             path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            sql: None,
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

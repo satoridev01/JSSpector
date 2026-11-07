@@ -637,6 +637,96 @@ fn place_traversal(probe: &Probe, value: &str) -> Option<Attempt> {
     }
 }
 
+/// A SQL-injection differential: the injecting request (`positive`), a request with a plain,
+/// non-injecting identifier in the same place (`negative`), and `computed` — a value the database can
+/// only produce by evaluating the injected sub-select's string concatenation, absent from the request
+/// text. The injection is proved when `computed` surfaces in the positive response but not the negative
+/// one: a bound parameter can never introduce a computed column, so its appearance means the
+/// statement's meaning changed, and the negative control rules out an unrelated coincidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlCase {
+    pub positive: Attempt,
+    pub negative: Attempt,
+    pub computed: String,
+}
+
+/// The SQL-injection differential for a table-identifier injection, or `None` when the finding is not
+/// an identifier-position injection the planner mapped (see [`Probe::sql`]). The injecting value is a
+/// sub-select aliasing every column the surrounding statements reference: filter columns (equality-
+/// matched) carry a sentinel the request also binds, so the statement's `WHERE` matches; value columns
+/// carry `'<a>'||'<b>'`, which the database concatenates to a token absent from the request text. The
+/// negative control sends a plain identifier instead, so it cannot produce that token.
+pub fn sql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Option<SqlCase> {
+    let plan = probe.sql.as_ref()?;
+    let first = format!("jssqli{}", canary.token);
+    let second = format!("z{nonce}");
+    let computed = format!("{first}{second}");
+    let sentinel = format!("jsssent{nonce}");
+    let mut parts = Vec::new();
+    for col in &plan.columns {
+        if col.filter {
+            parts.push(format!("'{sentinel}' as {}", col.name));
+        } else {
+            parts.push(format!("'{first}'||'{second}' as {}", col.name));
+        }
+    }
+    let injection = format!("(select {})", parts.join(", "));
+    let control = format!("jssqlctrl{nonce}");
+    Some(SqlCase {
+        positive: place_sql(probe, &injection, &plan.body_fields, &sentinel),
+        negative: place_sql(probe, &control, &plan.body_fields, &sentinel),
+        computed,
+    })
+}
+
+/// Places a SQL-injection value where the probe said the tainted input enters (a route parameter as a
+/// single percent-encoded segment, a query value, a body field, a header), attaching a JSON body that
+/// fills the handler's body fields with `sentinel` so the bound parameters the sink supplies match the
+/// sub-select's filter columns.
+fn place_sql(probe: &Probe, value: &str, body_fields: &[String], sentinel: &str) -> Attempt {
+    let verb = probe.method.verb(&probe.entry);
+    let mut target = probe.path.clone();
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut body_members: Vec<(String, String)> = body_fields
+        .iter()
+        .map(|f| (f.clone(), sentinel.to_owned()))
+        .collect();
+    match &probe.entry {
+        Entry::PathParam(name) => {
+            target = target.replace(&format!("{{{name}}}"), &encode_segment(value));
+        }
+        Entry::Query(name) => {
+            let sep = if target.contains('?') { '&' } else { '?' };
+            target = format!("{target}{sep}{}={}", encode(name), encode(value));
+        }
+        Entry::Body(name) => {
+            let field = name.clone().unwrap_or_else(|| "id".to_owned());
+            body_members.retain(|(key, _)| key != &field);
+            body_members.insert(0, (field, value.to_owned()));
+        }
+        Entry::Header(name) => {
+            headers.push((name.clone(), header_safe(value)));
+        }
+        Entry::Url => {
+            target = format!("/{}", value.trim_start_matches('/'));
+        }
+    }
+    target = fill_remaining(&target, &probe.path_fillers);
+    let body = (!body_members.is_empty()).then(|| {
+        if !headers.iter().any(|(name, _)| name == "Content-Type") {
+            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+        }
+        json_fields(&body_members)
+    });
+    Attempt {
+        verb,
+        target,
+        body,
+        headers,
+        signal: Signal::InResponse,
+    }
+}
+
 /// Three otherwise-identical NoSQL requests: one match-all operator and two independent
 /// match-none controls. Only a database interpreting the object as an operator should make the
 /// first response differ while both controls agree.
@@ -954,6 +1044,14 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
     }
     // Any unfilled `{param}` slot gets its guard-pinned value, or a placeholder, so the route matches.
     target = fill_remaining(&target, &probe.path_fillers);
+    // Body fields a guard requires present when the payload rides a different request part: send them
+    // as the JSON body so the request passes the guard and reaches the sink.
+    if body.is_none() && !probe.body_requires.is_empty() && !matches!(probe.entry, Entry::Body(_)) {
+        body = Some(json_fields(&probe.body_requires));
+        if !headers.iter().any(|(name, _)| name == "Content-Type") {
+            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+        }
+    }
     Attempt {
         verb,
         target,
@@ -961,6 +1059,23 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
         headers,
         signal,
     }
+}
+
+/// A JSON object of `fields`. Empty object when there are none.
+fn json_fields(fields: &[(String, String)]) -> String {
+    let mut out = String::from("{");
+    for (i, (key, value)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\"{}\":\"{}\"",
+            json_escape(key),
+            json_escape(value)
+        ));
+    }
+    out.push('}');
+    out
 }
 
 /// Did the app reproduce the finding, given what the sandbox observed for one attempt: the
@@ -1233,7 +1348,7 @@ fn json_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::plan::{AppendedParam, Entry, Method, Probe};
+    use super::super::plan::{AppendedParam, Entry, Method, Probe, SqlColumn, SqlPlan};
     use super::*;
 
     fn probe(class: VulnClass, path: &str, entry: Entry) -> Probe {
@@ -1252,6 +1367,8 @@ mod tests {
             removes: false,
             appended_param: None,
             path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            sql: None,
         }
     }
 
@@ -1795,6 +1912,41 @@ mod tests {
             cases[0].match_none_in.target,
             format!("/api/v1/course/getCategoryPageDetail?categoryId[$in][]={absent}")
         );
+    }
+
+    #[test]
+    fn sql_cases_require_a_database_computed_value_and_plain_control() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::SqlInjection,
+            "/api/info/{table}/provider",
+            Entry::PathParam("table".to_owned()),
+        );
+        p.method = Method::Post;
+        p.sql = Some(SqlPlan {
+            columns: vec![
+                SqlColumn {
+                    name: "MalID".to_owned(),
+                    filter: true,
+                },
+                SqlColumn {
+                    name: "DisplayValue".to_owned(),
+                    filter: false,
+                },
+            ],
+            body_fields: vec!["id".to_owned()],
+        });
+
+        let case = sql_cases(&p, &canary, 7).expect("SQL plan produces a differential");
+        assert_eq!(case.computed, "jssqliabc123z7");
+        assert!(!case.positive.target.contains(&case.computed));
+        assert!(!case.negative.target.contains(&case.computed));
+        assert!(case.positive.target.contains("%7C%7C"));
+        assert_eq!(case.positive.body.as_deref(), Some("{\"id\":\"jsssent7\"}"));
+        assert_eq!(case.negative.body, case.positive.body);
+
+        assert!("response jssqliabc123z7".contains(&case.computed));
+        assert!(!"control response".contains(&case.computed));
     }
 
     #[test]

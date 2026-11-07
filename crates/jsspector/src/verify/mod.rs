@@ -171,6 +171,37 @@ pub fn run(
             );
         }
     }
+    // A sink reached only past a guard on a body field the payload does not itself ride (the payload
+    // enters through a path segment or query parameter, but `const { id } = req.body; if (!id) throw`
+    // rejects the request first). Mine those required body fields so the request carries them and
+    // reaches the sink. Only when the payload is not already in the body (that part's siblings cover
+    // it) and the method can carry a body.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && !matches!(probe.entry, plan::Entry::Body(_))
+            && probe.method.verb(&probe.entry) != "GET"
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            probe.body_requires = plan::guard_required_fields(
+                &source,
+                "body",
+                "",
+                &plan::guard_anchor_lines(finding),
+            );
+        }
+    }
+    // A SQL injection whose tainted value is interpolated in a table-identifier position
+    // (`FROM ${tbl}`): mine the columns the statements interpolating that identifier reference and the
+    // body fields the handler reads, so the probe can replace the table with a sub-select that both
+    // satisfies those columns and returns a database-computed value.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && finding.class == jss_core::VulnClass::SqlInjection
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            probe.sql = plan::sql_plan_for(finding, &probe.entry, &source);
+        }
+    }
     // An entry that forwards the request URL often reaches its sink only for paths the handler
     // recognizes, and may read the tainted value from a query parameter of the parsed URL rather
     // than from the path — the outbound host of an SSRF, or the file path of a traversal. Mine the

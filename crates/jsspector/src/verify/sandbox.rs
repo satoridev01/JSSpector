@@ -1619,6 +1619,7 @@ fn build_image(
     let pm = package_manager(install_root);
     let has_build = std::fs::read_to_string(app_root.join("package.json"))
         .is_ok_and(|manifest| has_build_script(&manifest));
+    let native_build = needs_native_toolchain(install_root);
     let dockerfile = dockerfile(
         &image,
         install_workdir,
@@ -1628,6 +1629,7 @@ fn build_image(
         port,
         pm,
         has_build,
+        native_build,
     );
     build_from_dockerfile(&dockerfile, tag, context)
 }
@@ -1991,6 +1993,44 @@ fn manifest_declared_deps(dir: &std::path::Path) -> std::collections::BTreeSet<S
         }
     }
     out
+}
+
+/// Whether the dependency tree installed from `install_root` pulls in a package that compiles a
+/// native (C/C++) addon at install time. Such a package drives `node-gyp` (directly, or through a
+/// prebuild helper that falls back to it when no prebuilt binary matches the platform), which needs
+/// a build toolchain — `python3`, `make`, a C++ compiler — that the slim base image does not carry.
+/// Without it the native package's install script fails, and npm rolls the *entire* `node_modules`
+/// back, so even the pure-JS runtime dependencies (the web framework, the router) go unresolved and
+/// the app can never listen. This is a heuristic over the ecosystem's standard native-build helper
+/// packages, matched in the lockfile or manifest — it names the build machinery, never the target's
+/// own packages, so it stays general across repositories.
+fn needs_native_toolchain(install_root: &std::path::Path) -> bool {
+    // Distinctive helper package names: each appears only when a dependency builds or loads a native
+    // addon. `node-gyp-build` is covered by the `node-gyp` substring.
+    const HELPERS: [&str; 6] = [
+        "node-addon-api",
+        "node-gyp",
+        "node-pre-gyp",
+        "prebuild-install",
+        "cmake-js",
+        "prebuildify",
+    ];
+    for lock in [
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+    ] {
+        if let Ok(text) = std::fs::read_to_string(install_root.join(lock))
+            && (text.contains("\"hasInstallScript\": true")
+                || HELPERS.iter().any(|helper| text.contains(helper)))
+        {
+            return true;
+        }
+    }
+    manifest_declared_deps(install_root)
+        .iter()
+        .any(|dep| HELPERS.contains(&dep.as_str()))
 }
 
 /// Whether a package runs an install-time lifecycle script (`preinstall`/`install`/`postinstall`/
@@ -2452,6 +2492,7 @@ fn dockerfile(
     port: u16,
     pm: PackageManager,
     has_build: bool,
+    native_build: bool,
 ) -> String {
     let token = &canary.token;
     // Plant the canary under every path it may be read through in one pass. The content is a JSON
@@ -2478,6 +2519,16 @@ fn dockerfile(
     } else {
         String::new()
     };
+    // A dependency that compiles a native addon needs a C/C++ toolchain the slim base image omits;
+    // without it the native install script fails and npm rolls back the whole `node_modules`, so even
+    // the pure-JS runtime deps vanish and the app never listens. Install the toolchain (as the real
+    // deployment's own Dockerfile does) only when a native-build helper is in the tree, so pure-JS
+    // apps are not slowed. Tolerant: an apt hiccup degrades to the existing install-skip path.
+    let native_toolchain = if native_build {
+        format!("RUN {NATIVE_TOOLCHAIN_INSTALL}\n")
+    } else {
+        String::new()
+    };
     let build = if has_build {
         format!("RUN {}\n", build_command(pm))
     } else {
@@ -2494,6 +2545,7 @@ fn dockerfile(
          WORKDIR /app\n\
          COPY . /app\n\
          WORKDIR {install_workdir}\n\
+         {native_toolchain}\
          {workspace_fixup}\
          RUN {install}\n\
          WORKDIR {workdir}\n\
@@ -2533,6 +2585,12 @@ fn dockerfile(
 /// before an npm install, since npm cannot resolve that protocol and aborts the entire install on the
 /// first one it sees. Edits in place and tolerates a missing or malformed manifest. Dependencies
 /// removed here are development-only monorepo tools, never runtime dependencies.
+/// Installs the native-addon build toolchain on the Debian-based slim base image: `python3`, `make`
+/// and a C++ compiler — the same packages the project's own production Dockerfile installs to build
+/// its native dependencies. Run as root during the image build. Tolerant (`|| true`) so a transient
+/// apt failure degrades to the ordinary install-skip rather than breaking the whole build.
+const NATIVE_TOOLCHAIN_INSTALL: &str = "apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/* || true";
+
 const NPM_WORKSPACE_FIXUP: &str = "node -e 'try{const fs=require(\"fs\");const j=JSON.parse(fs.readFileSync(\"package.json\",\"utf8\"));const o=j.devDependencies;if(o&&typeof o===\"object\")for(const k of Object.keys(o)){if(typeof o[k]===\"string\"&&o[k].indexOf(\"workspace:\")===0)delete o[k];}fs.writeFileSync(\"package.json\",JSON.stringify(j,null,2));}catch(e){}'";
 
 /// Standard base64 (no line wrapping): the only characters produced are `A-Za-z0-9+/=`, all
@@ -5452,6 +5510,7 @@ mod tests {
             3000,
             PackageManager::Yarn,
             true,
+            false,
         );
         assert!(file.contains("RUN corepack enable"), "{file}");
         assert!(file.contains("yarn build"), "{file}");
@@ -5467,6 +5526,7 @@ mod tests {
             r#"["npm","start"]"#,
             3000,
             PackageManager::Npm,
+            false,
             false,
         );
         assert!(!no_build.contains("build"), "{no_build}");
@@ -5674,6 +5734,7 @@ mod tests {
             3000,
             PackageManager::Npm,
             true,
+            false,
         );
         assert!(file.contains(NPM_WORKSPACE_FIXUP), "{file}");
         assert!(file.contains("/jss-lifecycle-host.mjs"), "{file}");
@@ -5687,6 +5748,7 @@ mod tests {
             3000,
             PackageManager::Yarn,
             true,
+            false,
         );
         assert!(!yarn.contains(NPM_WORKSPACE_FIXUP), "{yarn}");
     }
@@ -6043,6 +6105,7 @@ mod tests {
             3000,
             PackageManager::Pnpm,
             false,
+            false,
         );
         let install = file.find("pnpm install").unwrap();
         let run_workdir = file.find("WORKDIR /app/src/web\n").unwrap();
@@ -6080,8 +6143,75 @@ mod tests {
             3000,
             PackageManager::Npm,
             false,
+            false,
         );
         assert!(file.contains(r#"printf '"%s"' 'cafed00d'"#), "{file}");
+    }
+
+    #[test]
+    fn a_native_build_helper_triggers_the_toolchain_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A lockfile that resolves a native-addon helper: the native package's install script needs a
+        // compiler, without which npm rolls back the whole `node_modules`.
+        write(
+            root,
+            "package.json",
+            r#"{"dependencies":{"better-sqlite3":"^13.0.3"}}"#,
+        );
+        write(
+            root,
+            "package-lock.json",
+            r#"{"packages":{"node_modules/node-addon-api":{"version":"8.0.0"}}}"#,
+        );
+        assert!(needs_native_toolchain(root));
+
+        // A pure-JS lockfile needs no toolchain.
+        let plain = tempfile::tempdir().unwrap();
+        write(
+            plain.path(),
+            "package.json",
+            r#"{"dependencies":{"fastify":"^5.4.0"}}"#,
+        );
+        write(
+            plain.path(),
+            "package-lock.json",
+            r#"{"packages":{"node_modules/fastify":{"version":"5.4.0"}}}"#,
+        );
+        assert!(!needs_native_toolchain(plain.path()));
+    }
+
+    #[test]
+    fn the_toolchain_install_runs_before_the_dependency_install() {
+        let canary = Canary::new("cafed00d".to_owned());
+        let with = dockerfile(
+            "node:22-slim",
+            "/app",
+            "/app",
+            &canary,
+            r#"["npm","start"]"#,
+            3000,
+            PackageManager::Npm,
+            false,
+            true,
+        );
+        let toolchain = with.find(NATIVE_TOOLCHAIN_INSTALL).expect("toolchain step");
+        let install = with.find("npm ci").expect("install step");
+        assert!(toolchain < install, "{with}");
+
+        // Omitted for a pure-JS app so its build is not slowed.
+        let without = dockerfile(
+            "node:22-slim",
+            "/app",
+            "/app",
+            &canary,
+            r#"["npm","start"]"#,
+            3000,
+            PackageManager::Npm,
+            false,
+            false,
+        );
+        assert!(!without.contains(NATIVE_TOOLCHAIN_INSTALL), "{without}");
     }
 
     #[test]
@@ -6217,6 +6347,7 @@ mod tests {
             r#"["node","index.js"]"#,
             3000,
             PackageManager::Npm,
+            false,
             false,
         );
         let copy = file.find("COPY . /app\n").unwrap();

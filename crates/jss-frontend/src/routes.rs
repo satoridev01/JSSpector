@@ -174,6 +174,8 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
         .map(|r| (r.rel_path.as_str(), r))
         .collect();
     let next_middleware = next_middleware_policies(root, reports);
+    // Directory-prefix routing applied by `@fastify/autoload` (computed once for the repo).
+    let autoload_dirs = autoload_dir_names(root);
 
     // Mount edges: child router -> (parent router, prefix).
     let mut parents: BTreeMap<RouterId, Vec<(RouterId, String, Auth)>> = BTreeMap::new();
@@ -222,9 +224,10 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
                 _ => entry.path.clone(),
             };
             let provider = resource_prefix(root, file, entry.line).unwrap_or_default();
+            let autoload = autoload_prefix(&autoload_dirs, file).unwrap_or_default();
             for (prefix, mount_auth) in prefixes {
                 let full = if entry.kind == "http" || entry.kind == "file-route" {
-                    openapi_path(&join(&prefix, &join(&provider, &path)))
+                    openapi_path(&join(&prefix, &join(&autoload, &join(&provider, &path))))
                 } else {
                     path.clone()
                 };
@@ -370,6 +373,122 @@ fn next_middleware_auth(policies: &[NextMiddleware], file: &str, route: &str) ->
         .map(|_| Auth::User)
         .max()
         .unwrap_or_default()
+}
+
+/// The directory basenames a repository autoloads with `@fastify/autoload`. Each autoloaded
+/// directory turns its subdirectory names into route prefixes (`dirNameRoutePrefix`, on by default),
+/// so a route plugin's deployed path carries the directory chain above it. A bounded scan reads the
+/// source files that import `@fastify/autoload` and extracts the trailing path-literal of each `dir:`
+/// option (`dir: path.join(__dirname, "routes")` -> `routes`); the basename alone is kept so the
+/// prefix can be anchored on the matching ancestor directory without resolving the app's own base
+/// path (`__dirname`, a custom `rootPath` helper). Empty when the repo does not use autoload.
+fn autoload_dir_names(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    let mut budget: u32 = 4000;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 10 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return names;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_dir() {
+                if name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            } else if matches!(
+                std::path::Path::new(name.as_ref())
+                    .extension()
+                    .and_then(|e| e.to_str()),
+                Some("js" | "mjs" | "cjs" | "ts" | "mts" | "cts")
+            ) {
+                budget -= 1;
+                let Ok(source) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                if !source.contains("@fastify/autoload") {
+                    continue;
+                }
+                for line in source.lines() {
+                    if let Some(rest) = line.split_once("dir:").map(|(_, r)| r)
+                        && let Some(basename) = autoload_dir_literal(rest)
+                    {
+                        names.insert(basename);
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The directory basename named by the last quoted string literal in a `dir:` option expression:
+/// `path.join(__dirname, "./routes")` -> `routes`. `None` when the expression has no string literal
+/// (a fully computed directory the scan cannot read).
+fn autoload_dir_literal(expr: &str) -> Option<String> {
+    let mut last = None;
+    let mut chars = expr.char_indices();
+    while let Some((at, quote)) = chars.next() {
+        if matches!(quote, '"' | '\'' | '`') {
+            let start = at + quote.len_utf8();
+            let Some((end, _)) = chars.by_ref().find(|(_, candidate)| *candidate == quote) else {
+                break;
+            };
+            last = expr.get(start..end);
+        }
+    }
+    let literal = last?.trim_end_matches('/');
+    let basename = literal.rsplit('/').next()?.trim();
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || !basename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(basename.to_owned())
+}
+
+/// The route prefix `@fastify/autoload` derives from a route plugin's directory position. For a file
+/// under an autoloaded directory, the subdirectory names between that directory and the file become
+/// the prefix (`<autoload-dir>/api/utils/index.js` -> `/api/utils`); the file name itself never
+/// contributes a segment. `None` when the repo does not autoload, or the file sits at an autoloaded
+/// directory root (no enclosing subdirectory, so no prefix).
+fn autoload_prefix(dir_names: &std::collections::BTreeSet<String>, file: &str) -> Option<String> {
+    if dir_names.is_empty() {
+        return None;
+    }
+    let components: Vec<&str> = Path::new(file)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    let file_idx = components.len().checked_sub(1)?;
+    // The deepest autoloaded ancestor directory yields the most specific prefix.
+    let anchor = components
+        .get(..file_idx)?
+        .iter()
+        .rposition(|segment| dir_names.contains(*segment))?;
+    let segments = components.get(anchor + 1..file_idx)?;
+    if segments.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", segments.join("/")))
 }
 
 /// OS.js-style provider modules register routes through `proc.resource(path)`, which prefixes the
@@ -745,5 +864,59 @@ mod tests {
             file_route_path("app/(dashboard)/app/route.ts", "file-route").as_deref(),
             Some("/app")
         );
+    }
+
+    #[test]
+    fn autoload_directory_prefix() {
+        let dirs: std::collections::BTreeSet<String> = ["routes".to_owned()].into_iter().collect();
+        // Subdirectory names between the autoload dir and the route file become the prefix; the file
+        // name itself never contributes a segment.
+        assert_eq!(
+            autoload_prefix(&dirs, "server/routes/api/utils/index.js").as_deref(),
+            Some("/api/utils")
+        );
+        assert_eq!(
+            autoload_prefix(&dirs, "server/routes/api/users.js").as_deref(),
+            Some("/api")
+        );
+        // A file at the autoload root has no enclosing subdirectory, so no prefix.
+        assert_eq!(autoload_prefix(&dirs, "server/routes/index.js"), None);
+        // A repo that does not autoload gets no prefix.
+        assert_eq!(
+            autoload_prefix(
+                &std::collections::BTreeSet::new(),
+                "server/routes/api/x/index.js"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn autoload_dir_literal_takes_the_trailing_segment() {
+        assert_eq!(
+            autoload_dir_literal(r#" path.join(__dirname, "./routes"),"#).as_deref(),
+            Some("routes")
+        );
+        assert_eq!(
+            autoload_dir_literal(r#" fs.joinPath(fs.rootPath, './plugins')"#).as_deref(),
+            Some("plugins")
+        );
+        // A fully computed directory with no string literal is not recoverable.
+        assert_eq!(autoload_dir_literal(" resolveRoutesDir(),"), None);
+    }
+
+    #[test]
+    fn autoload_dir_names_reads_fastify_autoload_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("server/plugins")).unwrap();
+        std::fs::write(
+            root.join("server/plugins/config.js"),
+            "import FastifyAutoLoad from \"@fastify/autoload\";\n\
+             fastify.register(FastifyAutoLoad, { dir: fs.joinPath(fs.rootPath, \"./routes\") });\n",
+        )
+        .unwrap();
+        let names = autoload_dir_names(root);
+        assert!(names.contains("routes"), "{names:?}");
     }
 }

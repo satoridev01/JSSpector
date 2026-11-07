@@ -924,13 +924,17 @@ pub fn nosql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<NosqlCase>
             fields.push(name.to_owned());
         }
     }
-    fields
-        .iter()
-        .map(|field| match &probe.entry {
-            Entry::Query(_) => nosql_query_case(probe, field, &absent),
-            _ => nosql_body_case(probe, &primary, field, &absent),
-        })
-        .collect()
+    let mut cases = Vec::new();
+    if let (Some(field), Some(filler)) = (&primary, &probe.body_query_override) {
+        cases.push(nosql_body_query_override_case(
+            probe, field, filler, &absent,
+        ));
+    }
+    cases.extend(fields.iter().map(|field| match &probe.entry {
+        Entry::Query(_) => nosql_query_case(probe, field, &absent),
+        _ => nosql_body_case(probe, &primary, field, &absent),
+    }));
+    cases
 }
 
 /// A per-probe 24-hex value that casts as a MongoDB ObjectId but does not match seeded data.
@@ -1016,6 +1020,52 @@ fn nosql_query_case(probe: &Probe, field: &str, absent: &str) -> NosqlCase {
             target,
             body: None,
             headers: Vec::new(),
+            signal: Signal::InResponse,
+        }
+    };
+    NosqlCase {
+        field: field.to_owned(),
+        match_all: attempt(format!("[$ne]={}", encode(absent))),
+        match_none_eq: attempt(format!("[$eq]={}", encode(absent))),
+        match_none_in: attempt(format!("[$in][]={}", encode(absent))),
+        absent: absent.to_owned(),
+    }
+}
+
+/// A body/query validation bypass: keep a validator-typed scalar in the JSON body, then place the
+/// same-named MongoDB operator in the query string. A handler that merges `{ ...body, ...query }`
+/// validates the scalar first but consumes the later query object at the sink.
+fn nosql_body_query_override_case(
+    probe: &Probe,
+    field: &str,
+    body_filler: &str,
+    absent: &str,
+) -> NosqlCase {
+    let verb = probe.method.verb(&probe.entry);
+    let attempt = |operator: String| {
+        let mut target = fill_remaining(&probe.path, &probe.path_fillers);
+        let sep = if target.contains('?') { '&' } else { '?' };
+        target.push_str(&format!("{sep}{}{operator}", encode(field)));
+        let mut members = probe.siblings.clone();
+        members.retain(|(name, _)| name != field);
+        let mut body = format!(
+            "{{\"{}\":{}",
+            json_escape(field),
+            json_member_value(body_filler)
+        );
+        for (name, value) in members {
+            body.push_str(&format!(
+                ",\"{}\":{}",
+                json_escape(&name),
+                json_member_value(&value)
+            ));
+        }
+        body.push('}');
+        Attempt {
+            verb,
+            target,
+            body: Some(body),
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
             signal: Signal::InResponse,
         }
     };
@@ -1647,6 +1697,7 @@ mod tests {
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_query_override: None,
             sql: None,
             array_element: false,
         }
@@ -2168,6 +2219,33 @@ mod tests {
                 format!("{{\"email\":{{\"$ne\":\"{absent2}\"}},\"name\":\"jsspector\",\"password\":\"Valid1!x\"}}")
                     .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn nosql_body_query_override_keeps_a_valid_scalar_in_the_body() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::NosqlInjection,
+            "/unsubscribe/{type}",
+            Entry::Body(Some("email".to_owned())),
+        );
+        p.method = Method::Post;
+        p.path_fillers
+            .push(("type".to_owned(), "alerts".to_owned()));
+        p.body_query_override = Some("jss@jsspector.test".to_owned());
+
+        let cases = nosql_cases(&p, &canary, 4);
+        let bypass = &cases[0];
+        assert_eq!(bypass.field, "email");
+        assert!(bypass.match_all.target.contains("email[$ne]="));
+        assert_eq!(
+            bypass.match_all.body.as_deref(),
+            Some("{\"email\":\"jss@jsspector.test\"}")
+        );
+        assert_eq!(
+            bypass.match_all.headers,
+            [("Content-Type".to_owned(), "application/json".to_owned())]
         );
     }
 

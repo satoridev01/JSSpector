@@ -249,6 +249,12 @@ pub fn run(
             let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
             let mined =
                 plan::validator_required_body_fields(&route_src, at.line, &payload_field, &resolve);
+            if probe.body_query_override.is_some()
+                && let Some(value) =
+                    plan::validator_body_field_filler(&route_src, at.line, &payload_field, &resolve)
+            {
+                probe.body_query_override = Some(value);
+            }
             if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
                 let idents = plan::route_middleware_idents(&route_src, at.line);
                 let resolved: Vec<(String, bool, bool)> = idents

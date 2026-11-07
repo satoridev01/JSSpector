@@ -99,6 +99,13 @@ pub struct Probe {
     /// passes the guard and reaches the sink. Mined from the handler source only; empty when the
     /// handler requires no such body field, or the payload already rides the body.
     pub body_requires: Vec<(String, String)>,
+    /// For a NoSQL finding sourced from a body field that is later overwritten by a same-named
+    /// query field through an ordered spread merge (`{ ...req.body, ...req.query }`), the scalar
+    /// value to keep in the body while the operator object rides in the query string. This models a
+    /// validator bypass where middleware validates only `body("field")`, then the handler merges the
+    /// unvalidated query after it. `None` when no such overwrite is present. The initial generic
+    /// scalar is replaced with a validator-typed filler when route middleware declares one.
+    pub body_query_override: Option<String>,
     /// For a SQL injection whose tainted value is interpolated in a table-identifier position, how to
     /// drive it (see [`SqlPlan`]). `None` for a non-SQL class or a value-position SQL injection that
     /// verify v1 does not yet drive. Mined from the handler source only.
@@ -598,6 +605,14 @@ impl Probe {
                 }
                 _ => false,
             };
+        let body_query_override = (finding.class == VulnClass::NosqlInjection)
+            .then(|| match (&entry, source) {
+                (Entry::Body(Some(field)), Some(src)) if query_overrides_body_field(src, field) => {
+                    Some("jsspector".to_owned())
+                }
+                _ => None,
+            })
+            .flatten();
         Ok(Self {
             method,
             path,
@@ -614,10 +629,75 @@ impl Probe {
             appended_param,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_query_override,
             sql: None,
             array_element,
         })
     }
+}
+
+/// Whether `field` is destructured from an object literal in which a query object is spread after a
+/// body object from the same request (`const { field } = { ...req.body, ...req.query }`). JavaScript
+/// applies later spreads last, so the unvalidated query value replaces a body value that middleware
+/// may already have validated. Conservative by construction: both spreads must be in the same object
+/// literal, in that order, and `field` must appear in the immediately assigned destructuring pattern.
+pub fn query_overrides_body_field(source: &str, field: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(".body") {
+        let body_dot = from + rel;
+        from = body_dot + ".body".len();
+        let root_start = source[..body_dot]
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
+            .last()
+            .map(|(at, _)| at)
+            .unwrap_or(body_dot);
+        if root_start == body_dot || !source[..root_start].trim_end().ends_with("...") {
+            continue;
+        }
+        let root = &source[root_start..body_dot];
+        let Some(open) = source[..root_start].rfind('{') else {
+            continue;
+        };
+        let Some(close) = delimiter_close(source, open, b'{', b'}') else {
+            continue;
+        };
+        if close <= body_dot {
+            continue;
+        }
+        let query = format!("...{root}.query");
+        let Some(query_rel) = source[body_dot + ".body".len()..close].find(&query) else {
+            continue;
+        };
+        let query_at = body_dot + ".body".len() + query_rel;
+        if query_at <= body_dot {
+            continue;
+        }
+        let before_object = source[..open].trim_end();
+        let Some(eq) = before_object.rfind('=') else {
+            continue;
+        };
+        if !before_object[eq + 1..].trim().is_empty() {
+            continue;
+        }
+        let Some(lhs_open) = before_object[..eq].rfind('{') else {
+            continue;
+        };
+        let Some(lhs_close) = delimiter_close(source, lhs_open, b'{', b'}') else {
+            continue;
+        };
+        if lhs_close > eq {
+            continue;
+        }
+        if source[lhs_open + 1..lhs_close]
+            .split([',', ':', '=', ' ', '\n', '\r', '\t'])
+            .any(|token| token == field)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether the body `field` reaches the sink as an *element* of an iteration, so a NoSQL operator
@@ -1879,6 +1959,36 @@ pub fn validator_required_body_fields(
         }
     }
     out
+}
+
+/// A type-valid value for the payload body field itself, when an express-validator middleware chain
+/// requires it. This is used by the ordered body/query overwrite probe: the body must satisfy its
+/// validator while the same-named, later query value carries the operator object.
+pub fn validator_body_field_filler(
+    route_source: &str,
+    route_line: u32,
+    payload_field: &str,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    for root in route_middleware_roots(route_source, route_line) {
+        let Some(module) = resolve(&root) else {
+            continue;
+        };
+        // A bare middleware identifier can be narrowed to its declared array. A member expression
+        // (`validators.group.rule`) resolves only through its namespace root, so inspect the module's
+        // validator chains and select only the requested field; unrelated chains cannot leak into
+        // the request because this function returns a single exact-field filler.
+        let requirements = const_array_body(&module, &root)
+            .map(|array| validator_body_requirements(&array))
+            .unwrap_or_else(|| validator_body_requirements(&module));
+        if let Some((_, value)) = requirements
+            .into_iter()
+            .find(|(field, _)| field == payload_field)
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// Type-valid fillers for non-payload path slots constrained by required express-validator
@@ -4918,6 +5028,46 @@ const {\n  validateTenant,\n  validateCreateShippingBatch,\n  validate2,\n} = re
     }
 
     #[test]
+    fn a_later_query_spread_can_override_a_validated_body_field() {
+        let handler = r#"
+          async function unsubscribe(request) {
+            const { email, tenant } = {
+              ...request.body,
+              ...request.query,
+              ...request.params,
+            };
+            return Users.findOneAndUpdate({ email }, { tenant });
+          }
+        "#;
+        assert!(super::query_overrides_body_field(handler, "email"));
+        assert!(!super::query_overrides_body_field(handler, "missing"));
+        let safe_order = handler
+            .replace("...request.body,", "...request.query,")
+            .replace(
+                "...request.query,\n              ...request.params",
+                "...request.body,\n              ...request.params",
+            );
+        assert!(!super::query_overrides_body_field(&safe_order, "email"));
+
+        let route =
+            "router.post('/unsubscribe/:type', validators.validateUnsubscribe, controller.run);";
+        let validators = r#"
+          const validateUnsubscribe = [
+            oneOf([
+              body("email").exists().isEmail(),
+              body("user_id").exists().isMongoId(),
+            ]),
+          ];
+        "#;
+        assert_eq!(
+            super::validator_body_field_filler(route, 1, "email", &|name| {
+                (name == "validators").then(|| validators.to_owned())
+            }),
+            Some("jss@jsspector.test".to_owned())
+        );
+    }
+
+    #[test]
     fn namespace_validator_supplies_a_typed_non_payload_path_slot() {
         let route = "router.get(\n  \"/:email/health-score\",\n  analyticsValidations.healthScoreValidators.getHealthScore,\n  controller.getEngagementHealth\n);\n";
         let validator = "const validateUserEmail = param(\"email\").isEmail();\n\
@@ -5189,6 +5339,7 @@ module.exports = { healthScoreValidators };\n";
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_query_override: None,
             sql: None,
             array_element: false,
         };

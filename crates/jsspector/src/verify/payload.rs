@@ -1950,6 +1950,7 @@ mod tests {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            removes_dir: false,
             creates: false,
             appended_param: None,
             path_fillers: Vec::new(),

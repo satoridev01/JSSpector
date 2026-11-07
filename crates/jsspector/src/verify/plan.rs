@@ -75,9 +75,14 @@ pub struct Probe {
     pub lists_dir: bool,
     /// When the sink removes a filesystem entry (`fs.unlink`, `fs.rm`, `fs.rmdir`, `rimraf`) rather
     /// than reading it, the traversal cannot be proved by reflected content: the proof is a planted
-    /// file outside the base directory disappearing after the request while a sibling control file
-    /// planted alongside it survives. Derived from the sink API only.
+    /// filesystem entry outside the base directory disappearing after the request while a sibling
+    /// control entry planted alongside it survives. Derived from the sink API only.
     pub removes: bool,
+    /// When the removing sink only operates on a *directory* (`fs.rmdir(Sync)`, or a recursive helper
+    /// guarded by `isDirectory()` whose terminal sink is `rmdir`), the planted target and control must
+    /// be directories, not files: `rmdirSync` on a plain file errors and the differential would never
+    /// fire. Derived from the sink API only; `false` for `unlink`/`rm` which remove a file.
+    pub removes_dir: bool,
     /// When the sink creates a filesystem entry (`fs.mkdir`, `fs.writeFile`, `fs.createWriteStream`,
     /// a file-upload move) rather than reading one, the traversal cannot be proved by reflected
     /// content either: the proof is a new entry appearing inside an attacker-named directory planted
@@ -642,6 +647,8 @@ impl Probe {
         let lists_dir =
             finding.class == VulnClass::PathTraversal && sink_lists_directory(&finding.sink.api);
         let removes = finding.class == VulnClass::PathTraversal && sink_removes(&finding.sink.api);
+        let removes_dir =
+            finding.class == VulnClass::PathTraversal && sink_removes_dir(&finding.sink.api);
         let creates = finding.class == VulnClass::PathTraversal && sink_creates(&finding.sink.api);
         // A listing whose read path is `<tainted-dir>/<sibling>` reaches a real directory only when
         // the sibling route parameter carries a value the handler accepts; recover it from the route
@@ -682,6 +689,7 @@ impl Probe {
             doc_envelope: None,
             lists_dir,
             removes,
+            removes_dir,
             creates,
             appended_param,
             path_fillers: Vec::new(),
@@ -737,6 +745,7 @@ impl Probe {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            removes_dir: false,
             creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
@@ -1342,7 +1351,169 @@ fn appended_path_fields(source: &str, names: &[String], entry: &Entry) -> Vec<St
             return out;
         }
     }
+    appended_concat_fields(source, names, &fields)
+}
+
+/// The request fields a handler appends after the tainted value inside a *string concatenation* that
+/// builds the path (`serverpath + "Flash" + mypath + "/" + req.query.filename`, with `mypath`
+/// tainted -> `["filename"]`). Fixed string-literal separators (`"/"`) are skipped; each operand that
+/// is a member of the same request part (`req.query.filename`, or a bare destructured field) is
+/// recorded, in order, stopping at the first operand that is neither a literal nor such a field (a
+/// server-computed local, a call) so nothing uncontrolled is mistaken for attacker input. Mined from
+/// the handler source only.
+fn appended_concat_fields(source: &str, names: &[String], fields: &[String]) -> Vec<String> {
+    let bytes = source.as_bytes();
+    for name in names {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(name.as_str()) {
+            let at = from + rel;
+            from = at + name.len();
+            // The occurrence must be a standalone identifier operand, not a member access
+            // (`a.mypath`), a property name, or a longer identifier (`mypathx`).
+            let before = at.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+            if before.is_some_and(|b| is_ident(b) || b == b'.') {
+                continue;
+            }
+            let after_name = at + name.len();
+            if bytes
+                .get(after_name)
+                .is_some_and(|b| is_ident(*b) || *b == b'.')
+            {
+                continue;
+            }
+            let appended = concat_operand_fields(source, after_name, names, fields);
+            if !appended.is_empty() {
+                return appended;
+            }
+        }
+    }
     Vec::new()
+}
+
+/// Walks the `+`-concatenation operands that follow position `start`, collecting request-part fields
+/// (see [`appended_concat_fields`]). Returns the ordered field names, or empty when the tainted value
+/// is the last operand or the next operand is not controllable.
+fn concat_operand_fields(
+    source: &str,
+    start: usize,
+    names: &[String],
+    fields: &[String],
+) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = start;
+    loop {
+        // Skip whitespace to the next operator.
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        // Only a `+` continues the concatenation; anything else ends it.
+        if bytes.get(i) != Some(&b'+') {
+            break;
+        }
+        i += 1;
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        let (operand, next) = concat_operand(source, i);
+        let operand = operand.trim();
+        i = next;
+        if operand.is_empty() {
+            break;
+        }
+        // A string literal is a fixed separator (`"/"`, `"Flash"`): not attacker input, keep scanning.
+        if string_literal_arg(operand).is_some() {
+            continue;
+        }
+        // A member of the same request part (`req.query.filename`) or a bare destructured field is
+        // attacker-controlled: record it. Anything else stops the scan.
+        match concat_field(operand, fields) {
+            Some(field) if !names.iter().any(|n| n == &field) => {
+                if !out.contains(&field) {
+                    out.push(field);
+                }
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// One concatenation operand beginning at `start`: the text up to the next top-level `+` or the
+/// top-level `)`/`]`/`}`/`,`/`;` that ends the enclosing expression, honoring `()`/`[]`/`{}` nesting
+/// and skipping string/template literals. Returns the operand text and the offset of the terminator.
+fn concat_operand(source: &str, start: usize) -> (&str, usize) {
+    let bytes = source.as_bytes();
+    let mut depth = 0i32;
+    let mut i = start;
+    while let Some(b) = bytes.get(i).copied() {
+        match b {
+            b'\'' | b'"' | b'`' => {
+                i = skip_string_literal(source, i);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return (&source[start..i], i);
+                }
+                depth -= 1;
+            }
+            b'+' if depth == 0 => return (&source[start..i], i),
+            b',' | b';' if depth == 0 => return (&source[start..i], i),
+            _ => {}
+        }
+        i += 1;
+    }
+    (&source[start..], bytes.len())
+}
+
+/// The index just past the string/template literal that starts at `start` (an opening quote), honoring
+/// `\`-escapes. A template literal is skipped to its closing backtick without descending into `${...}`.
+fn skip_string_literal(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let Some(quote) = bytes.get(start).copied() else {
+        return bytes.len();
+    };
+    let mut i = start + 1;
+    while let Some(b) = bytes.get(i).copied() {
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == quote {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// The request-part field a concatenation operand names: the member of a `req`/`request`/`ctx`
+/// `.query`/`.body`/`.params` access (`req.query.filename` -> `filename`), or a bare identifier that
+/// is a known field of the part (`fields`). `None` for anything else.
+fn concat_field(operand: &str, fields: &[String]) -> Option<String> {
+    for recv in ["req.", "request.", "ctx."] {
+        if let Some(rest) = operand.strip_prefix(recv) {
+            for part in ["query.", "body.", "params."] {
+                if let Some(member) = rest.strip_prefix(part) {
+                    let field: String = member
+                        .bytes()
+                        .take_while(|b| is_ident(*b))
+                        .map(char::from)
+                        .collect();
+                    // The access must be exactly `recv.part.field` with nothing chained after it.
+                    if !field.is_empty() && member.len() == field.len() {
+                        return Some(field);
+                    }
+                }
+            }
+        }
+    }
+    if operand.bytes().all(is_ident) && !operand.is_empty() && fields.iter().any(|f| f == operand) {
+        return Some(operand.to_owned());
+    }
+    None
 }
 
 /// The field names a handler reads from a request part: members accessed directly
@@ -4188,6 +4359,15 @@ fn sink_removes(api: &str) -> bool {
     )
 }
 
+/// Whether a removing sink API only operates on a *directory* (`fs.rmdir(Sync)`): the delete proof
+/// must plant a directory, not a file, since `rmdir` on a plain file errors (`ENOTDIR`) and the
+/// destructive differential would never fire. `fs.unlink`/`fs.rm` remove a file, so they stay file-
+/// based. Keyed on the final `.`-segment of the API name, so it is framework-agnostic.
+fn sink_removes_dir(api: &str) -> bool {
+    let name = api.rsplit('.').next().unwrap_or(api).to_ascii_lowercase();
+    matches!(name.as_str(), "rmdir" | "rmdirsync")
+}
+
 /// Whether a sink API creates a filesystem entry (rather than reading or removing one): `fs.mkdir(Sync)`,
 /// `fs.writeFile(Sync)`, `fs.appendFile(Sync)`, `fs.createWriteStream`, `fs.copyFile(Sync)`, and a
 /// file-upload move (`.mv`). For these the traversal proof is a new entry appearing inside an
@@ -6351,6 +6531,7 @@ module.exports = { healthScoreValidators };\n";
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            removes_dir: false,
             creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
@@ -6617,6 +6798,53 @@ module.exports = { healthScoreValidators };\n";
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn string_concatenation_names_an_appended_request_field_after_the_tainted_segment() {
+        // `serverpath + "Flash" + mypath + "/" + req.query.filename`: the tainted `mypath` is only a
+        // directory prefix; the handler appends `filename` (another query member) after a `"/"`
+        // separator, so `filename` is the attacker-controlled terminal segment. The fixed string
+        // literals are skipped, and the tainted value itself is not recorded.
+        let source = r#"
+            let mypath = req.query.path
+            let filepath = path.normalize(
+                serverpath + "Flash" + mypath + "/" + req.query.filename
+            )
+            deleteFolderRecursive(filepath)
+        "#;
+        assert_eq!(
+            appended_path_fields(
+                source,
+                &["mypath".to_owned(), "path".to_owned()],
+                &Entry::Query("path".to_owned()),
+            ),
+            vec!["filename".to_owned()]
+        );
+        // A server-computed local appended after the tainted value is not attacker-controlled: nothing
+        // is recorded past it.
+        let computed = r#"
+            let mypath = req.query.path
+            let filepath = serverpath + mypath + "/" + folderName
+        "#;
+        assert!(
+            appended_path_fields(
+                computed,
+                &["mypath".to_owned(), "path".to_owned()],
+                &Entry::Query("path".to_owned()),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn rmdir_sink_marks_the_delete_oracle_to_plant_a_directory() {
+        // `fs.rmdirSync` only removes a directory, so the destructive differential must plant a
+        // directory target, not a file. `fs.unlink`/`fs.rm` remove a file and stay file-based.
+        assert!(sink_removes_dir("fs.rmdirSync"));
+        assert!(sink_removes_dir("rmdir"));
+        assert!(!sink_removes_dir("fs.unlinkSync"));
+        assert!(!sink_removes_dir("fs.rm"));
     }
 
     fn finding(class: VulnClass, auth: Auth, entry: Option<&str>, expr: &str) -> Finding {

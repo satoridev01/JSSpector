@@ -649,9 +649,9 @@ impl Session {
         }
         // A traversal sink that deletes its argument cannot be proved by reflected content — a
         // successful delete echoes nothing — and the generic climbing attempts would consume the
-        // planted canary before any differential ran. Prove it directly: plant a file outside the
-        // base directory, drive the handler to remove it by traversal, and confirm it disappeared
-        // while a sibling control file planted alongside it survived.
+        // planted canary before any differential ran. Prove it directly: plant a filesystem entry
+        // outside the base directory, drive the handler to remove it by traversal, and confirm it
+        // disappeared while a sibling control entry planted alongside it survived.
         if probe.class == jss_core::VulnClass::PathTraversal && probe.removes {
             return match self.verify_delete_oracle(probe) {
                 Some(poc) => Outcome::Verified {
@@ -794,14 +794,26 @@ impl Session {
             Some(at) => &oracle.target_path[..at],
             None => oracle.dir.as_str(),
         };
-        let plant = format!(
-            "mkdir -p '{parent}' '{dir}' && : > '{target}' && : > '{control}'",
-            dir = oracle.dir,
-            target = oracle.target_path,
-            control = oracle.control_path,
-        );
+        // `fs.rmdirSync` (and recursive helpers guarded by `isDirectory()`) only remove a directory,
+        // so plant the target and control as directories; `fs.unlink`/`fs.rm` remove a file, so plant
+        // files. Planting the wrong kind would make the removal error before any differential fires.
+        let plant = if probe.removes_dir {
+            format!(
+                "mkdir -p '{parent}' '{dir}' '{target}' '{control}'",
+                dir = oracle.dir,
+                target = oracle.target_path,
+                control = oracle.control_path,
+            )
+        } else {
+            format!(
+                "mkdir -p '{parent}' '{dir}' && : > '{target}' && : > '{control}'",
+                dir = oracle.dir,
+                target = oracle.target_path,
+                control = oracle.control_path,
+            )
+        };
         let _ = self.exec(&self.app, &["sh", "-c", &plant]);
-        // Both planted files must exist before the request, or the differential proves nothing.
+        // Both planted entries must exist before the request, or the differential proves nothing.
         if !self.file_exists(&oracle.target_path) || !self.file_exists(&oracle.control_path) {
             return None;
         }
@@ -811,17 +823,23 @@ impl Session {
         if self.file_exists(&oracle.target_path) || !self.file_exists(&oracle.control_path) {
             return None;
         }
+        let entry_kind = if probe.removes_dir {
+            "directory"
+        } else {
+            "file"
+        };
         Some(Reproduction {
             command: curl_command(&oracle.present, self.port),
             method: oracle.present.verb.to_owned(),
             target: oracle.present.target.clone(),
             headers: Vec::new(),
             body: oracle.present.body.clone(),
-            evidence:
-                "a canary file planted outside the application's base directory was removed by \
-                the traversal request while a sibling control file planted alongside it survived, \
-                proving the removal opened the attacker-controlled path outside the base directory"
-                    .to_owned(),
+            evidence: format!(
+                "a canary {entry_kind} planted outside the application's base directory was removed \
+                 by the traversal request while a sibling control {entry_kind} planted alongside it \
+                 survived, proving the removal opened the attacker-controlled path outside the base \
+                 directory"
+            ),
             response: String::new(),
         })
     }
@@ -6933,6 +6951,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            removes_dir: false,
             creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
@@ -6956,6 +6975,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            removes_dir: false,
             creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
@@ -6979,6 +6999,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            removes_dir: false,
             creates: false,
             appended_param: None,
             path_fillers: Vec::new(),
@@ -7006,6 +7027,7 @@ http.createServer((req, res) => {
             doc_envelope: None,
             lists_dir: false,
             removes: false,
+            removes_dir: false,
             creates: false,
             appended_param: None,
             path_fillers: Vec::new(),

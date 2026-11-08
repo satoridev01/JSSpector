@@ -2509,14 +2509,20 @@ pub fn validator_required_body_fields(
     resolve: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for middleware in route_middleware_idents(route_source, route_line) {
-        let Some(module) = resolve(&middleware) else {
+    // Resolve each middleware argument as a full expression so a member-expression validator
+    // (`userValidations.syncAnalyticsAndMobile`) is handled, not only a bare identifier bound to a
+    // local array. The resolved chain text is scanned for required `body(...)`/`check(...)` fields.
+    for expr in route_middleware_exprs(route_source, route_line) {
+        let mut parts = expr.split('.');
+        let Some(root) = parts.next() else {
             continue;
         };
-        let Some(array) = const_array_body(&module, &middleware) else {
+        let Some(module) = resolve(root) else {
             continue;
         };
-        for (field, value) in validator_body_requirements(&array) {
+        let leaf: Vec<&str> = parts.collect();
+        let chain = validator_chain_text(&module, root, &leaf);
+        for (field, value) in validator_body_requirements(&chain) {
             if field == payload_field {
                 continue;
             }
@@ -6153,6 +6159,24 @@ const {\n  validateTenant,\n  validateCreateShippingBatch,\n  validate2,\n} = re
         assert_eq!(
             got,
             vec![("device_names".to_owned(), "[\"jsspector\"]".to_owned())]
+        );
+    }
+
+    #[test]
+    fn member_expression_validator_supplies_a_oneof_sibling_for_a_body_payload() {
+        // The middleware is a member expression (`userValidations.syncAnalyticsAndMobile`), not a
+        // bare identifier, and the payload field (`email`) is one branch of a `oneOf`. The other
+        // branch's field (`firebase_uid`) must be carried as a sibling so the group is satisfied
+        // without the payload field needing to be a valid scalar — letting the operator object reach
+        // the sink.
+        let route = "router.post(\n  \"/syncAnalyticsAndMobile\",\n  userValidations.syncAnalyticsAndMobile,\n  controller.sync\n);\n";
+        let module = "const syncAnalyticsAndMobile = [\n  oneOf([\n    body(\"firebase_uid\").exists().notEmpty().trim(),\n    body(\"email\").exists().notEmpty().isEmail(),\n  ]),\n  body(\"phoneNumber\").optional().isMobilePhone(),\n];\nmodule.exports = { syncAnalyticsAndMobile };\n";
+        let got = super::validator_required_body_fields(route, 1, "email", &|name| {
+            (name == "userValidations").then(|| module.to_owned())
+        });
+        assert_eq!(
+            got,
+            vec![("firebase_uid".to_owned(), "jsspector".to_owned())]
         );
     }
 

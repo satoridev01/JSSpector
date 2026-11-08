@@ -723,6 +723,72 @@ pub fn create_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Creat
     })
 }
 
+/// The requests and planted paths that prove a *write-overwrite* sink (`fs.writeFile`,
+/// `fs.appendFile`, `fs.copyFile`) opens an attacker-controlled *existing* file outside the base
+/// directory. Unlike the create oracle, this covers a read-modify-write handler that opens the target
+/// before writing it (so a fresh leaf under an empty planted directory would fail the handler's own
+/// read before any write ran): a `target` file is planted outside the base with known content, a
+/// `control` file is planted alongside it the request never names, and one request per candidate route
+/// climbs to `target`. A vulnerable handler rewrites `target` (its content changes) while `control`
+/// keeps its content; a handler that confines the path reaches neither.
+pub struct OverwriteOracle {
+    /// One request per candidate route, each climbing to the planted `target_path`.
+    pub present: Vec<Attempt>,
+    /// The directory to create before planting, holding both planted files.
+    pub dir: String,
+    /// The out-of-base file the traversal targets; its content must change after the request.
+    pub target_path: String,
+    /// A sibling file planted alongside the target but never named by the request; must stay identical.
+    pub control_path: String,
+    /// The known content both files are planted with. The target differing from it after the request
+    /// (while the control still equals it) is the proof. A generic minified JSON object, so a handler
+    /// that re-serializes what it read (even unchanged, with different whitespace) still shows a diff.
+    pub planted: String,
+}
+
+/// Builds the write-overwrite oracle for a path-traversal probe whose sink writes its argument, or
+/// `None` for an entry with no placeable path segment. The planted target sits outside the
+/// application's base directory (under the planted-canary root), reached by a deep `../` climb that
+/// path normalization resolves from any base depth. One request is produced per candidate route (the
+/// probe's own path and any sibling routes the same handler is registered on), since a single
+/// controller method mounted on several paths often performs its write only on the branch its route
+/// selects.
+pub fn overwrite_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<OverwriteOracle> {
+    if probe.class != VulnClass::PathTraversal {
+        return None;
+    }
+    let unique = format!("jss-ow-{}-{nonce}", canary.token);
+    let dir = format!("/{PLANTED_DIR}/{unique}");
+    let target_path = format!("{dir}/target");
+    let control_path = format!("{dir}/jss-ow-keep");
+    let climb = "../".repeat(12);
+    let value = format!("{climb}{PLANTED_DIR}/{unique}/target");
+    let mut paths: Vec<String> = vec![probe.path.clone()];
+    for alt in &probe.alt_paths {
+        if !paths.contains(alt) {
+            paths.push(alt.clone());
+        }
+    }
+    let present: Vec<Attempt> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let mut probe = probe.clone();
+            probe.path = path;
+            place_traversal(&probe, &value)
+        })
+        .collect();
+    if present.is_empty() {
+        return None;
+    }
+    Some(OverwriteOracle {
+        present,
+        dir,
+        target_path,
+        control_path,
+        planted: "{\"a\":1}".to_owned(),
+    })
+}
+
 /// Sets `field` in a sibling list to `value`, overriding an existing entry or appending a new one, so
 /// a required sibling the handler reads from the request is driven to the value the oracle needs.
 fn set_sibling(siblings: &mut Vec<(String, String)>, field: &str, value: &str) {
@@ -1474,7 +1540,12 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
     target = fill_remaining(&target, &probe.path_fillers);
     // Body fields a guard requires present when the payload rides a different request part: send them
     // as the JSON body so the request passes the guard and reaches the sink.
-    if body.is_none() && !probe.body_requires.is_empty() && !matches!(probe.entry, Entry::Body(_)) {
+    if body.is_none()
+        && !matches!(probe.entry, Entry::Body(_))
+        && (!probe.body_requires.is_empty() || probe.body_object)
+    {
+        // `json_fields` of an empty list is `{}`: a minimal body object for a handler that forwards the
+        // whole `req.body` and guards only its type, merged with any specific guard-required fields.
         body = Some(json_fields(&probe.body_requires));
         if !headers.iter().any(|(name, _)| name == "Content-Type") {
             headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
@@ -1947,11 +2018,13 @@ mod tests {
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override: None,
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
+            alt_paths: Vec::new(),
         }
     }
 
@@ -1990,6 +2063,55 @@ mod tests {
         // base64url is a single clean path segment (no `/`, no `=` padding).
         assert!(!seg.contains('/') && !seg.contains('='));
         assert_eq!(a[0].signal, Signal::ServiceReached(canary.service_token(1)));
+    }
+
+    #[test]
+    fn a_non_body_payload_can_carry_a_minimal_body_object() {
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/files",
+            Entry::Query("name".to_owned()),
+        );
+        p.method = Method::Put;
+        p.body_object = true;
+
+        let attempt = place(&p, "PUT", "../marker", Signal::InResponse);
+
+        assert_eq!(attempt.body.as_deref(), Some("{}"));
+        assert_eq!(
+            attempt.headers,
+            vec![("Content-Type".to_owned(), "application/json".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_overwrite_oracle_tries_the_primary_and_sibling_routes() {
+        let canary = Canary::new("token".to_owned());
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/api/settings/layermenu",
+            Entry::Query("mapFile".to_owned()),
+        );
+        p.method = Method::Put;
+        p.body_object = true;
+        p.alt_paths = vec!["/api/settings/mapsettings".to_owned()];
+
+        let oracle = overwrite_oracle(&p, &canary, 7).unwrap();
+
+        assert_eq!(oracle.present.len(), 2);
+        assert_eq!(oracle.present[0].body.as_deref(), Some("{}"));
+        assert!(
+            oracle.present[0]
+                .target
+                .starts_with("/api/settings/layermenu?mapFile=")
+        );
+        assert!(
+            oracle.present[1]
+                .target
+                .starts_with("/api/settings/mapsettings?mapFile=")
+        );
+        assert_ne!(oracle.target_path, oracle.control_path);
+        assert_eq!(oracle.planted, "{\"a\":1}");
     }
 
     #[test]

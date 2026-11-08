@@ -485,6 +485,7 @@ fn scan_file_program_inner(
         service_worker: false,
         modules: BTreeMap::new(),
         relative: BTreeMap::new(),
+        dyn_imports: BTreeMap::new(),
         factory_bindings: BTreeMap::new(),
         result: ScanResult::default(),
         depth: 0,
@@ -1447,6 +1448,11 @@ struct Walker<'e> {
     modules: BTreeMap<String, Imported>,
     /// Local names bound to relative modules: name -> (specifier, export or None).
     relative: BTreeMap<String, (String, Option<String>)>,
+    /// Local names bound to a dynamic `import()` of a template specifier with one interpolation:
+    /// `const { default: router } = await import(`./apis/v${v}/router.js`)` -> `router` ->
+    /// (`./apis/v`, `v`, `/router.js`, `default`). Lets a `use(`/api/v${v}`, router)` mount resolve
+    /// to every matching file with its own concrete prefix.
+    dyn_imports: BTreeMap<String, DynImport>,
     /// Variables bound to the result of calling an imported factory
     /// (`const authorization = authorizationController(options)`): name -> factory.
     factory_bindings: BTreeMap<String, String>,
@@ -3205,6 +3211,136 @@ fn is_router_factory(name: &str) -> bool {
     has(&m().router_factories, last) || has(&m().router_factories, name)
 }
 
+/// Whether an expression is a method chain rooted in a router factory with no variable to name it:
+/// `express.Router().use('/x', child).get('/y', h)` or `new Hono().basePath('/api')`. Such a value
+/// is typically the module's default export (`export default express.Router()...`); it owns the
+/// routes and mounts chained onto it, but has no identifier, so registrations on it would otherwise
+/// have no receiver and their mount prefixes could never be joined across files.
+fn is_anonymous_router_chain(expr: &Expression<'_>) -> bool {
+    let mut current = expr.get_inner_expression();
+    for _ in 0..64 {
+        match current {
+            Expression::CallExpression(call) => {
+                if callee_name(&call.callee)
+                    .as_deref()
+                    .is_some_and(is_router_factory)
+                {
+                    return true;
+                }
+                let Some(member) = call.callee.get_inner_expression().as_member_expression() else {
+                    return false;
+                };
+                current = member.object().get_inner_expression();
+            }
+            Expression::NewExpression(new) => {
+                return callee_name(&new.callee)
+                    .as_deref()
+                    .is_some_and(is_router_factory);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A local name bound to a dynamic `import()` of a one-interpolation template specifier.
+#[derive(Debug, Clone)]
+struct DynImport {
+    /// Literal text before the interpolation (`./apis/v`).
+    pre: String,
+    /// The single interpolated variable's name (`v`).
+    var: String,
+    /// Literal text after the interpolation (`/router.js`).
+    suf: String,
+    /// The export of the loaded module this name binds (`default`, or `*` for the namespace).
+    export: String,
+}
+
+/// A template literal with exactly one interpolation that is a bare identifier, returned as the
+/// text before it, the identifier's name, and the text after it: `` `/api/v${v}` `` ->
+/// `("/api/v", "v", "")`. `None` for any other template (no interpolation, several, or a
+/// non-identifier like `${v}.${x}`).
+fn single_interpolation(expr: &Expression<'_>) -> Option<(String, String, String)> {
+    let Expression::TemplateLiteral(t) = expr.get_inner_expression() else {
+        return None;
+    };
+    if t.expressions.len() != 1 || t.quasis.len() != 2 {
+        return None;
+    }
+    let Expression::Identifier(id) = t.expressions.first()?.get_inner_expression() else {
+        return None;
+    };
+    let cooked = |i: usize| -> Option<String> {
+        t.quasis
+            .get(i)
+            .and_then(|q| q.value.cooked)
+            .and_then(|c| c.as_str())
+            .map(str::to_owned)
+    };
+    Some((cooked(0)?, id.name.as_str().to_owned(), cooked(1)?))
+}
+
+/// The template specifier of a dynamic `import()` (or `await import()`), when it has one
+/// interpolation: `await import(`./apis/v${v}/router.js`)` -> `("./apis/v", "v", "/router.js")`.
+fn dynamic_import_template(expr: &Expression<'_>) -> Option<(String, String, String)> {
+    let inner = match expr.get_inner_expression() {
+        Expression::AwaitExpression(a) => a.argument.get_inner_expression(),
+        other => other,
+    };
+    let Expression::ImportExpression(import) = inner else {
+        return None;
+    };
+    single_interpolation(&import.source)
+}
+
+/// Root-relative files matching a relative template specifier split around its interpolation, each
+/// with the interpolation's concrete value: for `./apis/v` + `/router.js` from `apps/x/routes.js`,
+/// `apps/x/apis/v2/router.js` -> `("apps/x/apis/v2/router.js", "2")`. The value never spans a path
+/// separator, so `v${v}` matches one directory level, not a deeper tree.
+fn interpolated_files(
+    file: &str,
+    pre: &str,
+    suf: &str,
+    files: &std::collections::BTreeSet<String>,
+) -> Vec<(String, String)> {
+    let dir = file.rsplit_once('/').map_or("", |(d, _)| d);
+    // Resolve `./` and `../` segments of the pre-part against the importing file's directory.
+    let mut segments: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split('/').collect()
+    };
+    let (head, tail) = pre.rsplit_once('/').unwrap_or(("", pre));
+    for part in head.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut base = segments.join("/");
+    if !base.is_empty() {
+        base.push('/');
+    }
+    base.push_str(tail); // The literal start of the interpolated segment (often empty).
+    let mut out = Vec::new();
+    for candidate in files {
+        let Some(rest) = candidate.strip_prefix(&base) else {
+            continue;
+        };
+        let Some(value) = rest.strip_suffix(suf) else {
+            continue;
+        };
+        if value.is_empty() || value.contains('/') {
+            continue;
+        }
+        out.push((candidate.clone(), value.to_owned()));
+    }
+    out
+}
+
 /// What a chain of registrations starts from: `Router()` in `Router().get('/a', h).post(..)`,
 /// `app` in `app.route('/book').get(h)`, `new Hono()` in `new Hono().basePath('/api')`.
 fn chain_root<'e, 'a>(expr: &'e Expression<'a>) -> &'e Expression<'a> {
@@ -3883,6 +4019,19 @@ impl Walker<'_> {
                                     .exports
                                     .insert("default".to_owned(), "<default>".to_owned());
                             }
+                            // `export default new Controller()`: the default export is an instance
+                            // of the class, so a handler registered as `controller.list` is the
+                            // class method `Controller.list`. Name the default by the class so the
+                            // member reference resolves to the method.
+                            Expression::NewExpression(new) => {
+                                if let Expression::Identifier(id) =
+                                    new.callee.get_inner_expression()
+                                {
+                                    self.facts
+                                        .exports
+                                        .insert("default".to_owned(), id.name.as_str().to_owned());
+                                }
+                            }
                             _ => {}
                         }
                         // `export default async (req, res) => {}`, `export default handler`,
@@ -3934,6 +4083,19 @@ impl Walker<'_> {
                         ) {
                             return;
                         }
+                        // `export default express.Router().use('/x', child).get('/y', h)`: an
+                        // anonymous router is the default export. Name it `<default>` so its routes
+                        // and mounts carry that receiver, and record it as the default export, so a
+                        // parent file mounting this module under a prefix links to it.
+                        if is_anonymous_router_chain(expr) {
+                            self.facts
+                                .exports
+                                .insert("default".to_owned(), "<default>".to_owned());
+                            let saved = self.chain_receiver.replace("<default>".to_owned());
+                            self.expr(expr, env);
+                            self.chain_receiver = saved;
+                            return;
+                        }
                         self.expr(expr, env);
                     }
                 }
@@ -3966,6 +4128,43 @@ impl Walker<'_> {
             };
             if let Some(spec) = require_spec(init) {
                 self.bind_require(&declarator.id, &spec, None);
+                continue;
+            }
+            // `const { default: router } = await import(`./apis/v${v}/router.js`)`: a dynamic import
+            // of a per-version module. Remember what each bound name loads so a later versioned mount
+            // (`app.use(`/api/v${v}`, router)`) resolves to every matching file.
+            if let Some((pre, var, suf)) = dynamic_import_template(init) {
+                match &declarator.id {
+                    BindingPattern::BindingIdentifier(id) => {
+                        self.dyn_imports.insert(
+                            id.name.as_str().to_owned(),
+                            DynImport {
+                                pre,
+                                var,
+                                suf,
+                                export: "*".to_owned(),
+                            },
+                        );
+                    }
+                    BindingPattern::ObjectPattern(object) => {
+                        for property in &object.properties {
+                            if let (Some(key), BindingPattern::BindingIdentifier(local)) =
+                                (prop_name(&property.key), &property.value)
+                            {
+                                self.dyn_imports.insert(
+                                    local.name.as_str().to_owned(),
+                                    DynImport {
+                                        pre: pre.clone(),
+                                        var: var.clone(),
+                                        suf: suf.clone(),
+                                        export: key,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
             // `const { exec } = require('child_process').promises` and `require('fs').promises`
@@ -11485,6 +11684,13 @@ impl Walker<'_> {
             {
                 // `router.use('/api', child)`: a mount, unless the last argument is a handler.
                 if has(&m().mount_methods, method) && !is_function {
+                    // `app.use(`/api/v${v}`, router)` where `router` is a dynamic import of
+                    // `./apis/v${v}/router.js`: one mount per matching file, each under its own
+                    // concrete version prefix. Resolves the versioned-API loop a single string
+                    // prefix cannot express.
+                    if self.record_versioned_mount(first, last, object.as_deref(), auth) {
+                        return;
+                    }
                     let (target, target_file, target_export) = match last {
                         Some(e) => self.mount_target(e),
                         None => (None, None, None),
@@ -11783,6 +11989,53 @@ impl Walker<'_> {
     /// What a mount argument names: a local router or an import's member (`api.router`, as
     /// `api.router`), or the file of `require('./users')` (or of a factory
     /// `require('./users')()`, or its export `require('./users').router`).
+    /// Records the mounts of a versioned-API loop and reports whether it did: `app.use(
+    /// `/api/v${v}`, router)` where `router` was bound by `import(`./apis/v${v}/router.js`)` mounts
+    /// `apis/v1/router.js` under `/api/v1`, `apis/v2/router.js` under `/api/v2`, and so on — one
+    /// `MountFact` per version found on disk, each with its own concrete prefix. Both templates must
+    /// interpolate the same loop variable, so each file is mounted under the matching version.
+    fn record_versioned_mount(
+        &mut self,
+        prefix_expr: Option<&Expression<'_>>,
+        router_expr: Option<&Expression<'_>>,
+        receiver: Option<&str>,
+        auth: Auth,
+    ) -> bool {
+        let Some((pfx_pre, pfx_var, pfx_suf)) = prefix_expr.and_then(single_interpolation) else {
+            return false;
+        };
+        let Some(Expression::Identifier(id)) = router_expr.map(Expression::get_inner_expression)
+        else {
+            return false;
+        };
+        let Some(import) = self.dyn_imports.get(id.name.as_str()) else {
+            return false;
+        };
+        if import.var != pfx_var {
+            return false;
+        }
+        let export = (import.export != "*").then(|| import.export.clone());
+        let matches = interpolated_files(
+            self.linking.file,
+            &import.pre,
+            &import.suf,
+            self.linking.files,
+        );
+        let mut recorded = false;
+        for (file, value) in matches {
+            self.facts.mounts.push(MountFact {
+                receiver: receiver.map(str::to_owned),
+                prefix: format!("{pfx_pre}{value}{pfx_suf}"),
+                target: None,
+                target_file: Some(file),
+                target_export: export.clone(),
+                auth,
+            });
+            recorded = true;
+        }
+        recorded
+    }
+
     fn mount_target(
         &self,
         expr: &Expression<'_>,

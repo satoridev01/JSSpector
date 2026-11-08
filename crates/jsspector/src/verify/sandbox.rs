@@ -657,13 +657,23 @@ impl Session {
         // inside it by traversal, and confirm the directory became non-empty while a sibling control
         // directory planted alongside it stayed empty.
         if probe.class == jss_core::VulnClass::PathTraversal && probe.creates {
-            return match self.verify_create_oracle(probe) {
-                Some(poc) => Outcome::Verified {
+            if let Some(poc) = self.verify_create_oracle(probe) {
+                return Outcome::Verified {
                     how: format!("{} {}", poc.method, poc.target),
                     poc,
-                },
-                None => Outcome::NotReproduced { tried: 1 },
-            };
+                };
+            }
+            // A read-modify-write handler (`fs.writeFile` after opening the same path) never creates a
+            // brand-new leaf: it reads the target first, so the create differential cannot fire. Prove
+            // it instead by overwriting an attacker-selected *existing* file outside the base, with an
+            // untouched sibling control.
+            if let Some(poc) = self.verify_overwrite_oracle(probe) {
+                return Outcome::Verified {
+                    how: format!("{} {}", poc.method, poc.target),
+                    poc,
+                };
+            }
+            return Outcome::NotReproduced { tried: 1 };
         }
         // A traversal *read* sink that appends a fixed segment after the tainted input reads
         // `<tainted-dir>/<suffix>`. Plant the canary file at that location so the climbing payloads,
@@ -907,6 +917,86 @@ impl Session {
         .ok()
         .filter(|output| output.status.success())
         .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains('Y'))
+    }
+
+    /// Confirms a path-traversal write that *overwrites an existing* file (`fs.writeFile` after the
+    /// handler opens the same path) by a content differential: a `target` file is planted outside the
+    /// application's base directory with known content, and a `control` file is planted alongside it the
+    /// request never names. The request climbs to `target` and asks the handler to write it. A
+    /// vulnerable handler rewrites `target` (its content changes) while `control` keeps its content; a
+    /// handler that confines the path reaches neither. One request per candidate route is tried, since a
+    /// controller method mounted on several paths may write only on the branch its route selects. The
+    /// planting and the requests both stay inside the isolated app container.
+    fn verify_overwrite_oracle(&self, probe: &Probe) -> Option<Reproduction> {
+        let oracle = payload::overwrite_oracle(probe, &self.canary, self.nonce)?;
+        let document = base64(oracle.planted.as_bytes());
+        for attempt in &oracle.present {
+            // Re-plant fresh target and control with identical known content before each attempt, so a
+            // prior attempt that rewrote the target cannot mask or fake a later one. The write runs as
+            // the app process (possibly a dropped non-root user); make the files writable.
+            let plant = format!(
+                "rm -rf '{dir}' && mkdir -p '{dir}' && echo {document} | base64 -d > '{target}' && echo {document} | base64 -d > '{control}' && chmod 777 '{dir}' && chmod 666 '{target}' '{control}'",
+                dir = oracle.dir,
+                target = oracle.target_path,
+                control = oracle.control_path,
+            );
+            let _ = self.exec(&self.app, &["sh", "-c", &plant]);
+            // Both files must exist with the planted content before the request, or the differential
+            // proves nothing.
+            if self.file_contents(&oracle.target_path).as_deref() != Some(oracle.planted.as_str())
+                || self.file_contents(&oracle.control_path).as_deref()
+                    != Some(oracle.planted.as_str())
+            {
+                continue;
+            }
+            let _ = self.fetch(attempt);
+            // The target must have been rewritten (content changed) and the control left untouched: the
+            // write was directed by the attacker-controlled path, not an indiscriminate rewrite.
+            let changed = self
+                .file_contents(&oracle.target_path)
+                .is_some_and(|after| after != oracle.planted);
+            let control_intact = self.file_contents(&oracle.control_path).as_deref()
+                == Some(oracle.planted.as_str());
+            if changed && control_intact {
+                let _ = self.exec(
+                    &self.app,
+                    &["sh", "-c", &format!("rm -rf '{}'", oracle.dir)],
+                );
+                return Some(Reproduction {
+                    command: curl_command(attempt, self.port),
+                    method: attempt.verb.to_owned(),
+                    target: attempt.target.clone(),
+                    headers: Vec::new(),
+                    body: attempt.body.clone(),
+                    evidence:
+                        "a canary file planted outside the application's base directory with known \
+                        content was overwritten by the traversal request while a sibling control file \
+                        planted alongside it kept its content, proving the write opened the \
+                        attacker-controlled path outside the base directory"
+                            .to_owned(),
+                    response: String::new(),
+                    controls: Vec::new(),
+                });
+            }
+        }
+        let _ = self.exec(
+            &self.app,
+            &["sh", "-c", &format!("rm -rf '{}'", oracle.dir)],
+        );
+        None
+    }
+
+    /// The exact bytes of a file inside the running app container, or `None` when it does not exist.
+    /// Used by the overwrite oracle to observe, out of band from the HTTP response, that a planted
+    /// file's content was rewritten by a traversal request.
+    fn file_contents(&self, path: &str) -> Option<String> {
+        let output = self
+            .exec(&self.app, &["sh", "-c", &format!("cat '{path}'")])
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Confirms a nested-write prototype-pollution sink (`obj[outer][inner] = v`) by reading the
@@ -1654,7 +1744,8 @@ fn build_image(
     let image = base_image(install_root);
     let pm = package_manager(install_root);
     let has_build = std::fs::read_to_string(app_root.join("package.json"))
-        .is_ok_and(|manifest| has_build_script(&manifest));
+        .ok()
+        .and_then(|manifest| build_script(&manifest, app_root));
     let native_build = needs_native_toolchain(install_root);
     let dockerfile = dockerfile(
         &image,
@@ -2335,12 +2426,41 @@ fn install_command(pm: PackageManager) -> &'static str {
 /// production server (`next start`, `vite preview`, a compiled `dist/`) serves the build output and
 /// will not start without it. Tolerated failure keeps a sub-step that needs the network (asset
 /// downloads) from failing the image when the primary build has already produced its output.
-fn build_command(pm: PackageManager) -> &'static str {
+fn build_command(pm: PackageManager, script: &str) -> String {
     match pm {
-        PackageManager::Npm => "npm run build --if-present || true",
-        PackageManager::Yarn => "yarn build || true",
-        PackageManager::Pnpm => "pnpm run build || true",
+        PackageManager::Npm => format!("npm run {script} --if-present || true"),
+        PackageManager::Yarn => format!("yarn run {script} || true"),
+        PackageManager::Pnpm => format!("pnpm run {script} || true"),
     }
+}
+
+/// The script that produces what the app's `start` launches. Normally `build`; when there is none,
+/// a `compile` script is used only if `start` runs `node <file>` on a file absent from the
+/// checkout — the start then depends on generated output (`"start": "node dist/index.js"` with
+/// `"compile": "… cp -r server dist"`) and cannot launch without that step.
+fn build_script(manifest: &str, app_root: &std::path::Path) -> Option<&'static str> {
+    if has_build_script(manifest) {
+        return Some("build");
+    }
+    let json = serde_json::from_str::<serde_json::Value>(manifest).ok()?;
+    let scripts = json.get("scripts")?.as_object()?;
+    let start = scripts.get("start")?.as_str()?;
+    let mut words = start.split_whitespace();
+    if words.next()? != "node" {
+        return None;
+    }
+    let file = words.find(|word| !word.starts_with('-'))?;
+    let generated = [".js", ".mjs", ".cjs"]
+        .iter()
+        .any(|ext| file.ends_with(ext))
+        && !file.starts_with('/')
+        && !file.split('/').any(|part| part == "..")
+        && !app_root.join(file).exists();
+    let compile = scripts
+        .get("compile")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| !command.trim().is_empty());
+    (generated && compile).then_some("compile")
 }
 
 /// A cheap check for a `"build"` key under a `"scripts"` object, mirroring [`has_start_script`].
@@ -2495,7 +2615,7 @@ fn dockerfile(
     start_command: &str,
     port: u16,
     pm: PackageManager,
-    has_build: bool,
+    has_build: Option<&str>,
     native_build: bool,
 ) -> String {
     let token = &canary.token;
@@ -2533,10 +2653,9 @@ fn dockerfile(
     } else {
         String::new()
     };
-    let build = if has_build {
-        format!("RUN {}\n", build_command(pm))
-    } else {
-        String::new()
+    let build = match has_build {
+        Some(script) => format!("RUN {}\n", build_command(pm, script)),
+        None => String::new(),
     };
     // Install and build in the directory that owns the manifest and lockfile, then move to the
     // launch directory so the app's `.env` seeding and `CMD` run with its own working directory.
@@ -5909,11 +6028,11 @@ mod tests {
             r#"["npm","start"]"#,
             3000,
             PackageManager::Yarn,
-            true,
+            Some("build"),
             false,
         );
         assert!(file.contains("RUN corepack enable"), "{file}");
-        assert!(file.contains("yarn build"), "{file}");
+        assert!(file.contains("yarn run build"), "{file}");
         // The canary is planted under its extension variants, so a handler that appends a known
         // extension to the tainted path (`input + '.md'`) still reads the token.
         assert!(file.contains("/jss-canary-read.md"), "{file}");
@@ -5926,10 +6045,40 @@ mod tests {
             r#"["npm","start"]"#,
             3000,
             PackageManager::Npm,
-            false,
+            None,
             false,
         );
         assert!(!no_build.contains("build"), "{no_build}");
+    }
+
+    #[test]
+    fn a_compile_script_builds_a_missing_node_start_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = r#"{
+            "scripts": {
+                "start": "node dist/index.js",
+                "compile": "cp -r server dist"
+            }
+        }"#;
+
+        assert_eq!(build_script(manifest, dir.path()), Some("compile"));
+        write(dir.path(), "dist/index.js", "");
+        assert_eq!(build_script(manifest, dir.path()), None);
+        assert_eq!(
+            build_script(
+                r#"{"scripts":{"start":"node dist/index.js","build":"tsc"}}"#,
+                dir.path(),
+            ),
+            Some("build")
+        );
+        write(dir.path(), "server.js", "");
+        assert_eq!(
+            build_script(
+                r#"{"scripts":{"start":"node server.js","compile":"echo nope"}}"#,
+                dir.path(),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -6133,7 +6282,7 @@ mod tests {
             r#"["node","/jss-lifecycle-host.mjs","server.js"]"#,
             3000,
             PackageManager::Npm,
-            true,
+            Some("build"),
             false,
         );
         assert!(file.contains(NPM_WORKSPACE_FIXUP), "{file}");
@@ -6147,7 +6296,7 @@ mod tests {
             r#"["node","/jss-lifecycle-host.mjs","server.js"]"#,
             3000,
             PackageManager::Yarn,
-            true,
+            Some("build"),
             false,
         );
         assert!(!yarn.contains(NPM_WORKSPACE_FIXUP), "{yarn}");
@@ -6197,7 +6346,7 @@ mod tests {
             r#"["node","/jss-node-red-host.mjs","src/x.js"]"#,
             3000,
             PackageManager::Npm,
-            false,
+            None,
             false,
         );
         assert!(file.contains("/jss-node-red-host.mjs"), "{file}");
@@ -6554,7 +6703,7 @@ mod tests {
             r#"["node","dashboard.js"]"#,
             3000,
             PackageManager::Pnpm,
-            false,
+            None,
             false,
         );
         let install = file.find("pnpm install").unwrap();
@@ -6592,7 +6741,7 @@ mod tests {
             r#"["npm","start"]"#,
             3000,
             PackageManager::Npm,
-            false,
+            None,
             false,
         );
         assert!(file.contains(r#"printf '"%s"' 'cafed00d'"#), "{file}");
@@ -6642,7 +6791,7 @@ mod tests {
             r#"["npm","start"]"#,
             3000,
             PackageManager::Npm,
-            false,
+            None,
             true,
         );
         let toolchain = with.find(NATIVE_TOOLCHAIN_INSTALL).expect("toolchain step");
@@ -6658,7 +6807,7 @@ mod tests {
             r#"["npm","start"]"#,
             3000,
             PackageManager::Npm,
-            false,
+            None,
             false,
         );
         assert!(!without.contains(NATIVE_TOOLCHAIN_INSTALL), "{without}");
@@ -6797,7 +6946,7 @@ mod tests {
             r#"["node","index.js"]"#,
             3000,
             PackageManager::Npm,
-            false,
+            None,
             false,
         );
         let copy = file.find("COPY . /app\n").unwrap();
@@ -6906,11 +7055,13 @@ http.createServer((req, res) => {
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override: None,
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
+            alt_paths: Vec::new(),
         };
         let confined = Probe {
             method: Method::Get,
@@ -6930,11 +7081,13 @@ http.createServer((req, res) => {
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override: None,
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
+            alt_paths: Vec::new(),
         };
         let command = Probe {
             method: Method::Get,
@@ -6954,11 +7107,13 @@ http.createServer((req, res) => {
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override: None,
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
+            alt_paths: Vec::new(),
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -6982,11 +7137,13 @@ http.createServer((req, res) => {
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override: None,
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
+            alt_paths: Vec::new(),
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

@@ -147,6 +147,25 @@ pub fn run(
             };
         }
     }
+    // Sibling routes the same handler is also registered on (`router.put('/a', c.save).put('/b',
+    // c.save)`): a single controller method mounted on several paths often writes only on the branch
+    // its route selects, so the write-overwrite oracle tries each. Read from the route source.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some(at) = &finding.entry_at
+            && let Ok(source) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let method = finding
+                .function
+                .rsplit(['.', ' '])
+                .next()
+                .unwrap_or(finding.function.as_str());
+            let literals = plan::handler_route_literals(&source, method);
+            if literals.len() > 1 {
+                probe.alt_paths = plan::sibling_paths(&probe.path, &literals);
+            }
+        }
+    }
     // Other request parameters the handler requires alongside the tainted one: without them it
     // rejects the request before the sink is reached. Read from the handler source.
     for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
@@ -285,6 +304,11 @@ pub fn run(
                 "",
                 &plan::guard_anchor_lines(finding),
             );
+            // A handler that forwards the whole request body into the sink path (`Service.update(
+            // req.params.map, req.body)`) where downstream code requires it to be an object rejects or
+            // crashes on a body-less request before the sink. Send a minimal JSON object body so a
+            // path/query-delivered payload passes the body-shape precondition and reaches the sink.
+            probe.body_object = plan::handler_consumes_whole_body(&source);
         }
     }
     // A route guarded by express-validator middleware (`body("device_names").exists().isArray(...)`)

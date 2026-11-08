@@ -110,6 +110,16 @@ pub struct Probe {
     /// passes the guard and reaches the sink. Mined from the handler source only; empty when the
     /// handler requires no such body field, or the payload already rides the body.
     pub body_requires: Vec<(String, String)>,
+    /// When the handler forwards the *whole* request body (`req.body`, not a single member) into the
+    /// path that reaches the sink — directly as a call argument, a spread, or a bare assignment — and
+    /// downstream code requires it to be a non-null object before the sink runs (`if (typeof body !==
+    /// "object") throw`, a destructure, a property access), a request with no body is rejected or
+    /// crashes before the sink. When set, and the payload rides a different request part on a
+    /// body-carrying method, a minimal JSON object body is sent (merged with any [`Self::body_requires`]
+    /// fields) so the body-shape precondition is satisfied and the tainted value reaches the sink. An
+    /// empty object can never fabricate a finding: it only lets the request past a body-presence guard.
+    /// Mined from the handler source only; `false` when the handler reads no whole-body value.
+    pub body_object: bool,
     /// For a NoSQL finding sourced from a body field that is later overwritten by a same-named
     /// query field through an ordered spread merge (`{ ...req.body, ...req.query }`), the scalar
     /// value to keep in the body while the operator object rides in the query string. This models a
@@ -145,6 +155,13 @@ pub struct Probe {
     /// prototype-pollution, or a nested write whose two keys verify v1 cannot both map to request
     /// inputs. Mined from the sink argument and handler source only.
     pub proto_pollution: Option<ProtoPollution>,
+    /// Full request paths of *sibling* routes that register the same handler (`router.put('/a', h)`
+    /// and `router.put('/b', h)` both reach `h`), other than [`Self::path`]. A single controller
+    /// method is often mounted on several paths that differ only in which branch of the handler runs;
+    /// a write-overwrite oracle whose observable effect depends on that branch tries each sibling so
+    /// the one whose branch performs the write is exercised. Filled from the route-registration source
+    /// only; empty when the handler is registered on a single path. Nothing here is target-specific.
+    pub alt_paths: Vec<String>,
 }
 
 /// How to drive a nested-write prototype-pollution sink (`obj[outer][inner] = v`). Both keys are
@@ -694,11 +711,13 @@ impl Probe {
             appended_param,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override,
             sql: None,
             array_element,
             appended_fields,
             proto_pollution: None,
+            alt_paths: Vec::new(),
         })
     }
 
@@ -750,11 +769,13 @@ impl Probe {
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override: None,
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: Some(ProtoPollution { outer, inner }),
+            alt_paths: Vec::new(),
         })
     }
 }
@@ -3985,6 +4006,86 @@ fn registered_path_literal(args: &str) -> Option<String> {
     None
 }
 
+/// The absolute static path literals of every route registered to a given handler method in a
+/// route-registration source: for `router.put("/a", c.save).put("/b", c.save)` and method `save`,
+/// `["/a", "/b"]`. For each whole-word occurrence of `method`, the enclosing call's first string-
+/// literal argument is the registered path. Only fixed absolute paths are kept — a literal with a
+/// `:param`, `{slot}`, wildcard or interpolation is skipped, since a sibling with an unfilled slot
+/// could not be driven. Mined from the route source only; nothing here is target-specific.
+pub fn handler_route_literals(source: &str, method: &str) -> Vec<String> {
+    if method.is_empty() {
+        return Vec::new();
+    }
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(method) {
+        let at = from + rel;
+        from = at + method.len();
+        let before = at.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+        if before.is_some_and(is_ident) {
+            continue;
+        }
+        if bytes.get(at + method.len()).copied().is_some_and(is_ident) {
+            continue;
+        }
+        // Scan back to the `(` that opens the call this handler reference is an argument of.
+        let mut depth = 0i32;
+        let mut open = None;
+        let mut i = at;
+        while i > 0 {
+            i -= 1;
+            let Some(byte) = bytes.get(i).copied() else {
+                break;
+            };
+            match byte {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' if depth == 0 => {
+                    open = Some(i);
+                    break;
+                }
+                b'(' | b'[' | b'{' => depth -= 1,
+                _ => {}
+            }
+        }
+        let Some(open) = open else { continue };
+        if let Some(lit) = leading_string(source[open + 1..at].trim_start())
+            && lit.starts_with('/')
+            && lit.len() > 1
+            && !lit.contains(['$', ' ', '{', '}', '*', ':'])
+        {
+            let lit = lit.trim_end_matches('/').to_owned();
+            if !out.contains(&lit) {
+                out.push(lit);
+            }
+        }
+    }
+    out
+}
+
+/// The full request paths of the sibling routes among `literals`, given the probe's own full `current`
+/// path: the literal `current` ends with identifies the live route, and the segment before it is the
+/// mount prefix the other literals share. For `current = "/api/v2/settings/layermenu"` and literals
+/// `["/layermenu", "/mapsettings"]`, `["/api/v2/settings/mapsettings"]`. Empty when `current` matches
+/// none of the literals (so the prefix is unknown). Nothing here is target-specific.
+pub fn sibling_paths(current: &str, literals: &[String]) -> Vec<String> {
+    // Each literal starts with `/`, so `ends_with` already lands on a clean path-segment boundary;
+    // prefer the longest match so a `/a` literal does not win over `/settings/a`.
+    let Some(matched) = literals
+        .iter()
+        .filter(|lit| lit.starts_with('/') && current.ends_with(lit.as_str()))
+        .max_by_key(|lit| lit.len())
+    else {
+        return Vec::new();
+    };
+    let prefix = &current[..current.len() - matched.len()];
+    literals
+        .iter()
+        .filter(|lit| lit.as_str() != matched.as_str())
+        .map(|lit| format!("{prefix}{lit}"))
+        .collect()
+}
+
 /// The most specific request entry among the finding's sink argument and source expression: a
 /// named query/body/path/header parameter is preferred over a whole-object body or the raw URL.
 fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
@@ -4013,6 +4114,12 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
     // the whole part off the request (`let { query, body } = req`), not through a `req.query` member
     // access: resolve the specific field of that part that carries taint to the sink.
     if let Some(entry) = bare_part_entry(finding, path, source) {
+        return Some(entry);
+    }
+    // A coarse member source (`req.query`) the engine recorded without the specific field — the
+    // handler reads `req.query.<name>` and forwards it to a callee whose parameter the sink names:
+    // resolve the field whose name the flow trace records the value being assigned to.
+    if let Some(entry) = coarse_part_field_entry(finding, path, source) {
         return Some(entry);
     }
     let mut candidates: Vec<Entry> = Vec::new();
@@ -4075,6 +4182,46 @@ fn bare_part_entry(finding: &Finding, path: &str, source: Option<&str>) -> Optio
     let tainted = tainted_identifiers(finding, &Entry::Url);
     for (field, local) in destructured_fields_of(src, part) {
         if tainted.contains(&local)
+            && let Some(entry) = source_entry(&format!("request.{part}.{field}"), path)
+        {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// When the finding's source is a coarse request member with a receiver but no specific field
+/// (`req.query`, `req.body`, `req.params`, `req.headers`) — the engine recorded only the part the
+/// handler reads, not the member — the specific field of that part that reaches the sink. The handler
+/// reads `req.<part>.<name>` and forwards it (commonly into a callee whose parameter the sink argument
+/// names); the finding's flow trace records that value being `assigned to \`<name>\``, so among the
+/// part's accessors in the handler source the one whose field is a tainted identifier is the attacker
+/// input. Returns that request entry, or `None`. Mined from the handler source only; nothing here is
+/// tied to a specific target.
+fn coarse_part_field_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
+    let part = strip_request_receiver(finding.source.expr.trim())?;
+    // Only a bare part with no member of its own (`req.query`); `req.query.name` already carries the
+    // field and is resolved by the generic member-access logic, and a call/bracket form is not a part.
+    if !matches!(part, "query" | "body" | "params" | "headers" | "header") {
+        return None;
+    }
+    let src = source?;
+    let tainted = tainted_identifiers(finding, &Entry::Url);
+    for accessor in request_accessors(src) {
+        let Some(chain) = strip_request_receiver(&accessor) else {
+            continue;
+        };
+        let mut segments = chain.split('.');
+        if segments.next() != Some(part) {
+            continue;
+        }
+        let Some(field) = segments
+            .next()
+            .filter(|field| !field.is_empty() && field.bytes().all(is_ident))
+        else {
+            continue;
+        };
+        if tainted.iter().any(|name| name == field)
             && let Some(entry) = source_entry(&format!("request.{part}.{field}"), path)
         {
             return Some(entry);
@@ -5132,6 +5279,43 @@ fn split_top_level(input: &str, separator: &str) -> Vec<String> {
     }
     out.push(input[start..].to_owned());
     out
+}
+
+/// Whether the handler forwards the *whole* request body somewhere (a call argument `Service.update(
+/// req.body)`, a spread `{ ...req.body }`, a bare assignment `const b = req.body`, or a whole-body
+/// destructure `const { x } = req.body`) rather than only reading individual members. Detected as a
+/// `<receiver>.body` access that is not itself a member read (`req.body.name`, `req.body['name']`) and
+/// not the tail of a longer identifier (`req.bodyText`). Such code needs the request to carry a body
+/// *object*, so downstream code that destructures it or guards its type (`if (typeof b !== "object")
+/// throw`) rejects or crashes on a body-less request before the sink. Receiver names match the rest of
+/// the planner; nothing here is tied to a specific target.
+pub fn handler_consumes_whole_body(source: &str) -> bool {
+    for recv in ["req", "request", "ctx"] {
+        let needle = format!("{recv}.body");
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            // Word boundary before the receiver (`req.body`, not `xreq.body`).
+            if at > 0
+                && source
+                    .as_bytes()
+                    .get(at - 1)
+                    .is_some_and(|byte| is_ident(*byte))
+            {
+                continue;
+            }
+            // The character right after `body`: an identifier byte means a longer name (`bodyText`);
+            // a `.` or `[` means a member read (`req.body.name`), which the field-level machinery
+            // already covers. Anything else (`)`, `,`, `;`, `}`, whitespace, end) is a whole-body use.
+            match source.as_bytes().get(from) {
+                Some(byte) if is_ident(*byte) => continue,
+                Some(b'.') | Some(b'[') => continue,
+                _ => return true,
+            }
+        }
+    }
+    false
 }
 
 /// Whether the handler reads `name` from request `part`: by member access (`req.body.name`) or by
@@ -6623,11 +6807,13 @@ module.exports = { activityValidators };\n";
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
+            body_object: false,
             body_query_override: None,
             sql: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
+            alt_paths: Vec::new(),
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -7107,6 +7293,76 @@ module.exports = { activityValidators };\n";
         }];
         let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
         assert_eq!(probe.entry, Entry::Query("file".to_owned()));
+    }
+
+    #[test]
+    fn a_coarse_query_forwarded_across_a_call_resolves_the_field_by_name() {
+        // The engine reports the coarse `req.query` as the source and names the sink argument by the
+        // callee's parameter (`mapFile`), not a `req.query` member. The handler reads `req.query.mapFile`
+        // and passes it to that callee; the flow trace records the value `assigned to \`mapFile\``, so the
+        // query field whose name matches is the attacker input.
+        let source = "putSettingsToMapFile(req, res) { \
+            SettingsService.updateMapFile(req.query.mapFile, req.body, req.url); }";
+        let mut f = finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("PUT /api/v2/settings/layermenu"),
+            "req.query",
+        );
+        f.sink.api = "fs.writeFile".to_owned();
+        f.sink.arg = "this.getFullPathToFile(mapFile)".to_owned();
+        f.trace = vec![TraceStep {
+            file: None,
+            line: 1,
+            col: 1,
+            note: "assigned to `mapFile`".to_owned(),
+        }];
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::Query("mapFile".to_owned()));
+    }
+
+    #[test]
+    fn sibling_routes_of_the_same_handler_are_recovered_from_the_route_source() {
+        // One controller method mounted on several paths: the literals are every registered path, and
+        // the siblings are the full paths of all but the live one, sharing its mount prefix.
+        let router = "export default express.Router() \
+            .put('/layermenu', controller.putSettingsToMapFile) \
+            .put('/mapsettings', controller.putSettingsToMapFile) \
+            .put('/toolsettings', controller.putSettingsToMapFile) \
+            .put('/update/:map/:tool', controller.updateMapTool);";
+        let literals = handler_route_literals(router, "putSettingsToMapFile");
+        assert_eq!(
+            literals,
+            vec!["/layermenu", "/mapsettings", "/toolsettings"]
+        );
+        // The `:param` route of a different handler is not among them.
+        assert!(!literals.iter().any(|l| l.contains(':')));
+        let siblings = sibling_paths("/api/v2/settings/layermenu", &literals);
+        assert_eq!(
+            siblings,
+            vec![
+                "/api/v2/settings/mapsettings".to_owned(),
+                "/api/v2/settings/toolsettings".to_owned(),
+            ]
+        );
+        // A single-route handler has no siblings.
+        assert!(sibling_paths("/api/v2/settings/layermenu", &["/layermenu".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn a_whole_request_body_is_distinguished_from_a_body_member() {
+        assert!(handler_consumes_whole_body(
+            "Service.update(req.params.id, req.body);"
+        ));
+        assert!(handler_consumes_whole_body(
+            "const { value } = request.body;"
+        ));
+        assert!(!handler_consumes_whole_body(
+            "Service.update(req.body.value);"
+        ));
+        assert!(!handler_consumes_whole_body(
+            "const bodyText = req.bodyText;"
+        ));
     }
 
     #[test]

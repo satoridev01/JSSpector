@@ -171,6 +171,63 @@ fn scan_links_a_route_to_a_sink_two_files_away() {
 }
 
 #[test]
+fn versioned_dynamic_mounts_link_anonymous_default_routers_and_class_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "server/routes.js",
+        "export default async function routes(app) {\n\
+         for (const v of app.get('apiVersions')) {\n\
+           const { default: router } = await import(`./apis/v${v}/router.js`);\n\
+           app.use(`/api/v${v}`, router);\n\
+         }\n}\n",
+    );
+    write(
+        root,
+        "server/apis/v2/router.js",
+        "import express from 'express';\n\
+         import files from './files/router.js';\n\
+         export default express.Router().use('/files', files);\n",
+    );
+    write(
+        root,
+        "server/apis/v2/files/router.js",
+        "import express from 'express';\n\
+         import controller from './controller.js';\n\
+         export default express.Router().get('/:name', controller.read);\n",
+    );
+    write(
+        root,
+        "server/apis/v2/files/controller.js",
+        "import fs from 'fs';\n\
+         class Controller {\n\
+           read(req, res) { return fs.readFile(req.params.name, () => res.end()); }\n\
+         }\n\
+         export default new Controller();\n",
+    );
+
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    assert!(
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| { route["method"] == "GET" && route["path"] == "/api/v2/files/{name}" }),
+        "{routes}"
+    );
+
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["class"] == "path-traversal")
+        .expect("the class-instance handler should remain linked to its full route");
+    assert_eq!(finding["entry"], "GET /api/v2/files/{name}");
+}
+
+#[test]
 fn provider_resource_routes_use_the_deployed_metadata_prefix() {
     let dir = tempfile::tempdir().unwrap();
     write(

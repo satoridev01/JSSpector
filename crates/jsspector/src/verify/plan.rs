@@ -3026,6 +3026,20 @@ fn chain_starts(array: &str) -> Vec<(usize, Option<String>, String)> {
             if before.is_some_and(|b| is_ident(b) || b == b'.') {
                 continue;
             }
+            // A builder call that sits as the direct argument of another chain's method call
+            // (`.if(query("timeframe").equals("custom"))`, `oneOf(query(...))`) is part of a
+            // condition, not an independently required field: its field is not unconditionally
+            // present. A genuine top-level chain element is preceded by `[`, `,`, `=`, `;`, `{`,
+            // `>` (arrow body) or the start of the text, never by an opening `(`.
+            let prefix = array[..at].trim_end();
+            if let Some(before_open) = prefix.strip_suffix('(').map(str::trim_end)
+                && before_open
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|b| is_ident(*b) || matches!(b, b'.' | b')'))
+            {
+                continue;
+            }
             let field = leading_string(array[at + needle.len()..].trim_start());
             out.push((at, field, builder.to_owned()));
         }
@@ -6247,6 +6261,34 @@ module.exports = { healthScoreValidators };\n";
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_field_only_named_inside_a_conditional_is_not_mined_as_required() {
+        // `timeframe` is optional in its own chain and otherwise appears only as the condition of
+        // another field's `.if(query("timeframe").equals("custom"))`. Neither occurrence makes it an
+        // unconditionally required query parameter, so mining must not emit a (junk) filler for it —
+        // doing so would send `timeframe=jsspector`, fail the `.isIn([...])` validator, and mask the
+        // injection behind an identical validation error for every payload.
+        let route = "router.get(\n  \"/:email/activity-report\",\n  analyticsValidations.activityValidators.getReport,\n  controller.getActivityReport\n);\n";
+        let validator = "const validateTimeframe = query(\"timeframe\").optional().isIn([\"last7days\", \"custom\"]).withMessage(\"Invalid timeframe\");\n\
+const validateDateRange = [\n  query(\"startDate\").if(query(\"timeframe\").equals(\"custom\")).isISO8601(),\n  query(\"endDate\").if(query(\"timeframe\").equals(\"custom\")).isISO8601(),\n];\n\
+const validateUserEmail = param(\"email\").isEmail();\n\
+const activityValidators = {\n  getReport: [validateUserEmail, validateTimeframe, ...validateDateRange],\n};\n\
+module.exports = { activityValidators };\n";
+        let mined = super::validator_query_fillers(route, 1, "email", &|name| {
+            (name == "analyticsValidations").then(|| validator.to_owned())
+        });
+        assert!(
+            mined.is_empty(),
+            "no query field is unconditionally required here, got {mined:?}"
+        );
+
+        let parenthesized = "const validators = [(query(\"tenant\").notEmpty())];";
+        let chains = super::chain_starts(parenthesized);
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].1.as_deref(), Some("tenant"));
+        assert_eq!(chains[0].2, "query");
     }
 
     #[test]

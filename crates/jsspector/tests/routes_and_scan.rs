@@ -2571,6 +2571,35 @@ fn wrapped_handlers_behind_a_shared_secret_guard_are_admin_routes() {
     );
 }
 
+#[test]
+fn wrapped_handler_factories_are_linked_to_their_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "routes/profile.js",
+        "export function profileImageUrlUpload() {\n  return async (req, res) => {\n    const url = req.body.imageUrl;\n    const response = await fetch(url);\n    res.send(await response.text());\n  };\n}\n",
+    );
+    write(
+        root,
+        "server.js",
+        "import express from 'express';\nimport { profileImageUrlUpload } from './routes/profile.js';\n\
+         import * as utils from './utils.js';\nconst app = express();\n\
+         app.post('/profile/image/url', utils.asyncHandler(profileImageUrlUpload()));\n",
+    );
+
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    assert_eq!(routes[0]["handler"], "profileImageUrlUpload");
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(scan["findings"][0]["entry"], "POST /profile/image/url");
+}
+
 /// mStream's DLNA routes: `all(path, genaRoute('cds'))` registers the closure a factory
 /// returns. The route goes by the factory, whose closure calls the sink's function, so that
 /// public route is the finding's entry, even though an admin-only route reaches the same

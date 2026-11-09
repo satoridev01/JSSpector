@@ -9,7 +9,9 @@ auth:
   # NestJS-style decorators on a class or method.
   decorators: [UseGuards, Auth, Roles, Authorized, Protected]
   # Named like auth but only set things up: no request is refused.
-  setup: [session, cookieSession, expressSession, passport.initialize, passport.session]
+  setup: [session, cookieSession, expressSession, passport.initialize, passport.session,
+    jwtChallenges, verify.jwtChallenges, updateAuthenticatedUsers,
+    security.updateAuthenticatedUsers]
   # `return res.status(403).send(..)` in an inline `(req, res, next)` middleware: a guard.
   denial_methods: [status, sendStatus, writeHead]
   # What that check must read to guard anything, as whole words (or phrases) of names and

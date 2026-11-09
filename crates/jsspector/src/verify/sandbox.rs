@@ -1,14 +1,15 @@
-//! The container side of `--verify`: build an image from the scanned repo, start the app with no
-//! network reach beyond a marker service, drive the derived requests from inside the container,
-//! and tear everything down. Everything here shells out to the `docker` CLI; no ports are
-//! published and no Rust HTTP client is pulled in — requests are made by Node already present in
-//! the image, so all traffic stays on a private network.
+//! The execution side of `--verify`: prepare the scanned repo, start the app, drive the derived
+//! requests and tear everything down. The default Docker runtime keeps traffic on a private
+//! network. `JSS_VERIFY_RUNTIME=local` is for an already-disposable CI sandbox such as a Satori job:
+//! it reads the repository Dockerfile's package setup and exposed port, then runs the app as a child
+//! process in that same sandbox without requiring nested Docker.
 
 use super::payload::{self, Attempt, Canary, Signal};
 use super::plan::Probe;
 use super::{ControlObservation, Outcome, Reproduction};
 use serde::Deserialize;
-use std::process::{Command, Output, Stdio};
+use std::cell::RefCell;
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A monotonic request counter, used to give every driven request a distinct `X-Forwarded-For` so a
@@ -57,6 +58,12 @@ const REDIS_ALIASES: [&str; 2] = ["redis", "cache"];
 /// Whether a Docker daemon is reachable. The CLI on some platforms exits 0 even when it cannot
 /// connect, so this checks that `docker info` actually printed a server version, not an error.
 pub fn available() -> bool {
+    if local_runtime_requested() {
+        return Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+    }
     let Ok(output) = Command::new("docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
         .output()
@@ -69,9 +76,14 @@ pub fn available() -> bool {
     output.status.success() && version.bytes().next().is_some_and(|b| b.is_ascii_digit())
 }
 
+fn local_runtime_requested() -> bool {
+    std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
+}
+
 /// A built image, a private network, a marker service and a running app — one per `scan --verify`
 /// run, reused across findings. [`Self::teardown`] removes all of it; [`Drop`] is a backstop.
 pub struct Session {
+    runtime: Runtime,
     tag: String,
     network: String,
     app: String,
@@ -127,6 +139,17 @@ pub struct Session {
     torn_down: bool,
 }
 
+enum Runtime {
+    Docker,
+    Local {
+        app_root: std::path::PathBuf,
+        log: std::path::PathBuf,
+        command: Vec<String>,
+        process: RefCell<Option<Child>>,
+        created_files: Vec<std::path::PathBuf>,
+    },
+}
+
 impl Session {
     /// Builds the image from `root` and starts the app and marker service, or returns why it
     /// could not (no start script, build failure, app never listened). The caller turns an `Err`
@@ -150,6 +173,9 @@ impl Session {
         entry_file: Option<&std::path::Path>,
         gating_sources: &[String],
     ) -> Result<Self, String> {
+        if local_runtime_requested() {
+            return Self::start_local(root, app_path, entry_file, gating_sources);
+        }
         let id = run_id();
         let canary = Canary::new(format!("{id}{}", short_rand()))
             .with_callback_host(configured_callback_host()?);
@@ -234,6 +260,7 @@ impl Session {
         }
 
         let mut session = Self {
+            runtime: Runtime::Docker,
             tag,
             network,
             app,
@@ -262,6 +289,203 @@ impl Session {
             return Err(err);
         }
         Ok(session)
+    }
+
+    fn start_local(
+        root: &std::path::Path,
+        app_path: &std::path::Path,
+        entry_file: Option<&std::path::Path>,
+        gating_sources: &[String],
+    ) -> Result<Self, String> {
+        let id = run_id();
+        let canary = Canary::new(format!("{id}{}", short_rand()))
+            .with_callback_host(configured_callback_host()?);
+        let app_root = root.join(app_path);
+        if db_service(&app_root) || redis_service(&app_root) {
+            return Err(
+                "the local verifier does not yet provide MongoDB or Redis sidecars".to_owned(),
+            );
+        }
+        let entry_rel = entry_file.and_then(|file| file.strip_prefix(app_path).ok());
+        let start_command = start_command(&app_root, entry_rel)
+            .ok_or_else(|| "no launchable script or `main` file in package.json".to_owned())?;
+        let local_command: Vec<String> = serde_json::from_str(&start_command)
+            .map_err(|error| format!("invalid generated start command: {error}"))?;
+        if local_command.is_empty() {
+            return Err("generated start command is empty".to_owned());
+        }
+        let mut install_rel = install_path(root, app_path);
+        let node_path = entry_file
+            .and_then(|module| dependency_provider(root, &install_rel, module))
+            .map(|provider| {
+                install_rel = provider.clone();
+                root.join(provider)
+                    .join("node_modules")
+                    .display()
+                    .to_string()
+            });
+        let install_root = root.join(&install_rel);
+        prepare_local_app(root, &install_root)?;
+        let created_files = plant_local_files(&canary)?;
+        let log = std::env::temp_dir().join(format!("jsspector-verify-{id}.log"));
+        let port = dockerfile_port(root).unwrap_or(3000);
+        let (run_as, mut base_env) = match privilege_drop_fixture(&app_root, port) {
+            Some(fixture) => (Some(fixture.run_as), fixture.env),
+            None => (None, Vec::new()),
+        };
+        for cred in credential_env(gating_sources) {
+            if base_env.iter().all(|existing| existing.name != cred.name) {
+                base_env.push(cred);
+            }
+        }
+        let mut session = Self {
+            runtime: Runtime::Local {
+                app_root,
+                log,
+                command: local_command,
+                process: RefCell::new(None),
+                created_files,
+            },
+            tag: String::new(),
+            network: String::new(),
+            app: format!("jss-local-app-{id}"),
+            marker: String::new(),
+            db: None,
+            db_env: Vec::new(),
+            redis: None,
+            redis_env: Vec::new(),
+            canary,
+            port,
+            nonce: 0,
+            run_as,
+            base_env,
+            node_path,
+            node_sqlite: uses_node_sqlite(root, &root.join(app_path)),
+            omit_forwarding: std::cell::Cell::new(false),
+            root: root.to_path_buf(),
+            guarded_modules: entry_file
+                .and_then(|entry| std::fs::read_to_string(root.join(entry)).ok())
+                .map(|src| guarded_bare_requires(&src).into_iter().collect())
+                .unwrap_or_default(),
+            torn_down: false,
+        };
+        session.boot_local()?;
+        Ok(session)
+    }
+
+    fn boot_local(&mut self) -> Result<(), String> {
+        let mut env = self.base_env.clone();
+        let mut stub_missing_modules = false;
+        let mut scratch_dirs = Vec::new();
+        for _ in 0..5 {
+            self.run_local_app(&env, stub_missing_modules, &scratch_dirs)?;
+            let err = match self.wait_until_listening() {
+                Ok(port) => {
+                    self.port = port;
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
+            let mut missing = Vec::new();
+            for wanted in required_env(&err)
+                .into_iter()
+                .chain(config_env(&err, &self.root))
+            {
+                if env.iter().all(|have| have.name != wanted.name)
+                    && missing
+                        .iter()
+                        .all(|have: &RequiredEnv| have.name != wanted.name)
+                {
+                    missing.push(wanted);
+                }
+            }
+            let enable_module_stub = !stub_missing_modules && missing_bare_module(&err);
+            let new_dir = missing_write_dir(&err).filter(|dir| !scratch_dirs.contains(dir));
+            if missing.is_empty() && !enable_module_stub && new_dir.is_none() {
+                return Err(err);
+            }
+            env.extend(missing);
+            stub_missing_modules |= enable_module_stub;
+            if let Some(dir) = new_dir {
+                scratch_dirs.push(dir);
+            }
+        }
+        Err("the app still could not start after five launch attempts".to_owned())
+    }
+
+    fn run_local_app(
+        &self,
+        env: &[RequiredEnv],
+        stub_missing_modules: bool,
+        scratch_dirs: &[String],
+    ) -> Result<(), String> {
+        let Runtime::Local {
+            app_root,
+            log,
+            command,
+            process,
+            ..
+        } = &self.runtime
+        else {
+            return Err("local application requested for a Docker session".to_owned());
+        };
+        if self.run_as.is_some() {
+            return Err("local verification cannot emulate an application runtime user".to_owned());
+        }
+        if let Some(mut previous) = process.borrow_mut().take() {
+            let _ = previous.kill();
+            let _ = previous.wait();
+        }
+        for var in env {
+            if var.directory {
+                std::fs::create_dir_all(&var.value)
+                    .map_err(|error| format!("creating {}: {error}", var.value))?;
+            }
+        }
+        for dir in scratch_dirs {
+            std::fs::create_dir_all(dir).map_err(|error| format!("creating {dir}: {error}"))?;
+        }
+        let stdout = std::fs::File::create(log)
+            .map_err(|error| format!("creating local verifier log: {error}"))?;
+        let stderr = stdout
+            .try_clone()
+            .map_err(|error| format!("opening local verifier log: {error}"))?;
+        let (program, args) = command
+            .split_first()
+            .ok_or_else(|| "generated start command is empty".to_owned())?;
+        let mut child = Command::new(program);
+        child
+            .args(args)
+            .current_dir(app_root)
+            .env("PORT", self.port.to_string())
+            .env("HOST", "127.0.0.1")
+            .env("NODE_ENV", "development")
+            .stdout(stdout)
+            .stderr(stderr);
+        if let Some(node_path) = &self.node_path {
+            child.env("NODE_PATH", node_path);
+        }
+        let mut node_options = Vec::new();
+        if self.node_sqlite {
+            node_options.push("--experimental-sqlite");
+        }
+        if stub_missing_modules {
+            node_options.push("--require=/jss-launch-shim.js");
+            if !self.guarded_modules.is_empty() {
+                child.env("JSS_GUARDED_MODULES", self.guarded_modules.join(","));
+            }
+        }
+        if !node_options.is_empty() {
+            child.env("NODE_OPTIONS", node_options.join(" "));
+        }
+        for var in env {
+            child.env(&var.name, &var.value);
+        }
+        let child = child
+            .spawn()
+            .map_err(|error| format!("starting local application: {error}"))?;
+        process.replace(Some(child));
+        Ok(())
     }
 
     /// Starts the marker service and the app, and waits for the app to listen.
@@ -1470,8 +1694,13 @@ impl Session {
                 payload::reproduced(attempt, &self.canary, &body, exists, false)
             }
             Signal::ServiceReached(token) => {
-                let reached = self.tail_logs(&self.marker).contains(token)
-                    && self.relay_public_callback(token);
+                let reached = match &self.runtime {
+                    Runtime::Docker => {
+                        self.tail_logs(&self.marker).contains(token)
+                            && self.relay_public_callback(token)
+                    }
+                    Runtime::Local { .. } => self.public_callback_reached(token),
+                };
                 payload::reproduced(attempt, &self.canary, &body, false, reached)
             }
         };
@@ -1492,7 +1721,20 @@ impl Session {
     }
 
     fn exec(&self, container: &str, cmd: &[&str]) -> Result<Output, String> {
-        exec_in(container, cmd)
+        match &self.runtime {
+            Runtime::Docker => exec_in(container, cmd),
+            Runtime::Local { app_root, .. } if container == self.app => {
+                let (program, args) = cmd
+                    .split_first()
+                    .ok_or_else(|| "empty local verifier command".to_owned())?;
+                Command::new(program)
+                    .args(args)
+                    .current_dir(app_root)
+                    .output()
+                    .map_err(|error| error.to_string())
+            }
+            Runtime::Local { .. } => Err("local verifier sidecars are unavailable".to_owned()),
+        }
     }
 
     /// Mirror an isolated marker hit to the registered public callback from the verifier host.
@@ -1527,6 +1769,44 @@ impl Session {
             );
         }
         confirmed
+    }
+
+    fn public_callback_reached(&self, token: &str) -> bool {
+        let Some(host) = self.canary.callback_host() else {
+            return false;
+        };
+        let Some(callback_token) = host.strip_suffix(".callback.satori.ci") else {
+            return false;
+        };
+        let Ok(auth) = std::env::var("SATORI_TOKEN") else {
+            return false;
+        };
+        let url = format!("https://api-v2.satori.ci/callbacks/{callback_token}");
+        for _ in 0..10 {
+            let mut command = Command::new("curl");
+            command.args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "10",
+                "--header",
+                &format!("Authorization: Bearer {auth}"),
+            ]);
+            if let Ok(org) = std::env::var("SATORI_ORGANIZATION") {
+                command.args(["--header", &format!("X-Satori-Organization: {org}")]);
+            }
+            if let Ok(output) = command.arg(&url).output()
+                && output.status.success()
+            {
+                let body = String::from_utf8_lossy(&output.stdout);
+                if body.contains("\"protocol\":\"http\"") && body.contains(token) {
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        false
     }
 }
 
@@ -1685,13 +1965,26 @@ fn shell_quote(value: &str) -> String {
 
 impl Session {
     fn container_running(&self, name: &str) -> bool {
-        docker(&["inspect", "-f", "{{.State.Running}}", name])
-            .map(|out| out.trim() == "true")
-            .unwrap_or(false)
+        match &self.runtime {
+            Runtime::Docker => docker(&["inspect", "-f", "{{.State.Running}}", name])
+                .map(|out| out.trim() == "true")
+                .unwrap_or(false),
+            Runtime::Local { process, .. } if name == self.app => process
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|child| child.try_wait().is_ok_and(|status| status.is_none())),
+            Runtime::Local { .. } => false,
+        }
     }
 
     fn tail_logs(&self, name: &str) -> String {
-        tail_logs(name)
+        match &self.runtime {
+            Runtime::Docker => tail_logs(name),
+            Runtime::Local { log, .. } if name == self.app => std::fs::read_to_string(log)
+                .map(|text| tail(&text, 50))
+                .unwrap_or_default(),
+            Runtime::Local { .. } => String::new(),
+        }
     }
 
     /// Removes the app, the marker service, the network and the image. Safe to call twice.
@@ -1700,16 +1993,35 @@ impl Session {
             return;
         }
         self.torn_down = true;
-        remove_container(&self.app);
-        remove_container(&self.marker);
-        if let Some(db) = &self.db {
-            remove_container(db);
+        match &self.runtime {
+            Runtime::Docker => {
+                remove_container(&self.app);
+                remove_container(&self.marker);
+                if let Some(db) = &self.db {
+                    remove_container(db);
+                }
+                if let Some(redis) = &self.redis {
+                    remove_container(redis);
+                }
+                let _ = docker(&["network", "rm", &self.network]);
+                let _ = docker(&["rmi", "-f", &self.tag]);
+            }
+            Runtime::Local {
+                log,
+                process,
+                created_files,
+                ..
+            } => {
+                if let Some(mut child) = process.borrow_mut().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                let _ = std::fs::remove_file(log);
+                for path in created_files {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
-        if let Some(redis) = &self.redis {
-            remove_container(redis);
-        }
-        let _ = docker(&["network", "rm", &self.network]);
-        let _ = docker(&["rmi", "-f", &self.tag]);
     }
 }
 
@@ -1717,6 +2029,152 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.teardown();
     }
+}
+
+fn prepare_local_app(root: &std::path::Path, install_root: &std::path::Path) -> Result<(), String> {
+    let commands = dockerfile_setup_commands(root);
+    if commands.is_empty() {
+        run_local_setup(install_root, install_command(package_manager(install_root)))?;
+        if let Ok(manifest) = std::fs::read_to_string(install_root.join("package.json"))
+            && let Some(script) = build_script(&manifest, install_root)
+        {
+            run_local_setup(
+                install_root,
+                &build_command(package_manager(install_root), script),
+            )?;
+        }
+    } else {
+        for command in commands {
+            run_local_setup(root, &command)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_local_setup(root: &std::path::Path, script: &str) -> Result<(), String> {
+    let output = Command::new("sh")
+        .args(["-c", script])
+        .current_dir(root)
+        .env("CI", "true")
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .output()
+        .map_err(|error| format!("running local setup `{script}`: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "local setup `{script}` failed:\n{}",
+            tail(&String::from_utf8_lossy(&output.stderr), 50)
+        ))
+    }
+}
+
+/// Package preparation explicitly declared by the repository Dockerfile. Filesystem cleanup,
+/// ownership changes and image-only metadata are intentionally ignored: the Satori job already is
+/// the disposable filesystem boundary, while package installation and compilation are required to
+/// reproduce the application runtime.
+fn dockerfile_setup_commands(root: &std::path::Path) -> Vec<String> {
+    let Ok(source) = std::fs::read_to_string(root.join("Dockerfile")) else {
+        return Vec::new();
+    };
+    source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("RUN "))
+        .filter(|command| {
+            let command = command.trim();
+            (command.starts_with("npm install")
+                || command.starts_with("npm ci")
+                || command.starts_with("npm dedupe")
+                || command.starts_with("yarn install")
+                || command.starts_with("pnpm install")
+                || command.starts_with("corepack "))
+                && !command.contains("cyclonedx")
+                && !command.contains("sbom")
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+fn dockerfile_port(root: &std::path::Path) -> Option<u16> {
+    let source = std::fs::read_to_string(root.join("Dockerfile")).ok()?;
+    source.lines().rev().find_map(|line| {
+        let value = line
+            .trim()
+            .strip_prefix("EXPOSE ")?
+            .split_whitespace()
+            .next()?;
+        value.split('/').next()?.parse().ok()
+    })
+}
+
+fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut files: Vec<(std::path::PathBuf, Vec<u8>)> = canary
+        .planted_files()
+        .into_iter()
+        .map(|path| {
+            (
+                std::path::PathBuf::from(path),
+                format!("\"{}\"", canary.token).into_bytes(),
+            )
+        })
+        .collect();
+    files.extend([
+        (
+            std::path::PathBuf::from("/jss-driver.js"),
+            DRIVER_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-launch-shim.js"),
+            LAUNCH_SHIM_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-esm-hook.mjs"),
+            LAUNCH_ESM_HOOK_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-plugin-host.mjs"),
+            PLUGIN_HOST_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-express-host.mjs"),
+            EXPRESS_HOST_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-lifecycle-host.mjs"),
+            LIFECYCLE_HOST_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-route-host.mjs"),
+            ROUTE_HOST_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-node-red-host.mjs"),
+            NODE_RED_HOST_JS.as_bytes().to_vec(),
+        ),
+    ]);
+    let mut created = Vec::new();
+    for (path, contents) in files {
+        if path.exists() {
+            for written in &created {
+                let _ = std::fs::remove_file(written);
+            }
+            return Err(format!(
+                "local verifier refuses to overwrite existing `{}`",
+                path.display()
+            ));
+        }
+        if let Err(error) = std::fs::write(&path, contents) {
+            for written in &created {
+                let _ = std::fs::remove_file(written);
+            }
+            return Err(format!(
+                "writing local verifier fixture {}: {error}",
+                path.display()
+            ));
+        }
+        created.push(path);
+    }
+    Ok(created)
 }
 
 /// Builds the verify image: the repo copied in, dependencies installed, the marker file planted,
@@ -5482,6 +5940,32 @@ const { chromium } = require('playwright');
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_runtime_reads_package_setup_and_port_from_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM node:24 AS build\n\
+             RUN npm install -g typescript@^6\n\
+             RUN npm install --omit=dev\n\
+             RUN rm -rf frontend/src/assets\n\
+             RUN npm run sbom\n\
+             FROM example/distroless\n\
+             EXPOSE 3000/tcp\n\
+             CMD [\"/app/build/app.js\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            dockerfile_setup_commands(dir.path()),
+            vec![
+                "npm install -g typescript@^6".to_owned(),
+                "npm install --omit=dev".to_owned()
+            ]
+        );
+        assert_eq!(dockerfile_port(dir.path()), Some(3000));
+    }
 
     #[test]
     fn profiled_seed_script_discovers_queried_collections_and_cleans_up() {

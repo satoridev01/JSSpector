@@ -154,8 +154,9 @@ struct ScanArgs {
     #[arg(long, value_name = "FILE")]
     write_baseline: Option<PathBuf>,
     /// Confirm each reported finding by running the app in a throwaway Docker container and
-    /// sending the request it implies (opt-in; needs a running Docker daemon). `--verify=strict`
-    /// fails the command when Docker is unreachable instead of skipping.
+    /// sending the request it implies. By default this uses Docker; in an already-disposable
+    /// execution sandbox, `JSS_VERIFY_RUNTIME=local` prepares and runs the app in that sandbox.
+    /// `--verify=strict` fails instead of skipping when the selected runtime is unavailable.
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "best-effort")]
     verify: Option<VerifyMode>,
     /// Dynamically verify only this exact finding fingerprint. Repeatable; the report still

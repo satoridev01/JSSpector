@@ -1,5 +1,6 @@
-//! `scan --verify`: confirm a finding by running the scanned app in a throwaway container and
-//! sending the request the finding implies. Opt-in; nothing here runs without `--verify`.
+//! `scan --verify`: confirm a finding by running the scanned app in a throwaway Docker container,
+//! or directly inside an already-disposable job sandbox, and sending the request the finding
+//! implies. Opt-in; nothing here runs without `--verify`.
 //!
 //! The work splits in two: [`plan`] and [`payload`] decide what to send and how to recognize a
 //! hit, with no I/O (unit-tested directly); [`sandbox`] builds the image, starts the app with no
@@ -81,7 +82,7 @@ pub struct Verdict {
     pub outcome: Outcome,
 }
 
-/// How a run should behave when Docker is not reachable.
+/// How a run should behave when the selected execution runtime is not reachable.
 pub enum Missing {
     /// Mark every finding skipped (the default: `--verify` is best-effort).
     Skip,
@@ -492,16 +493,18 @@ pub fn run(
             .collect());
     }
     if !sandbox::available() {
+        let runtime = if std::env::var("JSS_VERIFY_RUNTIME").as_deref() == Ok("local") {
+            "the local verifier needs Node.js on PATH"
+        } else {
+            "--verify needs a running Docker daemon; none is reachable (start Docker, set JSS_VERIFY_RUNTIME=local inside a disposable sandbox, or drop --verify)"
+        };
         return match missing {
-            Missing::Fail => Err(
-                "--verify needs a running Docker daemon; none is reachable (start Docker, or drop --verify)"
-                    .to_owned(),
-            ),
+            Missing::Fail => Err(runtime.to_owned()),
             Missing::Skip => Ok(findings
                 .iter()
                 .map(|f| {
                     verdict(f, Outcome::Skipped {
-                        reason: "no Docker daemon reachable".to_owned(),
+                        reason: runtime.to_owned(),
                     })
                 })
                 .collect()),

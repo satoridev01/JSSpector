@@ -1440,7 +1440,9 @@ impl Model {
         let lower = name.to_ascii_lowercase();
         // `session ` from `session({...})`: the callee, without its string arguments.
         let head = lower.split_whitespace().next().unwrap_or("");
-        if self.auth_setup.iter().any(|s| s == head) {
+        if self.auth_setup.iter().any(|s| s == head)
+            || (head.starts_with("verify.") && head.ends_with("challenges"))
+        {
             return None;
         }
         if self.auth_admin.iter().any(|a| lower.contains(a.as_str())) {

@@ -12537,15 +12537,36 @@ impl Walker<'_> {
     fn route_handler_name(&self, expr: &Expression<'_>) -> Option<String> {
         if let Expression::CallExpression(c) = expr.get_inner_expression()
             && c.arguments.len() == 1
-            && let Some(Expression::Identifier(inner)) = c
+            && let Some(inner) = c
                 .arguments
                 .first()
                 .and_then(Argument::as_expression)
                 .map(Expression::get_inner_expression)
-            && (self.relative.contains_key(inner.name.as_str())
-                || self.summaries.contains_key(inner.name.as_str()))
         {
-            return Some(inner.name.as_str().to_owned());
+            if let Expression::Identifier(inner) = inner
+                && (self.relative.contains_key(inner.name.as_str())
+                    || self.summaries.contains_key(inner.name.as_str()))
+            {
+                return Some(inner.name.as_str().to_owned());
+            }
+            // A route wrapper can receive a handler factory invocation rather than the handler
+            // itself (`asyncHandler(profileImageUrlUpload())`). The function created by that
+            // zero/constant-argument factory is what the route reaches, just as when the factory is
+            // passed directly. Keep requiring a function known to this module so an arbitrary
+            // middleware call is never mistaken for the route handler.
+            if let Expression::CallExpression(factory_call) = inner
+                && let Expression::Identifier(factory) = factory_call.callee.get_inner_expression()
+                && (self.relative.contains_key(factory.name.as_str())
+                    || self.summaries.contains_key(factory.name.as_str()))
+                && factory_call.arguments.iter().all(|argument| {
+                    matches!(
+                        argument,
+                        Argument::StringLiteral(_) | Argument::NumericLiteral(_)
+                    )
+                })
+            {
+                return Some(factory.name.as_str().to_owned());
+            }
         }
         // `genaRoute('cds')`: a factory whose returned handler is a closure of it (its calls
         // and findings are the factory's own).
@@ -15124,6 +15145,13 @@ mod tests {
                 "defineRoute()({ useMiddlewares: ['withAuthentication'], fn: async (req, res) => { exec('ping ' + req.query.h); } });"
             ),
             vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "app.use(verify.databaseRelatedChallenges());\napp.use(security.updateAuthenticatedUsers());\n\
+                 app.get('/p', (req, res) => { exec('ping ' + req.query.h); });"
+            ),
+            vec![(Auth::NoneDetected, Severity::Critical)]
         );
     }
 

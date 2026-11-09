@@ -373,6 +373,12 @@ pub fn run(
             && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
         {
             probe.sql = plan::sql_plan_for(finding, &probe.entry, &source);
+            // A value-position injection (`WHERE email = '${x}'`) is not an identifier substitution;
+            // record how to break out of the enclosing quote so the exercise phase can drive a
+            // boolean differential. Only when no identifier plan already claimed the finding.
+            if probe.sql.is_none() {
+                probe.sql_value = plan::sql_value_plan_for(finding, &probe.entry, &source);
+            }
         }
     }
     // An entry that forwards the request URL often reaches its sink only for paths the handler
@@ -473,6 +479,54 @@ pub fn run(
         }
     }
 
+    // A sink the handler reaches only on a branch guarded by a session it looks up from a request
+    // cookie it reads itself (`const u = sessions.get(req.cookies.token); if (u) { fetch(url) }`) is
+    // not driveable by an anonymous request even though no route-level auth middleware flagged it:
+    // the in-handler check is an exploit precondition, and an authenticated user still reaches the
+    // sink. Mint a genuine session by exercising the app's own registration/login routes, mined by
+    // generic auth vocabulary from the route-registration source, and carry the returned token back
+    // under the cookie the handler reads. A session the app itself never issues cannot be forged, so
+    // this only reaches a sink a real logged-in request would, never one that is actually closed.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.auth.is_none()
+            && let Ok(handler) = std::fs::read_to_string(root.join(&finding.file))
+            && let Some(cookie) = plan::session_cookie_gate(&handler, finding.sink.line as usize)
+        {
+            // Routes are registered in the entry/app module and sometimes in the handler's own file;
+            // mine both for the login and registration endpoints.
+            let mut login = Vec::new();
+            let mut register = Vec::new();
+            let route_files = [
+                finding.entry_at.as_ref().map(|at| at.file.as_str()),
+                Some(finding.file.as_str()),
+            ];
+            for file in route_files.into_iter().flatten() {
+                let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+                    continue;
+                };
+                let (l, r) = plan::auth_endpoints(&src);
+                for p in l {
+                    if !login.contains(&p) {
+                        login.push(p);
+                    }
+                }
+                for p in r {
+                    if !register.contains(&p) {
+                        register.push(p);
+                    }
+                }
+            }
+            if !login.is_empty() {
+                probe.auth = Some(plan::AuthBootstrap {
+                    cookie,
+                    register_paths: register,
+                    login_paths: login,
+                });
+            }
+        }
+    }
+
     let needs_http = plans.iter().any(|p| matches!(p, Ok(plan::Plan::Http(_))));
     let needs_browser = plans
         .iter()
@@ -503,9 +557,12 @@ pub fn run(
             Missing::Skip => Ok(findings
                 .iter()
                 .map(|f| {
-                    verdict(f, Outcome::Skipped {
-                        reason: runtime.to_owned(),
-                    })
+                    verdict(
+                        f,
+                        Outcome::Skipped {
+                            reason: runtime.to_owned(),
+                        },
+                    )
                 })
                 .collect()),
         };

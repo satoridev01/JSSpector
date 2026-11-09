@@ -128,9 +128,16 @@ pub struct Probe {
     /// scalar is replaced with a validator-typed filler when route middleware declares one.
     pub body_query_override: Option<String>,
     /// For a SQL injection whose tainted value is interpolated in a table-identifier position, how to
-    /// drive it (see [`SqlPlan`]). `None` for a non-SQL class or a value-position SQL injection that
-    /// verify v1 does not yet drive. Mined from the handler source only.
+    /// drive it (see [`SqlPlan`]). `None` for a non-SQL class or a value-position SQL injection, which
+    /// is driven through [`Self::sql_value`] instead. Mined from the handler source only.
     pub sql: Option<SqlPlan>,
+    /// For a SQL injection whose tainted value is interpolated inside a quoted string-literal position
+    /// of the statement (`WHERE email = '${x}'`), how to break out of that quote (see [`SqlValue`]).
+    /// Such an injection can never surface a computed sub-select (it is a value, not a table name), so
+    /// it is proved by a boolean differential: a quote-breakout carrying an always-true boolean changes
+    /// the handler's observable response while otherwise-identical always-false breakouts do not. `None`
+    /// for a non-SQL class or an identifier-position injection. Mined from the handler source only.
+    pub sql_value: Option<SqlValue>,
     /// For a NoSQL body injection whose tainted value reaches the sink as an *element* of the body
     /// field rather than the field itself: the handler iterates the field (`for (const d of
     /// device_names) ... findOne({ name: d })`, `field.forEach(d => ...)`) and queries each element, so
@@ -162,6 +169,36 @@ pub struct Probe {
     /// the one whose branch performs the write is exercised. Filled from the route-registration source
     /// only; empty when the handler is registered on a single path. Nothing here is target-specific.
     pub alt_paths: Vec<String>,
+    /// When the handler reaches its sink only on a branch guarded by a session the handler looks up
+    /// from a request credential it reads itself (`const u = sessions.get(req.cookies.token); if (u)
+    /// { fetch(url) }`), how to mint that session honestly against the app's own authentication: the
+    /// credential name to carry the minted token under, and the login/registration endpoints the
+    /// sandbox exercises to obtain it. Such an in-handler check is an exploit precondition, not input
+    /// neutralization: an authenticated user still drives the sink, so the verifier satisfies it by
+    /// registering and logging in through the app's own routes and replaying the request with the
+    /// returned token. `None` when no in-handler session guard sits between the entry and the sink.
+    /// Mined from the handler and route-registration source only; nothing here is target-specific.
+    pub auth: Option<AuthBootstrap>,
+}
+
+/// How to obtain a genuine authenticated session for a sink gated behind an in-handler credential
+/// check, by exercising the app's own login (and, when needed, registration) routes. The token the
+/// login returns is carried back to the gated request under [`Self::cookie`]. Nothing here names a
+/// specific app: the endpoints are mined by generic authentication vocabulary from the route source,
+/// and the credentials are freshly generated for the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthBootstrap {
+    /// The cookie name the handler reads the session token from (`req.cookies.<name>`): the minted
+    /// token is sent back under this cookie so the handler's `sessions.get(req.cookies.<name>)`
+    /// resolves to the registered session and its guarded branch runs.
+    pub cookie: String,
+    /// Candidate account-creation endpoints (a user/account collection the run registers a throwaway
+    /// account on before logging in), most-specific first. Empty when the app seeds accounts and no
+    /// registration route is needed.
+    pub register_paths: Vec<String>,
+    /// Candidate login endpoints that exchange the generated credentials for a session token, tried
+    /// in order until one returns a token.
+    pub login_paths: Vec<String>,
 }
 
 /// How to drive a nested-write prototype-pollution sink (`obj[outer][inner] = v`). Both keys are
@@ -255,6 +292,26 @@ pub struct SqlPlan {
     /// nothing); it is proved instead by a planted row disappearing. `None` for a non-destructive
     /// identifier injection (a `SELECT ... FROM <id>` the reflected/blind oracles already drive).
     pub delete: Option<SqlDelete>,
+}
+
+/// How to drive a SQL injection whose tainted value is interpolated inside a quoted string-literal
+/// position of a SQL statement (`WHERE email = '${x}'`). Unlike an identifier substitution this is a
+/// value that a safe sink would pass as a bound parameter, so it is proved by a boolean differential:
+/// the probe closes the enclosing quote and appends an always-true boolean followed by a line comment
+/// that neutralizes the statement's remaining text. The only thing that varies between the exploit and
+/// its controls is the truth value of that injected boolean, so a response difference can come only
+/// from the database evaluating injected SQL. Mined from the handler source only; nothing here is tied
+/// to a specific app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlValue {
+    /// The quote character enclosing the interpolated value (`'` or `"`); the breakout emits it to
+    /// close the literal before the injected boolean.
+    pub quote: char,
+    /// How many grouping parentheses are still open at the interpolation point (`WHERE ((name LIKE
+    /// '%${x}%' ...)` opens two). The breakout closes exactly this many before the injected boolean so
+    /// the statement stays balanced once a line comment removes the original tail; otherwise the
+    /// unmatched `)` of the original predicate make every leg a syntax error and nothing is observable.
+    pub open_parens: usize,
 }
 
 /// How to drive a quote-breakout against a destructive table-identifier injection
@@ -714,10 +771,12 @@ impl Probe {
             body_object: false,
             body_query_override,
             sql: None,
+            sql_value: None,
             array_element,
             appended_fields,
             proto_pollution: None,
             alt_paths: Vec::new(),
+            auth: None,
         })
     }
 
@@ -772,10 +831,12 @@ impl Probe {
             body_object: false,
             body_query_override: None,
             sql: None,
+            sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: Some(ProtoPollution { outer, inner }),
             alt_paths: Vec::new(),
+            auth: None,
         })
     }
 }
@@ -4207,6 +4268,10 @@ fn coarse_part_field_entry(finding: &Finding, path: &str, source: Option<&str>) 
     }
     let src = source?;
     let tainted = tainted_identifiers(finding, &Entry::Url);
+    // The distinct fields of this part the handler actually reads (`req.query.q` -> `q`), in source
+    // order. A field whose name is itself a tainted identifier (the handler destructured it, so the
+    // field and the local coincide) pins the attacker input directly.
+    let mut fields: Vec<String> = Vec::new();
     for accessor in request_accessors(src) {
         let Some(chain) = strip_request_receiver(&accessor) else {
             continue;
@@ -4226,6 +4291,21 @@ fn coarse_part_field_entry(finding: &Finding, path: &str, source: Option<&str>) 
         {
             return Some(entry);
         }
+        if !fields.iter().any(|f| f == field) {
+            fields.push(field.to_owned());
+        }
+    }
+    // No field name coincided with a tainted local — the handler read the member into a differently
+    // named local (`let criteria = req.query.q`, so the trace's tainted local is `criteria`, not `q`).
+    // When the handler reads exactly one distinct field of this part, that field is unambiguously where
+    // the coarse-part taint enters, so drive it; with several fields there is nothing to disambiguate
+    // them and we leave it to the generic ranking rather than guess. Restricted to directly
+    // attacker-placeable parts: a header is resolved by its own request-target logic (`coarse_header_
+    // entry`), which handles non-identifier names and rejects a header that sits in no sink position.
+    if matches!(part, "query" | "body" | "params")
+        && let [only] = fields.as_slice()
+    {
+        return source_entry(&format!("request.{part}.{only}"), path);
     }
     None
 }
@@ -5400,6 +5480,130 @@ pub fn sql_plan_for(finding: &Finding, entry: &Entry, source: &str) -> Option<Sq
     sql_identifier_plan(source, &tainted)
 }
 
+/// The [`SqlValue`] for a SQL-injection finding whose tainted value is interpolated inside a quoted
+/// string-literal position of a SQL statement (`WHERE email = '${x}'`). `None` for a non-SQL finding,
+/// an identifier-position injection (driven through [`sql_plan_for`] instead), or a value that is not
+/// interpolated inside a quoted SQL literal. Mined from the handler source only.
+pub fn sql_value_plan_for(finding: &Finding, entry: &Entry, source: &str) -> Option<SqlValue> {
+    if finding.class != VulnClass::SqlInjection {
+        return None;
+    }
+    let mut tainted = tainted_identifiers(finding, entry);
+    propagate_path_derived_taint(source, &mut tainted);
+    sql_value_plan(source, &tainted)
+}
+
+/// Scans `source` for a tainted value interpolated inside a quoted string-literal position of a SQL
+/// template (`'${x}'` / `"${x}"` within a statement that reads like SQL), returning the enclosing
+/// quote so the verifier can break out of it. An interpolation in an identifier position (`FROM ${x}`),
+/// or one not wrapped in a matching value quote, is not matched here. Mined textually from the handler
+/// source only; conservative — it returns the first quoted tainted interpolation it recognizes.
+fn sql_value_plan(source: &str, tainted: &[String]) -> Option<SqlValue> {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("${") {
+        let at = from + rel;
+        from = at + 2;
+        let Some(close) = source[at + 2..].find('}').map(|c| at + 2 + c) else {
+            continue;
+        };
+        let inner = source[at + 2..close].trim();
+        // The interpolation must actually carry attacker input — a tainted identifier used as a word,
+        // or a direct request accessor — so an interpolated constant is never mistaken for a sink.
+        if !interpolation_carries_taint(inner, tainted) {
+            continue;
+        }
+        // A value position sits inside an *open* string literal of the statement: scanning the
+        // enclosing template from its start to this interpolation leaves a quote open. This covers a
+        // bare `'${x}'` as well as a value with surrounding text such as a `LIKE` pattern
+        // (`'%${x}%'`), where the quote is not immediately adjacent to the interpolation. An
+        // identifier position (`FROM ${x}`) leaves no quote open and is handled elsewhere. The same
+        // scan reports how many grouping parens are still open so the breakout can re-balance them.
+        let Some((quote, open_parens)) = open_string_context(source, at) else {
+            continue;
+        };
+        let Some(stmt) = enclosing_template_literal(source, at) else {
+            continue;
+        };
+        if !looks_like_sql(&stmt) {
+            continue;
+        }
+        return Some(SqlValue { quote, open_parens });
+    }
+    None
+}
+
+/// The string-literal quote (`'` or `"`) left open at `interp_at` (the offset of a `${`) together with
+/// the number of grouping parentheses still open there, found by scanning the enclosing template
+/// literal from its start. `None` when no literal is open at that point (an identifier/bare position).
+/// Nested `${...}` interpolations are skipped whole so quote and paren characters inside an earlier
+/// expression do not corrupt the state — in a template literal `${` always begins an interpolation
+/// regardless of surrounding quotes. Parens inside string literals are not counted. This recognizes a
+/// value whether or not the quote is adjacent to the interpolation (`'${x}'` and the `LIKE` pattern
+/// `'%${x}%'` both report `'`), and reports the open-paren depth the breakout must re-balance.
+fn open_string_context(source: &str, interp_at: usize) -> Option<(char, usize)> {
+    let open = source[..interp_at].rfind('`')?;
+    let segment = &source[open + 1..interp_at];
+    let bytes = segment.as_bytes();
+    let mut quote: Option<char> = None;
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while let Some(byte) = bytes.get(i) {
+        if *byte == b'$' && bytes.get(i + 1) == Some(&b'{') {
+            match segment[i + 2..].find('}') {
+                Some(end) => {
+                    i = i + 2 + end + 1;
+                    continue;
+                }
+                None => return quote.map(|q| (q, depth)),
+            }
+        }
+        let c = *byte as char;
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '(' => depth += 1,
+            None if c == ')' => depth = depth.saturating_sub(1),
+            None => {}
+        }
+        i += 1;
+    }
+    quote.map(|q| (q, depth))
+}
+
+/// Whether an interpolated expression carries attacker input: it reads a request object directly
+/// (`req.`/`request.`) or mentions one of the tainted identifiers as a whole word.
+fn interpolation_carries_taint(inner: &str, tainted: &[String]) -> bool {
+    if inner.contains("req.") || inner.contains("request.") {
+        return true;
+    }
+    tainted.iter().any(|name| {
+        !name.is_empty()
+            && inner.match_indices(name.as_str()).any(|(at, _)| {
+                let before = inner[..at].chars().next_back();
+                let after = inner[at + name.len()..].chars().next();
+                let boundary = |c: Option<char>| {
+                    c.map(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                        .unwrap_or(true)
+                };
+                boundary(before) && boundary(after)
+            })
+    })
+}
+
+/// Whether a placeholder-substituted template literal reads like a SQL statement: it contains a SQL
+/// verb and a clause keyword, so an ordinary interpolated string is not mistaken for a query.
+fn looks_like_sql(stmt: &str) -> bool {
+    let low = stmt.to_ascii_lowercase();
+    let verb = ["select ", "insert ", "update ", "delete "]
+        .iter()
+        .any(|kw| low.contains(kw));
+    let clause = [" from ", " where ", " values", " set ", " into "]
+        .iter()
+        .any(|kw| low.contains(kw));
+    verb && clause
+}
+
 /// The plan to drive a SQL injection whose tainted value is interpolated in a table-identifier
 /// position (`FROM ${tbl}`, `JOIN ${tbl}`, `UPDATE ${tbl}`, `INTO ${tbl}`): every column the statements
 /// interpolating that identifier reference (classified filter/value) and the request body fields the
@@ -6268,9 +6472,284 @@ pub fn derive_http_entry(finding: &Finding) -> Option<String> {
     Some(format!("{method} /{}", segments.join("/")))
 }
 
+/// The cookie name a handler reads a session token from when the sink sits on a branch guarded by
+/// that session (`const u = sessions.get(req.cookies.token); if (u) { fetch(url) }`): the sink is
+/// reachable only for a request whose `req.cookies.<name>` resolves to a live session, so the
+/// verifier must mint one and carry it under that cookie. Returns the cookie name when the handler
+/// (a) reads `req.cookies.<name>` into a local, (b) branches on that local (`if (local)` /
+/// `if (!local)`), and (c) the sink line falls after that branch. `None` when no such in-handler
+/// session guard precedes the sink — the common unauthenticated case, left untouched. Recognizes
+/// only the handler's *own* credential read, never a route-level auth middleware (which the engine
+/// already reports through `finding.auth`); nothing here is tied to a specific app.
+pub fn session_cookie_gate(source: &str, sink_line: usize) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        // A local bound to a value read from a request cookie: `const u = X.get(req.cookies.token)`,
+        // `let u = req.cookies.token`. Capture the bound local and the cookie name.
+        let Some((local, cookie)) = cookie_binding(line) else {
+            continue;
+        };
+        let read_line = idx + 1;
+        // The sink must sit after the cookie read, and the local must gate a branch between the read
+        // and the sink. A guard that references the local anywhere before the sink line is enough: it
+        // is the authentication check the handler performs before reaching the sink.
+        if read_line >= sink_line {
+            continue;
+        }
+        // Scan from the cookie read up to and including the sink line: the guard may sit on its own
+        // line above the sink (`if (u) {` then `fetch(url)`) or wrap it inline (`if (u) { fetch(url) }`).
+        let guards = lines
+            .iter()
+            .take(sink_line)
+            .skip(idx)
+            .any(|l| branches_on_local(l, &local));
+        if guards {
+            return Some(cookie);
+        }
+    }
+    None
+}
+
+/// The `(local, cookie)` of a line binding a local to a request-cookie read: `const u =
+/// sessions.get(req.cookies.token)`, `let token = req.cookies.sid`. `None` for a line that is not
+/// such a binding.
+fn cookie_binding(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    let rest = ["const ", "let ", "var "]
+        .iter()
+        .find_map(|kw| trimmed.strip_prefix(kw))?;
+    let (local, rhs) = rest.split_once('=')?;
+    let local = local.trim();
+    // A single plain identifier on the left (not a destructure), used later as a boolean guard.
+    if local.is_empty() || !local.bytes().all(is_ident) {
+        return None;
+    }
+    let cookie = cookie_name_in(rhs)?;
+    Some((local.to_owned(), cookie))
+}
+
+/// The cookie name read in an expression: the `<name>` of the first `req.cookies.<name>` (or
+/// `request.cookies.<name>`, `.cookies["<name>"]`) accessor. `None` when the expression reads no
+/// request cookie.
+fn cookie_name_in(expr: &str) -> Option<String> {
+    let marker = ".cookies";
+    let mut from = 0;
+    while let Some(pos) = expr[from..].find(marker) {
+        let after = &expr[from + pos + marker.len()..];
+        // Preceding token should be a request object (`req`/`request`/`ctx.req`); keep it permissive
+        // but require the accessor to read a concrete cookie name.
+        if let Some(rest) = after.strip_prefix('.') {
+            let name: String = rest
+                .bytes()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        } else if let Some(rest) = after.strip_prefix('[')
+            && let Some(name) = unquote(rest.split(']').next().unwrap_or("").trim())
+            && !name.is_empty()
+        {
+            return Some(name);
+        }
+        from += pos + marker.len();
+    }
+    None
+}
+
+/// Whether a line is a boolean branch on `local`: `if (local)`, `if (!local)`, `if (local &&`,
+/// `} else if (local`, a ternary `local ?`. Used to confirm the session local gates the sink.
+fn branches_on_local(line: &str, local: &str) -> bool {
+    let trimmed = line.trim_start();
+    if !(trimmed.contains("if (") || trimmed.contains("if(") || trimmed.contains('?')) {
+        return false;
+    }
+    // Find `local` as a whole word adjacent to a boolean context (`(`, `!`, `&&`, `||`, whitespace).
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = line[from..].find(local) {
+        let start = from + pos;
+        let end = start + local.len();
+        let before_ok = bytes
+            .get(start.wrapping_sub(1))
+            .is_none_or(|byte| !is_ident(*byte));
+        let after_ok = bytes.get(end).is_none_or(|byte| !is_ident(*byte));
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Candidate login and account-registration endpoints mined from route-registration `source`, for a
+/// sink gated behind an in-handler session the verifier must mint. Returns `(login, register)` path
+/// lists: login paths are those whose final concrete segment is generic authentication vocabulary
+/// (`login`, `signin`, `authenticate`, `session`, `token`), register paths those whose final
+/// concrete segment is a user/account collection (`users`, `accounts`, `register`, `signup`). Static
+/// absolute paths only (`'/rest/user/login'`); parameterized and relative specifiers are dropped.
+/// The vocabulary is generic HTTP-auth naming, not any one app's routes.
+pub fn auth_endpoints(source: &str) -> (Vec<String>, Vec<String>) {
+    const LOGIN_WORDS: [&str; 7] = [
+        "login",
+        "signin",
+        "sign-in",
+        "authenticate",
+        "session",
+        "sessions",
+        "token",
+    ];
+    const REGISTER_WORDS: [&str; 10] = [
+        "users",
+        "user",
+        "accounts",
+        "account",
+        "register",
+        "signup",
+        "sign-up",
+        "registration",
+        "customers",
+        "members",
+    ];
+    // Login endpoints are ranked: an endpoint whose final segment is exactly an auth verb
+    // (`/rest/user/login`) is a far stronger candidate than one that merely contains the word
+    // (`/rest/passkey/login-options`, `/rest/saveLoginIp`), which may return an unrelated challenge
+    // token. The exact-match tier is tried first so the real session login is reached before a weaker
+    // lookalike can short-circuit the bootstrap.
+    let mut login_exact = Vec::new();
+    let mut login_loose = Vec::new();
+    let mut register = Vec::new();
+    for path in route_path_literals(source) {
+        // Only directly driveable paths: a parameterized segment (`/api/Users/:id`, `/x/{id}`) cannot
+        // be filled with a real value here, so skip it.
+        if path.contains("/:") || path.contains('{') {
+            continue;
+        }
+        let Some(last) = path.rsplit('/').find(|seg| !seg.is_empty()) else {
+            continue;
+        };
+        let last = last.to_ascii_lowercase();
+        let lower = path.to_ascii_lowercase();
+        if LOGIN_WORDS.contains(&last.as_str()) {
+            if !login_exact.contains(&path) {
+                login_exact.push(path);
+            }
+        } else if lower.contains("login") || lower.contains("signin") {
+            if !login_loose.contains(&path) {
+                login_loose.push(path);
+            }
+        } else if REGISTER_WORDS.contains(&last.as_str()) && !register.contains(&path) {
+            register.push(path);
+        }
+    }
+    login_exact.extend(login_loose);
+    (login_exact, register)
+}
+
+/// Absolute route path string literals a router-registration source declares: the first string
+/// argument of a `.get(`/`.post(`/`.put(`/`.patch(`/`.delete(`/`.all(`/`.use(`/`.route(` call that is
+/// an absolute path (`'/rest/user/login'`). Parameterized and query-bearing noise is tolerated — the
+/// raw literal is returned for the caller to classify and drive.
+fn route_path_literals(source: &str) -> Vec<String> {
+    const CALLS: [&str; 9] = [
+        ".get(", ".post(", ".put(", ".patch(", ".delete(", ".all(", ".use(", ".route(", ".head(",
+    ];
+    let mut out = Vec::new();
+    for call in CALLS {
+        let mut from = 0;
+        while let Some(pos) = source[from..].find(call) {
+            let after = &source[from + pos + call.len()..];
+            from += pos + call.len();
+            let arg = after.trim_start();
+            let Some(lit) = first_string_literal(arg) else {
+                continue;
+            };
+            if lit.starts_with('/') && lit.len() > 1 && !out.contains(&lit) {
+                out.push(lit);
+            }
+        }
+    }
+    out
+}
+
+/// The first single- or double-quoted string literal at the start of `text` (allowing a leading
+/// quote only), without escapes handling beyond what a route literal needs. `None` when `text` does
+/// not begin with a quote.
+fn first_string_literal(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' && quote != b'`' {
+        return None;
+    }
+    let mut value = String::new();
+    for &b in bytes.get(1..)? {
+        if b == quote {
+            return Some(value);
+        }
+        if b == b'\n' {
+            return None;
+        }
+        value.push(b as char);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::Method;
+
+    #[test]
+    fn in_handler_session_cookie_gate_is_detected_as_an_auth_precondition() {
+        // A handler that reaches its sink only inside a branch guarded by a session it looks up from a
+        // request cookie it reads itself is an authenticated-user sink: the cookie name must be mined
+        // so the verifier can carry a minted token back under it. The sink is on line 4.
+        let handler = "function h(req, res) {\n\
+             const url = req.body.imageUrl\n\
+             const loggedInUser = sessions.get(req.cookies.token)\n\
+             if (loggedInUser) { fetch(url) }\n\
+           }";
+        assert_eq!(
+            super::session_cookie_gate(handler, 4).as_deref(),
+            Some("token")
+        );
+        // No in-handler session guard: an ordinary unauthenticated handler is left untouched so the
+        // verifier drives it anonymously, never fabricating an auth step it does not need.
+        let anon = "function h(req, res) {\n\
+             const url = req.body.imageUrl\n\
+             fetch(url)\n\
+           }";
+        assert_eq!(super::session_cookie_gate(anon, 3), None);
+        // A cookie read that does not gate the sink (no branch on the bound local before it) is not an
+        // auth precondition either.
+        let ungated = "function h(req, res) {\n\
+             const t = req.cookies.token\n\
+             fetch(req.body.url)\n\
+           }";
+        assert_eq!(super::session_cookie_gate(ungated, 3), None);
+    }
+
+    #[test]
+    fn auth_endpoints_rank_exact_login_first_and_skip_parameterized() {
+        // Route registrations carrying a mix of auth-vocabulary paths: the exact-segment login
+        // (`/rest/user/login`) must lead the loose lookalikes (`/rest/passkey/login-options`,
+        // `/rest/saveLoginIp`) so the real session login is reached before a weaker token endpoint can
+        // short-circuit the bootstrap, a user/account collection is mined for registration, and a
+        // parameterized path is dropped (it cannot be driven with a real value).
+        let source = "app.post('/rest/passkey/login-options', a)\n\
+             app.post('/rest/saveLoginIp', b)\n\
+             app.get('/api/Users', c)\n\
+             app.route('/api/Users/:id')\n\
+             app.post('/rest/user/login', login())\n\
+             app.post('/api/Products', d)";
+        let (login, register) = super::auth_endpoints(source);
+        assert_eq!(login.first().map(String::as_str), Some("/rest/user/login"));
+        assert!(login.contains(&"/rest/passkey/login-options".to_owned()));
+        assert!(login.contains(&"/rest/saveLoginIp".to_owned()));
+        assert_eq!(register, vec!["/api/Users".to_owned()]);
+        assert!(!login.iter().any(|p| p.contains(":id")));
+        assert!(!register.iter().any(|p| p.contains(":id")));
+    }
 
     #[test]
     fn parse_entry_treats_express_all_as_any_method() {
@@ -6810,10 +7289,12 @@ module.exports = { activityValidators };\n";
             body_object: false,
             body_query_override: None,
             sql: None,
+            sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
             proto_pollution: None,
             alt_paths: Vec::new(),
+            auth: None,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -7790,6 +8271,49 @@ module.exports = { activityValidators };\n";
             super::without_optional_chaining("a?.b?.[c]?.(d) ? x :y?.5:1"),
             "a.b[c](d) ? x :y?.5:1"
         );
+    }
+
+    #[test]
+    fn a_value_position_sql_injection_is_mapped_to_a_quote_breakout() {
+        // A login handler interpolates a body field into a quoted string-literal position of a SQL
+        // statement. This is a value, not a table name, so the identifier plan declines it; the
+        // value-position plan recovers the enclosing quote so the sandbox can drive a boolean breakout.
+        let source = "models.sequelize.query(`SELECT * FROM Users WHERE email = \
+            '${req.body.email || ''}' AND password = '${hash(req.body.password || '')}' \
+            AND deletedAt IS NULL`, { plain: true })";
+        let mut f = finding(
+            VulnClass::SqlInjection,
+            Auth::NoneDetected,
+            Some("POST /rest/user/login"),
+            "req.body.email",
+        );
+        f.sink.api = ".query".to_owned();
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::Body(Some("email".to_owned())));
+        assert!(
+            sql_plan_for(&f, &probe.entry, source).is_none(),
+            "a quoted value is not an identifier substitution"
+        );
+        let value =
+            sql_value_plan_for(&f, &probe.entry, source).expect("value-position injection mapped");
+        assert_eq!(value.quote, '\'');
+
+        // An identifier position (`FROM ${table}`) is driven by the identifier plan, not misread as a
+        // value breakout.
+        let id_source = "db.query(`SELECT id FROM ${req.body.table} WHERE id = 1`)";
+        let mut idf = finding(
+            VulnClass::SqlInjection,
+            Auth::NoneDetected,
+            Some("POST /x"),
+            "req.body.table",
+        );
+        idf.sink.api = ".query".to_owned();
+        let idp = Probe::from_finding_with_source(&idf, Some(id_source)).unwrap();
+        assert!(sql_value_plan_for(&idf, &idp.entry, id_source).is_none());
+
+        // A non-SQL template carrying the same interpolation is not treated as a SQL value position.
+        let html = "res.send(`<p>${req.body.email}</p>`)";
+        assert!(sql_value_plan_for(&f, &probe.entry, html).is_none());
     }
 
     #[test]

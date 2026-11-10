@@ -8,6 +8,7 @@ modules:
   graceful-fs: fs
   original-fs: fs
   vm: vm
+  notevil: notevil
   path: path
   path/posix: path
   path/win32: path
@@ -44,6 +45,7 @@ sinks:
   - {module: execa, exports: [execaCommand, execaCommandSync, command, commandSync], class: command-injection, severity: critical, args: ["any:0"]}
   - {module: execa, exports: ["", execa, execaSync], class: command-injection, severity: high, args: ["any:0"]}
   - {module: vm, exports: [runInNewContext, runInThisContext, runInContext, compileFunction, Script], class: code-injection, severity: critical, args: ["any:0"]}
+  - {module: notevil, exports: [eval], class: code-injection, severity: critical, args: ["any:0"]}
   - module: fs
     exports: [readFile, readFileSync, writeFile, writeFileSync, appendFile, appendFileSync, createReadStream,
       createWriteStream, unlink, unlinkSync, rm, rmSync, rmdir, rmdirSync, readdir, readdirSync, open, openSync,

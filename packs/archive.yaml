@@ -2,6 +2,7 @@
 name: archive
 modules:
   yauzl: yauzl
+  unzipper: unzipper
 client_sources:
   - {methods: [on], event: entry, params: first, kind: archive}
 # yauzl checks the name of every entry it reads (no absolute path, no `..` segment, no
@@ -12,3 +13,4 @@ validated_archives:
      unless_false: decodeStrings}
 result_sources:
   - {methods: [getEntries], kind: archive}
+  - {methods: [buffer], family: unzipper, via: [Open], kind: archive}

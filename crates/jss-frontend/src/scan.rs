@@ -762,6 +762,20 @@ fn analyze(
                 method: r.method.clone(),
                 path: r.path.clone(),
                 handler: r.handler.clone(),
+                handlers: facts
+                    .route_handlers
+                    .get(&(r.span.start, r.span.end))
+                    .map(|handlers| {
+                        handlers
+                            .iter()
+                            .filter(|(handler, _)| handler != &r.handler)
+                            .map(|(handler, auth)| ir::EntryHandler {
+                                handler: handler.clone(),
+                                auth: *auth,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 line: line(r.span.start),
                 at: r.at.clone(),
                 auth: r.auth,
@@ -779,6 +793,7 @@ fn analyze(
                 method: r.method.clone(),
                 path: r.path.clone(),
                 handler: r.handler.clone(),
+                handlers: Vec::new(),
                 line: line(r.span.start),
                 at: r.at.clone(),
                 auth: r.auth,

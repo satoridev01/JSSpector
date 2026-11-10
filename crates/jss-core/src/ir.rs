@@ -122,6 +122,11 @@ pub struct Entry {
     pub method: String,
     pub path: String,
     pub handler: String,
+    /// Named middleware that runs before the final handler, with the authentication already in
+    /// force when that middleware begins. These are reachable from the same entry without
+    /// becoming duplicate routes in the inventory.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub handlers: Vec<EntryHandler>,
     pub line: u32,
     /// Where a helper's own `router.get(...)` call is, when the route is registered through
     /// one (`line` is then the call to the helper): file and line.
@@ -134,6 +139,12 @@ pub struct Entry {
     /// function), the handler's first and last lines: the entry reaches the findings there only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct EntryHandler {
+    pub handler: String,
+    pub auth: Auth,
 }
 
 /// `router.use('/prefix', child)`.

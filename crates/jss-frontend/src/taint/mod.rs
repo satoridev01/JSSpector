@@ -586,6 +586,9 @@ pub struct FileFacts {
     pub functions: BTreeMap<String, (u32, Vec<String>)>,
     /// Calls each function makes: (callee, offset, arguments).
     pub calls: BTreeMap<String, Vec<(String, u32, Vec<jss_core::ir::Value>)>>,
+    /// Named middleware reached by a route registration, keyed by that registration's span.
+    /// Each value carries the authentication in force before that middleware runs.
+    pub route_handlers: BTreeMap<(u32, u32), Vec<(String, Auth)>>,
     /// Classes declared here, with their bases.
     pub classes: Vec<jss_core::ir::ClassDecl>,
     /// Properties assigned an instance of one of our classes: (property, class).
@@ -8698,7 +8701,7 @@ impl Walker<'_> {
                 .and_then(Argument::as_expression)
                 .and_then(|e| self.mount_path(e, env)),
         };
-        let route_auth = receiver_name
+        let inherited_auth = receiver_name
             .as_deref()
             .and_then(|r| self.router_auth.get(&router_key(r, env)))
             .map(|guards| {
@@ -8715,8 +8718,8 @@ impl Walker<'_> {
                     .max()
                     .unwrap_or_default()
             })
-            .unwrap_or_default()
-            .max(middleware_auth);
+            .unwrap_or_default();
+        let route_auth = inherited_auth.max(middleware_auth);
         // `router.use(auth)`, `app.use('/api', jwt())`: middleware for the routes registered after
         // it on this router (under that path). A use() that mounts routers (`use(adminRouter)`,
         // `use('/admin', requireAdmin, child)`) guards only what it mounts.
@@ -8804,6 +8807,31 @@ impl Walker<'_> {
         }
         // Routes are kept from the final pass only (facts reset before it); templates from any.
         {
+            if role == Role::Route && !self.summarize && !self.record_only {
+                let expressions: Vec<&Expression<'_>> = call
+                    .arguments
+                    .iter()
+                    .filter_map(Argument::as_expression)
+                    .collect();
+                let mut positional_auth = Auth::NoneDetected;
+                let mut handlers = Vec::new();
+                for expression in expressions
+                    .get(1..expressions.len().saturating_sub(1))
+                    .unwrap_or(&[])
+                {
+                    if let Some(handler) = self.route_handler_name(expression) {
+                        handlers.push((handler, inherited_auth.max(positional_auth)));
+                    }
+                    if let Some(auth) = route_middleware_auth(expression) {
+                        positional_auth = positional_auth.max(auth);
+                    }
+                }
+                if !handlers.is_empty() {
+                    self.facts
+                        .route_handlers
+                        .insert((call.span.start, call.span.end), handlers);
+                }
+            }
             self.record_entry(&callee, call, role, route_auth, env);
             // `routes.forEach((r) => router[r.method](r.path, r.handler))`: one record-only
             // walk of the callback per known row.
@@ -8927,7 +8955,29 @@ impl Walker<'_> {
                     Some(Expression::ObjectExpression(_))
                 );
             if arg_role == Role::Route {
-                self.pending_auth = route_auth;
+                let preceding_auth = call
+                    .arguments
+                    .iter()
+                    .skip(1)
+                    .take(index.saturating_sub(1))
+                    .filter_map(Argument::as_expression)
+                    .filter_map(route_middleware_auth)
+                    .max()
+                    .unwrap_or_default();
+                let inline = argument.as_expression().is_some_and(|expression| {
+                    matches!(
+                        expression.get_inner_expression(),
+                        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                    )
+                });
+                self.pending_auth = if inline {
+                    inherited_auth.max(preceding_auth)
+                } else {
+                    // Named handlers are attributed after the cross-file call graph is linked.
+                    // Keeping positional auth in this global pending slot would leak the last
+                    // handler's guard into an earlier handler that is walked later.
+                    Auth::NoneDetected
+                };
             }
             let taint = match (argument.as_expression(), &route_name) {
                 // Walked below, once, as callbacks.
@@ -9893,8 +9943,25 @@ impl Walker<'_> {
                         primary_escaped: 0,
                     });
                 }
-                // Pack result sources: `zip.getEntries()`.
-                if let Some(source) = m().result_sources.iter().find(|s| has(&s.methods, method)) {
+                // Pack result sources: `zip.getEntries()`, or a qualified library API such as
+                // `unzipper.Open.buffer()`. Resolve the root identifier through the import map
+                // so aliases do not weaken the module constraint.
+                let chain = receiver_chain(&call.callee);
+                let family = match &callee {
+                    Callee::Module { family, .. } => Some(*family),
+                    _ => chain
+                        .iter()
+                        .rev()
+                        .find_map(|name| self.modules.get(name).map(|imported| imported.family)),
+                };
+                if let Some(source) = m().result_sources.iter().find(|source| {
+                    has(&source.methods, method)
+                        && source
+                            .family
+                            .as_deref()
+                            .is_none_or(|expected| family == Some(expected))
+                        && source.via.iter().all(|expected| has(&chain, expected))
+                }) {
                     return Some(Origin::source(source.kind.as_str(), call.span));
                 }
                 // `schema.safeParse(req.body)`: the input, typed by the schema (no operator objects).
@@ -11704,34 +11771,6 @@ impl Walker<'_> {
                         auth,
                     });
                     return;
-                }
-                // `router.get('/', controller.get, render)`: an earlier controller action of
-                // the chain answers the request too, so it is reachable from this route.
-                let chain: Vec<&Expression<'_>> = call
-                    .arguments
-                    .iter()
-                    .filter_map(Argument::as_expression)
-                    .collect();
-                let earlier: Vec<String> = chain
-                    .get(1..chain.len().saturating_sub(1))
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter(|e| is_controller_action(e))
-                    .filter_map(|e| self.route_handler_name(e.get_inner_expression()))
-                    .filter(|name| *name != handler)
-                    .collect();
-                for earlier_handler in earlier {
-                    self.facts.routes.push(RouteFact {
-                        at: None,
-                        receiver: object.clone(),
-                        receiver_file: None,
-                        method: method.to_ascii_uppercase(),
-                        path: path.clone(),
-                        handler: earlier_handler,
-                        span: call.span,
-                        auth,
-                        kind: "http",
-                    });
                 }
                 self.facts.routes.push(RouteFact {
                     at: None,
@@ -14904,6 +14943,16 @@ mod tests {
     }
 
     #[test]
+    fn evaluator_wrappers_are_code_sinks() {
+        let finding = one(
+            "const { eval: safeEval } = require('notevil'); app.post('/run', (req, res) => { res.send(safeEval(req.body.expression)); });",
+        );
+        assert_eq!(finding.len(), 1, "{finding:?}");
+        assert_eq!(finding[0].0, VulnClass::CodeInjection);
+        assert_eq!(finding[0].2, "notevil.eval");
+    }
+
+    #[test]
     fn archive_entry_names_are_sources() {
         let yauzl = one(
             "zip.on('entry', (entry) => { fs.createWriteStream(path.join(dest, entry.fileName)); });",
@@ -14915,6 +14964,12 @@ mod tests {
         );
         assert_eq!(adm.len(), 1, "{adm:?}");
         assert!(one("for (const e of zip.getEntries()) { fs.writeFileSync(path.join(out, path.basename(e.entryName)), x); }").is_empty());
+        let open_buffer = one(
+            "const uz = require('unzipper'); async function extract(data) { const directory = await uz.Open.buffer(data); for (const entry of directory.files) { fs.createWriteStream(path.join('uploads', entry.path)); } }",
+        );
+        assert_eq!(open_buffer.len(), 1, "{open_buffer:?}");
+        assert_eq!(open_buffer[0].3, "archive");
+        assert!(one("const other = { Open: { buffer() { return { files: [] }; } } }; async function extract(data) { const directory = await other.Open.buffer(data); for (const entry of directory.files) { fs.createWriteStream(path.join('uploads', entry.path)); } }").is_empty());
     }
 
     #[test]
@@ -15117,6 +15172,12 @@ mod tests {
         assert_eq!(
             auth_of("app.get('/p', requireLogin, (req, res) => { exec('ping ' + req.query.h); });"),
             vec![(Auth::User, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "app.post('/p', ensureFileIsPassed, (req, res) => { exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::NoneDetected, Severity::Critical)]
         );
         assert_eq!(
             auth_of(

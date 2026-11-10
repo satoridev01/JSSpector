@@ -540,6 +540,14 @@ pub struct ScalarFrom {
 #[serde(deny_unknown_fields)]
 pub struct ResultSource {
     pub methods: Vec<String>,
+    /// The method must be reached through an imported module of this family. This also
+    /// recognizes nested namespaces such as `unzipper.Open.buffer()`.
+    #[serde(default)]
+    pub family: Option<String>,
+    /// A nested receiver segment that must be present (`Open` in
+    /// `unzipper.Open.buffer()`).
+    #[serde(default)]
+    pub via: Vec<String>,
     pub kind: String,
 }
 

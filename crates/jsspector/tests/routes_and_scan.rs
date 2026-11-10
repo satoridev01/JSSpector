@@ -625,6 +625,45 @@ fn middleware_auth_follows_registration_order_and_router() {
 }
 
 #[test]
+fn named_route_middleware_is_reachable_in_order_without_duplicate_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "app.js",
+        "const express = require('express');\nconst { exec } = require('child_process');\n\
+         const app = express();\n\
+         function before(req, res, next) { exec('before ' + req.query.cmd); next(); }\n\
+         function requireAdmin(req, res, next) { next(); }\n\
+         function after(req, res) { exec('after ' + req.query.cmd); res.end(); }\n\
+         app.get('/chain', before, requireAdmin, after);\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    assert_eq!(routes.as_array().unwrap().len(), 1, "{routes}");
+    assert_eq!(routes[0]["path"], "/chain");
+    assert_eq!(routes[0]["handler"], "after");
+    assert_eq!(routes[0]["auth"], "admin");
+
+    let report = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    let before = findings.iter().find(|f| f["function"] == "before").unwrap();
+    assert_eq!(before["entry"], "GET /chain");
+    assert_eq!(before["auth"], "none-detected");
+    assert_eq!(before["severity"], "critical");
+    let after = findings.iter().find(|f| f["function"] == "after").unwrap();
+    assert_eq!(after["entry"], "GET /chain");
+    assert_eq!(after["auth"], "admin");
+    assert_eq!(after["severity"], "high");
+}
+
+#[test]
 fn dynamically_loaded_controller_namespace_links_route_and_auth_to_findings() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

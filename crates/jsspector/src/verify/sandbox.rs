@@ -80,6 +80,19 @@ fn local_runtime_requested() -> bool {
     std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
 }
 
+fn verifier_node_env() -> String {
+    std::env::var("JSS_VERIFY_NODE_ENV")
+        .ok()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        .unwrap_or_else(|| "development".to_owned())
+}
+
 /// A built image, a private network, a marker service and a running app — one per `scan --verify`
 /// run, reused across findings. [`Self::teardown`] removes all of it; [`Drop`] is a backstop.
 pub struct Session {
@@ -459,7 +472,7 @@ impl Session {
             .current_dir(app_root)
             .env("PORT", self.port.to_string())
             .env("HOST", "127.0.0.1")
-            .env("NODE_ENV", "development")
+            .env("NODE_ENV", verifier_node_env())
             .stdout(stdout)
             .stderr(stderr);
         if let Some(node_path) = &self.node_path {
@@ -600,7 +613,7 @@ impl Session {
             "-e",
             "HOST=0.0.0.0",
             "-e",
-            "NODE_ENV=development",
+            &format!("NODE_ENV={}", verifier_node_env()),
         ]
         .iter()
         .map(|s| (*s).to_owned())
@@ -868,6 +881,15 @@ impl Session {
         // disappeared while a sibling control entry planted alongside it survived.
         if probe.class == jss_core::VulnClass::PathTraversal && probe.removes {
             return match self.verify_delete_oracle(probe) {
+                Some(poc) => Outcome::Verified {
+                    how: format!("{} {}", poc.method, poc.target),
+                    poc,
+                },
+                None => Outcome::NotReproduced { tried: 1 },
+            };
+        }
+        if probe.class == jss_core::VulnClass::PathTraversal && probe.archive_upload {
+            return match self.verify_archive_create_oracle(probe) {
                 Some(poc) => Outcome::Verified {
                     how: format!("{} {}", poc.method, poc.target),
                     poc,
@@ -1147,6 +1169,112 @@ impl Session {
                 outside the base directory"
                     .to_owned(),
             response: String::new(),
+            controls: Vec::new(),
+        })
+    }
+
+    /// Confirms an archive-entry traversal by uploading a one-file ZIP whose entry climbs into an
+    /// empty canary directory outside the extraction base. The sibling control directory stays
+    /// empty, so a hit proves the archive entry name controlled the write path rather than merely
+    /// exercising the upload endpoint.
+    fn verify_archive_create_oracle(&self, probe: &Probe) -> Option<Reproduction> {
+        let unique = format!("jss-zip-{}-{}", self.canary.token, self.nonce);
+        // Keep the witness outside the extraction directory but inside the application's working
+        // tree. Some applications reject writes outside their project root while still allowing an
+        // archive entry to escape its intended upload directory (which is still ZIP Slip).
+        let pwd = self.exec(&self.app, &["pwd"]).ok()?;
+        let workdir = String::from_utf8_lossy(&pwd.stdout).trim().to_owned();
+        if !valid_container_workdir(&workdir) {
+            return None;
+        }
+        let workdir = workdir.trim_end_matches('/');
+        let dir = format!("{workdir}/{}/{unique}", payload::PLANTED_DIR);
+        let control = format!("{workdir}/{}/{unique}-keep", payload::PLANTED_DIR);
+        let plant = format!(
+            "rm -rf '{dir}' '{control}' && mkdir -p '{dir}' '{control}' && chmod 777 '{dir}' '{control}'"
+        );
+        let _ = self.exec(&self.app, &["sh", "-c", &plant]);
+        if !self.dir_empty(&dir) || !self.dir_empty(&control) {
+            return None;
+        }
+
+        let workdir_prefix = match workdir.trim_start_matches('/') {
+            "" => String::new(),
+            relative => format!("{relative}/"),
+        };
+        let entry = format!(
+            "{}{workdir_prefix}{}/{unique}/jss-zip-leaf",
+            "../".repeat(12),
+            payload::PLANTED_DIR
+        );
+        let archive = stored_zip(&entry, self.canary.token.as_bytes());
+        let boundary = format!("jsspector-{}", self.nonce);
+        let multipart = multipart_file(
+            &boundary,
+            "file",
+            "jsspector.zip",
+            "application/zip",
+            &archive,
+        );
+        let target = payload::fill_remaining(&probe.path, &probe.path_fillers);
+        let verb = probe.method.verb(&probe.entry);
+        let spec = binary_request_spec(
+            self.port,
+            verb,
+            &target,
+            &[(
+                "Content-Type".to_owned(),
+                format!("multipart/form-data; boundary={boundary}"),
+            )],
+            &multipart,
+        );
+        let output = self
+            .exec(&self.app, &["node", "/jss-driver.js", &spec])
+            .ok()?;
+        let response = String::from_utf8_lossy(&output.stdout).into_owned();
+        let reproduced = !self.dir_empty(&dir) && self.dir_empty(&control);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] archive {} {} entry={entry:?} target_dir={dir:?} -> status {:?} stderr[{}] body[{}] reproduced={reproduced}",
+                verb,
+                target,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+                response.trim(),
+            );
+        }
+        let _ = self.exec(
+            &self.app,
+            &["sh", "-c", &format!("rm -rf '{dir}' '{control}'")],
+        );
+        if !reproduced {
+            return None;
+        }
+        let archive_b64 = base64(&archive);
+        let command = format!(
+            "printf %s {} | base64 -d > /tmp/jsspector.zip\n{} \\\n  --form {}",
+            shell_quote(&archive_b64),
+            curl_command(
+                &Attempt {
+                    verb,
+                    target: target.clone(),
+                    body: None,
+                    headers: Vec::new(),
+                    signal: Signal::FileWritten(format!("{dir}/jss-zip-leaf")),
+                },
+                self.port,
+            ),
+            shell_quote("file=@/tmp/jsspector.zip;filename=jsspector.zip;type=application/zip")
+        );
+        Some(Reproduction {
+            command,
+            method: verb.to_owned(),
+            target,
+            headers: Vec::new(),
+            body: None,
+            evidence: "a ZIP entry containing traversal segments created a canary file outside the extraction directory while a sibling control directory stayed empty"
+                .to_owned(),
+            response: response_excerpt(&response),
             controls: Vec::new(),
         })
     }
@@ -1938,6 +2066,15 @@ impl Session {
         }
         false
     }
+}
+
+fn valid_container_workdir(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 512
+        && !path.contains("..")
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -4632,6 +4769,119 @@ fn request_spec(attempt: &Attempt, port: u16, forward: bool) -> String {
     )
 }
 
+fn binary_request_spec(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> String {
+    let headers: serde_json::Map<String, serde_json::Value> = headers
+        .iter()
+        .cloned()
+        .map(|(name, value)| (name, serde_json::Value::String(value)))
+        .collect();
+    serde_json::json!({
+        "port": port,
+        "method": method,
+        "path": path,
+        "headers": headers,
+        "body": null,
+        "bodyBase64": base64(body),
+    })
+    .to_string()
+}
+
+fn multipart_file(
+    boundary: &str,
+    field: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// A minimal one-entry ZIP using the stored method. Keeping this dependency-free makes the
+/// verifier work in the same stripped-down release binary as every other payload generator.
+fn stored_zip(name: &str, contents: &[u8]) -> Vec<u8> {
+    let name = name.as_bytes();
+    let crc = crc32(contents);
+    let size = u32::try_from(contents.len()).unwrap_or(u32::MAX);
+    let name_len = u16::try_from(name.len()).unwrap_or(u16::MAX);
+    let mut out = Vec::new();
+    push_u32(&mut out, 0x0403_4b50);
+    push_u16(&mut out, 20);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u32(&mut out, crc);
+    push_u32(&mut out, size);
+    push_u32(&mut out, size);
+    push_u16(&mut out, name_len);
+    push_u16(&mut out, 0);
+    out.extend_from_slice(name);
+    out.extend_from_slice(contents);
+
+    let central_offset = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    push_u32(&mut out, 0x0201_4b50);
+    push_u16(&mut out, 20);
+    push_u16(&mut out, 20);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u32(&mut out, crc);
+    push_u32(&mut out, size);
+    push_u32(&mut out, size);
+    push_u16(&mut out, name_len);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    out.extend_from_slice(name);
+    let central_size = u32::try_from(out.len()).unwrap_or(u32::MAX) - central_offset;
+
+    push_u32(&mut out, 0x0605_4b50);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 1);
+    push_u16(&mut out, 1);
+    push_u32(&mut out, central_size);
+    push_u32(&mut out, central_offset);
+    push_u16(&mut out, 0);
+    out
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 fn esc(text: &str) -> String {
     text.chars()
         .flat_map(|c| match c {
@@ -5621,7 +5871,8 @@ function attempt(){
   req.on('upgrade',(res,socket)=>{try{socket.destroy();}catch(e){}process.exit(0);});
   req.on('error',()=>attempt());
   req.on('timeout',()=>{req.destroy();process.exit(0);});
-  if(spec.body){req.write(spec.body);}
+  const body = spec.bodyBase64 ? Buffer.from(spec.bodyBase64, 'base64') : spec.body;
+  if(body){req.write(body);}
   req.end();
 }
 attempt();
@@ -6514,6 +6765,41 @@ mod tests {
         let loopback = request_spec(&attempt, 3000, false);
         let loopback_value: serde_json::Value = serde_json::from_str(&loopback).unwrap();
         assert!(loopback_value["headers"].get("X-Forwarded-For").is_none());
+    }
+
+    #[test]
+    fn archive_payload_is_a_valid_stored_zip_and_binary_request() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        let archive = stored_zip("../../outside/canary", b"marker");
+        assert_eq!(&archive[..4], b"PK\x03\x04");
+        assert!(archive.windows(4).any(|window| window == b"PK\x01\x02"));
+        assert_eq!(
+            &archive[archive.len() - 22..archive.len() - 18],
+            b"PK\x05\x06"
+        );
+
+        let body = multipart_file(
+            "boundary",
+            "file",
+            "payload.zip",
+            "application/zip",
+            &archive,
+        );
+        let spec = binary_request_spec(
+            3000,
+            "POST",
+            "/upload",
+            &[(
+                "Content-Type".to_owned(),
+                "multipart/form-data; boundary=boundary".to_owned(),
+            )],
+            &body,
+        );
+        let value: serde_json::Value = serde_json::from_str(&spec).unwrap();
+        assert_eq!(value["method"], "POST");
+        assert_eq!(value["path"], "/upload");
+        assert_eq!(value["bodyBase64"], base64(&body));
+        assert!(value["body"].is_null());
     }
 
     #[test]
@@ -7666,6 +7952,7 @@ http.createServer((req, res) => {
             removes: false,
             removes_dir: false,
             creates: false,
+            archive_upload: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -7694,6 +7981,7 @@ http.createServer((req, res) => {
             removes: false,
             removes_dir: false,
             creates: false,
+            archive_upload: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -7722,6 +8010,7 @@ http.createServer((req, res) => {
             removes: false,
             removes_dir: false,
             creates: false,
+            archive_upload: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -7754,6 +8043,7 @@ http.createServer((req, res) => {
             removes: false,
             removes_dir: false,
             creates: false,
+            archive_upload: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),

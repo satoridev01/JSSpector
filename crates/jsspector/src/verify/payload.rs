@@ -1800,7 +1800,7 @@ fn route_with_token(route: &str, token: &str, fillers: &[(String, String)]) -> S
 /// Fills any remaining `{name}` route slot: with the value a guard enclosing the sink pins the slot
 /// to (so a branch- or allow-list-gated segment is accepted), falling back to a harmless placeholder
 /// so the path still matches when the slot is unconstrained.
-fn fill_remaining(path: &str, fillers: &[(String, String)]) -> String {
+pub(crate) fn fill_remaining(path: &str, fillers: &[(String, String)]) -> String {
     let mut out = String::with_capacity(path.len());
     let mut rest = path;
     while let Some(open) = rest.find('{') {
@@ -2235,6 +2235,7 @@ mod tests {
             removes: false,
             removes_dir: false,
             creates: false,
+            archive_upload: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),

@@ -89,6 +89,9 @@ pub struct Probe {
     /// *outside* the base directory while a sibling control directory planted alongside it stays
     /// empty. Derived from the sink API only.
     pub creates: bool,
+    /// The tainted path is an entry name inside an uploaded archive. Verification must send a
+    /// multipart ZIP rather than place a traversal string in a normal request field.
+    pub archive_upload: bool,
     /// For a listing whose read path is `<tainted-dir>/<sibling>`, the sibling route parameter the
     /// handler appends after the tainted one and the fixed values it constrains that sibling to (an
     /// enum / whitelist guard). The canary directory is planted under each value and the sibling slot
@@ -673,6 +676,54 @@ impl Probe {
                 finding.class.name()
             ));
         }
+        if finding.source.kind == "archive" {
+            if finding.class != VulnClass::PathTraversal || !sink_creates(&finding.sink.api) {
+                return skip(
+                    "archive verification currently supports filesystem-create sinks only",
+                );
+            }
+            if finding.auth != Auth::NoneDetected {
+                return skip(&format!(
+                    "reaching it needs {} authentication, which verify v1 does not perform",
+                    finding.auth.name()
+                ));
+            }
+            let Some(entry_point) = finding.entry.as_deref() else {
+                return skip("no entry point maps to this archive sink; nothing to upload");
+            };
+            let (method, path) = parse_entry(entry_point).ok_or_else(|| {
+                Skip(format!("entry `{entry_point}` is not a routable HTTP path"))
+            })?;
+            return Ok(Self {
+                method,
+                path,
+                entry: Entry::Body(None),
+                class: finding.class,
+                siblings: Vec::new(),
+                gate_paths: Vec::new(),
+                url_query_params: Vec::new(),
+                read_suffix: None,
+                envelope: None,
+                doc_envelope: None,
+                lists_dir: false,
+                removes: false,
+                removes_dir: false,
+                creates: true,
+                archive_upload: true,
+                appended_param: None,
+                path_fillers: Vec::new(),
+                body_requires: Vec::new(),
+                body_object: false,
+                body_query_override: None,
+                sql: None,
+                sql_value: None,
+                array_element: false,
+                appended_fields: Vec::new(),
+                proto_pollution: None,
+                alt_paths: Vec::new(),
+                auth: None,
+            });
+        }
         if finding.source.kind != "http" {
             return skip(&format!(
                 "source is {}, not an HTTP request",
@@ -765,6 +816,7 @@ impl Probe {
             removes,
             removes_dir,
             creates,
+            archive_upload: false,
             appended_param,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -825,6 +877,7 @@ impl Probe {
             removes: false,
             removes_dir: false,
             creates: false,
+            archive_upload: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -7283,6 +7336,7 @@ module.exports = { activityValidators };\n";
             removes: false,
             removes_dir: false,
             creates: false,
+            archive_upload: false,
             appended_param: None,
             path_fillers: Vec::new(),
             body_requires: Vec::new(),
@@ -7628,6 +7682,25 @@ module.exports = { activityValidators };\n";
             key: "k".to_owned(),
             fingerprint: "f".to_owned(),
         }
+    }
+
+    #[test]
+    fn an_archive_entry_reaching_a_create_sink_builds_an_upload_probe() {
+        let mut archive = finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("POST /file-upload"),
+            "unzipper.Open.buffer(buffer)",
+        );
+        archive.source.kind = "archive";
+        archive.sink.api = "fs.createWriteStream".to_owned();
+
+        let probe = Probe::from_finding(&archive).unwrap();
+        assert!(probe.archive_upload);
+        assert!(probe.creates);
+        assert_eq!(probe.method, Method::Post);
+        assert_eq!(probe.path, "/file-upload");
+        assert_eq!(probe.entry, Entry::Body(None));
     }
 
     /// A DOM finding: a browser-side source and sink, in a static front-end file.

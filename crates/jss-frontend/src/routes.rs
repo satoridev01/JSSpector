@@ -30,6 +30,9 @@ pub struct Route {
     /// (`<at>:file#name`, a route a helper registers inline).
     #[serde(skip)]
     pub handler_ref: String,
+    /// Named middleware reached before `handler_ref`, with authentication in force at each one.
+    #[serde(skip)]
+    pub handler_refs: Vec<(String, Auth)>,
     pub auth: Auth,
     /// `http`, `socket`, `ipc`, `graphql`, `trpc`, `queue`, ...
     pub kind: String,
@@ -57,26 +60,33 @@ pub fn attach_entries(root: &Path, reports: &mut [ScanReport]) {
     // route is reachable without logging in.
     let mut entries: Vec<(Auth, String, jss_core::ir::FunctionId, jss_core::EntryLoc)> = routes
         .iter()
-        .filter_map(|route| {
-            jss_core::ir::resolve_reference(&by_file, &route.file, &route.handler_ref).map(
-                |target| {
-                    (
-                        route.auth,
-                        format!("{} {}", route.method, route.path),
-                        target,
-                        match &route.at {
-                            Some((file, line)) => jss_core::EntryLoc {
-                                file: file.clone(),
-                                line: *line,
+        .flat_map(|route| {
+            std::iter::once((&route.handler_ref, route.auth))
+                .chain(
+                    route
+                        .handler_refs
+                        .iter()
+                        .map(|(handler, auth)| (handler, *auth)),
+                )
+                .filter_map(|(handler, auth)| {
+                    jss_core::ir::resolve_reference(&by_file, &route.file, handler).map(|target| {
+                        (
+                            auth,
+                            format!("{} {}", route.method, route.path),
+                            target,
+                            match &route.at {
+                                Some((file, line)) => jss_core::EntryLoc {
+                                    file: file.clone(),
+                                    line: *line,
+                                },
+                                None => jss_core::EntryLoc {
+                                    file: route.file.clone(),
+                                    line: route.line,
+                                },
                             },
-                            None => jss_core::EntryLoc {
-                                file: route.file.clone(),
-                                line: route.line,
-                            },
-                        },
-                    )
-                },
-            )
+                        )
+                    })
+                })
         })
         .collect();
     entries.sort();
@@ -249,6 +259,16 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
                         .and_then(|r| r.split_once('#'))
                         .map_or_else(|| entry.handler.clone(), |(_, name)| name.to_owned()),
                     handler_ref: entry.handler.clone(),
+                    handler_refs: entry
+                        .handlers
+                        .iter()
+                        .map(|handler| {
+                            (
+                                handler.handler.clone(),
+                                handler.auth.max(mount_auth).max(middleware_auth),
+                            )
+                        })
+                        .collect(),
                     auth,
                     kind: if entry.kind == "default-export" || entry.kind == "file-route" {
                         "http".to_owned()

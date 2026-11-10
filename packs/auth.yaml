@@ -2,7 +2,7 @@
 name: auth
 auth:
   # Middleware names (or callee names of middleware factories) containing one of these.
-  middleware: [auth, login, logged, token, jwt, session, passport, protect, ensure, requireuser, verify, role, signedin, permission, acl, rbac]
+  middleware: [auth, login, logged, token, jwt, session, passport, protect, requireuser, verify, role, signedin, permission, acl, rbac]
   admin: [admin, superuser, staff, owner, root, sysadmin]
   # `if (!req.user) return ...`: request fields whose absence ends the request.
   request_fields: [user, session, auth, account, isAuthenticated]

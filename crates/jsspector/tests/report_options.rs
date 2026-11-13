@@ -105,7 +105,13 @@ fn verify_fingerprint_limits_dynamic_verification_without_hiding_findings() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report = json(&output);
-    assert!(!report["findings"].as_array().unwrap().is_empty());
+    let findings = report["findings"].as_array().unwrap();
+    assert!(!findings.is_empty());
+    assert!(
+        findings.iter().all(|finding| {
+            finding.get("exploitation").is_none() && finding.get("poc").is_none()
+        })
+    );
     assert!(report.get("verification").is_none());
 }
 

@@ -317,6 +317,20 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                     ..as_path.clone()
                 };
                 let mut out = vec![as_path, absolute];
+                // A handler that resolves only the request *path* against a fixed base
+                // (`new URL(url.pathname, base)`, a path-prefixing proxy) keeps the base's host for an
+                // ordinary path, but a protocol-relative path (`//host/..`, RFC 3986 §4.2 network-path
+                // reference) overrides it: the resolved URL takes the attacker's host while inheriting
+                // the base's scheme. Send the marker host that way so a path-only proxy still lands at
+                // the marker. Carries the probe token so its hit is told from any other request.
+                let token = canary.service_token(nonce);
+                out.push(Attempt {
+                    verb,
+                    target: format!("//{}/{token}", canary.marker_host()),
+                    body: None,
+                    headers: Vec::new(),
+                    signal: Signal::ServiceReached(token),
+                });
                 // The parsed request URL may feed its query parameters into the sink, with one of
                 // them chosen as the outbound host (`const q = Object.fromEntries(url.searchParams);
                 // fetch(q.base + endpoint)`). Send the marker URL in each query parameter the handler
@@ -1559,12 +1573,20 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
             }
         }
         Entry::Body(name) => {
-            body = Some(match name {
-                // The field under test, plus the other body fields the handler requires.
-                Some(field) => json_object_fields(field, value, &probe.siblings),
-                None => json_string(value),
-            });
-            headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+            if let (Some(field), Some(form)) = (name.as_deref(), probe.multipart.as_ref()) {
+                body = Some(multipart_body(probe, form, field, value));
+                headers.push((
+                    "Content-Type".to_owned(),
+                    format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+                ));
+            } else {
+                body = Some(match name {
+                    // The field under test, plus the other body fields the handler requires.
+                    Some(field) => json_object_fields(field, value, &probe.siblings),
+                    None => json_string(value),
+                });
+                headers.push(("Content-Type".to_owned(), "application/json".to_owned()));
+            }
         }
         Entry::PathParam(name) => {
             target = target.replace(&format!("{{{name}}}"), &encode_path(value));
@@ -1613,6 +1635,87 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
         headers,
         signal,
     }
+}
+
+const MULTIPART_BOUNDARY: &str = "jsspector-form-boundary";
+const MULTIPART_FILE_CONTENTS: &str = "jsspector-upload";
+
+/// Encode one verifier attempt as the multipart body the handler's real `Request.formData()` parser
+/// expects. The tainted part and ordinary siblings are text; fields that the handler consumes as a
+/// `File`/`Blob` receive a harmless named binary part so `.arrayBuffer()`/`.stream()` succeeds before
+/// the sink. Field names are mined string literals and filtered again here before entering headers.
+fn multipart_body(
+    probe: &Probe,
+    form: &super::plan::MultipartForm,
+    target: &str,
+    value: &str,
+) -> String {
+    let mut parts: Vec<(String, String, bool)> = Vec::new();
+    if safe_multipart_name(target) {
+        parts.push((target.to_owned(), value.to_owned(), false));
+    }
+    for field in &form.fields {
+        if field == target || !safe_multipart_name(field) {
+            continue;
+        }
+        let file = form.file_fields.contains(field);
+        let value = if file {
+            MULTIPART_FILE_CONTENTS.to_owned()
+        } else {
+            probe
+                .siblings
+                .iter()
+                .find(|(name, _)| name == field)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| "jsspector".to_owned())
+        };
+        parts.push((field.clone(), value, file));
+    }
+    for (field, value) in &probe.siblings {
+        if field == target
+            || !safe_multipart_name(field)
+            || parts.iter().any(|(name, _, _)| name == field)
+        {
+            continue;
+        }
+        let file = form.file_fields.contains(field);
+        parts.push((
+            field.clone(),
+            if file {
+                MULTIPART_FILE_CONTENTS.to_owned()
+            } else {
+                value.clone()
+            },
+            file,
+        ));
+    }
+    let mut body = String::new();
+    for (name, value, file) in parts {
+        body.push_str("--");
+        body.push_str(MULTIPART_BOUNDARY);
+        body.push_str("\r\nContent-Disposition: form-data; name=\"");
+        body.push_str(&name);
+        if file {
+            body.push_str("\"; filename=\"jsspector-upload.bin\"\r\n");
+            body.push_str("Content-Type: application/octet-stream\r\n\r\n");
+        } else {
+            body.push_str("\"\r\n\r\n");
+        }
+        body.push_str(&value);
+        body.push_str("\r\n");
+    }
+    body.push_str("--");
+    body.push_str(MULTIPART_BOUNDARY);
+    body.push_str("--\r\n");
+    body
+}
+
+fn safe_multipart_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+        })
 }
 
 /// The four requests that prove a nested-write prototype-pollution sink (`obj[outer][inner] = v`) by
@@ -2166,7 +2269,9 @@ fn json_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::plan::{AppendedParam, Entry, Method, Probe, SqlColumn, SqlDelete, SqlPlan};
+    use super::super::plan::{
+        AppendedParam, Entry, Method, MultipartForm, Probe, SqlColumn, SqlDelete, SqlPlan,
+    };
     use super::*;
 
     #[test]
@@ -2248,6 +2353,7 @@ mod tests {
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         }
     }
 
@@ -2607,6 +2713,39 @@ mod tests {
     }
 
     #[test]
+    fn a_form_data_traversal_sends_text_and_real_file_parts() {
+        let canary = Canary::new("multipart".to_owned());
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/upload",
+            Entry::Body(Some("destination".to_owned())),
+        );
+        p.method = Method::Post;
+        p.creates = true;
+        p.multipart = Some(MultipartForm {
+            fields: vec!["document".to_owned(), "note".to_owned()],
+            file_fields: vec!["document".to_owned()],
+        });
+        p.siblings = vec![("note".to_owned(), "required-note".to_owned())];
+
+        let oracle = create_oracle(&p, &canary, 7).unwrap();
+        let attempt = oracle.present.first().unwrap();
+        let body = attempt.body.as_deref().unwrap();
+        assert_eq!(attempt.verb, "POST");
+        assert!(attempt.headers.contains(&(
+            "Content-Type".to_owned(),
+            "multipart/form-data; boundary=jsspector-form-boundary".to_owned(),
+        )));
+        assert!(body.contains("name=\"destination\"\r\n\r\n"));
+        assert!(body.contains("../../"), "traversal missing from {body:?}");
+        assert!(body.contains(
+            "name=\"document\"; filename=\"jsspector-upload.bin\"\r\nContent-Type: application/octet-stream\r\n\r\njsspector-upload"
+        ));
+        assert!(body.contains("name=\"note\"\r\n\r\nrequired-note"));
+        assert!(body.ends_with("--jsspector-form-boundary--\r\n"));
+    }
+
+    #[test]
     fn command_injection_uses_only_read_only_id_proofs() {
         let canary = Canary::new("t".to_owned());
         let a = attempts(
@@ -2729,7 +2868,9 @@ mod tests {
     }
 
     /// An SSRF through the request target itself (`new URL(req.url, base)`): the marker URL as a
-    /// path, then as an absolute-form request target, both tied to the probe's own token.
+    /// path, then as an absolute-form request target, then the marker host as a protocol-relative
+    /// path (`//host/..`) for a handler that resolves only the path against a fixed base — all tied to
+    /// the probe's own token.
     #[test]
     fn a_url_ssrf_is_also_sent_as_an_absolute_form_target() {
         let canary = Canary::new("u".to_owned());
@@ -2739,8 +2880,23 @@ mod tests {
             4,
         );
         let url = canary.service_url(4);
+        let token = canary.service_token(4);
         let targets: Vec<&str> = a.iter().map(|x| x.target.as_str()).collect();
-        assert_eq!(targets, [format!("/{url}"), url.clone()]);
+        assert_eq!(
+            targets,
+            [
+                format!("/{url}"),
+                url.clone(),
+                format!("//{MARKER_HOST}/{token}")
+            ]
+        );
+        // The protocol-relative payload overrides the host of a path-only proxy (`new URL(url.pathname,
+        // base)`) while still carrying the probe token, and it never degrades to an ordinary path.
+        assert!(
+            a.iter()
+                .any(|x| x.target == format!("//{MARKER_HOST}/{token}")),
+            "{targets:?}"
+        );
         assert!(a.iter().all(|x| x.verb == "GET" && x.body.is_none()));
         assert!(
             a.iter()
@@ -2939,6 +3095,43 @@ mod tests {
                 format!("{{\"email\":{{\"$ne\":\"{absent2}\"}},\"name\":\"jsspector\",\"password\":\"Valid1!x\"}}")
                     .as_str()
             )
+        );
+    }
+
+    #[test]
+    fn alternate_nosql_field_keeps_the_primary_fields_typed_validator_filler() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::NosqlInjection,
+            "/api/v2/users/completeEmailLogin",
+            Entry::Body(Some("email".to_owned())),
+        );
+        // The planner mined this from `body("email").isEmail()`. When `token` is the
+        // operator-bearing alternate field, the email must remain valid instead of receiving the
+        // generic envelope placeholder.
+        p.siblings
+            .push(("email".to_owned(), "jss@jsspector.test".to_owned()));
+        let absent = nosql_absent_token(&canary, 9);
+        let cases = nosql_cases(&p, &canary, 9);
+        let token = cases.iter().find(|case| case.field == "token").unwrap();
+
+        assert_eq!(
+            token.match_all.body.as_deref(),
+            Some(
+                format!("{{\"token\":{{\"$ne\":\"{absent}\"}},\"email\":\"jss@jsspector.test\"}}")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            token.match_none_eq.body.as_deref(),
+            Some(
+                format!("{{\"token\":{{\"$eq\":\"{absent}\"}},\"email\":\"jss@jsspector.test\"}}")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            token.match_none_in.body.as_deref(),
+            Some("{\"token\":{\"$in\":[]},\"email\":\"jss@jsspector.test\"}")
         );
     }
 

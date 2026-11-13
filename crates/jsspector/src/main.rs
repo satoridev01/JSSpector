@@ -210,9 +210,6 @@ struct ScanOutput<'a> {
     skipped: &'a [FileNote],
     /// Files where the walker hit its depth cap.
     truncated: &'a [String],
-    /// `--verify` verdicts, one per reported finding; empty when `--verify` was not given.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    verification: &'a [verify::Verdict],
 }
 
 /// A finding as `scan --json` prints it: a title first, the finding, then the fields issue
@@ -231,10 +228,25 @@ struct ReportedFinding<'a> {
     /// The same source-to-sink flow in the concise form used by the terminal renderer.
     flow: String,
     remediation: String,
+    /// The exact dynamic-verification result, when this finding was selected for verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exploitation: Option<Exploitation<'a>>,
+    /// The request and evidence, present only when dynamic exploitation was verified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poc: Option<&'a verify::Reproduction>,
 }
 
 impl<'a> ReportedFinding<'a> {
-    fn new(finding: &'a Finding, sources: &mut text::Sources) -> Self {
+    fn new(
+        finding: &'a Finding,
+        sources: &mut text::Sources,
+        verdict: Option<&'a verify::Verdict>,
+    ) -> Self {
+        let (exploitation, poc) = verdict
+            .map(Exploitation::from_verdict)
+            .map_or((None, None), |(exploitation, poc)| {
+                (Some(exploitation), poc)
+            });
         Self {
             title: rules::title(finding),
             cwe: format!("CWE-{}", rules::rule(finding.class).cwe),
@@ -244,7 +256,179 @@ impl<'a> ReportedFinding<'a> {
             affected: excerpt::affected(finding, sources),
             flow: text::flow(finding, sources),
             remediation: rules::remediation(finding.class),
+            exploitation,
+            poc,
         }
+    }
+}
+
+/// A finding-local view of dynamic verification. The verifier's distinctions are preserved:
+/// failure to reproduce is not reported as proof that the finding is not exploitable.
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+enum Exploitation<'a> {
+    Verified { how: &'a str },
+    NotReproduced { tried: usize },
+    Skipped { reason: &'a str },
+}
+
+impl<'a> Exploitation<'a> {
+    fn from_verdict(verdict: &'a verify::Verdict) -> (Self, Option<&'a verify::Reproduction>) {
+        match &verdict.outcome {
+            verify::Outcome::Verified { how, poc } => (Self::Verified { how }, Some(poc)),
+            verify::Outcome::NotReproduced { tried } => {
+                (Self::NotReproduced { tried: *tried }, None)
+            }
+            verify::Outcome::Skipped { reason } => (Self::Skipped { reason }, None),
+        }
+    }
+}
+
+fn verdicts_by_fingerprint(
+    verdicts: &[verify::Verdict],
+) -> std::collections::BTreeMap<&str, &verify::Verdict> {
+    verdicts
+        .iter()
+        .map(|verdict| (verdict.fingerprint.as_str(), verdict))
+        .collect()
+}
+
+#[cfg(test)]
+mod exploitation_output_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use jss_core::{Auth, SinkLoc, SourceLoc, VulnClass};
+    use serde_json::json;
+
+    fn reproduction() -> verify::Reproduction {
+        verify::Reproduction {
+            command: "curl http://TARGET/items?id=proof".to_owned(),
+            method: "GET".to_owned(),
+            target: "/items?id=proof".to_owned(),
+            headers: Vec::new(),
+            body: None,
+            evidence: "the response contained proof".to_owned(),
+            response: "proof".to_owned(),
+            controls: Vec::new(),
+        }
+    }
+
+    fn verdict(fingerprint: &str, outcome: verify::Outcome) -> verify::Verdict {
+        verify::Verdict {
+            fingerprint: fingerprint.to_owned(),
+            entry: Some("GET /items".to_owned()),
+            class: "sql-injection".to_owned(),
+            outcome,
+        }
+    }
+
+    fn finding() -> Finding {
+        Finding {
+            file: "server.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "db.query".to_owned(),
+                arg: "req.query.id".to_owned(),
+                line: 1,
+                col: 1,
+            },
+            class: VulnClass::SqlInjection,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "handler".to_owned(),
+            entry: Some("GET /items".to_owned()),
+            entry_at: None,
+            source: SourceLoc {
+                kind: "http",
+                expr: "req.query.id".to_owned(),
+                line: 1,
+                col: 1,
+            },
+            trace: Vec::new(),
+            key: "sql|server.js|handler|db.query|req.query.id|0".to_owned(),
+            fingerprint: "0123456789abcdef".to_owned(),
+        }
+    }
+
+    #[test]
+    fn verified_exploitation_carries_the_structured_poc() {
+        let verdict = verdict(
+            "0123456789abcdef",
+            verify::Outcome::Verified {
+                how: "GET /items?id=proof".to_owned(),
+                poc: reproduction(),
+            },
+        );
+        let (exploitation, poc) = Exploitation::from_verdict(&verdict);
+
+        assert_eq!(
+            serde_json::to_value(exploitation).unwrap(),
+            json!({"outcome": "verified", "how": "GET /items?id=proof"})
+        );
+        let poc = serde_json::to_value(poc.unwrap()).unwrap();
+        assert_eq!(poc["command"], "curl http://TARGET/items?id=proof");
+        assert_eq!(poc["evidence"], "the response contained proof");
+    }
+
+    #[test]
+    fn non_verified_outcomes_never_carry_a_poc() {
+        let not_reproduced = verdict(
+            "0123456789abcdef",
+            verify::Outcome::NotReproduced { tried: 3 },
+        );
+        let (exploitation, poc) = Exploitation::from_verdict(&not_reproduced);
+        assert_eq!(
+            serde_json::to_value(exploitation).unwrap(),
+            json!({"outcome": "not-reproduced", "tried": 3})
+        );
+        assert!(poc.is_none());
+
+        let skipped = verdict(
+            "fedcba9876543210",
+            verify::Outcome::Skipped {
+                reason: "no runnable entry point".to_owned(),
+            },
+        );
+        let (exploitation, poc) = Exploitation::from_verdict(&skipped);
+        assert_eq!(
+            serde_json::to_value(exploitation).unwrap(),
+            json!({"outcome": "skipped", "reason": "no runnable entry point"})
+        );
+        assert!(poc.is_none());
+    }
+
+    #[test]
+    fn verdict_lookup_contains_only_selected_fingerprints() {
+        let verdicts = vec![verdict(
+            "0123456789abcdef",
+            verify::Outcome::NotReproduced { tried: 1 },
+        )];
+        let by_fingerprint = verdicts_by_fingerprint(&verdicts);
+
+        assert!(by_fingerprint.contains_key("0123456789abcdef"));
+        assert!(!by_fingerprint.contains_key("fedcba9876543210"));
+    }
+
+    #[test]
+    fn selected_skipped_finding_embeds_exploitation_without_a_poc() {
+        let finding = finding();
+        let verdict = verdict(
+            &finding.fingerprint,
+            verify::Outcome::Skipped {
+                reason: "no runnable entry point".to_owned(),
+            },
+        );
+        let mut sources = text::Sources::new(Path::new("."));
+        let reported = ReportedFinding::new(&finding, &mut sources, Some(&verdict));
+        let value = serde_json::to_value(reported).unwrap();
+
+        assert_eq!(
+            value["exploitation"],
+            json!({"outcome": "skipped", "reason": "no runnable entry point"})
+        );
+        assert!(value.get("poc").is_none());
     }
 }
 
@@ -514,18 +698,24 @@ fn scan(args: &ScanArgs) -> ExitCode {
     };
     let written = write_to(args.output.as_deref(), |out, color| match format {
         Format::Json => {
+            let verdicts = verdicts_by_fingerprint(&verification);
             let output = ScanOutput {
                 root: args.path.to_string_lossy().into_owned(),
                 files_scanned: analysis.files_scanned,
                 findings: findings
                     .iter()
-                    .map(|f| ReportedFinding::new(f, &mut sources))
+                    .map(|finding| {
+                        ReportedFinding::new(
+                            finding,
+                            &mut sources,
+                            verdicts.get(finding.fingerprint.as_str()).copied(),
+                        )
+                    })
                     .collect(),
                 baselined: baselined.len(),
                 ignored,
                 skipped: &analysis.skipped,
                 truncated: &analysis.truncated,
-                verification: &verification,
             };
             serde_json::to_writer_pretty(&mut *out, &output)
                 .map_err(io::Error::from)

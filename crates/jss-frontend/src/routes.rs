@@ -334,7 +334,10 @@ fn next_middleware_policies(root: &Path, reports: &[ScanReport]) -> Vec<NextMidd
             if !reads_identity || !rejects {
                 return None;
             }
-            let exclusions = next_matcher_exclusions(&source)?;
+            let mut exclusions = next_matcher_exclusions(&source)?;
+            exclusions.extend(next_middleware_public_prefixes(&source));
+            exclusions.sort();
+            exclusions.dedup();
             let parent = path.parent()?;
             let scope = if parent.file_name().and_then(|part| part.to_str()) == Some("src") {
                 parent.parent().unwrap_or_else(|| Path::new(""))
@@ -371,6 +374,221 @@ fn next_matcher_exclusions(source: &str) -> Option<Vec<String>> {
     (!exclusions.is_empty()).then_some(exclusions)
 }
 
+/// Literal pathname prefixes that an authentication middleware deliberately lets through.
+///
+/// Next applications often use a broad matcher and perform the real exclusion in the guard:
+///
+/// ```js
+/// const isApiRoute = pathname.startsWith("/api/");
+/// if (!token && !isApiRoute) return NextResponse.redirect(...);
+/// ```
+///
+/// The matcher alone makes `/api/x` look authenticated. Recover only the conservative form above:
+/// a named `pathname.startsWith(<literal>)` predicate used as a negated conjunct of the condition
+/// that redirects unauthenticated traffic. Conditions containing `||` are intentionally ignored,
+/// because the named predicate would not necessarily suppress the redirect by itself.
+fn next_middleware_public_prefixes(source: &str) -> Vec<String> {
+    let bindings = next_path_prefix_bindings(source);
+    let mut public = BTreeSet::new();
+    for condition in next_redirect_conditions(source) {
+        if condition.contains("||") {
+            continue;
+        }
+        for (name, prefixes) in &bindings {
+            if contains_negated_identifier(&condition, name) {
+                public.extend(prefixes.iter().cloned());
+            }
+        }
+    }
+    public.into_iter().collect()
+}
+
+/// `const isApi = pathname.startsWith("/api/")`: predicate name -> literal prefixes.
+fn next_path_prefix_bindings(source: &str) -> BTreeMap<String, Vec<String>> {
+    let mut bindings = BTreeMap::new();
+    for statement in source.split(';') {
+        let Some(equal) = statement.find('=') else {
+            continue;
+        };
+        let Some(left) = statement.get(..equal) else {
+            continue;
+        };
+        let Some(name) = left
+            .split_whitespace()
+            .last()
+            .filter(|name| js_identifier(name))
+        else {
+            continue;
+        };
+        let Some(right) = statement.get(equal + 1..) else {
+            continue;
+        };
+        let mut rest = right;
+        let mut prefixes = Vec::new();
+        while let Some(at) = rest.find("pathname.startsWith") {
+            let Some(after) = rest.get(at + "pathname.startsWith".len()..) else {
+                break;
+            };
+            let Some(open) = after.find('(') else {
+                break;
+            };
+            let Some(argument) = after.get(open + 1..).map(str::trim_start) else {
+                break;
+            };
+            let Some(quote @ ('\'' | '"')) = argument.chars().next() else {
+                let Some(next) = after.get(open + 1..) else {
+                    break;
+                };
+                rest = next;
+                continue;
+            };
+            let Some(value) = argument.get(quote.len_utf8()..) else {
+                break;
+            };
+            let Some(end) = value.find(quote) else {
+                break;
+            };
+            let Some(prefix) = value.get(..end).map(|value| value.trim_start_matches('/')) else {
+                break;
+            };
+            if !prefix.is_empty()
+                && prefix
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
+            {
+                prefixes.push(prefix.to_owned());
+            }
+            let Some(next) = value.get(end + quote.len_utf8()..) else {
+                break;
+            };
+            rest = next;
+        }
+        if !prefixes.is_empty() {
+            bindings.insert(name.to_owned(), prefixes);
+        }
+    }
+    bindings
+}
+
+fn js_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+/// Conditions of `if (...)` statements whose branch redirects with `NextResponse.redirect`.
+fn next_redirect_conditions(source: &str) -> Vec<String> {
+    let lower = source.to_ascii_lowercase();
+    let mut conditions = Vec::new();
+    for (redirect, _) in lower.match_indices("nextresponse.redirect") {
+        let Some(before) = source.get(..redirect) else {
+            continue;
+        };
+        let candidates: Vec<(usize, &str)> = before.match_indices("if").collect();
+        for (at, _) in candidates.into_iter().rev() {
+            let boundary = |ch: Option<char>| ch.is_none_or(|ch| !js_identifier_char(ch));
+            if !boundary(before.get(..at).and_then(|text| text.chars().next_back()))
+                || !boundary(before.get(at + 2..).and_then(|text| text.chars().next()))
+            {
+                continue;
+            }
+            let Some(after_if) = before.get(at + 2..) else {
+                continue;
+            };
+            let Some(relative_open) = after_if.find('(') else {
+                continue;
+            };
+            let open = at + 2 + relative_open;
+            let Some(close) = matching_paren(source, open) else {
+                continue;
+            };
+            if close < redirect {
+                if let Some(condition) = source.get(open + 1..close) {
+                    conditions.push(condition.to_owned());
+                }
+                break;
+            }
+        }
+    }
+    conditions
+}
+
+fn js_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
+/// Closing parenthesis for `source[open] == '('`, skipping quoted JavaScript strings.
+fn matching_paren(source: &str, open: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let tail = bytes.get(open..)?;
+    for (offset, byte) in tail.iter().copied().enumerate() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => quote = Some(byte),
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn contains_negated_identifier(condition: &str, name: &str) -> bool {
+    let bytes = condition.as_bytes();
+    for (at, _) in condition.match_indices(name) {
+        let Some(before) = condition.get(..at).map(str::trim_end) else {
+            continue;
+        };
+        if !before.ends_with('!') || before.ends_with("!=") {
+            continue;
+        }
+        let left = at
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index))
+            .copied();
+        let right = bytes.get(at + name.len()).copied();
+        if left.is_none_or(|ch| !js_identifier_char(ch as char))
+            && right.is_none_or(|ch| !js_identifier_char(ch as char))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn public_prefix_matches(public: &str, route: &str) -> bool {
+    if public.ends_with('/') {
+        route.starts_with(public)
+    } else {
+        route == public
+            || route
+                .strip_prefix(public)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
 fn next_middleware_auth(policies: &[NextMiddleware], file: &str, route: &str) -> Auth {
     let route = route.trim_start_matches('/');
     policies
@@ -383,12 +601,10 @@ fn next_middleware_auth(policies: &[NextMiddleware], file: &str, route: &str) ->
                     .is_some_and(|rest| rest.starts_with('/'))
         })
         .filter(|policy| {
-            !policy.exclusions.iter().any(|public| {
-                route == public
-                    || route
-                        .strip_prefix(public)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+            !policy
+                .exclusions
+                .iter()
+                .any(|public| public_prefix_matches(public, route))
         })
         .map(|_| Auth::User)
         .max()
@@ -884,6 +1100,62 @@ mod tests {
             file_route_path("app/(dashboard)/app/route.ts", "file-route").as_deref(),
             Some("/app")
         );
+    }
+
+    #[test]
+    fn nextjs_middleware_honors_public_prefix_in_guard_condition() {
+        let source = r#"
+            const token = await getToken({ req, secret });
+            const { pathname } = req.nextUrl;
+            const isAuthRoute = pathname.startsWith("/api/auth");
+            const isApiRoute = pathname.startsWith("/api/");
+            if (!token && !isAuthRoute && !isApiRoute) {
+                return NextResponse.redirect(new URL("/login", req.url));
+            }
+            export const config = { matcher: ["/((?!api/auth|_next).*)"] };
+        "#;
+        let mut exclusions = next_matcher_exclusions(source).unwrap();
+        exclusions.extend(next_middleware_public_prefixes(source));
+        let policies = [NextMiddleware {
+            scope: String::new(),
+            exclusions,
+        }];
+
+        assert_eq!(
+            next_middleware_auth(&policies, "src/app/api/facturas/route.js", "/api/facturas"),
+            Auth::NoneDetected,
+        );
+        // `startsWith("/api/")` does not exempt the exact `/api` pathname.
+        assert_eq!(
+            next_middleware_auth(&policies, "src/app/api/route.js", "/api"),
+            Auth::User,
+        );
+        assert_eq!(
+            next_middleware_auth(&policies, "src/app/dashboard/page.js", "/dashboard"),
+            Auth::User,
+        );
+    }
+
+    #[test]
+    fn nextjs_middleware_does_not_exempt_a_protected_prefix() {
+        let source = r#"
+            const token = await getToken({ req, secret });
+            const { pathname } = req.nextUrl;
+            const isApiRoute = pathname.startsWith("/api/");
+            if (!token && isApiRoute) {
+                return NextResponse.redirect(new URL("/login", req.url));
+            }
+        "#;
+        assert!(next_middleware_public_prefixes(source).is_empty());
+
+        // An OR condition does not prove the prefix suppresses the redirect and is left protected.
+        let ambiguous = r#"
+            const isApiRoute = pathname.startsWith("/api/");
+            if (!token && (!isApiRoute || maintenanceMode)) {
+                return NextResponse.redirect(new URL("/login", req.url));
+            }
+        "#;
+        assert!(next_middleware_public_prefixes(ambiguous).is_empty());
     }
 
     #[test]

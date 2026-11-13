@@ -2214,16 +2214,115 @@ fn curl_command(attempt: &Attempt, port: u16) -> String {
         ));
         parts.push(format!("--request-target {}", shell_quote(&target)));
     }
-    parts.extend(
-        attempt
-            .headers
-            .iter()
-            .map(|(name, value)| format!("--header {}", shell_quote(&format!("{name}: {value}")))),
-    );
-    if let Some(body) = body {
+    let multipart = body
+        .as_deref()
+        .and_then(|body| curl_multipart(&attempt.headers, body));
+    parts.extend(attempt.headers.iter().filter_map(|(name, value)| {
+        if multipart.is_some() && name.eq_ignore_ascii_case("content-type") {
+            None
+        } else {
+            Some(format!(
+                "--header {}",
+                shell_quote(&format!("{name}: {value}"))
+            ))
+        }
+    }));
+    if let Some(form) = &multipart {
+        parts.extend(form.args.clone());
+    } else if let Some(body) = body {
         parts.push(format!("--data-raw {}", shell_quote(&body)));
     }
-    parts.join(" \\\n  ")
+    let command = parts.join(" \\\n  ");
+    if multipart.as_ref().is_some_and(|form| form.has_file) {
+        format!(
+            "printf %s {} > /tmp/jsspector-upload.bin\n{command}",
+            shell_quote("jsspector-upload")
+        )
+    } else {
+        command
+    }
+}
+
+struct CurlMultipart {
+    args: Vec<String>,
+    has_file: bool,
+}
+
+/// Convert the verifier's canonical multipart body back into readable, copyable curl form
+/// arguments for advisory evidence. Malformed or external MIME bodies fall back to data-raw.
+fn curl_multipart(headers: &[(String, String)], body: &str) -> Option<CurlMultipart> {
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))?
+        .1
+        .as_str();
+    let boundary = content_type
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("boundary="))?
+        .trim_matches('"');
+    if boundary.is_empty() || !content_type.starts_with("multipart/form-data") {
+        return None;
+    }
+    let delimiter = format!("--{boundary}");
+    let mut args = Vec::new();
+    let mut has_file = false;
+    for raw in body.split(&delimiter).skip(1) {
+        let raw = raw.trim_start_matches("\r\n");
+        if raw.starts_with("--") || raw.trim().is_empty() {
+            continue;
+        }
+        let (head, contents) = raw.split_once("\r\n\r\n")?;
+        let contents = contents.strip_suffix("\r\n").unwrap_or(contents);
+        let disposition = head.lines().find(|line| {
+            line.to_ascii_lowercase()
+                .starts_with("content-disposition:")
+        })?;
+        let name = disposition_parameter(disposition, "name")?;
+        if !safe_mime_parameter(&name) {
+            return None;
+        }
+        if disposition_parameter(disposition, "filename").is_some() {
+            has_file = true;
+            let content_type = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-type")
+                            .then(|| value.trim())
+                    })
+                })
+                .unwrap_or("application/octet-stream");
+            args.push(format!(
+                "--form {}",
+                shell_quote(&format!(
+                    "{name}=@/tmp/jsspector-upload.bin;filename=jsspector-upload.bin;type={content_type}"
+                ))
+            ));
+        } else {
+            args.push(format!(
+                "--form {}",
+                shell_quote(&format!("{name}={contents}"))
+            ));
+        }
+    }
+    (!args.is_empty()).then_some(CurlMultipart { args, has_file })
+}
+
+fn disposition_parameter(line: &str, wanted: &str) -> Option<String> {
+    line.split(';').skip(1).find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        key.eq_ignore_ascii_case(wanted)
+            .then(|| value.trim().trim_matches('"').to_owned())
+    })
+}
+
+fn safe_mime_parameter(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+        })
 }
 
 fn shell_quote(value: &str) -> String {
@@ -2418,6 +2517,14 @@ fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String>
             std::path::PathBuf::from("/jss-node-red-host.mjs"),
             NODE_RED_HOST_JS.as_bytes().to_vec(),
         ),
+        (
+            std::path::PathBuf::from("/jss-azure-func-host.cjs"),
+            AZURE_FUNC_HOST_JS.as_bytes().to_vec(),
+        ),
+        (
+            std::path::PathBuf::from("/jss-worker-host.mjs"),
+            WORKER_HOST_JS.as_bytes().to_vec(),
+        ),
     ]);
     let mut created = Vec::new();
     for (path, contents) in files {
@@ -2468,9 +2575,17 @@ fn build_image(
     // a manifest-less subdirectory needs its ancestor's dependencies, not its ancestor's build.
     let image = base_image(install_root);
     let pm = package_manager(install_root);
-    let has_build = std::fs::read_to_string(app_root.join("package.json"))
-        .ok()
-        .and_then(|manifest| build_script(&manifest, app_root));
+    // The Azure and worker host shims load the application's own source directly, so the app's build
+    // step (a webpack/wrangler bundle produced for the deployment host) is dead weight — and running
+    // it needs dev-time tooling that may be absent or slow. Skip it when launching through one of them.
+    let has_build = (!start_command.contains("/jss-azure-func-host")
+        && !start_command.contains("/jss-worker-host"))
+    .then(|| {
+        std::fs::read_to_string(app_root.join("package.json"))
+            .ok()
+            .and_then(|manifest| build_script(&manifest, app_root))
+    })
+    .flatten();
     let native_build = needs_native_toolchain(install_root);
     let dockerfile = dockerfile(
         &image,
@@ -3152,10 +3267,22 @@ fn install_command(pm: PackageManager) -> &'static str {
 /// will not start without it. Tolerated failure keeps a sub-step that needs the network (asset
 /// downloads) from failing the image when the primary build has already produced its output.
 fn build_command(pm: PackageManager, script: &str) -> String {
+    // Next 16 enables Turbopack by default and rejects an existing custom `webpack` configuration
+    // unless the build explicitly selects webpack. Older applications can therefore have a perfectly
+    // valid `next build` script that starts failing only after a permissive semver range installs the
+    // newer runtime. If the ordinary build fails and the package has a local Next binary, retry the
+    // same production build with webpack; for every non-Next package the executable check is false.
+    let next_fallback = if script == "build" {
+        " || (test -x node_modules/.bin/next && node_modules/.bin/next build --webpack)"
+    } else {
+        ""
+    };
     match pm {
-        PackageManager::Npm => format!("npm run {script} --if-present || true"),
-        PackageManager::Yarn => format!("yarn run {script} || true"),
-        PackageManager::Pnpm => format!("pnpm run {script} || true"),
+        PackageManager::Npm => {
+            format!("npm run {script} --if-present{next_fallback} || true")
+        }
+        PackageManager::Yarn => format!("yarn run {script}{next_fallback} || true"),
+        PackageManager::Pnpm => format!("pnpm run {script}{next_fallback} || true"),
     }
 }
 
@@ -3413,6 +3540,8 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-lifecycle-host.mjs\n\
          RUN echo {} | base64 -d > /jss-route-host.mjs\n\
          RUN echo {} | base64 -d > /jss-node-red-host.mjs\n\
+         RUN echo {} | base64 -d > /jss-azure-func-host.cjs\n\
+         RUN echo {} | base64 -d > /jss-worker-host.mjs\n\
          ENV NODE_EXTRA_CA_CERTS=/jss-marker.crt\n\
          ENV PORT={port}\n\
          ENV HOST=0.0.0.0\n\
@@ -3428,6 +3557,8 @@ fn dockerfile(
         base64(LIFECYCLE_HOST_JS.as_bytes()),
         base64(ROUTE_HOST_JS.as_bytes()),
         base64(NODE_RED_HOST_JS.as_bytes()),
+        base64(AZURE_FUNC_HOST_JS.as_bytes()),
+        base64(WORKER_HOST_JS.as_bytes()),
     )
 }
 
@@ -4003,7 +4134,32 @@ fn listening_probe(wanted: u16) -> String {
 /// `.listen`, it is run directly with `node`. This lets a repository of standalone scripts with no
 /// `package.json` still be exercised.
 fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Option<String> {
+    // A module worker (`export default { fetch(request) }`) — Cloudflare Workers, Deno, Bun — binds no
+    // listener of its own; the deployment runtime invokes its `fetch` method once per request and
+    // serves the whole origin. The manifest's own launch (a `wrangler dev` / `wrangler deploy` that
+    // needs the Workers runtime, or a bundler entry that may not even exist in the checkout) cannot
+    // serve it in the verifier image, so when the finding's own file is such a module, serve its
+    // `fetch` handler through the worker host shim. Checked before the manifest so the real entry point
+    // wins over a launch that could never bind the route under test.
+    if let Some(rel) = entry.and_then(|path| path.to_str())
+        && let Some(file) = package_file(root, rel)
+        && is_module_worker(&root.join(&file))
+    {
+        return Some(worker_host_command(&file));
+    }
     if let Some(command) = manifest_start_command(root) {
+        // A manifest whose only launch is the Azure Functions host (`func start`) depends on the Azure
+        // Functions Core Tools runtime to serve the `app.http(...)` triggers a v4 module registers; that
+        // runtime is not in the verifier image and the module binds no listener of its own. When the
+        // finding's own file is such a module, mount its registered triggers on a throwaway server
+        // through the Azure host shim so the route under test is actually served.
+        if manifest_launch_is_azure_functions(root)
+            && let Some(rel) = entry.and_then(|path| path.to_str())
+            && let Some(file) = package_file(root, rel)
+            && is_azure_functions_v4_module(&root.join(&file))
+        {
+            return Some(azure_host_command(&file));
+        }
         // A manifest whose only launch is a CLI dispatcher (commander/yargs) prints its usage and
         // exits without ever binding a port, so the route under test is never served. When the
         // finding's own file is a mountable Express router module, host that router on a throwaway
@@ -4197,6 +4353,169 @@ fn is_lifecycle_server_module(path: &std::path::Path) -> bool {
 /// `PORT`.
 fn route_host_command(file: &str) -> String {
     format!("[\"node\",\"/jss-route-host.mjs\",\"{file}\"]")
+}
+
+/// The launch command that mounts an Azure Functions v4 application module through the Azure host shim
+/// ([`AZURE_FUNC_HOST_JS`]): the shim mocks `@azure/functions`, transpiles and loads the module so its
+/// `app.http(...)` HTTP triggers register, and serves them over HTTP on `PORT`.
+fn azure_host_command(file: &str) -> String {
+    format!("[\"node\",\"/jss-azure-func-host.cjs\",\"{file}\"]")
+}
+
+/// The launch command that serves a module worker through the worker host shim ([`WORKER_HOST_JS`]):
+/// the shim imports the module, takes its default export's `fetch(request, env, ctx)` method, and
+/// serves it over HTTP on `PORT`, building a web `Request` per connection and writing the handler's
+/// web `Response` back.
+fn worker_host_command(file: &str) -> String {
+    format!("[\"node\",\"/jss-worker-host.mjs\",\"{file}\"]")
+}
+
+/// Whether a JavaScript/TypeScript file is a module worker: its default export is an object literal
+/// (`export default { ... }`) that declares a `fetch` handler, and it never binds a listener of its own
+/// (`.listen(`). Cloudflare Workers, Deno and Bun all serve an HTTP origin this way — the runtime
+/// invokes `default.fetch(request)` per request — so such a module publishes no server and is launched
+/// through the worker host shim rather than run directly, which would only evaluate and exit. The
+/// `export default {` shape plus a `fetch` method is the structural signal; no runtime package
+/// identifier or global is assumed.
+fn is_module_worker(path: &std::path::Path) -> bool {
+    let is_source = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs" | "ts" | "mts" | "cts"));
+    if !is_source {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    // A self-contained server (it constructs and `.listen(`s its own listener) is left to the normal
+    // launch path; a worker never binds one.
+    if src.contains(".listen(") {
+        return false;
+    }
+    // The default export must be an object literal.
+    let Some((_, after)) = src.split_once("export default") else {
+        return false;
+    };
+    if !after.trim_start().starts_with('{') {
+        return false;
+    }
+    // whose body declares a `fetch` *handler*: a method shorthand (`fetch(` / `async fetch(`) or a
+    // function-valued property (`fetch: async`/`fetch: function`/`fetch: (...) =>`). A `fetch` property
+    // holding a plain value (`fetch: 'https://...'`) is not a worker handler and must not match.
+    declares_fetch_handler(after)
+}
+
+/// Whether `body` declares a function-shaped `fetch` *member* of the object: the method shorthand
+/// `fetch(` / `async fetch(`, or a property whose value opens a function (`fetch: async`,
+/// `fetch: function`, `fetch: (...)`). It must be a property key, told apart from an ordinary
+/// `await fetch(url)` call in a handler body by its boundaries: what follows opens a function, and what
+/// precedes it (after an optional `async`/`*`) is an object-literal property boundary (`{`, `,`, or the
+/// start of a line), never an expression context (`await`, `return`, `=`, `.`, `(`). A `fetch` property
+/// bound to a non-function value does not qualify.
+fn declares_fetch_handler(body: &str) -> bool {
+    let mut search_start = 0;
+    while let Some(rel) = body[search_start..].find("fetch") {
+        let at = search_start + rel;
+        search_start = at + "fetch".len();
+        let rest = body[search_start..].trim_start();
+        let opens_function = rest.starts_with('(')
+            || rest.strip_prefix(':').is_some_and(|value| {
+                let value = value.trim_start();
+                value.starts_with("async")
+                    || value.starts_with("function")
+                    || value.starts_with('(')
+            });
+        if !opens_function {
+            continue;
+        }
+        // Strip a method modifier, then look at the last non-space character before the member.
+        let mut preceding = body[..at].trim_end();
+        preceding = preceding
+            .strip_suffix("async")
+            .unwrap_or(preceding)
+            .trim_end();
+        preceding = preceding.strip_suffix('*').unwrap_or(preceding).trim_end();
+        if matches!(preceding.chars().last(), None | Some('{') | Some(',')) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the package manifest's selected launch is the Azure Functions host (`func start` /
+/// `func host start`). Such a command needs the Azure Functions Core Tools runtime, which serves the
+/// `app.http(...)` triggers a v4 module registers but is not present in the verifier image; the module
+/// itself declares no listener, so it is launched through the Azure host shim instead. Mirrors
+/// [`manifest_start_command`]'s script precedence (`start`, then `serve`/`server`/`app`).
+fn manifest_launch_is_azure_functions(root: &std::path::Path) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return false;
+    };
+    let scripts = json.get("scripts").and_then(serde_json::Value::as_object);
+    let launch = scripts.and_then(|scripts| {
+        ["start", "serve", "server", "app"]
+            .into_iter()
+            .find_map(|name| {
+                scripts
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|command| !command.trim().is_empty())
+            })
+    });
+    launch.is_some_and(|command| {
+        command.split("&&").map(str::trim).any(|segment| {
+            segment == "func start"
+                || segment.starts_with("func start ")
+                || segment == "func host start"
+                || segment.starts_with("func host start ")
+        })
+    })
+}
+
+/// Whether a JavaScript/TypeScript file is an Azure Functions v4 application module: it imports the
+/// `@azure/functions` SDK and registers at least one HTTP trigger on the `app` object
+/// (`app.http(...)`/`app.get(...)`/…), but never binds a listener of its own (`.listen(`). The Azure
+/// Functions host loads such a module for these registration side effects and serves the triggers
+/// itself, so the module is launched through the Azure host shim rather than run directly. TypeScript
+/// and JSX sources are accepted — the shim transpiles them — since a v4 app is conventionally authored
+/// in TypeScript and compiled by the host's tooling.
+fn is_azure_functions_v4_module(path: &std::path::Path) -> bool {
+    let is_source = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext,
+                "js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "mts" | "cts"
+            )
+        });
+    if !is_source {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    if !src.contains("@azure/functions") {
+        return false;
+    }
+    [
+        "app.http(",
+        "app.get(",
+        "app.post(",
+        "app.put(",
+        "app.patch(",
+        "app.deleteRequest(",
+        "app.delete(",
+    ]
+    .iter()
+    .any(|marker| src.contains(marker))
 }
 
 /// The launch command that mounts a Node-RED node module through the Node-RED host shim
@@ -4425,6 +4744,29 @@ fn manifest_start_command(root: &std::path::Path) -> Option<String> {
     let manifest = std::fs::read_to_string(root.join("package.json")).ok()?;
     let json = serde_json::from_str::<serde_json::Value>(&manifest).ok();
     if has_start_script(&manifest) {
+        let scripts = json
+            .as_ref()
+            .and_then(|value| value.get("scripts"))
+            .and_then(serde_json::Value::as_object);
+        let start = scripts
+            .and_then(|scripts| scripts.get("start"))
+            .and_then(serde_json::Value::as_str);
+        let dev = scripts
+            .and_then(|scripts| scripts.get("dev"))
+            .and_then(serde_json::Value::as_str);
+        // A failed production build leaves `next start` with no `.next/BUILD_ID`. The verifier only
+        // needs the real route handler, so fall back to the repository's own Next dev script and let
+        // it compile that route on demand. Select webpack first for Next 16 projects whose existing
+        // webpack configuration makes the new Turbopack default abort; older Next versions retry
+        // without the flag if they do not recognize it.
+        if start.is_some_and(|command| contains_command(command, "next", "start"))
+            && dev.is_some_and(|command| contains_command(command, "next", "dev"))
+        {
+            return Some(
+                "[\"sh\",\"-c\",\"if [ -f .next/BUILD_ID ]; then npm start; else npm run dev -- --webpack --hostname 0.0.0.0 || npm run dev -- --hostname 0.0.0.0; fi\"]"
+                    .to_owned(),
+            );
+        }
         // A start script that only detaches the server (`./server.js > log 2>&1 & disown`)
         // returns at once, and the container with it: run the detached file in the foreground.
         let detached = json
@@ -4472,6 +4814,11 @@ fn manifest_start_command(root: &std::path::Path) -> Option<String> {
     // file directly so the route under test is served. The chosen file must itself bind a port, so
     // running it starts the server rather than loading a library.
     conventional_entry(root).map(|file| format!("[\"node\",\"{file}\"]"))
+}
+
+fn contains_command(command: &str, program: &str, argument: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.windows(2).any(|pair| pair == [program, argument])
 }
 
 /// A conventional launcher entry file of the package, when its manifest names no launch. Node's own
@@ -5843,6 +6190,344 @@ http.createServer((req, res) => {
 }).listen(port, '0.0.0.0', () => console.error('[node-red-host] listening on ' + port + ' routes=' + routes.map((r) => r.method + ' ' + r.path).join(',')));
 "#;
 
+/// Mounts an Azure Functions v4 application module. The Azure Functions host loads such a module for
+/// its side effects: at import time it calls `app.http('name', { route, methods, handler })` (and the
+/// per-verb `app.get(...)`/`app.post(...)` forms) on the `app` object imported from `@azure/functions`,
+/// registering HTTP triggers the host then serves under the `/api` route prefix. The module declares no
+/// server of its own, so the shim reconstructs that contract: it mocks `@azure/functions` so the
+/// registrations are captured, transpiles the module's TypeScript/JSX with the app's own installed
+/// compiler, loads it, and serves each captured trigger over HTTP on `PORT` — building the Azure
+/// `HttpRequest` the handler reads (`request.params`, `request.query.get(...)`, `request.headers`,
+/// `request.text()`), invoking the handler, and writing its `HttpResponseInit` back.
+///
+/// It fabricates nothing the sink depends on: a bare specifier that does not resolve (a webpack path
+/// alias to a client-only module the Functions host would bundle, never the handler's own file sink)
+/// degrades to a permissive stub that yields `undefined`, so a client import unrelated to the server
+/// handler cannot break the load, while the handler's real `fs`/`path` sink runs unchanged. A
+/// verification still requires the real canary to flow through the handler into the real sink. Run as
+/// CommonJS (`.cjs`) so its `require`-based module hooks apply regardless of the app's package type.
+const AZURE_FUNC_HOST_JS: &str = r#"
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+const port = Number(process.env.PORT || 3000);
+const cwd = process.cwd();
+const target = path.resolve(cwd, process.argv[2] || '');
+const appRequire = Module.createRequire(path.join(cwd, '__jss_azure_host__.js'));
+
+let ts = null;
+try { ts = appRequire('typescript'); } catch (e) {}
+let swc = null;
+if (!ts) { try { swc = appRequire('@swc/core'); } catch (e) {} }
+
+function transpile(code, filename) {
+  if (ts) {
+    return ts.transpileModule(code, {
+      fileName: filename,
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2020,
+        jsx: ts.JsxEmit.React,
+        esModuleInterop: true,
+        allowJs: true,
+        resolveJsonModule: true,
+        isolatedModules: true,
+      },
+    }).outputText;
+  }
+  if (swc) {
+    const tsx = /\.(tsx|jsx)$/.test(filename);
+    return swc.transformSync(code, {
+      filename,
+      jsc: { parser: { syntax: 'typescript', tsx }, target: 'es2020', transform: { react: { runtime: 'classic' } } },
+      module: { type: 'commonjs' },
+    }).code;
+  }
+  return code;
+}
+
+// A permissive stub for an import that cannot be resolved (a client-only webpack alias): every access
+// yields another stub and every call yields `undefined`, so it is never a truthy placeholder that could
+// divert the handler's control flow. The handler's own sink is what a verification must exercise.
+function stub() {
+  return new Proxy(function () { return undefined; }, {
+    get(_t, prop) {
+      if (prop === 'then') return undefined;
+      if (prop === '__esModule') return true;
+      if (prop === Symbol.toPrimitive) return () => '';
+      if (prop === Symbol.iterator || prop === Symbol.asyncIterator) return undefined;
+      return stub();
+    },
+    apply() { return undefined; },
+    construct() { return stub(); },
+  });
+}
+
+const routes = [];
+function register(name, methods, route, handler) {
+  if (typeof handler !== 'function') return;
+  routes.push({ name, methods, route: (route != null ? route : name), handler });
+}
+const appProxy = new Proxy({}, {
+  get(_t, prop) {
+    return (name, opts) => {
+      const o = (typeof opts === 'function') ? { handler: opts } : (opts || {});
+      let methods = o.methods;
+      if (!methods && typeof prop === 'string' && prop !== 'http') methods = [prop.toUpperCase()];
+      register(name, methods, o.route, o.handler);
+    };
+  },
+});
+const azureMock = {
+  app: appProxy,
+  InvocationContext: function () {},
+  HttpRequest: function () {},
+  HttpResponse: function () {},
+  input: stub(),
+  output: stub(),
+  trigger: stub(),
+  __esModule: true,
+};
+
+require.extensions['.ts'] = require.extensions['.tsx'] = require.extensions['.jsx'] = function (module, filename) {
+  module._compile(transpile(fs.readFileSync(filename, 'utf8'), filename), filename);
+};
+
+const origLoad = Module._load;
+Module._load = function (request) {
+  if (request === '@azure/functions') return azureMock;
+  try {
+    return origLoad.apply(this, arguments);
+  } catch (e) {
+    const code = e && e.code;
+    if (code === 'MODULE_NOT_FOUND' || code === 'ERR_REQUIRE_ESM'
+      || code === 'ERR_PACKAGE_PATH_NOT_EXPORTED' || code === 'ERR_UNSUPPORTED_DIR_IMPORT') {
+      return stub();
+    }
+    throw e;
+  }
+};
+
+try {
+  require(target);
+} catch (e) {
+  console.error('[azure-host] load error: ' + (e && (e.stack || e.message) || e));
+}
+
+function compile(route) {
+  let template = (typeof route === 'string' && route) ? route : '';
+  const full = '/api/' + template.replace(/^\/+/, '');
+  const keys = [];
+  const parts = full.split('/').map((seg) => {
+    let m = seg.match(/^\{\*(.+)\}$/);
+    if (m) { keys.push(m[1]); return '(.*)'; }
+    m = seg.match(/^\{([^:}]+)(?::[^}]+)?\??\}$/);
+    if (m) { keys.push(m[1]); return '([^/]+)'; }
+    return seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  });
+  return { regex: new RegExp('^' + parts.join('/') + '/?$'), keys };
+}
+
+function makeRequest(req, u, raw, params) {
+  const headers = new Map();
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    headers.set(k.toLowerCase(), Array.isArray(v) ? v.join(', ') : v);
+  }
+  return {
+    method: (req.method || 'GET').toUpperCase(),
+    url: 'http://localhost' + req.url,
+    headers: {
+      get: (n) => { const v = headers.get(String(n).toLowerCase()); return v == null ? null : v; },
+      has: (n) => headers.has(String(n).toLowerCase()),
+      entries: () => headers.entries(),
+      forEach: (cb) => headers.forEach((v, k) => cb(v, k)),
+    },
+    query: u.searchParams,
+    params,
+    user: null,
+    body: raw,
+    text: async () => raw.toString('utf8'),
+    json: async () => JSON.parse(raw.toString('utf8') || 'null'),
+    arrayBuffer: async () => raw,
+    formData: async () => new URLSearchParams(raw.toString('utf8')),
+  };
+}
+
+function makeContext() {
+  const log = function () {};
+  log.error = function () {}; log.warn = function () {}; log.info = function () {}; log.verbose = function () {};
+  return {
+    log, error: () => {}, warn: () => {}, info: () => {}, debug: () => {}, trace: () => {},
+    invocationId: 'jss', functionName: 'jss',
+    extraInputs: { get: () => undefined, set: () => {} },
+    extraOutputs: { get: () => undefined, set: () => {} },
+  };
+}
+
+function writeResult(res, result) {
+  if (res.writableEnded) return;
+  if (result == null) { res.statusCode = 204; return res.end(); }
+  res.statusCode = result.status || 200;
+  const headers = result.headers;
+  try {
+    if (headers && typeof headers.forEach === 'function') headers.forEach((v, k) => res.setHeader(k, v));
+    else if (headers && typeof headers === 'object') for (const k in headers) res.setHeader(k, headers[k]);
+  } catch (e) {}
+  let body = (result.jsonBody !== undefined) ? JSON.stringify(result.jsonBody) : result.body;
+  if (body == null) return res.end();
+  if (Buffer.isBuffer(body)) return res.end(body);
+  if (typeof body === 'string') return res.end(body);
+  if (body && typeof body.pipe === 'function') { try { return body.pipe(res); } catch (e) { return res.end(); } }
+  if (body instanceof Uint8Array || body instanceof ArrayBuffer) return res.end(Buffer.from(body));
+  if (body && typeof body.toString === 'function') return res.end(body.toString());
+  try { res.end(String(body)); } catch (e) { res.end(); }
+}
+
+http.createServer((req, res) => {
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch (e) { res.statusCode = 400; return res.end(); }
+  const method = (req.method || 'GET').toUpperCase();
+  const chunks = [];
+  let size = 0;
+  req.on('data', (c) => { size += c.length; if (size <= 5 * 1024 * 1024) chunks.push(c); });
+  req.on('error', () => { try { res.statusCode = 400; res.end(); } catch (e) {} });
+  req.on('end', async () => {
+    const raw = Buffer.concat(chunks);
+    let matched = null;
+    const params = {};
+    for (const r of routes) {
+      const c = r._c || (r._c = compile(r.route));
+      const mm = c.regex.exec(u.pathname);
+      if (!mm) continue;
+      if (r.methods && r.methods.length) {
+        const upper = r.methods.map((x) => String(x).toUpperCase());
+        if (!upper.includes(method) && !upper.includes('*')) continue;
+      }
+      matched = r;
+      c.keys.forEach((k, i) => {
+        const raw = mm[i + 1] == null ? '' : mm[i + 1];
+        try { params[k] = decodeURIComponent(raw); } catch (e) { params[k] = raw; }
+      });
+      break;
+    }
+    if (!matched) { res.statusCode = 404; return res.end('not found'); }
+    let result;
+    try {
+      result = await matched.handler(makeRequest(req, u, raw, params), makeContext());
+    } catch (e) {
+      try { if (!res.headersSent) res.statusCode = 500; if (!res.writableEnded) res.end(); } catch (x) {}
+      return;
+    }
+    writeResult(res, result);
+  });
+}).listen(port, '0.0.0.0', () => console.error('[azure-host] listening on ' + port + ' with ' + routes.length + ' route(s)'));
+"#;
+
+/// Serves a module worker. Cloudflare Workers, Deno and Bun all run an HTTP origin by importing a
+/// module whose default export is an object with a `fetch(request, env, ctx)` method, which the
+/// runtime invokes once per request and whose returned web `Response` it writes back. The worker binds
+/// no listener itself, so this shim reconstructs that contract: it imports the module, takes
+/// `default.fetch`, and serves it over HTTP on `PORT`, building the web `Request` the handler reads
+/// (its `url`, `method`, `headers`, body) and writing its `Response` back.
+///
+/// The incoming request is presented with an `https` scheme, modelling the TLS traffic a deployed
+/// worker actually receives: a worker that redirects plain `http` to `https` before doing its work
+/// (`if (url.protocol === 'http:') return Response.redirect(...)`) would otherwise never reach its own
+/// logic. This grants the request nothing — it fixes only the transport the exploit rides over, which
+/// the real deployment already provides — and the handler's real sink still runs unchanged on the
+/// attacker-controlled URL. Node 22 provides `fetch`/`Request`/`Response`/`Headers`/`URL` and a global
+/// `crypto` with `randomUUID`, so a worker's own `fetch`/`crypto` calls run against the real runtime.
+const WORKER_HOST_JS: &str = r#"
+import http from 'node:http';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+const port = Number(process.env.PORT || 3000);
+const target = path.resolve(process.cwd(), process.argv[2] || '');
+
+let handler = null;
+let env = {};
+try {
+  const mod = await import(pathToFileURL(target).href);
+  const def = mod && (mod.default || mod);
+  if (def && typeof def.fetch === 'function') {
+    handler = def.fetch.bind(def);
+  } else if (typeof def === 'function') {
+    handler = def;
+  }
+} catch (e) {
+  console.error('[worker-host] load error: ' + (e && (e.stack || e.message) || e));
+}
+
+function makeContext() {
+  return {
+    waitUntil: (p) => { try { Promise.resolve(p).catch(() => {}); } catch (e) {} },
+    passThroughOnException: () => {},
+    props: {},
+  };
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (size <= 5 * 1024 * 1024) chunks.push(c); });
+    req.on('error', () => resolve(Buffer.alloc(0)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+async function writeResponse(res, response) {
+  if (res.writableEnded) return;
+  if (!response) { res.statusCode = 204; return res.end(); }
+  try {
+    res.statusCode = response.status || 200;
+    if (response.headers && typeof response.headers.forEach === 'function') {
+      response.headers.forEach((v, k) => { try { res.setHeader(k, v); } catch (e) {} });
+    }
+    const buf = Buffer.from(await response.arrayBuffer());
+    res.end(buf);
+  } catch (e) {
+    try { if (!res.headersSent) res.statusCode = 502; if (!res.writableEnded) res.end(); } catch (x) {}
+  }
+}
+
+http.createServer(async (req, res) => {
+  const raw = await readBody(req);
+  if (!handler) { res.statusCode = 502; return res.end('no worker handler'); }
+  // The authority is synthetic (the worker reads only the path/query it carries); the scheme is
+  // `https` so the request models deployed TLS traffic rather than a redirectable plain-http hit.
+  const host = req.headers.host || 'localhost';
+  const url = 'https://' + host + req.url;
+  let request;
+  try {
+    const init = { method: req.method || 'GET', headers: req.headers, duplex: 'half' };
+    if (!['GET', 'HEAD'].includes((req.method || 'GET').toUpperCase()) && raw.length) {
+      init.body = raw;
+    }
+    request = new Request(url, init);
+  } catch (e) {
+    res.statusCode = 400; return res.end('bad request');
+  }
+  let response;
+  try {
+    response = await handler(request, env, makeContext());
+  } catch (e) {
+    try { if (!res.headersSent) res.statusCode = 500; if (!res.writableEnded) res.end(); } catch (x) {}
+    return;
+  }
+  await writeResponse(res, response);
+}).listen(port, '0.0.0.0', () => console.error('[worker-host] listening on ' + port + (handler ? ' with fetch handler' : ' with NO handler')));
+"#;
+
 /// Sends one request to the app on localhost and prints the response body. Reads its spec from
 /// argv[2]. Kept tiny and dependency-free (core `http`).
 const DRIVER_JS: &str = r#"
@@ -5912,60 +6597,63 @@ try {
 }
 "#;
 
-/// A self-signed certificate (and its key) for the host `jss-marker`, baked in as a verification
+/// A self-signed certificate (and its key) for the isolated marker, baked in as a verification
 /// fixture — not a secret. The marker serves TLS with it and the app image trusts it as a CA
 /// (`NODE_EXTRA_CA_CERTS`), so the app's own `https` verification accepts the marker without being
-/// weakened. SAN is `DNS:jss-marker`, matching the network alias; validity runs to 2126.
+/// weakened. Its SANs cover `jss-marker` and `*.callback.satori.ci`: the latter is needed when the
+/// one freshly registered callback hostname is DNS-aliased to this same private marker. No other
+/// callback hostname is added to the private network. Validity runs to 2126.
 const MARKER_CERT: &str = r#"-----BEGIN CERTIFICATE-----
-MIIDJDCCAgygAwIBAgIUftLDL4Vr1Ml5LgbJGBgAmUWw810wDQYJKoZIhvcNAQEL
-BQAwFTETMBEGA1UEAwwKanNzLW1hcmtlcjAgFw0yNjExMDMyMTQwMjJaGA8yMTI2
-MTAxMDIxNDAyMlowFTETMBEGA1UEAwwKanNzLW1hcmtlcjCCASIwDQYJKoZIhvcN
-AQEBBQADggEPADCCAQoCggEBANgmb3Seut5AAC+eYFshT1Mf9lpyRqC0VmGs22N4
-a0OKWRVvZ7gUH0ZGK65t9jZ7DiP4vmKMFJnt4RGYoYnqUixhQoxy+weSLLLF1JBh
-32sBW/iMy19bsWqmopaX1lAsQDS50oJEUil8Mbt58fyYHhb8dXpICA1x5duRuiUX
-BD6KImDyNHCkeq3wkkpyMj1Q1c/lBAV8UVF+SHQn1eIcgExtkpRZzAMmfZHER+PI
-NILtINMESEb0BfxnY3s4Kx+nZOoiajBHjNdmbWeolM9gzPUvGApkYz6VANjJwWUg
-X2VLfvcHuaviwbkyXzZamSrsAVpd133loAGCLpDWBvnCew0CAwEAAaNqMGgwHQYD
-VR0OBBYEFH6cydpB1sESWixE6OIqU2PCkv5gMB8GA1UdIwQYMBaAFH6cydpB1sES
-WixE6OIqU2PCkv5gMA8GA1UdEwEB/wQFMAMBAf8wFQYDVR0RBA4wDIIKanNzLW1h
-cmtlcjANBgkqhkiG9w0BAQsFAAOCAQEAu1Wrz3WoE2+zeijmE4k3+IPyV5cEfeJi
-uNeaMcwcmBWTyvKxFhQJ4ePMCjUOaZFaif5tGvaOo3Vhd6OYZDGbJ24EPYS6fTEc
-OrdGqWjIWTeunJ/Z9SUydx/QQZ3jywJFz29mLOwM7yMXqtGCXeW+ej47ga0wiHuJ
-JmpJqEubm4VSpLP25/bxdyjj7pVQuNP3F4WdwvmLFO3h+8D+qM1R6aErvVmrf0bJ
-IJYc03Nc2HAb8p+qFHZnkq42HuW8v6iBRci1nxu2JKAuYSzS/KOD28nNEXXI8WIG
-1OqBPnwKyuYXWys+W2Y2nl1uFx+uFdgdZ+7RBVkJzBRtHkgcorG+nw==
+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
+QcvK4tx3luOLSkF2/rLY
 -----END CERTIFICATE-----
 "#;
 
 /// The private key for [`MARKER_CERT`]. A throwaway key for an isolated, internal-only test
 /// service; it secures nothing and is intentionally public.
 const MARKER_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDYJm90nrreQAAv
-nmBbIU9TH/ZackagtFZhrNtjeGtDilkVb2e4FB9GRiuubfY2ew4j+L5ijBSZ7eER
-mKGJ6lIsYUKMcvsHkiyyxdSQYd9rAVv4jMtfW7FqpqKWl9ZQLEA0udKCRFIpfDG7
-efH8mB4W/HV6SAgNceXbkbolFwQ+iiJg8jRwpHqt8JJKcjI9UNXP5QQFfFFRfkh0
-J9XiHIBMbZKUWcwDJn2RxEfjyDSC7SDTBEhG9AX8Z2N7OCsfp2TqImowR4zXZm1n
-qJTPYMz1LxgKZGM+lQDYycFlIF9lS373B7mr4sG5Ml82Wpkq7AFaXdd95aABgi6Q
-1gb5wnsNAgMBAAECggEABTJseIPNOX9Ph6cGupul9z8L8TZoilGIyFeEcWe5hfVh
-3yBWrxJDVGtPrQKbR4Pgo8vc/olmaWeYsdWFupi19xTWew3T8ghh+L5oZJll01Oh
-UANga7D7JpirQV1POKVZLjb+SHRxWI11EWGzqyJ1imKruj57fIlzhowN+crdbJ95
-ZFd+7WKn9JJFSOXJM93973OldCp9pe6Zw6RA2ZdpeDezh/iuV8W7iQcm6yG9yAzh
-nlWDLXnzKaLGjlHc7ieSws9Wx54w9caH2tf28fFwAvFEywQpfaJWNorPuCVqIm6L
-1NwViJX6IIVCfxPDdvXAAlZN3GeLUhFe9G7l+9YnJQKBgQDzP6JsfiCEY2t7809G
-B9WavpgvpkA3xQu/+E1Wnfy0UjKXd5xivaZ5Yp6pHK9PEkxtgmOKxJXMVhvAcuQc
-UhsMc37uQye7RAsExcpGahIo7KiF3vL+GYF1UT3SeyA3LrFVI26vQgCaz5MaBslg
-bgI4CQB4mTGHEstVNwliv/rIDwKBgQDjeySvJ2JZsoE9tA4B7qFDyIojbyaJdl7w
-ZG0bq8N9/trjD8RvTDFznWDazJo7cng6CXoFJKoQ8/p2Q/GjMHsydVKZWqjjpOW5
-6D6yZnxUioaVm+fDpM01OKieEphTe77w5eGkjr0vrb4mixxdpcdg4hlxatkniyEV
-HEsedPvPIwKBgBII5sb6dvi50k9HU9pSXGDzvp7RybMY1e0uwLUqU4EfEwct5Bdi
-DkSzriXFra3EIox//VddiemzfK1BF26OG9lJeuC5c+mretGoxH2CAcSs/zWluQhj
-5bhIBLhlTpcozBcO4Hb4Asl3mGV2mVmf7mQvLqzCVuy31QGFahm7OCG7AoGAfZ7A
-SFVoc34m7ssivSBpP8RbvGuiDWEn1nqu4gv9XfPCLofDg27BFEaBePJp7ZAuImaf
-Un3HyKri0jJ9GxAnyFqPrY4qG+Qw1HQTQ3NjD1CcN7wrxZeZlt1eCETeh6Obcu6P
-p88HXHAGxMQnevOUYcUaJc7KcpLbRwwj04Lol58CgYBOU+E5XyTFENcfXQqmevqG
-jHsK6ZuxTJBu3/ljnl/s4eDRdDQeWg9jxHjCIb+RZ+lzLDBrK72e8uGTAzy2bJOo
-TMKYIU1ehZPUtYF64aOhLdUeKbibo7gMuVOuuNnQn/fQmDyQPv0MAfDeYp5BHMlY
-TMvXfMFYx7ZXHLP5nQYIeQ==
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC1FfauUTzHx9ZI
+T4hP1e1z+lCo7Mqh/YfrzYV33ALWJxG1t7O6EqOzKlnFyGJe72xSi7JUss0hqggx
+mQmfnnwSk9RIk30PCB/nyigX5Alb5vrShBrnZ9vpm/MtXZzTQ53WeC9qoibZT0re
+nWYq3QGJXMHauauLekgrxv9d41uUzkbMF5XOjMI3xdxvZkFxky/k4UGr6cEUQ+cj
+ZsXpsL/i7D0d5eobWPaKViCQ1CuTL/Zmry+dVlBBr11sSEeBMqoTEWl2zj7TnfL9
+Rxhs9Luie0xQAml1hgNdyaD1edhl7YRbmWCqL1sg55ynoVKWbgd2CPew0E5itvFZ
+zpvUSCYbAgMBAAECggEABqi6G4rtO0OEA8C4+IabZsprsOqUQQS7vNYf9Fpo2Esz
+gYUx3MPWtT33cyh9RZR0XUy50BeLJ5PDHV/NVMtVMLGy+sBBtw3LbpCmjMpb9b82
+tgsZmizdj2emt6JbpAE2iq58v+UanJ8n16veF/FsnwqELnDpeAWVJdb5iRBVS9GC
+OvQScyVSN9egf2qAeyTKJ0XSLC0kphF4N4xA1WPf7Fd/kijLuCEN4RWQNS6zGQGU
+XqYqoV+7uwIdHetMkMoCNQAC8ecVmuzbeRMd8+QdJPpQQ0+N299B56LB9QAyTBF4
+Dy0AvTTcaMTpkPKpg0abX7yttQF3p3Rqh2iYdRyl8QKBgQDhSj5EQSe3g/ghbO2w
+xgK2lAvGilfz3wVGXFRGu0C9kniCXDXXvQE3Xfi37NnO5+TenCQ3bcOTl08jvL6O
+A6UETWU1HNBP4A0KuGWJ72to6hroNARgXqc96NOKx5G/sIKLeVIfPMt0TPUdz0dN
+BTnzI49L6CjZZb2UNq8rPVqc1QKBgQDNxSmv9l5Pn9mXa4bPYUj0GqmQKe191g4o
+2Ur3rWgCSpChuV0Edg4GwOzi7nNte9hv7tCEPOs15QcyPxvWX7/kVlOela/OBVzQ
+sc3m+WL4836jq9bSIE/RQlQILvPbEhHxYTWhpOG2N3HtwgU0vL4aBZA/5Mj0JYtR
+Qju1qpFvLwKBgEtq4itRMG2DtSXjZDKAJtpd9w8wsr7F0us571B6UPLlPIhPPAsL
+j4OsZp2ToVpdUMWguZMAoK8gwPJytcuutqgZDJ9aFPYYR+Vl0z/4sRk+/WDsQObN
+6OiVr3NO2aC1Aw6Tv4ULggRd2tRu1iyXak3VgpvjjQExyOP75mnwMQw9AoGAFfc6
+IAKYxr81pyhfV7v24bgG6dDP/WLgWBP6IL5uH/B9yAXVnChODwKBRyhVQha6YBiK
+QdOO+E3emsqJ2jSWc3WTr5YjEkcYRV71r/ZnTlQP7MDnSb8RRjFibw00Euq256GM
+7BiBz8XTb6IKlDqhwH1fjLKLkSSA3sfHP/lZVRkCgYEAtMc/YAsfE1hvlUiJPNQH
+Atim9OfvZSDm0lp0LDaKOFNdL9hr2bSb62L0otu2CIq/AXuYOfvsCSIGSZ2msipc
+tPgc1T0LwdsHTm0yF5buV2M9qoqKP3AsupUwHj33tg6eRM9kVAEnchtL8CDslxnH
+SqwRqIrWiDKu9S43xShSlHI=
 -----END PRIVATE KEY-----
 "#;
 
@@ -6658,6 +7346,41 @@ mod tests {
     }
 
     #[test]
+    fn a_multipart_poc_uses_readable_form_arguments_with_a_real_file() {
+        let body = "--jsspector-form-boundary\r\n\
+                    Content-Disposition: form-data; name=\"destination\"\r\n\r\n\
+                    ../../outside\r\n\
+                    --jsspector-form-boundary\r\n\
+                    Content-Disposition: form-data; name=\"document\"; filename=\"jsspector-upload.bin\"\r\n\
+                    Content-Type: application/octet-stream\r\n\r\n\
+                    jsspector-upload\r\n\
+                    --jsspector-form-boundary--\r\n";
+        let attempt = Attempt {
+            verb: "POST",
+            target: "/upload".to_owned(),
+            body: Some(body.to_owned()),
+            headers: vec![(
+                "Content-Type".to_owned(),
+                "multipart/form-data; boundary=jsspector-form-boundary".to_owned(),
+            )],
+            signal: Signal::InResponse,
+        };
+        let command = curl_command(&attempt, 8000);
+        assert!(
+            command.starts_with("printf %s 'jsspector-upload' > /tmp/jsspector-upload.bin\ncurl")
+        );
+        assert!(command.contains("--form 'destination=../../outside'"));
+        assert!(command.contains(
+            "--form 'document=@/tmp/jsspector-upload.bin;filename=jsspector-upload.bin;type=application/octet-stream'"
+        ));
+        assert!(!command.contains("--data-raw"), "{command}");
+        assert!(
+            !command.contains("boundary=jsspector-form-boundary"),
+            "{command}"
+        );
+    }
+
+    #[test]
     fn docker_args_label_resource_creation_only() {
         let label = "monitor_42-a";
         let expected_label = format!("{VERIFY_RUN_LABEL_KEY}={label}");
@@ -6846,6 +7569,50 @@ mod tests {
     }
 
     #[test]
+    fn marker_certificate_validates_private_and_callback_hostnames_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("marker.crt");
+        let key = dir.path().join("marker.key");
+        std::fs::write(&cert, MARKER_CERT).unwrap();
+        std::fs::write(&key, MARKER_KEY).unwrap();
+        let cert_public = std::process::Command::new("openssl")
+            .args(["x509", "-in"])
+            .arg(&cert)
+            .args(["-noout", "-pubkey"])
+            .output()
+            .expect("OpenSSL is required to validate the marker certificate");
+        let key_public = std::process::Command::new("openssl")
+            .args(["pkey", "-in"])
+            .arg(&key)
+            .args(["-pubout"])
+            .output()
+            .expect("OpenSSL is required to validate the marker key");
+        assert!(cert_public.status.success());
+        assert!(key_public.status.success());
+        assert_eq!(cert_public.stdout, key_public.stdout);
+
+        let validates = |hostname: &str| {
+            std::process::Command::new("openssl")
+                .args(["x509", "-in"])
+                .arg(&cert)
+                .args(["-noout", "-checkhost", hostname])
+                .output()
+                .expect("OpenSSL is required to validate the marker certificate")
+                .status
+                .success()
+        };
+
+        assert!(validates("jss-marker"));
+        assert!(validates(
+            "0123456789abcdef0123456789abcdef.callback.satori.ci"
+        ));
+        assert!(!validates("callback.satori.ci"));
+        assert!(!validates(
+            "nested.0123456789abcdef0123456789abcdef.callback.satori.ci"
+        ));
+    }
+
+    #[test]
     fn mongo_sidecar_is_selected_from_declared_dependencies() {
         let dir = tempfile::tempdir().unwrap();
         write(
@@ -6895,6 +7662,90 @@ mod tests {
     }
 
     #[test]
+    fn an_azure_functions_v4_app_is_launched_through_the_azure_host_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An Azure Functions v4 app: `func start` is the only launch, and the module registers HTTP
+        // triggers on `app` from `@azure/functions` but binds no listener of its own.
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"build":"webpack","start":"func start"},"main":"dist/server/index.js"}"#,
+        );
+        write(
+            root,
+            "src/index.tsx",
+            "import { app } from '@azure/functions';\nimport fs from 'fs';\nimport path from 'path';\n\
+             app.http('getChunks', { route: 'chunks/{*filePath}', methods: ['GET'], handler: (request) => {\n\
+             const { filePath } = request.params;\n\
+             return { body: fs.readFileSync(path.join(__dirname, '../client', filePath)) };\n} });\n",
+        );
+        assert_eq!(
+            start_command(root, Some(std::path::Path::new("src/index.tsx"))).as_deref(),
+            Some(r#"["node","/jss-azure-func-host.cjs","src/index.tsx"]"#),
+            "the Azure Functions host launch is replaced by the Azure host shim",
+        );
+        assert!(manifest_launch_is_azure_functions(root));
+        assert!(is_azure_functions_v4_module(&root.join("src/index.tsx")));
+        // A plain Express server that happens to call `.listen(` (and never imports the SDK) is not an
+        // Azure module and keeps the normal launch path.
+        write(
+            root,
+            "server.js",
+            "const app = require('express')(); app.get('/x', (q, r) => r.end()); app.listen(3000);",
+        );
+        assert!(!is_azure_functions_v4_module(&root.join("server.js")));
+    }
+
+    #[test]
+    fn a_module_worker_is_launched_through_the_worker_host_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A Cloudflare module worker: the default export's `fetch` handler serves the origin, the
+        // manifest launch is `wrangler dev` (the Workers runtime, absent from the image), and the
+        // module binds no listener of its own.
+        write(
+            root,
+            "package.json",
+            r#"{"type":"module","scripts":{"start":"wrangler dev","deploy":"wrangler deploy"}}"#,
+        );
+        write(
+            root,
+            "worker.js",
+            "export default {\n  async fetch(request) {\n    const url = new URL(request.url);\n\
+             return fetch(new URL(url.pathname, 'https://example.com/'));\n  }\n};\n",
+        );
+        assert!(is_module_worker(&root.join("worker.js")));
+        assert_eq!(
+            start_command(root, Some(std::path::Path::new("worker.js"))).as_deref(),
+            Some(r#"["node","/jss-worker-host.mjs","worker.js"]"#),
+            "the worker's fetch handler is served through the worker host shim",
+        );
+        // A self-contained server that binds its own listener keeps the normal launch path, even with
+        // a default export, and a plain data object with a `fetch` field is not a worker.
+        write(
+            root,
+            "server.js",
+            "export default {}; require('http').createServer((q, r) => r.end()).listen(3000);",
+        );
+        assert!(!is_module_worker(&root.join("server.js")));
+        write(
+            root,
+            "config.js",
+            "export default { fetch: 'https://x/data' };\n",
+        );
+        assert!(!is_module_worker(&root.join("config.js")));
+        // A route-handler descriptor object whose handler body merely *calls* `fetch(url)` is not a
+        // worker: `fetch` there is an outbound call, not a `fetch` member of the default export.
+        write(
+            root,
+            "handler.js",
+            "export default { fn: async (req, res) => { return await fetch(req.query.url); } };\n",
+        );
+        assert!(!is_module_worker(&root.join("handler.js")));
+    }
+
+    #[test]
     fn the_package_manager_follows_the_lockfile() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -6933,6 +7784,10 @@ mod tests {
         );
         assert!(file.contains("RUN corepack enable"), "{file}");
         assert!(file.contains("yarn run build"), "{file}");
+        assert!(
+            file.contains("node_modules/.bin/next build --webpack"),
+            "a failed Next build is retried with the compatible webpack backend: {file}"
+        );
         // The canary is planted under its extension variants, so a handler that appends a known
         // extension to the tainted path (`input + '.md'`) still reads the token.
         assert!(file.contains("/jss-canary-read.md"), "{file}");
@@ -6949,6 +7804,7 @@ mod tests {
             false,
         );
         assert!(!no_build.contains("build"), "{no_build}");
+        assert!(!build_command(PackageManager::Npm, "compile").contains("next build"));
     }
 
     #[test]
@@ -7019,6 +7875,32 @@ mod tests {
             Some(r#"["npm","start"]"#)
         );
         assert_eq!(manifest_start_command(&root.join("lib/util")), None);
+    }
+
+    #[test]
+    fn a_next_start_uses_dev_when_the_production_build_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts":{"build":"next build","start":"next start","dev":"next dev"}}"#,
+        );
+        let command = manifest_start_command(dir.path()).unwrap();
+        assert!(command.contains("[ -f .next/BUILD_ID ]"), "{command}");
+        assert!(command.contains("npm start"), "{command}");
+        assert!(command.contains("npm run dev -- --webpack"), "{command}");
+        assert!(command.contains("npm run dev -- --hostname"), "{command}");
+
+        // A non-Next dev server and a Next package with no dev script retain the production launch.
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts":{"start":"next start","dev":"vite"}}"#,
+        );
+        assert_eq!(
+            manifest_start_command(dir.path()).as_deref(),
+            Some(r#"["npm","start"]"#)
+        );
     }
 
     #[test]
@@ -7965,6 +8847,7 @@ http.createServer((req, res) => {
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         };
         let confined = Probe {
             method: Method::Get,
@@ -7994,6 +8877,7 @@ http.createServer((req, res) => {
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         };
         let command = Probe {
             method: Method::Get,
@@ -8023,6 +8907,7 @@ http.createServer((req, res) => {
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -8056,6 +8941,7 @@ http.createServer((req, res) => {
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

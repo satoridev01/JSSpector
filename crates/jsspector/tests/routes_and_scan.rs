@@ -228,6 +228,53 @@ fn versioned_dynamic_mounts_link_anonymous_default_routers_and_class_instances()
 }
 
 #[test]
+fn a_module_worker_default_export_is_an_http_entry_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A Cloudflare/Deno/Bun module worker: the default export's `fetch` method serves every path of
+    // the origin, so a request-URL value that chooses the outbound host of `fetch` is an
+    // unauthenticated SSRF reachable from the whole origin.
+    write(
+        root,
+        "worker.js",
+        "export default {\n\
+         async fetch(request) {\n\
+           const url = new URL(request.url);\n\
+           const base = 'https://example.com/';\n\
+           const target = new URL(url.pathname, base);\n\
+           return fetch(target);\n\
+         }\n};\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    assert!(
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| { route["method"] == "ANY" && route["path"] == "/" }),
+        "{routes}"
+    );
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["class"] == "ssrf")
+        .expect("the module worker's fetch sink should be found");
+    assert_eq!(finding["entry"], "ANY /");
+
+    // A plain data object whose `fetch` property is a value, not a handler, is not a worker entry.
+    let other = tempfile::tempdir().unwrap();
+    write(
+        other.path(),
+        "config.js",
+        "export default { fetch: 'https://example.com/data' };\n",
+    );
+    let routes = run(&["routes", "--json", other.path().to_str().unwrap()]);
+    assert_eq!(routes.as_array().unwrap().len(), 0, "{routes}");
+}
+
+#[test]
 fn provider_resource_routes_use_the_deployed_metadata_prefix() {
     let dir = tempfile::tempdir().unwrap();
     write(

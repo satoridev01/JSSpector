@@ -182,6 +182,12 @@ pub struct Probe {
     /// returned token. `None` when no in-handler session guard sits between the entry and the sink.
     /// Mined from the handler and route-registration source only; nothing here is target-specific.
     pub auth: Option<AuthBootstrap>,
+    /// A body field read through the Web `Request.formData()` API must be sent as a real multipart
+    /// request, not as the JSON body used for ordinary `req.body` inputs.  The descriptor records
+    /// every field the handler reads and which of them it treats as a `File`/`Blob`, so the payload
+    /// builder can put the tainted value in its text part and provide harmless file parts for the
+    /// siblings needed to reach the sink. `None` for JSON, urlencoded and raw bodies.
+    pub multipart: Option<MultipartForm>,
 }
 
 /// How to obtain a genuine authenticated session for a sink gated behind an in-handler credential
@@ -202,6 +208,15 @@ pub struct AuthBootstrap {
     /// Candidate login endpoints that exchange the generated credentials for a session token, tried
     /// in order until one returns a token.
     pub login_paths: Vec<String>,
+}
+
+/// The shape of a body parsed with `Request.formData()`. `fields` contains every named `.get(...)`
+/// access other than the tainted field; members of `file_fields` are emitted with a filename and
+/// content type so calls such as `file.arrayBuffer()` receive a real `File` rather than a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartForm {
+    pub fields: Vec<String>,
+    pub file_fields: Vec<String>,
 }
 
 /// How to drive a nested-write prototype-pollution sink (`obj[outer][inner] = v`). Both keys are
@@ -722,6 +737,7 @@ impl Probe {
                 proto_pollution: None,
                 alt_paths: Vec::new(),
                 auth: None,
+                multipart: None,
             });
         }
         if finding.source.kind != "http" {
@@ -829,6 +845,7 @@ impl Probe {
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         })
     }
 
@@ -890,6 +907,7 @@ impl Probe {
             proto_pollution: Some(ProtoPollution { outer, inner }),
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         })
     }
 }
@@ -4200,9 +4218,197 @@ pub fn sibling_paths(current: &str, literals: &[String]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FormDataAccess {
+    field: String,
+    local: Option<String>,
+    file: bool,
+}
+
+/// The multipart shape for a named body field read through `Request.formData()`. Returns `None`
+/// unless the handler both calls `.formData()` and reads the target with `.get("target")`. A target
+/// that is itself consumed as a `File` is deliberately left unsupported: driving a file-name taint
+/// requires controlling the multipart filename, whereas this descriptor drives a textual field.
+pub fn multipart_form(source: &str, target: &str) -> Option<MultipartForm> {
+    let accesses = form_data_accesses(source);
+    let target_access = accesses.iter().find(|access| access.field == target)?;
+    if target_access.file {
+        return None;
+    }
+    let mut fields = Vec::new();
+    let mut file_fields = Vec::new();
+    for access in accesses {
+        if access.field == target {
+            continue;
+        }
+        if !fields.contains(&access.field) {
+            fields.push(access.field.clone());
+        }
+        if access.file && !file_fields.contains(&access.field) {
+            file_fields.push(access.field);
+        }
+    }
+    Some(MultipartForm {
+        fields,
+        file_fields,
+    })
+}
+
+/// A specific named field read from a Web `FormData` object. The taint engine reports the source as
+/// the coarse `request.formData()` call, so ordinary `req.body.name` member matching cannot locate
+/// the payload. Prefer a `.get()` binding named by the trace/sink; when there is exactly one textual
+/// field (the rest are file parts), it is unambiguous and can be driven directly.
+fn form_data_entry(finding: &Finding, source: Option<&str>) -> Option<Entry> {
+    if !finding.source.expr.contains("formData(") {
+        return None;
+    }
+    let accesses = form_data_accesses(source?);
+    let mut tainted: Vec<String> = finding
+        .trace
+        .iter()
+        .filter_map(|step| {
+            step.note
+                .strip_prefix("assigned to `")?
+                .strip_suffix('`')
+                .map(str::to_owned)
+        })
+        .collect();
+    tainted.extend(identifier_tokens(&finding.sink.arg));
+    if let Some(access) = accesses.iter().find(|access| {
+        !access.file
+            && access
+                .local
+                .as_ref()
+                .is_some_and(|local| tainted.contains(local))
+    }) {
+        return Some(Entry::Body(Some(access.field.clone())));
+    }
+    let textual: Vec<&FormDataAccess> = accesses.iter().filter(|access| !access.file).collect();
+    match textual.as_slice() {
+        [only] => Some(Entry::Body(Some(only.field.clone()))),
+        _ => None,
+    }
+}
+
+/// Every `const local = form.get("field")` access for a value returned by a Web
+/// `request.formData()` call. File/Blob fields are recognized only from strong uses (`arrayBuffer`,
+/// `stream`, `text`, or `instanceof File/Blob`), so an ordinary text part is never promoted merely
+/// because of its name.
+fn form_data_accesses(source: &str) -> Vec<FormDataAccess> {
+    let mut form_locals: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(".formData(") {
+        let at = from + rel;
+        from = at + ".formData(".len();
+        if let Some(local) = assigned_identifier_before(source, at)
+            && !form_locals.contains(&local)
+        {
+            form_locals.push(local);
+        }
+    }
+    let mut out: Vec<FormDataAccess> = Vec::new();
+    for form in form_locals {
+        let needle = format!("{form}.get(");
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            let open = at + needle.len() - 1;
+            let Some(close) = matching_close_paren(source, open) else {
+                continue;
+            };
+            let Some(field) = unquote(source[open + 1..close].trim()) else {
+                continue;
+            };
+            if !safe_form_field(&field) {
+                continue;
+            }
+            let local = assigned_identifier_before(source, at);
+            let direct_tail = source[close + 1..].trim_start();
+            let file = ["arrayBuffer", "stream", "text"].iter().any(|method| {
+                direct_tail.starts_with(&format!(".{method}("))
+                    || local
+                        .as_deref()
+                        .is_some_and(|name| identifier_member_call(source, name, method))
+            }) || local.as_deref().is_some_and(|name| {
+                identifier_instanceof(source, name, "File")
+                    || identifier_instanceof(source, name, "Blob")
+            });
+            if let Some(existing) = out.iter_mut().find(|access| access.field == field) {
+                existing.file |= file;
+                if existing.local.is_none() {
+                    existing.local = local;
+                }
+            } else {
+                out.push(FormDataAccess { field, local, file });
+            }
+        }
+    }
+    out
+}
+
+/// The identifier assigned immediately before a call (`const file = form.get(...)` -> `file`).
+/// Restricting this to a simple declaration/assignment in the same statement avoids treating a
+/// comparison or callback expression as a binding.
+fn assigned_identifier_before(source: &str, at: usize) -> Option<String> {
+    let prefix = source.get(..at)?;
+    let eq = prefix.rfind('=')?;
+    if prefix.as_bytes().get(eq.wrapping_sub(1)) == Some(&b'=')
+        || prefix.as_bytes().get(eq + 1) == Some(&b'>')
+    {
+        return None;
+    }
+    let start = prefix[..eq]
+        .rfind([';', '\n', '{', '}'])
+        .map_or(0, |index| index + 1);
+    let lhs = prefix[start..eq].trim();
+    let name = lhs
+        .split_whitespace()
+        .last()?
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '$');
+    (!name.is_empty()
+        && name.bytes().all(is_ident)
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| !byte.is_ascii_digit()))
+    .then(|| name.to_owned())
+}
+
+fn safe_form_field(field: &str) -> bool {
+    !field.is_empty()
+        && field.len() <= 128
+        && field.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'[' | b']')
+        })
+}
+
+fn identifier_member_call(source: &str, name: &str, method: &str) -> bool {
+    let needle = format!("{name}.{method}(");
+    source.match_indices(&needle).any(|(at, _)| {
+        source[..at]
+            .bytes()
+            .next_back()
+            .is_none_or(|byte| !is_ident(byte))
+    })
+}
+
+fn identifier_instanceof(source: &str, name: &str, class: &str) -> bool {
+    let needle = format!("{name} instanceof {class}");
+    source.match_indices(&needle).any(|(at, _)| {
+        source[..at]
+            .bytes()
+            .next_back()
+            .is_none_or(|byte| !is_ident(byte))
+    })
+}
+
 /// The most specific request entry among the finding's sink argument and source expression: a
 /// named query/body/path/header parameter is preferred over a whole-object body or the raw URL.
 fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Entry> {
+    if let Some(entry) = form_data_entry(finding, source) {
+        return Some(entry);
+    }
     // A Hono handler reads its request through method calls on a context object (`c.req.param('id')`,
     // `c.req.query('q')`, `c.req.header('x')`), and often destructures the whole-params object
     // (`const { module: mod } = c.req.param()`). The generic member-access logic names none of these,
@@ -4435,6 +4641,15 @@ fn params_sink_entry(finding: &Finding, path: &str, source: Option<&str>) -> Opt
     for name in interpolated_identifiers(&finding.sink.arg) {
         if path.contains(&format!("{{{name}}}")) && derived.contains(&name) {
             return Some(Entry::PathParam(name));
+        }
+    }
+    // A path param passed as a positional argument rather than interpolated (`path.join(base,
+    // '../client', filePath)`): a params-derived identifier the route declares a slot for and the
+    // sink argument names as a bare token. The route slot keeps this from matching an unrelated local.
+    let tokens = identifier_tokens(&finding.sink.arg);
+    for name in &derived {
+        if path.contains(&format!("{{{name}}}")) && tokens.contains(name) {
+            return Some(Entry::PathParam(name.clone()));
         }
     }
     None
@@ -7349,6 +7564,7 @@ module.exports = { activityValidators };\n";
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
+            multipart: None,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -7701,6 +7917,67 @@ module.exports = { activityValidators };\n";
         assert_eq!(probe.method, Method::Post);
         assert_eq!(probe.path, "/file-upload");
         assert_eq!(probe.entry, Entry::Body(None));
+    }
+
+    #[test]
+    fn request_form_data_resolves_the_text_field_and_required_file_part() {
+        let source = r#"
+          export async function POST(request) {
+            const form = await request.formData();
+            const upload = form.get("document");
+            const destination = form.get('destination');
+            const bytes = Buffer.from(await upload.arrayBuffer());
+            const name = `copy_${destination}_${Date.now()}.bin`;
+            await fs.writeFile(path.join(process.cwd(), "uploads", name), bytes);
+          }
+        "#;
+        let mut finding = finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("POST /upload"),
+            "request.formData()",
+        );
+        finding.sink.api = "fs.writeFile".to_owned();
+        finding.sink.arg = "path.join(process.cwd(), \"uploads\", name)".to_owned();
+        finding.trace.push(TraceStep {
+            file: None,
+            line: 5,
+            col: 1,
+            note: "assigned to `destination`".to_owned(),
+        });
+
+        let probe = Probe::from_finding_with_source(&finding, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::Body(Some("destination".to_owned())));
+        assert!(probe.creates);
+        assert_eq!(
+            multipart_form(source, "destination"),
+            Some(MultipartForm {
+                fields: vec!["document".to_owned()],
+                file_fields: vec!["document".to_owned()],
+            })
+        );
+        // A File-valued field needs a filename payload, which the text-field multipart driver does
+        // not guess at. It must remain unsupported rather than silently sending the wrong shape.
+        assert_eq!(multipart_form(source, "document"), None);
+    }
+
+    #[test]
+    fn form_data_file_detection_does_not_promote_plain_text_fields_by_name() {
+        let source = r#"
+          async function POST(req) {
+            const formData = await req.formData();
+            const filename = formData.get("filename");
+            const note = formData.get("note");
+            return fs.writeFile(filename, note);
+          }
+        "#;
+        assert_eq!(
+            multipart_form(source, "filename"),
+            Some(MultipartForm {
+                fields: vec!["note".to_owned()],
+                file_fields: Vec::new(),
+            })
+        );
     }
 
     /// A DOM finding: a browser-side source and sink, in a static front-end file.
@@ -8131,6 +8408,37 @@ module.exports = { activityValidators };\n";
         assert!(env.url_safe);
         // Without the handler source the coarse `req.params` stays unresolved, never guessed.
         assert!(Probe::from_finding(&f).is_err());
+    }
+
+    #[test]
+    fn a_params_segment_passed_positionally_to_path_join_resolves_the_route_slot() {
+        // An Azure Functions v4 handler destructures a catch-all route param and passes it as a
+        // positional `path.join(base, '../client', filePath)` argument rather than interpolating it.
+        // The planner must still map the tainted local back to its `{filePath}` route slot.
+        let source = r#"
+          app.http('getChunks', { route: 'chunks/{*filePath}', methods: ['GET'], handler: (request, context) => {
+            const { filePath } = request.params;
+            return { body: fs.readFileSync(path.join(__dirname, '../client', filePath)) };
+          } });
+        "#;
+        let mut f = finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("GET /api/chunks/{filePath}"),
+            "request.params",
+        );
+        f.sink.api = "fs.readFileSync".to_owned();
+        f.sink.arg = "path.join(__dirname, '../client', filePath)".to_owned();
+        f.trace = vec![TraceStep {
+            file: None,
+            line: 1,
+            col: 1,
+            note: "assigned to `filePath`".to_owned(),
+        }];
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::PathParam("filePath".to_owned()));
+        assert_eq!(probe.path, "/api/chunks/{filePath}");
+        assert_eq!(probe.method, Method::Get);
     }
 
     #[test]

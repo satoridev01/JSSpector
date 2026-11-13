@@ -2956,6 +2956,52 @@ fn is_controller_action(expr: &Expression<'_>) -> bool {
         })
 }
 
+/// A member of a validation namespace whose name only *mentions* an authentication word as part of
+/// the operation it validates: `userValidations.completeEmailLogin`. Authentication middleware is
+/// named for the guard it performs (`requireLogin`, `verifyToken`, `authRequest`, ...); a validator
+/// namespace's ordinary operation callbacks are not guards merely because the operation is a login.
+/// Keep explicit guard-shaped leaves eligible for the normal auth model so a project that stores a
+/// real `requireLogin` guard under `authValidators` is not downgraded.
+fn is_non_guard_validation_member(expr: &Expression<'_>) -> bool {
+    let Some(name) = callee_name(expr) else {
+        return false;
+    };
+    let Some((owner, leaf)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let validation_owner = owner.split('.').any(|segment| {
+        let lower = segment.to_ascii_lowercase();
+        ["validator", "validators", "validation", "validations"]
+            .iter()
+            .any(|suffix| lower == *suffix || lower.ends_with(suffix))
+    });
+    if !validation_owner {
+        return false;
+    }
+    let leaf = leaf.to_ascii_lowercase();
+    let explicit_guard = [
+        "auth",
+        "authenticate",
+        "authorize",
+        "authorise",
+        "ensureauth",
+        "ensurelogin",
+        "haspermission",
+        "isadmin",
+        "isauthenticated",
+        "islogged",
+        "loginrequired",
+        "protect",
+        "require",
+        "verifyauth",
+        "verifyjwt",
+        "verifytoken",
+    ]
+    .iter()
+    .any(|prefix| leaf.starts_with(prefix));
+    !explicit_guard
+}
+
 /// The top-level functions of a file that return a function they define: `function
 /// makeHandler(rt) { return (req, res) => ... }`, `const make = (rt) => (req, res) => ...`
 /// (exported or not). The returned closure is walked as part of the factory, so its calls are the
@@ -3101,6 +3147,7 @@ fn route_middleware_auth(expr: &Expression<'_>) -> Option<Auth> {
         // default deployment's posture, so it adds no requirement of its own.
         _ if is_conditional_permission_guard(expr) => None,
         _ if !is_controller_action(expr) => callee_name(expr)
+            .filter(|_| !is_non_guard_validation_member(expr))
             .and_then(|name| m().auth_of(&name))
             .or_else(|| inline_guard_auth(expr)),
         _ => None,
@@ -3185,6 +3232,117 @@ fn object_prop<'a, 'e>(expr: &'e Expression<'a>, names: &[&str]) -> Option<&'e E
             }
             _ => None,
         })
+}
+
+/// The HTTP handler of a module-worker default export (`export default { async fetch(request, env,
+/// ctx) {...} }`), as the walker name its `fetch` method is analyzed under (`fetch`), or `None` when
+/// the object has no such method. Cloudflare Workers, Deno (`Deno.serve`-style default export) and Bun
+/// all serve an HTTP origin by invoking the default export's `fetch(request)` method once per request;
+/// the runtime reads nothing else to dispatch, so that one method handles every method and path of the
+/// origin. Recognised structurally — a function-valued `fetch` property that takes at least the request
+/// parameter — so no runtime package identifier or global is assumed, and a plain data object with a
+/// `fetch: url` field is not mistaken for one.
+fn module_worker_fetch_handler(object: &ObjectExpression<'_>) -> Option<String> {
+    object.properties.iter().find_map(|property| {
+        let ObjectPropertyKind::ObjectProperty(p) = property else {
+            return None;
+        };
+        let key = prop_name(&p.key)?;
+        if key != "fetch" {
+            return None;
+        }
+        let takes_request = match p.value.get_inner_expression() {
+            Expression::FunctionExpression(f) => !f.params.items.is_empty(),
+            Expression::ArrowFunctionExpression(f) => !f.params.items.is_empty(),
+            _ => return None,
+        };
+        takes_request.then_some(key)
+    })
+}
+
+/// The route an Azure Functions v4 HTTP registration serves, as a `"METHOD /path"` entry, or `None`
+/// when the call is not such a registration. `app.http('name', { route, methods, handler })` serves
+/// the function under the `/api/<route>` prefix the Functions host applies by default, defaulting the
+/// route template to the function name and the method to `GET`. A catch-all `{*seg}` slot and a
+/// constrained `{seg:int}` slot collapse to a plain `{seg}` the request planner can fill. Recognised
+/// structurally — an `http` registration method, a string-literal function name and an options object
+/// carrying a `handler` function — so no `@azure/*` package identifier is assumed.
+fn azure_http_route(callee: &Callee, arguments: &[Argument<'_>]) -> Option<String> {
+    let Callee::Method { method, .. } = callee else {
+        return None;
+    };
+    if method != "http" {
+        return None;
+    }
+    let string_of = |e: &Expression<'_>| match e.get_inner_expression() {
+        Expression::StringLiteral(l) => l.value.as_str().map(str::to_owned),
+        _ => None,
+    };
+    let name = arguments
+        .first()
+        .and_then(Argument::as_expression)
+        .and_then(string_of)?;
+    let object = arguments.iter().find_map(|a| {
+        let expr = a.as_expression()?;
+        matches!(expr.get_inner_expression(), Expression::ObjectExpression(_)).then_some(expr)
+    })?;
+    let has_handler = object_prop(object, &["handler"]).is_some_and(|v| {
+        matches!(
+            v.get_inner_expression(),
+            Expression::ArrowFunctionExpression(_)
+                | Expression::FunctionExpression(_)
+                | Expression::Identifier(_)
+        )
+    });
+    if !has_handler {
+        return None;
+    }
+    let template = object_prop(object, &["route"])
+        .and_then(string_of)
+        .unwrap_or(name);
+    let verb = object_prop(object, &["methods"])
+        .and_then(|v| match v.get_inner_expression() {
+            Expression::ArrayExpression(a) => a
+                .elements
+                .iter()
+                .find_map(|e| e.as_expression().and_then(string_of)),
+            _ => string_of(v),
+        })
+        .map(|v| v.to_ascii_uppercase())
+        .unwrap_or_else(|| "GET".to_owned());
+    Some(format!("{verb} {}", azure_normalize_route(&template)))
+}
+
+/// An Azure Functions route template as the HTTP path it is served under: the default `/api` prefix,
+/// then the template with each `{*seg}` catch-all and `{seg:constraint}` slot reduced to a plain
+/// `{seg}` the planner fills. `chunks/{*filePath}` becomes `/api/chunks/{filePath}`.
+fn azure_normalize_route(template: &str) -> String {
+    let mut out = String::from("/api/");
+    let mut chars = template.trim_start_matches('/').chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '{' {
+            out.push(c);
+            continue;
+        }
+        out.push('{');
+        if chars.peek() == Some(&'*') {
+            chars.next();
+        }
+        while let Some(&n) = chars.peek() {
+            if n == '}' {
+                break;
+            }
+            if n == ':' {
+                while chars.peek().is_some_and(|&m| m != '}') {
+                    chars.next();
+                }
+                break;
+            }
+            out.push(n);
+            chars.next();
+        }
+    }
+    out
 }
 
 /// `GET`, `post`, `Delete`: an HTTP method name, as `router.route('POST', path, h)` takes it.
@@ -4008,6 +4166,27 @@ impl Walker<'_> {
                 }
                 other => {
                     if let Some(expr) = other.as_expression() {
+                        // Cloudflare/Deno/Bun module worker: `export default { fetch(request, env,
+                        // ctx) {...} }`. The runtime serves the whole HTTP origin by invoking the
+                        // default export's `fetch` method per request, so that method is the entry
+                        // point for every path and method.
+                        if let Expression::ObjectExpression(object) = expr.get_inner_expression()
+                            && let Some(handler) = module_worker_fetch_handler(object)
+                            && !self.summarize
+                            && !self.record_only
+                        {
+                            self.facts.routes.push(RouteFact {
+                                at: None,
+                                receiver: None,
+                                receiver_file: None,
+                                method: "ANY".to_owned(),
+                                path: "/".to_owned(),
+                                handler,
+                                span: expr.span(),
+                                auth: Auth::NoneDetected,
+                                kind: "http",
+                            });
+                        }
                         match expr.get_inner_expression() {
                             Expression::Identifier(id) => {
                                 self.facts
@@ -9075,6 +9254,9 @@ impl Walker<'_> {
                     continue;
                 };
                 let route = (shape == Shape::RouteObject).then(|| {
+                    if let Some(azure) = azure_http_route(&callee, &call.arguments) {
+                        return azure;
+                    }
                     let text = |key: &str| {
                         object_prop(argument.as_expression()?, &[key]).and_then(|v| {
                             match v.get_inner_expression() {
@@ -10326,6 +10508,12 @@ impl Walker<'_> {
                     Some(Expression::ObjectExpression(_))
                 )
             {
+                return (Role::Plain, Shape::RouteObject);
+            }
+            // Azure Functions v4: `app.http('name', { route, methods, handler })` — the options
+            // object (with the handler) follows the function-name argument, so it is driven as a
+            // route object whose path/method come from the Azure route template.
+            if azure_http_route(callee, arguments).is_some() {
                 return (Role::Plain, Shape::RouteObject);
             }
             // `app.get(path, handler)` on a router: a factory's product, a router-like name or a
@@ -12894,6 +13082,15 @@ impl Walker<'_> {
             if sink_for_api(&summary.api).is_some_and(|s| has(&s.ignore_kinds, origin.kind)) {
                 continue;
             }
+            // Preserve the sink-side shape while this finding is turned into another summary.
+            // Without this, a first helper can establish that text is built HTML/SQL, but a
+            // second helper loses that fact: the current call is accepted, then its transitive
+            // summary records only the caller-side origin. A later caller therefore never sees
+            // the same sink. This is especially important for DOM flows such as
+            // `callback -> updateDisplay -> renderCard -> innerHTML`.
+            let mut origin = origin;
+            origin.built = built;
+            origin.sqlish = sqlish;
             let mut origin = origin.step(call_span.start, format!("passed to `{name}()`"));
             for step in summary.steps.iter().filter(|_| summary.ext.is_none()) {
                 if origin.steps.len() < MAX_STEPS {
@@ -13255,8 +13452,7 @@ mod tests {
     use oxc_allocator::Allocator;
     use oxc_parser::Parser;
 
-    /// (class, sink api, source kind) for every finding in `src`.
-    fn scan(src: &str) -> Vec<(VulnClass, Severity, String, &'static str)> {
+    fn raw_findings(src: &str) -> Vec<RawFinding> {
         let allocator = Allocator::default();
         let ret = Parser::new(
             &allocator,
@@ -13266,8 +13462,12 @@ mod tests {
         .with_options(parse_options())
         .parse();
         assert!(!ret.fatal_error, "{:?}", ret.diagnostics);
-        scan_program(&ret.program, src)
-            .findings
+        scan_program(&ret.program, src).findings
+    }
+
+    /// (class, sink api, source kind) for every finding in `src`.
+    fn scan(src: &str) -> Vec<(VulnClass, Severity, String, &'static str)> {
+        raw_findings(src)
             .into_iter()
             .map(|f| (f.class, f.severity, f.api, f.origin.kind))
             .collect()
@@ -13338,6 +13538,58 @@ mod tests {
                  function walk(o, d) { if (d > 3) return o; for (const k in o) walk(o[k], d + 1); return o; }\n",
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn transitive_xss_summaries_preserve_each_material_call_path() {
+        let src = "function renderPkceCard(authCode) {\n\
+                       card.innerHTML = `<pre>${authCode}</pre>`;\n\
+                   }\n\
+                   function updatePkceDisplay(authCode) {\n\
+                       renderPkceCard(authCode);\n\
+                   }\n\
+                   async function handleRedirectCallback() {\n\
+                       const params = new URLSearchParams(window.location.search);\n\
+                       const code = params.get('code');\n\
+                       updatePkceDisplay(code || 'N/A');\n\
+                       if (!code) return;\n\
+                       const tokenData = await exchangeCodeForTokens(code);\n\
+                       showTokens(tokenData);\n\
+                   }\n\
+                   function showTokens(tokenData) {\n\
+                       const authCode = new URLSearchParams(window.location.search).get('code');\n\
+                       renderPkceCard(authCode || 'N/A');\n\
+                   }";
+        let found = raw_findings(src);
+        let functions: Vec<&str> = found
+            .iter()
+            .map(|finding| finding.function.as_str())
+            .collect();
+        assert_eq!(
+            functions,
+            ["handleRedirectCallback", "showTokens"],
+            "both the direct pre-validation path and the later gated path must survive: {found:?}",
+        );
+        assert!(
+            found.iter().all(|finding| {
+                finding.class == VulnClass::Xss && finding.api == ".innerHTML ="
+            })
+        );
+        let direct = &found[0];
+        assert!(
+            direct
+                .origin
+                .steps
+                .iter()
+                .any(|(_, note)| note == "passed to `updatePkceDisplay()`")
+        );
+        assert!(
+            direct
+                .origin
+                .steps
+                .iter()
+                .any(|(_, note)| note == "passed to `renderPkceCard()`")
         );
     }
 
@@ -15035,6 +15287,19 @@ mod tests {
             "fastify.route({ method: 'GET', url: '/x', handler: async (request, reply) => { exec('ls ' + request.query.d); } });",
         );
         assert_eq!(fastify.len(), 1, "{fastify:?}");
+        // Azure Functions v4: `app.http('name', { route, methods, handler })` registers an HTTP route
+        // whose handler reads the request, so a `request.params` value reaching a file sink is a finding.
+        let azure = one(
+            "app.http('getChunks', { route: 'chunks/{*filePath}', methods: ['GET'], handler: (request, context) => { const { filePath } = request.params; return { body: fs.readFileSync(path.join(__dirname, '../client', filePath)) }; } });",
+        );
+        assert_eq!(
+            azure.iter().map(|f| (f.0, f.3)).collect::<Vec<_>>(),
+            vec![(VulnClass::PathTraversal, "http")],
+            "{azure:?}",
+        );
+        // The function name alone (no `handler`) is not a route object, so an ordinary `obj.http(name)`
+        // call is not mistaken for one.
+        assert!(one("widget.http('open', 'ignored');").is_empty());
     }
 
     #[test]
@@ -15178,6 +15443,20 @@ mod tests {
                 "app.post('/p', ensureFileIsPassed, (req, res) => { exec('ping ' + req.body.h); });"
             ),
             vec![(Auth::NoneDetected, Severity::Critical)]
+        );
+        assert_eq!(
+            auth_of(
+                "app.post('/p', userValidations.completeEmailLogin, (req, res) => { exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::NoneDetected, Severity::Critical)],
+            "a validator for a login operation is not authentication middleware"
+        );
+        assert_eq!(
+            auth_of(
+                "app.post('/p', authValidators.requireLogin, (req, res) => { exec('ping ' + req.body.h); });"
+            ),
+            vec![(Auth::User, Severity::Critical)],
+            "an explicitly guard-shaped member stays authentication even under a validator namespace"
         );
         assert_eq!(
             auth_of(

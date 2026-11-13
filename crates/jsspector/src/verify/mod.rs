@@ -30,8 +30,7 @@ pub struct ControlObservation {
 }
 
 /// What verification concluded about one finding.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "outcome", rename_all = "kebab-case")]
+#[derive(Debug, Clone)]
 pub enum Outcome {
     /// The app reproduced the finding; `how` names the request that did it.
     Verified { how: String, poc: Reproduction },
@@ -72,13 +71,11 @@ impl Outcome {
 }
 
 /// A finding's verdict, for the report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct Verdict {
     pub fingerprint: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
     pub class: String,
-    #[serde(flatten)]
     pub outcome: Outcome,
 }
 
@@ -200,6 +197,9 @@ pub fn run(
                 }
             }
             probe.siblings = siblings;
+            if part == "body" {
+                probe.multipart = plan::multipart_form(&source, &target);
+            }
         }
     }
     // A route often reaches the sink on only one value of a non-payload path segment
@@ -331,12 +331,8 @@ pub fn run(
             let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
             let mined =
                 plan::validator_required_body_fields(&route_src, at.line, &payload_field, &resolve);
-            if probe.body_query_override.is_some()
-                && let Some(value) =
-                    plan::validator_body_field_filler(&route_src, at.line, &payload_field, &resolve)
-            {
-                probe.body_query_override = Some(value);
-            }
+            let payload_filler =
+                plan::validator_body_field_filler(&route_src, at.line, &payload_field, &resolve);
             if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
                 let idents = plan::route_middleware_idents(&route_src, at.line);
                 let resolved: Vec<(String, bool, bool)> = idents
@@ -356,11 +352,13 @@ pub fn run(
                     probe.entry, at.file, at.line
                 );
             }
-            for (field, value) in mined {
-                if probe.siblings.iter().all(|(k, _)| *k != field) {
-                    probe.siblings.push((field, value));
-                }
-            }
+            apply_body_validator_fillers(
+                &mut probe.siblings,
+                &mut probe.body_query_override,
+                &payload_field,
+                payload_filler,
+                mined,
+            );
         }
     }
     // A SQL injection whose tainted value is interpolated in a table-identifier position
@@ -637,6 +635,37 @@ pub fn run(
     Ok(verdicts)
 }
 
+/// Applies the express-validator body requirements mined for one route. The payload field's own
+/// typed filler is retained as a sibling because NoSQL verification also probes alternate common
+/// fields in the same body: the body builder removes this sibling when the primary field itself
+/// carries the operator, and keeps it for an alternate field (`token[$ne]`) so a required primary
+/// `.isEmail()` still passes. The same filler remains the scalar body half of a body/query overwrite
+/// probe when that specialized case is enabled.
+fn apply_body_validator_fillers(
+    siblings: &mut Vec<(String, String)>,
+    body_query_override: &mut Option<String>,
+    payload_field: &str,
+    payload_filler: Option<String>,
+    required: Vec<(String, String)>,
+) {
+    if body_query_override.is_some()
+        && let Some(value) = payload_filler.clone()
+    {
+        *body_query_override = Some(value);
+    }
+    if !payload_field.is_empty()
+        && let Some(value) = payload_filler
+        && siblings.iter().all(|(field, _)| field != payload_field)
+    {
+        siblings.push((payload_field.to_owned(), value));
+    }
+    for (field, value) in required {
+        if siblings.iter().all(|(name, _)| *name != field) {
+            siblings.push((field, value));
+        }
+    }
+}
+
 /// The source of the module that defines `fn_name`, for a parse function the handler consumes: the
 /// handler's own source when the function is local, otherwise the imported module resolved relative to
 /// the handler file (trying the common JavaScript module file names). `None` when it cannot be found.
@@ -877,7 +906,7 @@ pub fn write_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_middleware_source, resolve_module_source};
+    use super::{apply_body_validator_fillers, resolve_middleware_source, resolve_module_source};
 
     #[test]
     fn imported_transform_modules_cannot_escape_the_scan_root() {
@@ -995,5 +1024,43 @@ module.exports = { unrelatedValidators, userEngagementValidators };\n";
                 ("month".to_owned(), "1".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn primary_validator_filler_survives_as_a_sibling_for_an_alternate_body_probe() {
+        let route = r#"router.post(
+  "/completeEmailLogin",
+  userValidations.completeEmailLogin,
+  userController.completeEmailLogin
+);"#;
+        let validators = r#"
+const completeEmailLogin = [[
+  body("email").exists().bail().isEmail(),
+  body("token").exists().bail().notEmpty(),
+]];
+module.exports = { completeEmailLogin };
+"#;
+        let resolve = |name: &str| (name == "userValidations").then(|| validators.to_owned());
+        let required = super::plan::validator_required_body_fields(route, 1, "email", &resolve);
+        let primary = super::plan::validator_body_field_filler(route, 1, "email", &resolve);
+        let mut siblings = Vec::new();
+        let mut body_query_override = Some("generic-placeholder".to_owned());
+
+        apply_body_validator_fillers(
+            &mut siblings,
+            &mut body_query_override,
+            "email",
+            primary,
+            required,
+        );
+
+        assert_eq!(
+            siblings,
+            vec![
+                ("email".to_owned(), "jss@jsspector.test".to_owned()),
+                ("token".to_owned(), "jsspector".to_owned()),
+            ]
+        );
+        assert_eq!(body_query_override.as_deref(), Some("jss@jsspector.test"));
     }
 }

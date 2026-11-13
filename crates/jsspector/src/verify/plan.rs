@@ -4525,7 +4525,13 @@ fn coarse_part_field_entry(finding: &Finding, path: &str, source: Option<&str>) 
     if !matches!(part, "query" | "body" | "params" | "headers" | "header") {
         return None;
     }
-    let src = source?;
+    let whole = source?;
+    // Resolve the coarse part's field from the handler that actually reaches the sink, not the whole
+    // file: a sibling route elsewhere in the same module may read `req.body.<other>` (a CSRF token on
+    // an unrelated endpoint), and the single-field fallback below would otherwise pick that unrelated
+    // member instead of the field this handler reads. Scope to the enclosing block of the source line
+    // when it can be isolated; fall back to the whole file when it cannot.
+    let src = handler_scope(whole, finding.source.line).unwrap_or(whole);
     let tainted = tainted_identifiers(finding, &Entry::Url);
     // The distinct fields of this part the handler actually reads (`req.query.q` -> `q`), in source
     // order. A field whose name is itself a tainted identifier (the handler destructured it, so the
@@ -5560,6 +5566,17 @@ fn enclosing_block(source: &str, offset: usize) -> Option<(usize, usize)> {
     }
     let open = *stack.last()?;
     Some((open, matching_close_brace(source, open)?))
+}
+
+/// The source of the braced block that encloses `line` (a route handler's body), used to resolve a
+/// request input from the handler that reaches the sink rather than from the whole module — so an
+/// unrelated sibling route's member reads do not leak into the resolution. Returns `None` when `line`
+/// is not inside any block (top-level code) or cannot be located, leaving the caller to use the whole
+/// source. Not tied to any app: it is brace matching around the finding's own source line.
+fn handler_scope(source: &str, line: u32) -> Option<&str> {
+    let offset = line_offset(source, line as usize)?;
+    let (open, close) = enclosing_block(source, offset)?;
+    source.get(open..=close)
 }
 
 fn guard_clause_exits(after: &str) -> bool {
@@ -7917,6 +7934,42 @@ module.exports = { activityValidators };\n";
         assert_eq!(probe.method, Method::Post);
         assert_eq!(probe.path, "/file-upload");
         assert_eq!(probe.entry, Entry::Body(None));
+    }
+
+    #[test]
+    fn a_coarse_body_ssrf_resolves_the_field_its_own_handler_destructures() {
+        // The handler under test destructures `const { repostId } = req.body`; an unrelated sibling
+        // route reads `req.body.csrfToken`. Resolution must pin the destructured field of the handler
+        // that reaches the sink, not the only `req.body.<field>` member read elsewhere in the module.
+        let source = "\n\
+            app.post('/delete', async (req, res) => {\n\
+            \x20 if (typeof req.body.csrfToken !== 'string') return;\n\
+            \x20 await doDelete();\n\
+            });\n\
+            app.post('/repost', async (req, res) => {\n\
+            \x20 const { repostId } = req.body;\n\
+            \x20 const repostThreadsUrl = buildGraphAPIURL(`${repostId}/repost`);\n\
+            \x20 await axios.post(repostThreadsUrl, {});\n\
+            });\n";
+        let mut finding = finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("POST /repost"),
+            "req.body",
+        );
+        finding.sink.api = "http-client.post".to_owned();
+        finding.sink.arg = "repostThreadsUrl".to_owned();
+        finding.sink.line = 9;
+        finding.source.line = 7;
+        finding.trace.push(TraceStep {
+            file: None,
+            line: 7,
+            col: 9,
+            note: "assigned to `repostId`".to_owned(),
+        });
+
+        let probe = Probe::from_finding_with_source(&finding, Some(source)).unwrap();
+        assert_eq!(probe.entry, Entry::Body(Some("repostId".to_owned())));
     }
 
     #[test]

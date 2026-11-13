@@ -149,6 +149,16 @@ pub struct Session {
     /// it was meant to avoid (`path.join(getDataPath())` on a non-string). Collected by
     /// [`guarded_bare_requires`]; empty when there is no entry module or it guards nothing.
     guarded_modules: Vec<String>,
+    /// The app's launch command as a JSON argv array (the image `CMD`). Kept so a retry that must
+    /// first provision a runtime file (a TLS key/cert the app reads before it listens; see
+    /// [`missing_tls_material`]) can wrap the launch in a shell that stages that file and then
+    /// `exec`s this exact command.
+    start_command: String,
+    /// Whether the app serves TLS: set when startup needed a self-signed key/cert pair provisioned
+    /// so its `https`/`tls` server could bind. The driver then speaks HTTPS to it (see
+    /// [`request_spec`]); it also falls back across protocols, so this is an ordering hint, not a
+    /// security relaxation of the app.
+    tls: bool,
     torn_down: bool,
 }
 
@@ -295,6 +305,8 @@ impl Session {
                 .and_then(|entry| std::fs::read_to_string(root.join(entry)).ok())
                 .map(|src| guarded_bare_requires(&src).into_iter().collect())
                 .unwrap_or_default(),
+            start_command: start_command.clone(),
+            tls: false,
             torn_down: false,
         };
         if let Err(err) = session.boot() {
@@ -380,6 +392,8 @@ impl Session {
                 .and_then(|entry| std::fs::read_to_string(root.join(entry)).ok())
                 .map(|src| guarded_bare_requires(&src).into_iter().collect())
                 .unwrap_or_default(),
+            start_command: start_command.clone(),
+            tls: false,
             torn_down: false,
         };
         session.boot_local()?;
@@ -542,8 +556,13 @@ impl Session {
         // Directories the app tried to write into on startup before their parent existed
         // (see [`missing_write_dir`]); mounted as empty writable scratch on the next attempt.
         let mut scratch_dirs: Vec<String> = Vec::new();
+        // TLS key/cert files the app reads to stand up an `https`/`tls` server before it listens
+        // (see [`missing_tls_material`]); staged from the self-signed marker pair on the next
+        // attempt so the server can bind. Each entry is (container path, is_key).
+        let mut cert_files: Vec<(String, bool)> = Vec::new();
         for _ in 0..5 {
-            self.run_app(&env, stub_missing_modules, &scratch_dirs)?;
+            self.tls = !cert_files.is_empty();
+            self.run_app(&env, stub_missing_modules, &scratch_dirs, &cert_files)?;
             let err = match self.wait_until_listening() {
                 Ok(port) => {
                     self.port = port;
@@ -565,7 +584,10 @@ impl Session {
             }
             let enable_module_stub = !stub_missing_modules && missing_bare_module(&err);
             let new_dir = missing_write_dir(&err).filter(|dir| !scratch_dirs.contains(dir));
-            if missing.is_empty() && !enable_module_stub && new_dir.is_none() {
+            let new_cert = missing_tls_material(&err)
+                .filter(|(path, _)| cert_files.iter().all(|(have, _)| have != path));
+            if missing.is_empty() && !enable_module_stub && new_dir.is_none() && new_cert.is_none()
+            {
                 return Err(err);
             }
             remove_container(&self.app);
@@ -573,6 +595,9 @@ impl Session {
             stub_missing_modules |= enable_module_stub;
             if let Some(dir) = new_dir {
                 scratch_dirs.push(dir);
+            }
+            if let Some(cert) = new_cert {
+                cert_files.push(cert);
             }
         }
         Err("the app still could not start after five launch attempts".to_owned())
@@ -586,6 +611,7 @@ impl Session {
         env: &[RequiredEnv],
         stub_missing_modules: bool,
         scratch_dirs: &[String],
+        cert_files: &[(String, bool)],
     ) -> Result<(), String> {
         // The app: on the private network, hardened, its scratch space in tmpfs, no extra
         // privileges, bounded memory, CPUs and processes.
@@ -682,9 +708,51 @@ impl Session {
             args.push(format!("{name}={value}"));
         }
         args.push(self.tag.clone());
+        // A TLS server reads its key/cert off the filesystem before it listens; when those files are
+        // absent the app exits on startup. Stage the self-signed marker pair (already baked into the
+        // image, and trusted by the app through `NODE_EXTRA_CA_CERTS`) at the exact paths the app
+        // read, then `exec` the app's own launch command unchanged. This satisfies a genuine runtime
+        // precondition — a server needs a certificate to serve TLS — without altering the app, and
+        // the key/cert are a matching pair so the handshake the driver performs is real.
+        if let Some(command) = self.cert_staging_command(cert_files) {
+            args.push("sh".to_owned());
+            args.push("-c".to_owned());
+            args.push(command);
+        }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         docker(&args).map_err(|e| format!("could not start the app: {e}"))?;
         Ok(())
+    }
+
+    /// The `sh -c` launch wrapper that stages each requested TLS key/cert file from the baked
+    /// self-signed marker pair (`/jss-marker.key`, `/jss-marker.crt`) and then `exec`s the app's own
+    /// launch command (the image `CMD`), or `None` when nothing needs staging. The app's command is
+    /// taken verbatim from its manifest/entry (see [`start_command`]); only a filesystem fixture is
+    /// added ahead of it.
+    fn cert_staging_command(&self, cert_files: &[(String, bool)]) -> Option<String> {
+        if cert_files.is_empty() {
+            return None;
+        }
+        let argv: Vec<String> = serde_json::from_str(&self.start_command).ok()?;
+        if argv.is_empty() {
+            return None;
+        }
+        let exec = argv
+            .iter()
+            .map(|word| shell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut script = String::new();
+        for (path, is_key) in cert_files {
+            let source = if *is_key {
+                "/jss-marker.key"
+            } else {
+                "/jss-marker.crt"
+            };
+            script.push_str(&format!("cp {} {} && ", source, shell_quote(path)));
+        }
+        script.push_str(&format!("exec {exec}"));
+        Some(script)
     }
 
     fn start_db(&self) -> Result<(), String> {
@@ -1227,6 +1295,7 @@ impl Session {
                 format!("multipart/form-data; boundary={boundary}"),
             )],
             &multipart,
+            self.tls,
         );
         let output = self
             .exec(&self.app, &["node", "/jss-driver.js", &spec])
@@ -1902,7 +1971,7 @@ impl Session {
     }
 
     fn fetch(&self, attempt: &Attempt) -> Option<String> {
-        let spec = request_spec(attempt, self.port, !self.omit_forwarding.get());
+        let spec = request_spec(attempt, self.port, !self.omit_forwarding.get(), self.tls);
         let output = self
             .exec(&self.app, &["node", "/jss-driver.js", &spec])
             .ok()?;
@@ -1922,7 +1991,7 @@ impl Session {
 
     /// Sends one request from inside the app container and checks its signal.
     fn send(&self, attempt: &Attempt) -> Option<Reproduction> {
-        let spec = request_spec(attempt, self.port, !self.omit_forwarding.get());
+        let spec = request_spec(attempt, self.port, !self.omit_forwarding.get(), self.tls);
         let output = match self.exec(&self.app, &["node", "/jss-driver.js", &spec]) {
             Ok(output) => output,
             Err(_) => return None,
@@ -3700,6 +3769,64 @@ fn missing_write_dir(log: &str) -> Option<String> {
     Some(parent.to_string_lossy().into_owned())
 }
 
+/// When startup fails because the app tried to *read* a TLS key or certificate file that is not in
+/// the checkout (`ENOENT` on a `.pem`/`.key`/`.crt`/`.cert`/`.cer` path from a read-family `fs`
+/// call), the absolute path the app expected and whether it is the private key (as opposed to the
+/// certificate). An `https`/`tls` server reads this material before it binds; without it the process
+/// exits before listening. The sandbox stages the self-signed marker pair there on the next attempt
+/// (see [`Session::cert_staging_command`]) — a server genuinely needs a certificate to serve TLS, so
+/// this reproduces a deployment precondition rather than neutralizing any input. Returns the path and
+/// `is_key`, or `None` when the failure is something else.
+///
+/// Only a file whose name marks it as TLS material qualifies, and only for a read: conjuring an
+/// arbitrary file the app meant to consume could mask a real missing-input failure, so the extension
+/// (and, for `.pem`, a key/cert hint in the name) must be unambiguous.
+fn missing_tls_material(log: &str) -> Option<(String, bool)> {
+    if !log.contains("ENOENT") {
+        return None;
+    }
+    // A read-family fs operation must appear: the app meant to load this file, not create it. The app
+    // may construct the path with `path.join`, so the read op can be several frames above the failing
+    // call; requiring any read op in the log is enough to distinguish a load from a write.
+    const READ_OPS: [&str; 4] = ["readFileSync", "readFile", "createReadStream", "read("];
+    if !READ_OPS.iter().any(|op| log.contains(op)) {
+        return None;
+    }
+    let line = log
+        .lines()
+        .find(|line| line.contains("ENOENT: no such file or directory"))?;
+    // The failing path is the last single-quoted segment on the message line (`... open '/app/x.pem'`).
+    let mut path: Option<&str> = None;
+    let mut rest = line;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('\'') else {
+            break;
+        };
+        path = Some(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    let path = path?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    let lower = name.to_ascii_lowercase();
+    let is_tls_ext = lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || lower.ends_with(".crt")
+        || lower.ends_with(".cert")
+        || lower.ends_with(".cer");
+    if !is_tls_ext {
+        return None;
+    }
+    // `.key` is always the private key; `.crt`/`.cert`/`.cer` are always the certificate. A `.pem`
+    // can be either, decided by a `key`/`cert` hint in the file name (`server-key.pem` vs
+    // `server-cert.pem`/`server.pem`); a bare `.pem` with no hint is treated as the certificate.
+    let is_key = lower.ends_with(".key") || (lower.ends_with(".pem") && lower.contains("key"));
+    Some((path.to_owned(), is_key))
+}
+
 /// External-service credential environment variables a sink is gated on, read by name from the
 /// sink's own module and the modules it imports (`gating_sources`). Each is given a strong random
 /// filler so the handler's "a credential is configured" branch — the one the sink sits behind — is
@@ -5074,7 +5201,7 @@ fn container_dir(app: &std::path::Path) -> Option<String> {
 }
 
 /// The request the driver sends, as a compact JSON spec on one argv slot.
-fn request_spec(attempt: &Attempt, port: u16, forward: bool) -> String {
+fn request_spec(attempt: &Attempt, port: u16, forward: bool, tls: bool) -> String {
     let mut pairs: Vec<(String, String)> = attempt.headers.clone();
     // Give each driven request a distinct client address. A per-IP rate limiter buckets requests by
     // `X-Forwarded-For` (or a shared default when absent), so the scanner's own probe volume would
@@ -5110,7 +5237,7 @@ fn request_spec(attempt: &Attempt, port: u16, forward: bool) -> String {
         None => "null".to_owned(),
     };
     format!(
-        "{{\"port\":{port},\"method\":\"{}\",\"path\":\"{}\",\"headers\":{{{headers}}},\"body\":{body}}}",
+        "{{\"port\":{port},\"method\":\"{}\",\"path\":\"{}\",\"headers\":{{{headers}}},\"body\":{body},\"tls\":{tls}}}",
         attempt.verb,
         esc(&attempt.target)
     )
@@ -5122,6 +5249,7 @@ fn binary_request_spec(
     path: &str,
     headers: &[(String, String)],
     body: &[u8],
+    tls: bool,
 ) -> String {
     let headers: serde_json::Map<String, serde_json::Value> = headers
         .iter()
@@ -5135,6 +5263,7 @@ fn binary_request_spec(
         "headers": headers,
         "body": null,
         "bodyBase64": base64(body),
+        "tls": tls,
     })
     .to_string()
 }
@@ -6532,18 +6661,29 @@ http.createServer(async (req, res) => {
 /// argv[2]. Kept tiny and dependency-free (core `http`).
 const DRIVER_JS: &str = r#"
 const http = require('http');
+const https = require('https');
 const spec = JSON.parse(process.argv[2]);
 // An app that binds `localhost` listens on a single loopback address, which may be IPv6 (`::1`)
 // rather than IPv4. Try each loopback family in turn so the request reaches the server however it
 // bound; a connection error (nothing listening on that family) falls through to the next.
+// The app may serve plain HTTP or TLS. `spec.tls` orders the attempt (the sandbox sets it when it
+// provisioned a key/cert so the app could bind an `https`/`tls` server), but either protocol is
+// tried as a fallback so the request lands whichever the app speaks. For HTTPS the client does not
+// verify the app's self-signed certificate — this is the verifier's own test client reaching the
+// app under test, not a relaxation of any security control the app enforces.
 const hosts = ['127.0.0.1','::1'];
-let hi = 0;
+const mods = spec.tls ? [['https',https],['http',http]] : [['http',http],['https',https]];
+const combos = [];
+for(const m of mods){for(const h of hosts){combos.push([m[0],m[1],h]);}}
+let ci = 0;
 function attempt(){
-  if(hi>=hosts.length){process.exit(0);}
-  const host = hosts[hi++];
+  if(ci>=combos.length){process.exit(0);}
+  const [name,mod,host] = combos[ci++];
+  const options = {host,port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:10000};
+  if(name==='https'){options.rejectUnauthorized=false;}
   let sent = false;
   const done = (data)=>{if(sent){return;} sent=true; try{process.stdout.write(data,()=>process.exit(0));}catch(e){process.exit(0);}};
-  const req = http.request({host,port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:10000},(res)=>{
+  const req = mod.request(options,(res)=>{
     let data='';
     // Cap how much is kept (a large body is only compared, never parsed), but still emit what was
     // collected: dropping it entirely would make a large success response read as empty and hide,
@@ -6554,8 +6694,10 @@ function attempt(){
   // An upgrade request completes with an 'upgrade' event instead of a response; the out-of-band
   // marker signal is what confirms it, so just end the request once it is answered either way.
   req.on('upgrade',(res,socket)=>{try{socket.destroy();}catch(e){}process.exit(0);});
+  // A connection or protocol-mismatch error (the wrong scheme for this port) falls through to the
+  // next combo so the right protocol is still tried.
   req.on('error',()=>attempt());
-  req.on('timeout',()=>{req.destroy();process.exit(0);});
+  req.on('timeout',()=>{req.destroy();attempt();});
   const body = spec.bodyBase64 ? Buffer.from(spec.bodyBase64, 'base64') : spec.body;
   if(body){req.write(body);}
   req.end();
@@ -7178,6 +7320,43 @@ mod tests {
         assert_eq!(missing_write_dir(root_log), None);
     }
 
+    /// A startup failure where an `https`/`tls` server reads a key/cert file that is absent yields the
+    /// path to stage from the self-signed marker pair, with the key/cert role inferred from the name;
+    /// a write, or a read of a non-TLS file, yields nothing.
+    #[test]
+    fn missing_tls_material_fires_only_for_a_failed_tls_read() {
+        let key_log = "node:fs:560\n    return binding.open(\n\
+            Error: ENOENT: no such file or directory, open '/app/0.0.0.0-key.pem'\n\
+            \x20   at Object.readFileSync (node:fs:444:35)\n\
+            \x20 code: 'ENOENT', syscall: 'open', path: '/app/0.0.0.0-key.pem'\n";
+        assert_eq!(
+            missing_tls_material(key_log),
+            Some(("/app/0.0.0.0-key.pem".to_owned(), true))
+        );
+
+        let cert_log = "Error: ENOENT: no such file or directory, open '/app/0.0.0.0.pem'\n\
+            \x20   at Object.readFileSync (node:fs:444:35)\n";
+        assert_eq!(
+            missing_tls_material(cert_log),
+            Some(("/app/0.0.0.0.pem".to_owned(), false))
+        );
+
+        let crt_log = "Error: ENOENT: no such file or directory, open '/etc/ssl/server.crt'\n\
+            \x20   at Object.readFileSync (node:fs:444:35)\n";
+        assert_eq!(
+            missing_tls_material(crt_log),
+            Some(("/etc/ssl/server.crt".to_owned(), false))
+        );
+
+        // A write of a `.pem`, or a read of a non-TLS file, must not be treated as TLS material.
+        let write_log = "Error: ENOENT: no such file or directory, open '/app/out.pem'\n\
+            \x20   at Object.writeFileSync (node:fs:2430:20)\n";
+        assert_eq!(missing_tls_material(write_log), None);
+        let json_log = "Error: ENOENT: no such file or directory, open '/app/config.json'\n\
+            \x20   at Object.readFileSync (node:fs:444:35)\n";
+        assert_eq!(missing_tls_material(json_log), None);
+    }
+
     /// Only external-service credential names are set to a filler, and only from the sink's import
     /// graph; the sandbox's own variables and non-credential names (including `PATH`) are left alone.
     #[test]
@@ -7475,17 +7654,19 @@ mod tests {
             headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
             signal: Signal::ServiceReached("t".to_owned()),
         };
-        let spec = request_spec(&attempt, 3000, true);
+        let spec = request_spec(&attempt, 3000, true, false);
         // Round-trips as JSON (the driver does the same parse).
         let value: serde_json::Value = serde_json::from_str(&spec).unwrap();
         assert_eq!(value["method"], "POST");
         assert_eq!(value["port"], 3000);
         assert_eq!(value["headers"]["Content-Type"], "application/json");
         assert_eq!(value["body"], "{\"url\":\"http://jss-marker/t\"}");
+        assert_eq!(value["tls"], false);
+        assert!(request_spec(&attempt, 3000, true, true).contains("\"tls\":true"));
         // The forwarding header de-buckets a rate limiter by default, but is suppressed on the
         // loopback-origin retry so a genuine loopback request carries no forged proxy hop.
         assert!(value["headers"].get("X-Forwarded-For").is_some());
-        let loopback = request_spec(&attempt, 3000, false);
+        let loopback = request_spec(&attempt, 3000, false, false);
         let loopback_value: serde_json::Value = serde_json::from_str(&loopback).unwrap();
         assert!(loopback_value["headers"].get("X-Forwarded-For").is_none());
     }
@@ -7517,6 +7698,7 @@ mod tests {
                 "multipart/form-data; boundary=boundary".to_owned(),
             )],
             &body,
+            false,
         );
         let value: serde_json::Value = serde_json::from_str(&spec).unwrap();
         assert_eq!(value["method"], "POST");

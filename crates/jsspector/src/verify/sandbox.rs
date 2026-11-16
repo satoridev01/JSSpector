@@ -9138,16 +9138,84 @@ const target = path.resolve(process.cwd(), process.argv[2] || '');
 
 let handler = null;
 let env = {};
+// 'fetch' for a Web/edge or Cloudflare `fetch(request, env, ctx)` handler (returns a `Response`);
+// 'node' for a Vercel Node serverless function `(req, res)` that reads `req.query`/`req.body` and
+// writes an Express-like `res`. A bare default-export function of arity >= 2 is the Node convention;
+// an arity-1 function (or a worker's `default.fetch`) is the Web convention.
+let handlerKind = 'fetch';
 try {
   const mod = await import(pathToFileURL(target).href);
   const def = mod && (mod.default || mod);
   if (def && typeof def.fetch === 'function') {
     handler = def.fetch.bind(def);
+    handlerKind = 'fetch';
   } else if (typeof def === 'function') {
     handler = def;
+    handlerKind = def.length >= 2 ? 'node' : 'fetch';
   }
 } catch (e) {
   console.error('[worker-host] load error: ' + (e && (e.stack || e.message) || e));
+}
+
+// An Express-like response surface over a Node `ServerResponse`, so a Vercel Node function's
+// `res.status(code).json(obj)`, `res.send(buf)`, `res.setHeader(...)` calls work unchanged.
+function decorateRes(res) {
+  res.status = (c) => { res.statusCode = c; return res; };
+  res.set = res.header = (k, v) => {
+    if (k && typeof k === 'object') { for (const n in k) { try { res.setHeader(n, k[n]); } catch (e) {} } }
+    else { try { res.setHeader(k, v); } catch (e) {} }
+    return res;
+  };
+  res.type = (t) => { try { res.setHeader('Content-Type', t); } catch (e) {} return res; };
+  res.json = (obj) => { try { if (!res.headersSent) res.setHeader('Content-Type', 'application/json'); } catch (e) {} res.end(JSON.stringify(obj)); return res; };
+  res.send = (b) => {
+    if (b !== null && typeof b === 'object' && !Buffer.isBuffer(b)) return res.json(b);
+    res.end(b == null ? '' : (Buffer.isBuffer(b) ? b : String(b)));
+    return res;
+  };
+  res.sendStatus = (c) => { res.statusCode = c; res.end(String(c)); return res; };
+  res.redirect = (loc) => { res.statusCode = 302; try { res.setHeader('Location', loc); } catch (e) {} res.end(); return res; };
+  return res;
+}
+
+// The parsed request body a Vercel Node function reads as `req.body` (JSON or form-urlencoded, like
+// the deployment's built-in body parser); the raw text otherwise.
+function parseNodeBody(req, raw) {
+  if (!raw) return {};
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  try {
+    if (ct.indexOf('application/x-www-form-urlencoded') >= 0) return Object.fromEntries(new URLSearchParams(raw));
+    return JSON.parse(raw);
+  } catch (e) { return raw; }
+}
+
+// Serve a Vercel Node serverless function: decorate the real request/response with the fields such a
+// handler reads (`req.query`, `req.body`, `req.path`) and writes (`res.status().json()`), call it, and
+// let it end the response itself. A handler that instead returns a Web `Response` (an edge function of
+// arity 2) is still handled: its return value is written when it never touched `res`.
+async function serveNode(req, res, raw) {
+  decorateRes(res);
+  req.get = (h) => req.headers[String(h).toLowerCase()];
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch (e) { res.statusCode = 400; return res.end(); }
+  req.query = Object.fromEntries(u.searchParams);
+  req.path = u.pathname;
+  req.rawBody = raw.toString('utf8');
+  req.body = parseNodeBody(req, req.rawBody);
+  let result;
+  try {
+    result = await handler(req, res);
+  } catch (e) {
+    try { if (!res.headersSent) res.statusCode = 500; if (!res.writableEnded) res.end(); } catch (x) {}
+    return;
+  }
+  if (!res.writableEnded) {
+    if (result && typeof result.arrayBuffer === 'function') {
+      await writeResponse(res, result);
+    } else {
+      res.end();
+    }
+  }
 }
 
 function makeContext() {
@@ -9186,6 +9254,7 @@ async function writeResponse(res, response) {
 http.createServer(async (req, res) => {
   const raw = await readBody(req);
   if (!handler) { res.statusCode = 502; return res.end('no worker handler'); }
+  if (handlerKind === 'node') { return serveNode(req, res, raw); }
   // The authority is synthetic (the worker reads only the path/query it carries); the scheme is
   // `https` so the request models deployed TLS traffic rather than a redirectable plain-http hit.
   const host = req.headers.host || 'localhost';
@@ -9208,7 +9277,7 @@ http.createServer(async (req, res) => {
     return;
   }
   await writeResponse(res, response);
-}).listen(port, '0.0.0.0', () => console.error('[worker-host] listening on ' + port + (handler ? ' with fetch handler' : ' with NO handler')));
+}).listen(port, '0.0.0.0', () => console.error('[worker-host] listening on ' + port + (handler ? ' with ' + handlerKind + ' handler' : ' with NO handler')));
 "#;
 
 /// Sends one request to the app on localhost and prints the response body. Reads its spec from
@@ -10651,6 +10720,67 @@ mod tests {
             );
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
         }
+    }
+
+    #[test]
+    fn worker_host_serves_a_vercel_node_req_res_function() {
+        // The worker-host shim must run a Vercel *Node* serverless function — `(req, res)` reading
+        // `req.query` and writing an Express-like `res` — not only a Web/edge `fetch` handler. Boot the
+        // real shim against such a function and confirm it parses the query and returns the handler's
+        // own JSON response through `res.status().json()`.
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "jss-worker-host.mjs",
+            &String::from_utf8(local_helper_source(WORKER_HOST_JS)).unwrap(),
+        );
+        write(root, "jss-driver.js", &String::from_utf8(local_helper_source(DRIVER_JS)).unwrap());
+        write(
+            root,
+            "api/proxy.js",
+            "export default async function handler(req, res) {\n\
+               if (!req.query.url) return res.status(400).json({ error: 'missing' });\n\
+               return res.status(200).json({ echoed: req.query.url });\n\
+             }\n",
+        );
+        let port = available_local_port().unwrap();
+        let mut server = Command::new("node")
+            .arg("jss-worker-host.mjs")
+            .arg("api/proxy.js")
+            .current_dir(root)
+            .env("PORT", port.to_string())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let spec = format!(
+            "{{\"method\":\"GET\",\"path\":\"/api/proxy?url=http%3A%2F%2Fexample.test%2Fx\",\"port\":{port},\"headers\":{{}}}}"
+        );
+        let mut body = String::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let Ok(output) = Command::new("node")
+                .arg("jss-driver.js")
+                .arg(&spec)
+                .current_dir(root)
+                .output()
+            else {
+                continue;
+            };
+            body = String::from_utf8_lossy(&output.stdout).into_owned();
+            if body.contains("echoed") || body.contains("missing") {
+                break;
+            }
+        }
+        let _ = server.kill();
+        let _ = server.wait();
+        assert!(
+            body.contains("\"echoed\":\"http://example.test/x\""),
+            "the Node (req, res) function's query-driven JSON response was not served: {body:?}"
+        );
     }
 
     #[test]
@@ -13160,6 +13290,7 @@ http.createServer((req, res) => {
             nosql_inserts_before_sink: false,
             nosql_mutates: false,
             decode_base64: None,
+            allow_tokens: Vec::new(),
         };
         let confined = Probe {
             method: Method::Get,
@@ -13196,6 +13327,7 @@ http.createServer((req, res) => {
             nosql_inserts_before_sink: false,
             nosql_mutates: false,
             decode_base64: None,
+            allow_tokens: Vec::new(),
         };
         let command = Probe {
             method: Method::Get,
@@ -13232,6 +13364,7 @@ http.createServer((req, res) => {
             nosql_inserts_before_sink: false,
             nosql_mutates: false,
             decode_base64: None,
+            allow_tokens: Vec::new(),
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -13272,6 +13405,7 @@ http.createServer((req, res) => {
             nosql_inserts_before_sink: false,
             nosql_mutates: false,
             decode_base64: None,
+            allow_tokens: Vec::new(),
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);

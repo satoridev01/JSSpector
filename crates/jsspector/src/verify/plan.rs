@@ -227,6 +227,15 @@ pub struct Probe {
     /// base64. `None` for the common case where the input reaches the sink without a base64 decode.
     /// Mutually exclusive with [`Self::envelope`]; mined from the handler source only.
     pub decode_base64: Option<bool>,
+    /// For an SSRF whose handler gates the outbound URL on a *substring* allowlist
+    /// (`if (!url.includes("site.com")) return 403`, `url.startsWith("https://site.com")`), the
+    /// host-like substrings the URL must contain to pass that gate. A substring/prefix check never
+    /// constrains the request's real host, so the marker URL is re-shaped to carry each token in a
+    /// position that keeps the marker as the effective host (the URL userinfo, path, query or fragment)
+    /// — reaching the sink the allowlist was meant to close. Only must-contain (negated) checks are
+    /// mined; a non-negated `url.includes("169.254.169.254")` is a blocklist and is left out. Mined
+    /// from the handler source only; empty when the handler gates the URL on no such substring.
+    pub allow_tokens: Vec<String>,
 }
 
 /// How to obtain a genuine authenticated session for a sink gated behind an in-handler credential
@@ -849,6 +858,7 @@ impl Probe {
                 nosql_inserts_before_sink: false,
                 nosql_mutates: false,
                 decode_base64: None,
+                allow_tokens: Vec::new(),
             });
         }
         if finding.source.kind != "http" {
@@ -973,6 +983,18 @@ impl Probe {
             };
         let nosql_mutates = finding.class == VulnClass::NosqlInjection
             && (sink_mutates_documents(&finding.sink.api) || downstream_nosql_mutation);
+        // An SSRF whose handler checks the outbound URL against a substring/prefix allowlist
+        // (`if (!url.includes("site.com")) return 403`) rejects a marker URL before the sink; mine the
+        // host tokens that gate it so the payload builder can carry one in a host-preserving position.
+        let allow_tokens = if finding.class == VulnClass::Ssrf {
+            source
+                .map(|src| {
+                    ssrf_allowlist_host_tokens(handler_source(src, finding.source.line), &tainted)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             method,
             path,
@@ -1008,6 +1030,7 @@ impl Probe {
             nosql_inserts_before_sink,
             nosql_mutates,
             decode_base64,
+            allow_tokens,
         })
     }
 
@@ -1076,6 +1099,7 @@ impl Probe {
             nosql_inserts_before_sink: false,
             nosql_mutates: false,
             decode_base64: None,
+            allow_tokens: Vec::new(),
         })
     }
 }
@@ -6358,6 +6382,105 @@ fn url_substring_fragments(source: &str, cond: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The host-like substrings an SSRF handler requires the tainted outbound URL to contain before it
+/// reaches the request sink, when the allowlist is implemented as a *substring* or *prefix* test rather
+/// than a parsed-host comparison (`if (!url.includes("site.com")) return 403`,
+/// `if (!url.startsWith("https://site.com")) throw`). Each token is the string argument of a *negated*
+/// `.includes` / `.indexOf(...) === -1` / `.startsWith` / `.endsWith` whose receiver is a tainted
+/// URL-derived identifier, reduced to its host portion. Only must-contain (negated) checks are mined:
+/// a non-negated `url.includes("169.254.169.254")` is a blocklist and embedding its token would defeat
+/// the request, so it is left out. A receiver that is not the tainted URL (`allowed.includes(host)`
+/// over an allow array, or `new URL(url).hostname === "site.com"`) is also left out — it constrains the
+/// real host and is not bypassable by substring placement. Mined from the handler source only; empty
+/// when the handler gates the URL on no such substring.
+pub fn ssrf_allowlist_host_tokens(source: &str, names: &[String]) -> Vec<String> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for method in [".includes(", ".indexOf(", ".startsWith(", ".endsWith("] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(method) {
+            let dot = from + rel;
+            let open = dot + method.len();
+            from = open;
+            // The receiver is the identifier (allowing member access) just before the method call.
+            let before = &source[..dot];
+            let recv_start = before
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let recv = before[recv_start..].trim_matches('.');
+            if recv.is_empty() {
+                continue;
+            }
+            // The receiver, or the local it is a member of, must carry the tainted URL; a check on an
+            // allow array or a parsed hostname does not qualify.
+            let root = recv.split('.').next().unwrap_or(recv);
+            if !names.iter().any(|name| name == recv || name == root) {
+                continue;
+            }
+            let Some(arglist) = balanced_arg(&source[open..]) else {
+                continue;
+            };
+            let close = open + arglist.len();
+            let Some(first) = split_top_level_commas(arglist).into_iter().next() else {
+                continue;
+            };
+            let Some(lit) = string_literal_arg(first.trim()) else {
+                continue;
+            };
+            // Keep only must-contain checks. `.includes`/`.startsWith`/`.endsWith` qualify when the call
+            // is negated with a leading `!`; `.indexOf` qualifies when its result is compared for
+            // absence (`=== -1`, `< 0`).
+            let negated = if method == ".indexOf(" {
+                let after: String = source[close + 1..]
+                    .chars()
+                    .take(8)
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                after.starts_with("===-1") || after.starts_with("==-1") || after.starts_with("<0")
+            } else {
+                before[..recv_start].trim_end().ends_with('!')
+            };
+            if !negated {
+                continue;
+            }
+            if let Some(token) = host_substring(&lit)
+                && !out.contains(&token)
+            {
+                out.push(token);
+            }
+        }
+    }
+    out
+}
+
+/// The host portion of an allowlist literal, for carrying in a bypass URL: the literal with any scheme
+/// (`https://`, `http://`, `//`) and any path/query/fragment/userinfo stripped. `None` when what remains
+/// is not host-like — too short, missing a dot, or holding a character no hostname/authority carries —
+/// so a free-text allowlist token is not mistaken for a host.
+fn host_substring(lit: &str) -> Option<String> {
+    let mut rest = lit.trim();
+    for scheme in ["https://", "http://", "//"] {
+        if let Some(stripped) = rest.strip_prefix(scheme) {
+            rest = stripped;
+            break;
+        }
+    }
+    let host = rest.split(['/', '?', '#', '@']).next().unwrap_or(rest).trim();
+    if host.len() < 4 || !host.contains('.') {
+        return None;
+    }
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_'))
+    {
+        return None;
+    }
+    Some(host.to_owned())
+}
+
 /// Whether `recv` holds (part of) the request URL: a `req.originalUrl`/`req.url` accessor itself, or a
 /// local bound from one (`const url = req.originalUrl`). Keeps the substring-gate miner from treating
 /// an unrelated `.indexOf` receiver as a URL dispatch.
@@ -8678,6 +8801,7 @@ module.exports = { activityValidators };\n";
             nosql_inserts_before_sink: false,
             nosql_mutates: false,
             decode_base64: None,
+            allow_tokens: Vec::new(),
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -8685,6 +8809,67 @@ module.exports = { activityValidators };\n";
         assert_eq!(
             siblings,
             vec![("authorization".to_owned(), "jsspector".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_substring_url_allowlist_is_mined_as_bypassable_host_tokens() {
+        // The image-proxy shape: the handler decodes the URL, then rejects it unless it *contains* one
+        // of two Google hosts, and otherwise fetches it. Both host substrings are must-contain tokens a
+        // substring allowlist cannot actually bind the request host with, so both are mined.
+        let source = r#"
+          const imageUrl = req.query.url;
+          const decodedUrl = decodeURIComponent(imageUrl);
+          if (!decodedUrl.includes('googleusercontent.com') && !decodedUrl.includes('google.com')) {
+            return res.status(403).json({ error: 'nope' });
+          }
+          const response = await fetch(decodedUrl, { method: 'GET' });
+        "#;
+        let names = vec!["decodedUrl".to_owned(), "imageUrl".to_owned(), "url".to_owned()];
+        assert_eq!(
+            ssrf_allowlist_host_tokens(source, &names),
+            vec!["googleusercontent.com".to_owned(), "google.com".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_blocklist_and_a_parsed_host_allowlist_mine_no_bypass_tokens() {
+        // A non-negated `.includes` is a blocklist (the request is rejected *for* containing the token),
+        // so embedding it would defeat the request — not mined. An allow-array membership and a parsed
+        // `new URL(url).hostname` equality constrain the real host and are not substring-bypassable, so
+        // their receivers (`allowed`, `host`) are not the tainted URL and are also left out.
+        let names = vec!["url".to_owned(), "host".to_owned()];
+        assert!(
+            ssrf_allowlist_host_tokens(
+                "if (url.includes('169.254.169.254')) return res.status(403).end();",
+                &names,
+            )
+            .is_empty()
+        );
+        assert!(
+            ssrf_allowlist_host_tokens(
+                "const host = new URL(url).hostname; if (!allowed.includes(host)) throw new Error('x');",
+                &names,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_negated_prefix_and_indexof_url_allowlist_are_mined() {
+        // `startsWith`/`endsWith` prefix-or-suffix allowlists, and the `indexOf(...) === -1` spelling of
+        // "does not contain", are all must-contain gates reduced to their host substring.
+        let names = vec!["url".to_owned()];
+        assert_eq!(
+            ssrf_allowlist_host_tokens(
+                "if (!url.startsWith('https://api.example.com/')) return bad();",
+                &names,
+            ),
+            vec!["api.example.com".to_owned()]
+        );
+        assert_eq!(
+            ssrf_allowlist_host_tokens("if (url.indexOf('cdn.example.net') === -1) return bad();", &names),
+            vec!["cdn.example.net".to_owned()]
         );
     }
 

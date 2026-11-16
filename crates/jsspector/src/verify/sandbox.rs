@@ -290,6 +290,14 @@ pub struct Session {
     /// added only for apps that reference it, so it can never change the startup of an app that does
     /// not. Detected from the app's source (see [`uses_node_sqlite`]).
     node_sqlite: bool,
+    /// Whether the launched entry is an Electron main-process module (see [`is_electron_main_process`]).
+    /// Run directly with `node`, such a file throws because `require('electron')` returns the binary
+    /// path rather than the main-process API, so `const { app } = require('electron')` is `undefined`
+    /// and the app exits before its embedded HTTP server binds. When set, the Electron shim
+    /// ([`ELECTRON_SHIM_JS`]) is preloaded through `NODE_OPTIONS`, supplying an inert main-process API
+    /// so the app's own `whenReady` callback runs and the server listens — the same lifecycle Electron
+    /// would drive, with nothing about the request path or the sink altered.
+    electron_main: bool,
     /// When set, the synthetic per-request `X-Forwarded-For` (which de-buckets a per-IP rate limiter,
     /// see [`request_spec`]) is suppressed for the next requests. A genuine loopback request carries
     /// no forwarding header; an app that derives trust from the proxy chain (a loopback-only admin
@@ -492,6 +500,8 @@ impl Session {
             base_env,
             node_path,
             node_sqlite: uses_node_sqlite(root, &app_root),
+            electron_main: entry_file
+                .is_some_and(|entry| is_electron_main_process(&root.join(entry))),
             omit_forwarding: std::cell::Cell::new(false),
             root: root.to_path_buf(),
             guarded_modules,
@@ -673,6 +683,8 @@ impl Session {
             base_env,
             node_path,
             node_sqlite: uses_node_sqlite(root, &root.join(app_path)),
+            electron_main: entry_file
+                .is_some_and(|entry| is_electron_main_process(&root.join(entry))),
             omit_forwarding: std::cell::Cell::new(false),
             root: root.to_path_buf(),
             guarded_modules,
@@ -1030,6 +1042,9 @@ impl Session {
         if stub_missing_modules || mongodb_callback_promises {
             node_options.push("--require=/tmp/jss-launch-shim.js");
         }
+        if self.electron_main {
+            node_options.push("--require=/tmp/jss-electron-shim.js");
+        }
         if stub_missing_modules && !self.guarded_modules.is_empty() {
             child.env("JSS_GUARDED_MODULES", self.guarded_modules.join(","));
         }
@@ -1285,6 +1300,9 @@ impl Session {
         }
         if stub_missing_modules || mongodb_callback_promises {
             node_options.push("--require=/jss-launch-shim.js".to_owned());
+        }
+        if self.electron_main {
+            node_options.push("--require=/jss-electron-shim.js".to_owned());
         }
         if stub_missing_modules {
             // Modules the entry file `require`s inside a `try`/`catch` are ones it tolerates the
@@ -4136,6 +4154,10 @@ fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String>
             local_helper_source(LAUNCH_SHIM_JS),
         ),
         (
+            std::path::PathBuf::from("/tmp/jss-electron-shim.js"),
+            local_helper_source(ELECTRON_SHIM_JS),
+        ),
+        (
             std::path::PathBuf::from("/tmp/jss-esm-hook.mjs"),
             LAUNCH_ESM_HOOK_JS.as_bytes().to_vec(),
         ),
@@ -5386,6 +5408,7 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-marker.crt\n\
          RUN echo {} | base64 -d > /jss-marker.key\n\
          RUN echo {} | base64 -d > /jss-launch-shim.js\n\
+         RUN echo {} | base64 -d > /jss-electron-shim.js\n\
          RUN echo {} | base64 -d > /jss-esm-hook.mjs\n\
          RUN echo {} | base64 -d > /jss-plugin-host.mjs\n\
          RUN echo {} | base64 -d > /jss-db-bootstrap.mjs\n\
@@ -5404,6 +5427,7 @@ fn dockerfile(
         base64(MARKER_CERT.as_bytes()),
         base64(MARKER_KEY.as_bytes()),
         base64(LAUNCH_SHIM_JS.as_bytes()),
+        base64(ELECTRON_SHIM_JS.as_bytes()),
         base64(LAUNCH_ESM_HOOK_JS.as_bytes()),
         base64(PLUGIN_HOST_JS.as_bytes()),
         base64(DB_BOOTSTRAP_JS.as_bytes()),
@@ -7279,6 +7303,37 @@ fn node_file_command(file: &str) -> String {
     serde_json::json!(["node", file]).to_string()
 }
 
+/// Whether a JavaScript file is an Electron main-process entry: it pulls in the `electron` module and
+/// defers its own startup to the application lifecycle (`app.whenReady`). Such a file is a
+/// self-contained server in every respect — it constructs and `.listen`s on its HTTP server — but run
+/// directly with `node` it throws before binding, because off an Electron runtime `require('electron')`
+/// resolves to the packaged binary's path string rather than the main-process API, so
+/// `const { app } = require('electron')` is `undefined` and the first `app.` access crashes. It is
+/// launched with the Electron shim ([`ELECTRON_SHIM_JS`]) preloaded, which supplies an inert
+/// main-process API (a resolved `whenReady`, a real writable `getPath`, otherwise permissive stubs) so
+/// the app's own `whenReady` callback runs and its embedded server listens. Framework-neutral: keyed
+/// only on the `electron` import and the `whenReady` lifecycle call every Electron main process uses,
+/// never on a repository name or path.
+fn is_electron_main_process(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let imports_electron = ["require('electron')", "require(\"electron\")"]
+        .iter()
+        .any(|needle| src.contains(needle))
+        || ["from 'electron'", "from \"electron\""]
+            .iter()
+            .any(|needle| src.contains(needle));
+    imports_electron && src.contains(".whenReady(")
+}
+
 /// A UTF-8 file inside the package, never an absolute path or one containing `..`. Commands that
 /// consume the returned name serialize it as JSON, so ordinary non-ASCII repository filenames are
 /// safe and do not need to be rejected.
@@ -8090,6 +8145,90 @@ try {
     Module.register(require('url').pathToFileURL('/jss-esm-hook.mjs').href);
   }
 } catch (err) {}
+"#;
+
+/// Preload (`node --require`) that lets an Electron main-process module launch under plain `node` so
+/// its embedded HTTP server binds and the real sink can be exercised. It intercepts `require('electron')`
+/// (which off an Electron runtime returns the binary path, not the API) and returns an inert
+/// main-process surface: an `app` whose `whenReady()` resolves immediately — so the app's own startup
+/// callback runs — and whose `getPath()` returns a real writable scratch directory (the app joins it
+/// with `path.join` and writes logs/config there), with every other member a permissive proxy stub
+/// that is callable, constructable, and iterable (window size tuples destructure without throwing).
+/// It fabricates nothing about the request path, the routing, or the sink: the app's own
+/// `http.createServer(...).listen(...)` still runs, and a verification still requires the real canary
+/// to flow through the app's own handler into the real file-read sink. Dependency-free (Node core only).
+const ELECTRON_SHIM_JS: &str = r#"
+'use strict';
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
+const Module = require('module');
+const origLoad = Module._load;
+
+// A real, writable scratch directory tree for `app.getPath(name)`: the app joins the returned value
+// with `path.join` and writes logs/config into it, so it must be an actual string path, not a stub.
+let base = null;
+function userPath(name) {
+  if (!base) {
+    try { base = fs.mkdtempSync(path.join(os.tmpdir(), 'jss-electron-')); }
+    catch (e) { base = os.tmpdir(); }
+  }
+  const p = path.join(base, String(name || 'userData'));
+  try { fs.mkdirSync(p, { recursive: true }); } catch (e) {}
+  return p;
+}
+
+const handler = {
+  get: function (target, prop) {
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return function () { return ''; };
+    // Electron getters commonly return tuples (`getContentSize() -> [w, h]`); a non-iterable stub
+    // would crash the array destructuring that follows. Yield a bounded run of stubs instead.
+    if (prop === Symbol.iterator) return function* () { for (let i = 0; i < 8; i++) yield stub; };
+    if (prop === Symbol.asyncIterator) return undefined;
+    if (prop in target) return target[prop];
+    return stub;
+  },
+  apply: function () { return stub; },
+  construct: function () { return stub; },
+};
+const stub = new Proxy(function () {}, handler);
+
+const app = new Proxy({
+  commandLine: {
+    appendSwitch: function () {}, appendArgument: function () {},
+    hasSwitch: function () { return false; }, getSwitchValue: function () { return ''; },
+  },
+  whenReady: function () { return Promise.resolve(); },
+  on: function () { return app; }, once: function () { return app; }, off: function () { return app; },
+  addListener: function () { return app; }, removeListener: function () { return app; },
+  removeAllListeners: function () { return app; }, emit: function () { return false; },
+  getPath: function (name) { return userPath(name); },
+  getName: function () { return 'app'; }, getVersion: function () { return '0.0.0'; },
+  getLocale: function () { return 'en-US'; }, setName: function () {}, setPath: function () {},
+  quit: function () {}, exit: function () {}, relaunch: function () {}, focus: function () {},
+  hide: function () {}, show: function () {},
+  requestSingleInstanceLock: function () { return true; }, releaseSingleInstanceLock: function () {},
+  setAppUserModelId: function () {}, disableHardwareAcceleration: function () {},
+  isReady: function () { return true; }, getAppPath: function () { return process.cwd(); },
+  setLoginItemSettings: function () {}, getLoginItemSettings: function () { return {}; },
+  setAsDefaultProtocolClient: function () { return true; },
+}, handler);
+
+const electron = new Proxy({ app: app }, {
+  get: function (target, prop) {
+    if (prop === 'app') return app;
+    if (prop === 'then') return undefined;
+    if (prop === Symbol.toPrimitive) return function () { return ''; };
+    return stub;
+  },
+});
+
+const ELECTRON = new Set(['electron', 'electron/main', 'electron/common', 'electron/renderer']);
+Module._load = function (request) {
+  if (typeof request === 'string' && ELECTRON.has(request)) return electron;
+  return origLoad.apply(this, arguments);
+};
 "#;
 
 /// ESM counterpart of [`LAUNCH_SHIM_JS`]. Only an undeclared bare module that fails with
@@ -10785,6 +10924,113 @@ mod tests {
             );
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
         }
+    }
+
+    #[test]
+    fn an_electron_main_process_is_recognized_by_import_and_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An Electron main process: imports `electron` and defers startup to `app.whenReady`, binding
+        // its own HTTP server inside the lifecycle callback.
+        write(
+            root,
+            "main.js",
+            "const { app, BrowserWindow } = require('electron');\n\
+             const http = require('http');\n\
+             app.whenReady().then(() => { http.createServer((q, r) => r.end()).listen(38471); });\n",
+        );
+        assert!(is_electron_main_process(&root.join("main.js")));
+        // Such a file is still a self-contained server (it constructs and listens), so the normal
+        // launch path selects `node main.js`; the shim is layered on through NODE_OPTIONS.
+        assert!(is_standalone_server(&root.join("main.js")));
+        assert_eq!(
+            start_command(root, Some(std::path::Path::new("main.js"))).as_deref(),
+            Some(r#"["node","main.js"]"#),
+        );
+        // A plain HTTP server that never imports `electron` is not an Electron main process, and a
+        // module that imports `electron` but drives no `whenReady` lifecycle is not one either.
+        write(
+            root,
+            "plain.js",
+            "const http = require('http'); http.createServer((q, r) => r.end()).listen(3000);",
+        );
+        assert!(!is_electron_main_process(&root.join("plain.js")));
+        write(
+            root,
+            "preload.js",
+            "const { contextBridge } = require('electron'); contextBridge.exposeInMainWorld('x', {});",
+        );
+        assert!(!is_electron_main_process(&root.join("preload.js")));
+    }
+
+    #[test]
+    fn electron_shim_lets_an_electron_main_process_launch_under_node() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Off an Electron runtime, `require('electron')` resolves to the packaged binary's path — a
+        // bare string — so `const { app } = require('electron')` is `undefined`. Reproduce that exact
+        // shape with a local stand-in package.
+        write(root, "node_modules/electron/package.json", r#"{"name":"electron","main":"index.js"}"#);
+        write(root, "node_modules/electron/index.js", "module.exports = '/usr/bin/electron';");
+        write(root, "electron-shim.js", ELECTRON_SHIM_JS);
+        // The canary lives outside the application directory; the app reaches it only by `../` climbing
+        // out of `__dirname`, exactly the historical path-traversal read.
+        write(root, "canary.txt", "ELECTRON-CANARY");
+        write(
+            root,
+            "app/main.js",
+            "const { app, BrowserWindow, ipcMain } = require('electron');\n\
+             app.commandLine.appendSwitch('disable-features', 'X');\n\
+             const http = require('http');\n\
+             const path = require('path');\n\
+             const fs = require('fs');\n\
+             // `getPath` must return a real writable string the app joins and writes to.\n\
+             fs.writeFileSync(path.join(app.getPath('userData'), 'log.txt'), 'start');\n\
+             ipcMain.handle('noop', () => {});\n\
+             function createWindow() {\n\
+               const win = new BrowserWindow({ width: 100, height: 100 });\n\
+               const [w, h] = win.getContentSize();\n\
+               win.webContents.on('did-finish-load', () => {});\n\
+               win.loadFile('x.html');\n\
+               const rel = decodeURIComponent('/../canary.txt');\n\
+               const data = fs.readFileSync(path.join(__dirname, rel));\n\
+               console.log('READ:' + data.toString().trim());\n\
+               process.exit(0);\n\
+             }\n\
+             app.whenReady().then(() => { createWindow(); });\n",
+        );
+        // Without the shim the app crashes before its lifecycle callback runs.
+        let bare = Command::new("node")
+            .arg("app/main.js")
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            !bare.status.success(),
+            "the Electron main process should fail under plain node without the shim",
+        );
+        // With the shim preloaded, `whenReady` resolves, the main-process stubs absorb the window
+        // construction, and the app's own file read climbs out to the planted canary.
+        let shimmed = Command::new("node")
+            .arg("app/main.js")
+            .current_dir(root)
+            .env("NODE_OPTIONS", format!("--require={}", root.join("electron-shim.js").display()))
+            .output()
+            .unwrap();
+        assert!(
+            shimmed.status.success(),
+            "status={} stdout={} stderr={}",
+            shimmed.status,
+            String::from_utf8_lossy(&shimmed.stdout),
+            String::from_utf8_lossy(&shimmed.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&shimmed.stdout).trim(),
+            "READ:ELECTRON-CANARY",
+        );
     }
 
     #[test]

@@ -611,7 +611,10 @@ impl Session {
         if needs_redis {
             service_dirs.push(std::env::temp_dir().join(format!("jsspector-redis-{id}")));
         }
-        let port = dockerfile_port(root).unwrap_or(3000);
+        // Every local launch receives a private free port through `PORT`. Applications that hard-code
+        // their listener are still discovered by the readiness probe, while platform-host shims and
+        // ordinary `process.env.PORT` servers cannot collide with an orphan from an interrupted scan.
+        let port = available_local_port()?;
         let (run_as, mut base_env) = match local_privilege_drop_fixture(&app_root, port) {
             Some(fixture) => (Some(fixture.run_as), fixture.env),
             None => (None, Vec::new()),
@@ -3985,18 +3988,6 @@ fn run_local_setup(root: &std::path::Path, script: &str) -> Result<(), String> {
     }
 }
 
-fn dockerfile_port(root: &std::path::Path) -> Option<u16> {
-    let source = std::fs::read_to_string(root.join("Dockerfile")).ok()?;
-    source.lines().rev().find_map(|line| {
-        let value = line
-            .trim()
-            .strip_prefix("EXPOSE ")?
-            .split_whitespace()
-            .next()?;
-        value.split('/').next()?.parse().ok()
-    })
-}
-
 fn acquire_local_fixture_lock() -> Result<File, String> {
     let path = std::env::temp_dir().join(LOCAL_FIXTURE_LOCK);
     let file = OpenOptions::new()
@@ -6194,7 +6185,7 @@ fn listening_probe_excluding_candidates(
          const port=parseInt(p,16);\
          if(c[3]==='0A'&&p&&!excluded.has(port)&&(/^0+$/.test(a)||a==='0100007F'||a==='00000000000000000000000001000000'))ports.add(port)}}}}\
          const list=[...ports];const hosts=['127.0.0.1','::1'];\
-         const direct=ports.has({wanted})||!list.length;\
+         const direct=!excluded.has({wanted})&&(ports.has({wanted})||!list.length);\
          const single=direct?{wanted}:(list.length===1?list[0]:0);\
          function tcpOk(port,cb){{let hi=0;(function go(){{if(hi>=hosts.length)return cb(false);\
          net.connect({{port,host:hosts[hi++]}}).on('connect',function(){{this.destroy();cb(true)}}).on('error',()=>go());}})();}}\
@@ -9833,25 +9824,6 @@ mod tests {
     }
 
     #[test]
-    fn local_runtime_reads_port_from_dockerfile() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Dockerfile"),
-            "FROM node:24 AS build\n\
-             RUN npm install -g typescript@^6\n\
-             RUN npm install --omit=dev\n\
-             RUN rm -rf frontend/src/assets\n\
-             RUN npm run sbom\n\
-             FROM example/distroless\n\
-             EXPOSE 3000/tcp\n\
-             CMD [\"/app/build/app.js\"]\n",
-        )
-        .unwrap();
-
-        assert_eq!(dockerfile_port(dir.path()), Some(3000));
-    }
-
-    #[test]
     fn standalone_npm_install_temporarily_drops_only_workspace_dev_dependencies() {
         let dir = tempfile::tempdir().unwrap();
         let manifest_path = dir.path().join("package.json");
@@ -12388,6 +12360,23 @@ mod tests {
             .output()
             .unwrap();
         assert!(!out.status.success() || std::path::Path::new("/proc/net/tcp").exists());
+    }
+
+    #[test]
+    fn the_listening_probe_never_accepts_an_excluded_wanted_port() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let out = Command::new("node")
+            .args(["-e", &listening_probe_excluding(port, &[port])])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "a pre-existing listener on {port} was selected as the new app"
+        );
     }
 
     #[test]

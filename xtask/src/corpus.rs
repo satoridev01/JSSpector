@@ -1,11 +1,13 @@
 //! `cargo xtask corpus`: fetch a corpus of repositories and scan all of it (the full-corpus job,
-//! run locally or on Satori through `.satori.yml`).
+//! run locally or on Satori through `.satori.yml`). With `--verify`, the disposable execution
+//! environment runs each application and records dynamic exploitation evidence.
 //!
 //! The list of repositories is input, never part of this repository: `owner/name@commit`,
 //! `owner/name commit` or `owner/name` (the default branch's head), one per line or separated by
 //! spaces; `#` starts a comment. Repositories are fetched shallow, blobless and sparse
 //! (JavaScript/TypeScript sources and the package files that decide module types) at that
-//! commit. Nothing in them is ever run: they are only read by the scanner.
+//! commit. Static runs use sparse checkouts; dynamic runs need full checkouts so their package
+//! managers, build configuration and runtime assets are available.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -92,6 +94,10 @@ pub struct Options {
     pub out: PathBuf,
     /// Scanner threads per repository.
     pub threads: usize,
+    /// Dynamically verify findings in the disposable execution environment.
+    pub verify: bool,
+    /// Lowest finding severity to report and verify.
+    pub min_severity: String,
     /// Repositories fetched at once.
     pub jobs: usize,
     /// Print the findings at or above this severity, per repository.
@@ -174,7 +180,7 @@ fn fetch_all(options: &Options) -> BTreeMap<String, String> {
                     let Some(repo) = options.repos.get(index) else {
                         break;
                     };
-                    let result = fetch(repo, &repo.dir(&options.dir));
+                    let result = fetch(repo, &repo.dir(&options.dir), options.verify);
                     let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
                     match result {
                         Ok(commit) => eprintln!(
@@ -198,7 +204,7 @@ fn fetch_all(options: &Options) -> BTreeMap<String, String> {
 }
 
 /// Checks out `repo` at its commit in `dir` (shallow, blobless, sparse); returns the commit.
-fn fetch(repo: &Repo, dir: &Path) -> Result<String> {
+fn fetch(repo: &Repo, dir: &Path, full_checkout: bool) -> Result<String> {
     if !dir.join(".git").exists() {
         std::fs::create_dir_all(dir)?;
         git(dir, &["init", "-q"])?;
@@ -211,9 +217,15 @@ fn fetch(repo: &Repo, dir: &Path) -> Result<String> {
                 &format!("https://github.com/{}.git", repo.name),
             ],
         )?;
-        let mut sparse = vec!["sparse-checkout", "set", "--no-cone"];
-        sparse.extend_from_slice(SPARSE);
-        git(dir, &sparse)?;
+        if !full_checkout {
+            let mut sparse = vec!["sparse-checkout", "set", "--no-cone"];
+            sparse.extend_from_slice(SPARSE);
+            git(dir, &sparse)?;
+        }
+    } else if full_checkout {
+        // A cache created by a previous static run may still be sparse. Dynamic verification
+        // needs lockfiles, Dockerfiles, templates, public assets and other runtime inputs.
+        let _ = git(dir, &["sparse-checkout", "disable"]);
     }
     let target = repo.commit.as_deref().unwrap_or("HEAD");
     git(
@@ -246,15 +258,19 @@ fn scan(repo: &Repo, dir: &Path, options: &Options) -> Result<Value> {
     let report_path = options
         .out
         .join(format!("{}.json", repo.name.replace('/', "__")));
-    let output = Command::new(&options.binary)
-        .args([
-            "scan",
-            "--format",
-            "json",
-            "--min-severity",
-            "low",
-            "--no-config",
-        ])
+    let mut command = Command::new(&options.binary);
+    command.args([
+        "scan",
+        "--format",
+        "json",
+        "--min-severity",
+        &options.min_severity,
+        "--no-config",
+    ]);
+    if options.verify {
+        command.arg("--verify=strict");
+    }
+    let output = command
         .args(["--threads", &options.threads.max(1).to_string()])
         .arg("--output")
         .arg(&report_path)
@@ -297,6 +313,18 @@ fn scan(repo: &Repo, dir: &Path, options: &Options) -> Result<Value> {
             *count += 1;
         }
     }
+    let mut exploitation: BTreeMap<&str, usize> = ["verified", "not-reproduced", "skipped"]
+        .into_iter()
+        .map(|outcome| (outcome, 0))
+        .collect();
+    for finding in &findings {
+        if let Some(count) = at(finding, &["exploitation", "outcome"])
+            .as_str()
+            .and_then(|outcome| exploitation.get_mut(outcome))
+        {
+            *count += 1;
+        }
+    }
     let skipped = at(&report, &["skipped"])
         .as_array()
         .cloned()
@@ -318,6 +346,7 @@ fn scan(repo: &Repo, dir: &Path, options: &Options) -> Result<Value> {
         "status": "ok",
         "files": at(&report, &["files_scanned"]),
         "findings": by_severity,
+        "exploitation": exploitation,
         "skipped": skipped.len(),
         "panicked": panicked,
         "seconds": round(seconds),
@@ -362,6 +391,26 @@ fn print_findings(repo: &str, findings: &[Value], show: &str) {
             at(f, &["fingerprint"]).as_str().unwrap_or(""),
             at(f, &["function"]).as_str().unwrap_or(""),
         );
+        if let Some(outcome) = at(f, &["exploitation", "outcome"]).as_str() {
+            println!("    exploitation: {outcome}");
+        }
+        if let Some(command) = at(f, &["poc", "command"]).as_str() {
+            println!("    POC:");
+            for (index, line) in command.lines().enumerate() {
+                println!("      {}{line}", if index == 0 { "$ " } else { "  " });
+            }
+            if let Some(response) = at(f, &["poc", "response"]).as_str()
+                && !response.is_empty()
+            {
+                println!("    Output:");
+                for line in response.lines() {
+                    println!("      {line}");
+                }
+            }
+            if let Some(evidence) = at(f, &["poc", "evidence"]).as_str() {
+                println!("    Evidence: {evidence}");
+            }
+        }
     }
 }
 
@@ -380,6 +429,10 @@ fn summarize(rows: &[Value], seconds: f64) -> Value {
             *totals.entry(severity).or_default() +=
                 at(row, &["findings", severity]).as_u64().unwrap_or(0);
         }
+        for outcome in ["verified", "not-reproduced", "skipped"] {
+            *totals.entry(outcome).or_default() +=
+                at(row, &["exploitation", outcome]).as_u64().unwrap_or(0);
+        }
     }
     let failed = rows.len() - scanned;
     json!({
@@ -390,14 +443,19 @@ fn summarize(rows: &[Value], seconds: f64) -> Value {
             "critical": totals.get("critical"), "high": totals.get("high"),
             "medium": totals.get("medium"), "low": totals.get("low"),
         },
+        "exploitation": {
+            "verified": totals.get("verified"),
+            "not-reproduced": totals.get("not-reproduced"),
+            "skipped": totals.get("skipped"),
+        },
         "seconds": round(seconds),
     })
 }
 
 fn print_table(rows: &[Value], totals: &Value) {
     println!(
-        "\n{:<44} {:>6} {:>5} {:>5} {:>5} {:>5} {:>5} {:>8}",
-        "repository", "files", "crit", "high", "med", "low", "skip", "seconds"
+        "\n{:<44} {:>6} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>8}",
+        "repository", "files", "crit", "high", "med", "low", "ver", "skip", "seconds"
     );
     for row in rows {
         if at(row, &["status"]) != "ok" {
@@ -410,13 +468,14 @@ fn print_table(rows: &[Value], totals: &Value) {
         }
         let count = |s: &str| at(row, &["findings", s]).as_u64().unwrap_or(0);
         println!(
-            "{:<44} {:>6} {:>5} {:>5} {:>5} {:>5} {:>5} {:>8.1}{}",
+            "{:<44} {:>6} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>8.1}{}",
             at(row, &["repo"]).as_str().unwrap_or(""),
             at(row, &["files"]).as_u64().unwrap_or(0),
             count("critical"),
             count("high"),
             count("medium"),
             count("low"),
+            at(row, &["exploitation", "verified"]).as_u64().unwrap_or(0),
             at(row, &["skipped"]).as_u64().unwrap_or(0),
             at(row, &["seconds"]).as_f64().unwrap_or(0.0),
             if at(row, &["panicked"]).as_u64().unwrap_or(0) > 0 {
@@ -428,7 +487,8 @@ fn print_table(rows: &[Value], totals: &Value) {
     }
     println!(
         "\ncorpus: {} of {} repositories scanned, {} files, {} skipped, {} panicked; findings \
-         critical {} high {} medium {} low {}; {:.1}s",
+         critical {} high {} medium {} low {}; exploitation verified {} not-reproduced {} \
+         skipped {}; {:.1}s",
         at(totals, &["scanned"]),
         at(totals, &["repos"]),
         at(totals, &["files"]),
@@ -438,6 +498,9 @@ fn print_table(rows: &[Value], totals: &Value) {
         at(totals, &["findings", "high"]),
         at(totals, &["findings", "medium"]),
         at(totals, &["findings", "low"]),
+        at(totals, &["exploitation", "verified"]),
+        at(totals, &["exploitation", "not-reproduced"]),
+        at(totals, &["exploitation", "skipped"]),
         at(totals, &["seconds"]).as_f64().unwrap_or(0.0)
     );
 }

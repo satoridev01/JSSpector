@@ -33,7 +33,7 @@ pub fn browser_attempts(
     nonce: u32,
 ) -> Vec<BrowserAttempt> {
     let token = format!("{}-{nonce}", canary.token);
-    let payload = canary_payload(probe.sink, &token);
+    let payload = canary_payload(probe.sink, canary, &token);
     let encoded = encode(&payload);
     let mut out = Vec::new();
     let mut push = |url: String| {
@@ -99,14 +99,14 @@ pub fn via_referrer(probe: &BrowserProbe) -> bool {
 /// The payload to carry on a referrer-sourced load, and the token it signals with.
 pub fn referrer_payload(probe: &BrowserProbe, canary: &Canary, nonce: u32) -> (String, String) {
     let token = format!("{}-{nonce}", canary.token);
-    (canary_payload(probe.sink, &token), token)
+    (canary_payload(probe.sink, canary, &token), token)
 }
 
 /// A canary that, if executed, calls the marker service carrying `token` — and does nothing else.
 /// HTML context uses an image's error handler (runs even though `<script>` in `innerHTML` does
 /// not); a navigation sink uses a `javascript:` URL.
-fn canary_payload(sink: BrowserSink, token: &str) -> String {
-    let call = format!("fetch('http://jss-marker/{token}')");
+fn canary_payload(sink: BrowserSink, canary: &Canary, token: &str) -> String {
+    let call = format!("fetch('{}')", canary.service_url_for_token(token));
     match sink {
         BrowserSink::Html => format!("<img src=x onerror=\"{call}\">"),
         BrowserSink::Navigation => format!("javascript:{call}"),
@@ -183,6 +183,23 @@ mod tests {
         // javascript: scheme, encoded.
         assert!(a.iter().all(|x| x.url.contains("javascript")));
         assert!(a.iter().all(|x| x.token == "t-2"));
+    }
+
+    #[test]
+    fn a_local_browser_canary_calls_its_ephemeral_loopback_marker() {
+        let canary =
+            Canary::new("t".to_owned()).with_marker_host(Some("0x7f000001:4321".to_owned()));
+        let attempts = browser_attempts(
+            &probe(UrlVector::Search, BrowserSink::Html),
+            "/index.html",
+            &canary,
+            1,
+        );
+        assert!(
+            attempts[0]
+                .url
+                .contains("http%3A%2F%2F0x7f000001%3A4321%2Ft-1")
+        );
     }
 
     #[test]

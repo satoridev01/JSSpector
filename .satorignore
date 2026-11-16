@@ -1,0 +1,5 @@
+.git
+target
+.satori/reports
+.satori/exploitability-regressions.json
+.satori/build-regression-manifest.py

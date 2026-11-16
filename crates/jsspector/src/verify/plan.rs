@@ -188,6 +188,45 @@ pub struct Probe {
     /// builder can put the tainted value in its text part and provide harmless file parts for the
     /// siblings needed to reach the sink. `None` for JSON, urlencoded and raw bodies.
     pub multipart: Option<MultipartForm>,
+    /// For a command-injection sink, the shell quote character the tainted value is interpolated
+    /// inside when the command string is built (`exec('open "' + folder + '"')` -> `"`,
+    /// `exec("ping '" + host + "'")` -> `'`). The payload must first close that quote before its
+    /// command separator is seen by the shell, otherwise the metacharacters stay inside a quoted
+    /// argument and run nothing. `None` when the value sits unquoted (`exec('ls ' + dir)`) or the
+    /// class is not command injection. Mined from the sink argument text only.
+    pub cmd_quote: Option<char>,
+    /// For a command-injection sink, whether the tainted value passes through `path.dirname()` on its
+    /// way to the sink (`folder = path.dirname(path.join(base, relpath))`). `dirname` drops the final
+    /// `/`-segment, so a payload placed as the last segment is discarded before the shell sees it; the
+    /// payload must therefore carry a trailing `/<segment>` that `dirname` removes, leaving the
+    /// injection in the surviving parent portion. `false` when the value reaches the sink without a
+    /// `dirname` step, or the class is not command injection. Mined from the finding trace only.
+    pub cmd_dir_segment: bool,
+    /// For a NoSQL injection whose sink *filters* existing documents (`findOne`/`find`/`updateOne`/
+    /// `deleteMany`/`countDocuments`/…), rather than inserting new ones. The operator only takes
+    /// effect against a pre-existing record, so the differential needs a seeded document the sink
+    /// query selects, and every non-injected sibling the query ANDs in must therefore carry the
+    /// *same* value across the match-all and match-none probes (and match that seeded record) instead
+    /// of a per-probe-unique one. `false` for an insert-style sink (registration), which keeps the
+    /// per-probe-unique fillers that avoid unique-key collisions, and for every non-NoSQL class.
+    /// Derived from the sink API only.
+    pub nosql_lookup: bool,
+    /// Whether the handler inserts a request-derived document before reaching the lookup sink. Such
+    /// probes need distinct identity siblings even though the sink itself filters existing records,
+    /// otherwise the first request trips a unique index for both differential controls.
+    pub nosql_inserts_before_sink: bool,
+    /// Whether the NoSQL sink can mutate existing documents. Database-state differentials are
+    /// useful only for update/delete sinks; running them against a read-only `findOne` burns request
+    /// budget and can trip application rate limiters before the response differential runs.
+    pub nosql_mutates: bool,
+    /// When the handler base64-decodes its tainted input into a *raw* string that reaches the sink
+    /// directly (`const decoded = Buffer.from(c, 'base64').toString(); eval(decoded)`), rather than
+    /// `JSON.parse`-ing it into an envelope object (see [`Self::envelope`]). The payload must then be
+    /// base64-encoded before it enters the request, so the handler's decode reconstructs the exact
+    /// payload the sink evaluates. `Some(true)` for a base64url decode, `Some(false)` for standard
+    /// base64. `None` for the common case where the input reaches the sink without a base64 decode.
+    /// Mutually exclusive with [`Self::envelope`]; mined from the handler source only.
+    pub decode_base64: Option<bool>,
 }
 
 /// How to obtain a genuine authenticated session for a sink gated behind an in-handler credential
@@ -738,6 +777,12 @@ impl Probe {
                 alt_paths: Vec::new(),
                 auth: None,
                 multipart: None,
+                cmd_quote: None,
+                cmd_dir_segment: false,
+                nosql_lookup: false,
+                nosql_inserts_before_sink: false,
+                nosql_mutates: false,
+                decode_base64: None,
             });
         }
         if finding.source.kind != "http" {
@@ -785,6 +830,15 @@ impl Probe {
             Vec::new()
         };
         let envelope = source.and_then(|src| json_envelope(src, &tainted, &finding.sink.arg));
+        // A handler that base64-decodes its tainted input into a raw string the sink consumes directly
+        // (`eval(Buffer.from(c, 'base64').toString())`) — not JSON-parsed into an envelope object —
+        // needs the payload base64-encoded so the decode reconstructs it verbatim at the sink. Mutually
+        // exclusive with the JSON-envelope case, which already handles the decode as part of packing.
+        let decode_base64 = if envelope.is_some() {
+            None
+        } else {
+            source.and_then(|src| base64_decoded_into_sink(src, &tainted, &finding.sink.arg))
+        };
         let lists_dir =
             finding.class == VulnClass::PathTraversal && sink_lists_directory(&finding.sink.api);
         let removes = finding.class == VulnClass::PathTraversal && sink_removes(&finding.sink.api);
@@ -817,6 +871,42 @@ impl Probe {
                 _ => None,
             })
             .flatten();
+        // A command-injection value interpolated inside a shell quote must break out of that quote,
+        // and a value passed through `path.dirname()` must carry a sacrificial trailing segment; both
+        // are read off the finding itself so the payload lands as a live command separator.
+        let (cmd_quote, cmd_dir_segment) = if finding.class == VulnClass::CommandInjection {
+            (
+                shell_quote_context(&finding.sink.arg),
+                finding
+                    .trace
+                    .iter()
+                    .any(|step| step.note.contains("path.dirname")),
+            )
+        } else {
+            (None, false)
+        };
+        // A NoSQL sink that filters existing documents (a `find`/`update`/`delete`/`count` family
+        // call), as opposed to one that inserts new ones: the operator can only act on a pre-existing
+        // record, so the differential needs a seeded record the sink query selects and the siblings
+        // the query ANDs in must stay constant across probes to keep matching it.
+        let nosql_lookup =
+            finding.class == VulnClass::NosqlInjection && sink_filters_documents(&finding.sink.api);
+        let (nosql_inserts_before_sink, downstream_nosql_mutation) =
+            if finding.class == VulnClass::NosqlInjection {
+                source
+                    .map(|source| {
+                        nosql_handler_effects(
+                            source,
+                            finding.sink.line,
+                            finding.entry_at.as_ref().map(|at| at.line),
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                (false, false)
+            };
+        let nosql_mutates = finding.class == VulnClass::NosqlInjection
+            && (sink_mutates_documents(&finding.sink.api) || downstream_nosql_mutation);
         Ok(Self {
             method,
             path,
@@ -846,6 +936,12 @@ impl Probe {
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote,
+            cmd_dir_segment,
+            nosql_lookup,
+            nosql_inserts_before_sink,
+            nosql_mutates,
+            decode_base64,
         })
     }
 
@@ -908,6 +1004,12 @@ impl Probe {
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
         })
     }
 }
@@ -1850,6 +1952,9 @@ pub fn defines_function(source: &str, name: &str) -> bool {
 /// `<path>`). Used to locate a parse function defined in another module. Mined from the import
 /// statements only.
 pub fn import_source_path(source: &str, name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
     let mut from = 0;
     while let Some(rel) = source[from..].find("import") {
         let at = from + rel;
@@ -1861,7 +1966,8 @@ pub fn import_source_path(source: &str, name: &str) -> Option<String> {
         // newline that ends the (possibly multi-line named) import at bracket depth 0. Without this
         // a semicolon-free file would merge the import with following statements and could read a
         // later import's specifier.
-        let window = &source[at..source.len().min(at + 400)];
+        let end = source.floor_char_boundary(source.len().min(at.saturating_add(400)));
+        let window = &source[at..end];
         let stmt = &window[..import_statement_end(window)];
         if !contains_word(stmt, name) {
             continue;
@@ -2479,6 +2585,9 @@ fn decode_regex_literal(fragment: &str) -> String {
 
 /// Whether `text` contains `word` bounded by non-identifier characters.
 fn contains_word(text: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
     let bytes = text.as_bytes();
     let mut from = 0;
     while let Some(rel) = text[from..].find(word) {
@@ -2539,6 +2648,72 @@ fn decoded_tainted_buffer(expr: &str, names: &[String]) -> Option<bool> {
         }
     }
     None
+}
+
+/// Whether the handler base64-decodes a tainted value into a *raw* string the sink consumes directly
+/// (`const decoded = Buffer.from(c, 'base64').toString(); eval(decoded)`), returning whether the
+/// decode alphabet is base64url. Unlike [`json_envelope`], the decoded bytes are not `JSON.parse`d into
+/// an object: the whole decoded string is the sink argument, so a payload must be base64-encoded to
+/// survive the decode and reach the sink verbatim. Recognized two ways — the sink argument expression
+/// itself decodes a tainted identifier (`eval(Buffer.from(c, 'base64').toString())`), or a tainted
+/// local is bound to such a decode (`const decoded = Buffer.from(c, 'base64').toString()`) and carries
+/// the taint onward to the sink. A right-hand side that wraps the decode in `JSON.parse` is excluded
+/// (that is the envelope case). `None` otherwise. Mined from the handler source only.
+fn base64_decoded_into_sink(source: &str, names: &[String], sink_arg: &str) -> Option<bool> {
+    if !sink_arg.contains("JSON.parse")
+        && let Some(url_safe) = decoded_tainted_buffer(sink_arg, names)
+    {
+        return Some(url_safe);
+    }
+    for (local, rhs) in decode_bindings(source) {
+        if !names.iter().any(|name| name == &local) {
+            continue;
+        }
+        if rhs.contains("JSON.parse") {
+            continue;
+        }
+        if let Some(url_safe) = decoded_tainted_buffer(&rhs, names) {
+            return Some(url_safe);
+        }
+    }
+    None
+}
+
+/// Each `const|let|var <name> = <rhs>` binding in `source`, as `(name, rhs)` where `rhs` is the
+/// initializer up to its statement end (see [`statement_rhs`]). Used to find a local a base64 decode is
+/// bound to. Mined from the handler source only.
+fn decode_bindings(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for kw in ["const ", "let ", "var "] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(kw) {
+            let at = from + rel;
+            from = at + kw.len();
+            if at > 0
+                && source
+                    .as_bytes()
+                    .get(at - 1)
+                    .is_some_and(|byte| is_ident(*byte))
+            {
+                continue;
+            }
+            let after_kw = &source[at + kw.len()..];
+            let name: String = after_kw
+                .bytes()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let rhs = after_kw[name.len()..].trim_start();
+            let Some(rhs) = rhs.strip_prefix('=') else {
+                continue;
+            };
+            out.push((name, statement_rhs(rhs.trim_start()).to_owned()));
+        }
+    }
+    out
 }
 
 /// The identifier a `JSON.parse(...)` at byte offset `js_start` is assigned to, by reading back over
@@ -2629,10 +2804,16 @@ fn is_safe_suffix(suffix: &str) -> bool {
 /// for each, a value that gets past its guard — a string literal the source constrains it to, a
 /// URL when the name asks for one, or a neutral filler.
 pub fn required_siblings(source: &str, part: &str, target: &str) -> Vec<(String, String)> {
-    let mut names: Vec<String> = member_params(source, part)
-        .into_iter()
-        .filter(|name| name != target)
-        .collect();
+    let mut names = member_params(source, part);
+    // Body handlers commonly need a complete object for a create/update operation, so consumed
+    // destructured fields are useful shape requirements. Query destructuring, by contrast, usually
+    // collects optional filters, pagination and tenant overrides; sending every consumed field
+    // changes application defaults and can redirect a probe away from the real datastore. Explicit
+    // member reads and control-flow guards below remain the evidence for required query siblings.
+    if part == "body" {
+        names.extend(destructured_field_keys(source, part));
+    }
+    names.retain(|name| name != target && !joi_field_is_optional(source, name));
     names.sort();
     names.dedup();
     names.truncate(12);
@@ -2681,6 +2862,46 @@ pub fn validator_required_body_fields(
             }
             if out.iter().all(|(k, _)| *k != field) {
                 out.push((field, value));
+            }
+        }
+    }
+    out
+}
+
+/// Body fields that an express-validator middleware attached to the route explicitly marks
+/// `.optional()`. Handler-wide mining can otherwise mistake every destructured body property for a
+/// request precondition and send a neutral scalar for an optional array/object field, causing the
+/// validator to reject a request that would have passed had the field simply been omitted.
+pub fn validator_optional_body_fields(
+    route_source: &str,
+    route_line: u32,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for expr in route_middleware_exprs(route_source, route_line) {
+        let mut parts = expr.split('.');
+        let Some(root) = parts.next() else {
+            continue;
+        };
+        let Some(module) = resolve(root) else {
+            continue;
+        };
+        let leaf: Vec<&str> = parts.collect();
+        let chain = validator_chain_text(&module, root, &leaf);
+        let starts = chain_starts(&chain);
+        for (idx, (pos, field, builder)) in starts.iter().enumerate() {
+            if builder != "body" && builder != "check" {
+                continue;
+            }
+            let Some(field) = field else {
+                continue;
+            };
+            let end = starts
+                .get(idx + 1)
+                .map(|item| item.0)
+                .unwrap_or(chain.len());
+            if chain[*pos..end].contains(".optional(") && !out.contains(field) {
+                out.push(field.clone());
             }
         }
     }
@@ -2791,6 +3012,47 @@ pub fn validator_query_fillers(
     out
 }
 
+/// Query fields that attached express-validator middleware makes optional, either directly with
+/// `.optional()` or conditionally with `.if(...)`. These override handler-wide sibling guesses: an
+/// omitted optional tenant lets the application use its configured database, while a fabricated
+/// tenant can silently redirect the sink into a different, lazily-created database.
+pub fn validator_optional_query_fields(
+    route_source: &str,
+    route_line: u32,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for expr in route_middleware_exprs(route_source, route_line) {
+        let mut parts = expr.split('.');
+        let Some(root) = parts.next() else {
+            continue;
+        };
+        let Some(module) = resolve(root) else {
+            continue;
+        };
+        let leaf: Vec<&str> = parts.collect();
+        let chain = validator_chain_text(&module, root, &leaf);
+        let starts = chain_starts(&chain);
+        for (idx, (pos, field, builder)) in starts.iter().enumerate() {
+            if builder != "query" {
+                continue;
+            }
+            let Some(field) = field else {
+                continue;
+            };
+            let end = starts
+                .get(idx + 1)
+                .map(|item| item.0)
+                .unwrap_or(chain.len());
+            let window = &chain[*pos..end];
+            if (window.contains(".optional(") || window.contains(".if(")) && !out.contains(field) {
+                out.push(field.clone());
+            }
+        }
+    }
+    out
+}
+
 /// The route registration's middleware arguments as full identifier/member expressions
 /// (`analyticsValidations.userEngagementValidators.getMetrics`, `pagination`), excluding the path
 /// string literal and any call expression. These name the express-validator chains the route mounts.
@@ -2832,17 +3094,31 @@ fn validator_chain_text(module: &str, root: &str, leaf: &[&str]) -> String {
     let seed = resolve_member_chain(module, root, leaf).unwrap_or_default();
     let mut text = seed.clone();
     let mut seen: Vec<String> = Vec::new();
-    let mut frontier: Vec<String> = referenced_idents(&seed);
+    let mut frontier: Vec<String> = referenced_idents(&seed)
+        .into_iter()
+        .chain(referenced_member_exprs(&seed))
+        .collect();
     let mut depth = 0;
     while depth < 3 && !frontier.is_empty() {
         let mut next: Vec<String> = Vec::new();
-        for ident in std::mem::take(&mut frontier) {
-            if seen.contains(&ident) {
+        for expr in std::mem::take(&mut frontier) {
+            if seen.contains(&expr) {
                 continue;
             }
-            seen.push(ident.clone());
-            if let Some(def) = const_definition_text(module, &ident) {
+            seen.push(expr.clone());
+            let mut parts = expr.split('.');
+            let Some(binding) = parts.next() else {
+                continue;
+            };
+            let leaf: Vec<&str> = parts.collect();
+            let definition = if leaf.is_empty() {
+                const_definition_text(module, binding)
+            } else {
+                resolve_member_chain(module, binding, &leaf)
+            };
+            if let Some(def) = definition {
                 next.extend(referenced_idents(&def));
+                next.extend(referenced_member_exprs(&def));
                 text.push('\n');
                 text.push_str(&def);
             }
@@ -3005,8 +3281,8 @@ fn referenced_idents(text: &str) -> Vec<String> {
                 .and_then(|begin| bytes.get(begin..start))
                 .is_some_and(|prefix| prefix == b"...");
             let is_member = before.is_some_and(|c| c == b'.' || is_ident(c)) && !is_spread;
-            let is_call = after == Some(b'(');
-            if !is_member && !is_call {
+            let is_call_or_member_root = matches!(after, Some(b'(' | b'.'));
+            if !is_member && !is_call_or_member_root {
                 let ident = &text[start..i];
                 if !out.iter().any(|existing| existing == ident) {
                     out.push(ident.to_owned());
@@ -3014,6 +3290,58 @@ fn referenced_idents(text: &str) -> Vec<String> {
             }
         } else {
             i += 1;
+        }
+    }
+    out
+}
+
+/// Member expressions used as validator-chain elements (`...common.tenant`). They must be resolved
+/// to the named property rather than expanding the root object's entire definition, which would mix
+/// unrelated validators from sibling routes into this request.
+fn referenced_member_exprs(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(byte) = bytes.get(i).copied() else {
+            break;
+        };
+        if !byte.is_ascii_alphabetic() && byte != b'_' && byte != b'$' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while bytes.get(i).copied().is_some_and(is_ident) {
+            i += 1;
+        }
+        let mut members = 0;
+        loop {
+            if bytes.get(i) != Some(&b'.')
+                || !bytes
+                    .get(i + 1)
+                    .copied()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'$')
+            {
+                break;
+            }
+            i += 1;
+            while bytes.get(i).copied().is_some_and(is_ident) {
+                i += 1;
+            }
+            members += 1;
+        }
+        if members == 0 || bytes.get(i) == Some(&b'(') {
+            continue;
+        }
+        let before = text[..start].trim_end();
+        let chain_element = before.is_empty()
+            || before.ends_with("...")
+            || before.ends_with(['[', ',', '=', '(', '{']);
+        if chain_element {
+            let expr = text[start..i].to_owned();
+            if !out.contains(&expr) {
+                out.push(expr);
+            }
         }
     }
     out
@@ -3236,6 +3564,71 @@ fn validator_filler(field: &str, window: &str) -> String {
     "jsspector".to_owned()
 }
 
+/// JSON-safe neutral values declared by a Mongoose schema. These refine otherwise generic body
+/// siblings so the request reaches the sink instead of failing model casting first (`coin: Number`
+/// must receive a number, not the string `jsspector`). Only direct top-level schema properties are
+/// considered; unknown and nested declarations are left untouched.
+pub fn mongoose_schema_fillers(source: &str) -> Vec<(String, String)> {
+    let Some(schema_at) = source.find(".Schema(").or_else(|| source.find("Schema(")) else {
+        return Vec::new();
+    };
+    let after = &source[schema_at..];
+    let Some(open) = after.find('{') else {
+        return Vec::new();
+    };
+    let Some(object) = balanced_braces(&after[open + 1..]) else {
+        return Vec::new();
+    };
+    split_top_level_commas(object)
+        .into_iter()
+        .filter_map(|property| {
+            let (field, declaration) = property.split_once(':')?;
+            let field = field.trim().trim_matches(['\'', '"']);
+            if field.is_empty()
+                || !field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+            {
+                return None;
+            }
+            let declaration = declaration.trim();
+            let value = if declaration.starts_with("Number")
+                || declaration.starts_with("mongoose.Schema.Types.Number")
+            {
+                "1".to_owned()
+            } else if declaration.starts_with("Boolean") {
+                "true".to_owned()
+            } else if declaration.starts_with("[String") {
+                "[\"jsspector\"]".to_owned()
+            } else if declaration.starts_with("[Number") {
+                "[1]".to_owned()
+            } else if declaration.starts_with("String") {
+                "jsspector".to_owned()
+            } else if declaration.starts_with('{') {
+                // A direct schema property commonly uses an options object. Prefer a declared enum
+                // member (or string default) so generated sibling data passes model validation.
+                let configured = declaration
+                    .find("enum:")
+                    .and_then(|at| {
+                        declaration[at + "enum:".len()..]
+                            .find('[')
+                            .map(|n| at + "enum:".len() + n + 1)
+                    })
+                    .and_then(|at| leading_string(declaration[at..].trim_start()))
+                    .or_else(|| {
+                        declaration.find("default:").and_then(|at| {
+                            leading_string(declaration[at + "default:".len()..].trim_start())
+                        })
+                    });
+                configured?
+            } else {
+                return None;
+            };
+            Some((field.to_owned(), value))
+        })
+        .collect()
+}
+
 /// The first string-literal alternative of an `.isIn(["a", "b"])` assertion (`a`), returned as a bare
 /// scalar. `None` when the argument is not a literal array of strings.
 fn first_isin_literal(window: &str) -> Option<String> {
@@ -3305,12 +3698,99 @@ fn sibling_value(source: &str, part: &str, name: &str) -> String {
     if let Some(literal) = constrained_literal(source, part, name) {
         return literal;
     }
+    if let Some(value) = joi_field_filler(source, name) {
+        return value;
+    }
     if is_urlish(name) {
         // A syntactically valid absolute URL that does not resolve to the marker service, so it
         // passes a `URL.canParse` / `new URL()` guard without tripping the probe's own signal.
         return "http://jss-filler.test/".to_owned();
     }
     "jsspector".to_owned()
+}
+
+/// The route-handler block enclosing the finding source line. Callers that mine request siblings use
+/// this instead of the whole module so fields read by unrelated routes do not leak into the probe.
+pub fn handler_source(source: &str, line: u32) -> &str {
+    handler_scope(source, line).unwrap_or(source)
+}
+
+/// The callback block that begins on or after a route registration line and contains the finding
+/// source. This includes validation/schema setup immediately before an inner `try` block while still
+/// excluding sibling routes in the same module.
+pub fn route_handler_source(source: &str, route_line: u32, source_line: u32) -> &str {
+    let Some(route_offset) = line_offset(source, route_line as usize) else {
+        return handler_source(source, source_line);
+    };
+    let Some(source_offset) = line_offset(source, source_line as usize) else {
+        return source;
+    };
+    let mut stack = Vec::new();
+    for (at, byte) in source.bytes().enumerate().take(source_offset) {
+        match byte {
+            b'{' => stack.push(at),
+            b'}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    let Some(open) = stack.into_iter().find(|open| *open >= route_offset) else {
+        return handler_source(source, source_line);
+    };
+    let Some(close) = matching_close_brace(source, open) else {
+        return handler_source(source, source_line);
+    };
+    source.get(open..=close).unwrap_or(source)
+}
+
+fn joi_field_chain<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        let before_ok = bytes
+            .get(at.wrapping_sub(1))
+            .is_none_or(|byte| !is_ident(*byte));
+        let after = source.get(at + name.len()..)?;
+        if !before_ok || after.bytes().next().is_some_and(is_ident) {
+            continue;
+        }
+        let Some(rest) = after.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with("Joi.") {
+            continue;
+        }
+        let start = source.len() - rest.len();
+        let end = statement_end(source, start);
+        return source.get(start..end);
+    }
+    None
+}
+
+fn joi_field_is_optional(source: &str, name: &str) -> bool {
+    joi_field_chain(source, name)
+        .is_some_and(|chain| chain.contains(".default(") || chain.contains(".optional("))
+}
+
+fn joi_field_filler(source: &str, name: &str) -> Option<String> {
+    let chain = joi_field_chain(source, name)?;
+    if chain.contains(".boolean(") {
+        return Some("true".to_owned());
+    }
+    if chain.contains(".array(") {
+        return Some("[\"jsspector\"]".to_owned());
+    }
+    if chain.contains(".number(") || chain.contains(".integer(") {
+        return Some("1".to_owned());
+    }
+    if chain.contains(".uri(") {
+        return Some("http://jss-filler.test/".to_owned());
+    }
+    Some("jsspector".to_owned())
 }
 
 /// Whether a parameter name asks for a URL, so a URL-shaped filler passes its guard.
@@ -3589,6 +4069,8 @@ pub fn gate_paths(source: &str) -> Vec<String> {
                     || before.ends_with("==")
                     || before.ends_with("startsWith(")
                     || before.ends_with("includes(")
+                    || before.ends_with("indexOf(")
+                    || before.ends_with("lastIndexOf(")
                     || after.starts_with("===")
                     || after.starts_with("==")
                     || after.starts_with("].includes(");
@@ -4416,6 +4898,12 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
     if let Some(entry) = hono_entry(finding, path, source) {
         return Some(entry);
     }
+    // A Web Fetch / Next.js App Router handler parses its body with a method call on the request
+    // object (`const { token } = await request.json()`). The engine records the source as the bare
+    // parse call, which names no field; resolve the destructured body key that carries taint.
+    if let Some(entry) = web_body_entry(finding, source) {
+        return Some(entry);
+    }
     // A file-based route's dynamic segment is merged into the request parameters, so a handler that
     // reads it via `req.query.<name>` is reading the URL path. Driving it as a query string is
     // overridden by the real path segment and never reaches the sink, so this placement wins.
@@ -4850,6 +5338,116 @@ fn file_route_path_param(finding: &Finding, path: &str, source: Option<&str>) ->
     path_param_slot(path, used).map(Entry::PathParam)
 }
 
+/// The shell quote character a command-injection sink interpolates its tainted value inside, read
+/// from the sink argument's source text. A command is built either by concatenation
+/// (`'open "' + folder + '"'`) or a template literal (`` `open "${folder}"` ``); in both the literal
+/// text that precedes the first interpolation determines the open quote the value sits within. The
+/// preceding literal is scanned tracking single/double quote state (a quote toggles its own state
+/// only when not inside the other), and the state still open at the interpolation point is returned:
+/// `"` or `'`, or `None` when the value is unquoted. Nothing here is target-specific — it reads only
+/// the argument's own quoting.
+fn shell_quote_context(arg: &str) -> Option<char> {
+    let prefix = command_literal_prefix(arg)?;
+    let mut in_single = false;
+    let mut in_double = false;
+    for ch in prefix.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+    }
+    match (in_single, in_double) {
+        (true, _) => Some('\''),
+        (_, true) => Some('"'),
+        _ => None,
+    }
+}
+
+/// The runtime shell text a command-injection sink argument emits *before* the tainted interpolation.
+/// For a template literal (`` `cmd "${x}"` ``) it is the characters up to that `${...}`, with every
+/// intervening interpolation skipped (its runtime value is opaque, so it contributes no quote state);
+/// for a concatenation (`'cmd "' + x`) it is the first string literal's decoded contents. The tainted
+/// interpolation is taken to be the last `${...}` whose body is a plain variable/member read — one with
+/// no call `(`, since helper interpolations such as `${fnFile("ids.js")}` are transforms, not the
+/// attacker value (`` `node ${fnFile("ids.js")} '${query}'` `` -> the `'` opened just before
+/// `${query}`). Falls back to the first interpolation when none is a plain read. Only the common `\"`,
+/// `\'`, `` \` `` and `\\` escapes are unescaped, which is enough to track shell quote state. `None`
+/// when no leading string literal is found (the value is the whole argument, or a bare variable).
+fn command_literal_prefix(arg: &str) -> Option<String> {
+    let arg = arg.trim_start();
+    let bytes = arg.as_bytes();
+    let first = *bytes.first()?;
+    if first != b'`' {
+        // A concatenation (`'cmd "' + x`): the first string literal's decoded contents.
+        let open = match first {
+            b'\'' | b'"' => first,
+            _ => return None,
+        };
+        let mut out = String::new();
+        let mut chars = arg[1..].chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                c if c as u32 == open as u32 => return Some(out),
+                c => out.push(c),
+            }
+        }
+        return Some(out);
+    }
+    // A template literal: accumulate literal text, skipping each `${...}` interpolation (its braces
+    // balanced), and record the literal prefix at the first interpolation and at the last plain-read
+    // interpolation (the tainted value). Prefer the latter.
+    let mut literal = String::new();
+    let mut first_prefix: Option<String> = None;
+    let mut tainted_prefix: Option<String> = None;
+    let mut chars = arg[1..].chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    literal.push(next);
+                }
+            }
+            '`' => break,
+            '$' if chars.peek() == Some(&'{') => {
+                chars.next();
+                let mut depth = 1usize;
+                let mut body = String::new();
+                for c in chars.by_ref() {
+                    match c {
+                        '{' => {
+                            depth += 1;
+                            body.push(c);
+                        }
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            body.push(c);
+                        }
+                        _ => body.push(c),
+                    }
+                }
+                if first_prefix.is_none() {
+                    first_prefix = Some(literal.clone());
+                }
+                if !body.contains('(') {
+                    tainted_prefix = Some(literal.clone());
+                }
+            }
+            c => literal.push(c),
+        }
+    }
+    // A template literal with no interpolation is a constant command: no tainted prefix.
+    Some(tainted_prefix.or(first_prefix).unwrap_or(literal))
+}
+
 /// Whether a sink API enumerates a directory's entries (rather than reading a file's bytes):
 /// `fs.readdirSync`, `fs.promises.readdir`, `fs.opendirSync`. For these the traversal proof is a
 /// planted file name appearing in the listing, not file content. Framework-agnostic: keyed on the
@@ -4857,6 +5455,64 @@ fn file_route_path_param(finding: &Finding, path: &str, source: Option<&str>) ->
 fn sink_lists_directory(api: &str) -> bool {
     let lower = api.to_ascii_lowercase();
     lower.contains("readdir") || lower.contains("opendir") || lower.contains("scandir")
+}
+
+/// Whether a NoSQL sink API *filters* existing documents — the `find`/`update`/`delete`/`count`
+/// family a Mongoose model or MongoDB collection exposes — as opposed to inserting new ones
+/// (`insertOne`, `insertMany`, `create`, `save`). An injected operator only changes what such a
+/// filtering query matches, so the differential needs a pre-existing record the query selects and
+/// the siblings the filter ANDs in must stay constant across probes. Keyed on the final `.`-segment
+/// of the API name so it is driver-agnostic; defaults to filtering for an unrecognized query method,
+/// since an unknown name is far more likely a read/update than an insert.
+fn sink_filters_documents(api: &str) -> bool {
+    let name = api.rsplit('.').next().unwrap_or(api).to_ascii_lowercase();
+    !(name.starts_with("insert")
+        || name == "create"
+        || name == "insert"
+        || name == "save"
+        || name == "bulkwrite")
+}
+
+/// Whether a NoSQL sink changes existing records rather than only reading/filtering them.
+fn sink_mutates_documents(api: &str) -> bool {
+    let name = api.rsplit('.').next().unwrap_or(api).to_ascii_lowercase();
+    name.contains("update")
+        || name.contains("delete")
+        || name.contains("remove")
+        || name.contains("replace")
+        || name == "findandmodify"
+        || name == "bulkwrite"
+}
+
+/// Request handlers can insert the submitted document before a tainted lookup and mutate the
+/// selected record afterwards (registration/referral flows are the common shape). Return those two
+/// effects separately: the first requires unique probe identities, while the second enables the
+/// database-state oracle even though the tainted sink itself is read-only.
+fn nosql_handler_effects(source: &str, sink_line: u32, route_line: Option<u32>) -> (bool, bool) {
+    let handler = route_line
+        .map(|route_line| route_handler_source(source, route_line, sink_line))
+        .unwrap_or_else(|| handler_source(source, sink_line));
+    let handler_start = handler.as_ptr() as usize - source.as_ptr() as usize;
+    let Some(sink_start) = line_offset(source, sink_line as usize) else {
+        return (false, false);
+    };
+    let split = sink_start.saturating_sub(handler_start).min(handler.len());
+    let (before, after) = handler.split_at(split);
+    let inserts = [".create(", ".insertOne(", ".insertMany(", ".save("]
+        .iter()
+        .any(|needle| before.contains(needle));
+    let mutates = [
+        ".update",
+        ".findOneAndUpdate(",
+        ".findByIdAndUpdate(",
+        ".delete",
+        ".remove(",
+        ".replace",
+        ".bulkWrite(",
+    ]
+    .iter()
+    .any(|needle| after.contains(needle));
+    (inserts, mutates)
 }
 
 /// Whether a sink API removes a filesystem entry (rather than reading one): `fs.unlink(Sync)`,
@@ -4981,6 +5637,53 @@ fn named_request_entry(part: &str, name: &str, path: &str) -> Option<Entry> {
     }
 }
 
+/// The request entry a Web Fetch / Next.js App Router handler resolves to when it parses its body
+/// through a method call on the request object (`const { token } = await request.json()`). The engine
+/// records such a source as the bare parse call (`request.json()`), which names no field; map the
+/// finding's tainted local back to the destructured body key. Only `json()` destructures into named
+/// fields — `text()`/`arrayBuffer()`/`blob()` carry a single scalar body and `formData()` is resolved
+/// by [`form_data_entry`] — so other parse methods return `None`. A shorthand destructure binds the
+/// key to a local of the same name, which is the fallback when no rename pattern is found.
+fn web_body_entry(finding: &Finding, source: Option<&str>) -> Option<Entry> {
+    let (recv, method) = web_request_body_call(finding.source.expr.trim())?;
+    if method != "json" {
+        return None;
+    }
+    let local = first_assigned_local(finding)?;
+    let key = source
+        .and_then(|src| {
+            destructuring_bound_from_call(src, &format!("{recv}.{method}("))
+                .into_iter()
+                .find(|(_, bound)| *bound == local)
+                .map(|(key, _)| key)
+        })
+        .unwrap_or(local);
+    Some(Entry::Body(Some(key)))
+}
+
+/// A Web `Request` body-parse call on a bare `request`/`req` receiver (`request.json()`,
+/// `req.text()`, `request.formData()`): the receiver name and the parse method. A Hono
+/// `c.req.json()` carries a `.req.` receiver and is resolved by [`hono_entry`] instead, so only the
+/// bare App Router / Web Fetch handler parameter is matched here. The call must take no argument.
+fn web_request_body_call(expr: &str) -> Option<(&'static str, String)> {
+    for recv in ["request", "req"] {
+        let Some(after) = expr.strip_prefix(recv).and_then(|r| r.strip_prefix('.')) else {
+            continue;
+        };
+        let Some(paren) = after.find('(') else {
+            continue;
+        };
+        let method = &after[..paren];
+        if method.is_empty() || !method.bytes().all(is_ident) {
+            continue;
+        }
+        if after[paren + 1..].trim_start().starts_with(')') {
+            return Some((recv, method.to_owned()));
+        }
+    }
+    None
+}
+
 /// The first local a finding's value was assigned to at the source (its first in-file `assigned to
 /// \`x\`` trace step): the destructured local that carries the tainted request key.
 fn first_assigned_local(finding: &Finding) -> Option<String> {
@@ -5018,12 +5721,26 @@ fn local_for_key(source: &str, method: &str, key: &str) -> Option<String> {
 /// registers many handlers, each destructuring its own params, so all bindings are gathered and the
 /// caller selects the one naming the local or key it is resolving.
 fn hono_destructuring(source: &str, method: &str) -> Vec<(String, String)> {
-    let needle = format!(".req.{method}(");
+    destructuring_bound_from_call(source, &format!(".req.{method}("))
+}
+
+/// Every `key -> local` pair of an object-destructuring bound from a no-argument call whose text ends
+/// with `needle` (`const { token, password } = await request.json()` for needle `request.json(`).
+/// Shares its destructure-pattern walk-back with [`hono_destructuring`]. When `needle` begins with an
+/// identifier character (a bare receiver like `request.json(`), a word boundary is required before it
+/// so a longer identifier (`myrequest.json(`) is not matched; a needle beginning with `.` is already
+/// boundary-anchored.
+fn destructuring_bound_from_call(source: &str, needle: &str) -> Vec<(String, String)> {
+    let bytes = source.as_bytes();
+    let check_boundary = needle.as_bytes().first().is_some_and(|b| is_ident(*b));
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(rel) = source[from..].find(&needle) {
+    while let Some(rel) = source[from..].find(needle) {
         let at = from + rel;
         from = at + needle.len();
+        if check_boundary && at > 0 && bytes.get(at - 1).is_some_and(|b| is_ident(*b)) {
+            continue;
+        }
         // The call must take no argument: the next non-space byte after `(` is `)`.
         if source[from..].trim_start().as_bytes().first() != Some(&b')') {
             continue;
@@ -5186,6 +5903,91 @@ pub fn enclosing_guards(source: &str, sink_line: u32) -> Vec<(String, Option<Str
             continue;
         }
         i += 1;
+    }
+    out
+}
+
+/// Request fields of `part` whose *positive* `if (req.<part>.<field>) { ... }` block selects a branch
+/// that holds none of the flow anchors, so the tainted flow runs only when the field is ABSENT (the
+/// handler falls through to the `else` or following code). Such a field must not be sent as a sibling:
+/// setting it would divert control into the wrong branch and the sink would never run. A negated test
+/// (`if (!req.<part>.<field>) return`) marks the field *required*, not diverting, and is excluded; a
+/// block that does enclose a flow anchor is a real gate kept elsewhere. Mined from the handler source
+/// by brace matching against the anchors; nothing is app-specific.
+pub fn diverting_guard_fields(source: &str, part: &str, anchors: &[u32]) -> Vec<String> {
+    let anchor_offsets: Vec<usize> = anchors
+        .iter()
+        .filter_map(|line| line_offset(source, *line as usize))
+        .collect();
+    let bytes = source.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= source.len() {
+        let at_boundary = i == 0 || bytes.get(i - 1).is_some_and(|byte| !is_ident(*byte));
+        if at_boundary
+            && bytes.get(i) == Some(&b'i')
+            && bytes.get(i + 1) == Some(&b'f')
+            && bytes.get(i + 2).is_none_or(|b| !is_ident(*b))
+            && let Some(popen) = source[i + 2..].find('(').map(|r| i + 2 + r)
+            && source[i + 2..popen].trim().is_empty()
+            && let Some(pclose) = matching_close_paren(source, popen)
+        {
+            let cond = &source[popen + 1..pclose];
+            let after = &source[pclose + 1..];
+            let ws = after.len() - after.trim_start().len();
+            if after[ws..].starts_with('{') {
+                let bopen = pclose + 1 + ws;
+                if let Some(bclose) = matching_close_brace(source, bopen) {
+                    let encloses_flow = anchor_offsets
+                        .iter()
+                        .any(|&off| off > bopen && off < bclose);
+                    if !encloses_flow {
+                        for name in positive_member_params(cond, part) {
+                            if !out.contains(&name) {
+                                out.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+            i = popen + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Request fields of `part` read positively (not under a `!`) inside a condition
+/// (`req.query.openFolderOnly` -> `openFolderOnly`, but `!req.query.id` yields nothing). Used to find
+/// branch-selecting guards; a negated occurrence is a presence requirement handled elsewhere, so it is
+/// skipped here.
+fn positive_member_params(cond: &str, part: &str) -> Vec<String> {
+    let needle = format!(".{part}.");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = cond[from..].find(&needle) {
+        let at = from + rel;
+        from = at + needle.len();
+        if !receiver_before(&cond[..at]) {
+            continue;
+        }
+        // The receiver token that owns this access, and whatever precedes it: a `!` (optionally
+        // spaced) means a negated, required field, not a diverting one.
+        let recv_len = cond[..at]
+            .bytes()
+            .rev()
+            .take_while(|b| is_ident(*b))
+            .count();
+        let before = cond[..at - recv_len].trim_end();
+        if before.ends_with('!') {
+            continue;
+        }
+        let after = &cond[at + needle.len()..];
+        let ident: String = after.chars().take_while(|c| is_ident(*c as u8)).collect();
+        if !ident.is_empty() {
+            out.push(ident);
+        }
     }
     out
 }
@@ -5690,6 +6492,59 @@ fn is_request_field(source: &str, part: &str, name: &str) -> bool {
         || destructured_fields(source, part).iter().any(|n| n == name)
 }
 
+/// The request field KEYS a handler destructures from `<receiver>.<part>`, or — for a body — from a
+/// `request.json()`/`req.body` call result (`const { a, b: c } = await request.json()` -> `a`, `b`).
+/// Companion to [`member_params`] (member-access reads) for the destructured shape, returning the
+/// request field names (not the renamed locals), so a sibling is sent under the key the handler reads.
+/// Used by [`required_siblings`] so a handler that destructures its other required fields still gets
+/// them supplied. A field whose local binding is never referenced beyond the destructuring itself is
+/// an optional, unused read and is left out — only fields the handler actually consumes (`const {
+/// username } = await request.json(); User.create({ username })`) are returned. Mined from the handler
+/// source only.
+fn destructured_field_keys(source: &str, part: &str) -> Vec<String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for recv in ["req", "request", "ctx"] {
+        pairs.extend(destructured_fields_of(source, &format!("{recv}.{part}")));
+    }
+    if part == "body" {
+        for recv in ["request", "req"] {
+            pairs.extend(destructuring_bound_from_call(
+                source,
+                &format!("{recv}.json("),
+            ));
+        }
+    }
+    pairs
+        .into_iter()
+        .filter(|(_field, local)| ident_occurrences(source, local) > 1)
+        .map(|(field, _local)| field)
+        .collect()
+}
+
+/// The number of whole-identifier occurrences of `name` in `source` (bounded by non-identifier
+/// bytes). A destructured binding that appears only once is its own declaration and nothing else — an
+/// unused optional read; more than once means the handler references it.
+fn ident_occurrences(source: &str, name: &str) -> usize {
+    if name.is_empty() {
+        return 0;
+    }
+    let bytes = source.as_bytes();
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        let before_ok = bytes
+            .get(at.wrapping_sub(1))
+            .is_none_or(|byte| !is_ident(*byte));
+        let after_ok = bytes.get(at + name.len()).is_none_or(|b| !is_ident(*b));
+        if before_ok && after_ok {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// The locals a handler destructures from `<receiver>.<part>` (`const { a, b: c } = req.body` -> `a`,
 /// `c`). Member-access reads are covered by [`member_params`]; this covers the destructured shape.
 fn destructured_fields(source: &str, part: &str) -> Vec<String> {
@@ -5750,6 +6605,16 @@ fn destructured_fields(source: &str, part: &str) -> Vec<String> {
             }
         }
     }
+    // A Web Fetch / Next.js App Router handler parses its body with a method call and destructures the
+    // result (`const { token, password } = await request.json()`); those locals are read from the body
+    // just as a `const { token } = req.body` destructure would be.
+    if part == "body" {
+        for recv in ["request", "req"] {
+            for (_, local) in destructuring_bound_from_call(source, &format!("{recv}.json(")) {
+                out.push(local);
+            }
+        }
+    }
     out
 }
 
@@ -5762,7 +6627,13 @@ pub fn sql_plan_for(finding: &Finding, entry: &Entry, source: &str) -> Option<Sq
     }
     let mut tainted = tainted_identifiers(finding, entry);
     propagate_path_derived_taint(source, &mut tainted);
-    sql_identifier_plan(source, &tainted)
+    let mut plan = sql_identifier_plan(source, &tainted)?;
+    // A handler can contain several statements that interpolate the same request field. The
+    // destructive oracle applies only when this finding's reported sink argument is itself a DELETE;
+    // selecting a later DELETE elsewhere in the handler misclassifies a SELECT finding and makes the
+    // verifier observe the wrong statement.
+    plan.delete = sql_delete_identifier(&finding.sink.arg, &tainted);
+    Some(plan)
 }
 
 /// The [`SqlValue`] for a SQL-injection finding whose tainted value is interpolated inside a quoted
@@ -7125,6 +7996,30 @@ const {\n  validateTenant,\n  validateCreateShippingBatch,\n  validate2,\n} = re
     }
 
     #[test]
+    fn validator_middleware_reports_optional_body_fields_with_their_own_chain_window() {
+        let route = "router.post(\"/refresh\", validators.refresh, validate, controller.run);\n";
+        let module = "const common = {\n  tenant: [body(\"tenant\").exists().notEmpty()],\n  unrelated: [body(\"noise\").exists(), body(\"wrong_shape\").optional().isArray()],\n};\nconst refresh = [\n  ...common.tenant,\n  body(\"device_names\").optional().isArray(),\n  body(\"site_ids\").optional().isArray(),\n  body(\"refresh_all\").optional().isBoolean(),\n];\n";
+        let optional = super::validator_optional_body_fields(route, 1, &|name| {
+            (name == "validators").then(|| module.to_owned())
+        });
+        assert_eq!(
+            optional,
+            vec![
+                "device_names".to_owned(),
+                "site_ids".to_owned(),
+                "refresh_all".to_owned(),
+            ]
+        );
+        let required = super::validator_required_body_fields(route, 1, "device_names", &|name| {
+            (name == "validators").then(|| module.to_owned())
+        });
+        assert_eq!(
+            required,
+            vec![("tenant".to_owned(), "jsspector".to_owned())]
+        );
+    }
+
+    #[test]
     fn member_expression_validator_supplies_a_oneof_sibling_for_a_body_payload() {
         // The middleware is a member expression (`userValidations.syncAnalyticsAndMobile`), not a
         // bare identifier, and the payload field (`email`) is one branch of a `oneOf`. The other
@@ -7219,10 +8114,11 @@ module.exports = { healthScoreValidators };\n";
         // doing so would send `timeframe=jsspector`, fail the `.isIn([...])` validator, and mask the
         // injection behind an identical validation error for every payload.
         let route = "router.get(\n  \"/:email/activity-report\",\n  analyticsValidations.activityValidators.getReport,\n  controller.getActivityReport\n);\n";
-        let validator = "const validateTimeframe = query(\"timeframe\").optional().isIn([\"last7days\", \"custom\"]).withMessage(\"Invalid timeframe\");\n\
+        let validator = "const validateTenant = query(\"tenant\").optional().notEmpty();\n\
+const validateTimeframe = query(\"timeframe\").optional().isIn([\"last7days\", \"custom\"]).withMessage(\"Invalid timeframe\");\n\
 const validateDateRange = [\n  query(\"startDate\").if(query(\"timeframe\").equals(\"custom\")).isISO8601(),\n  query(\"endDate\").if(query(\"timeframe\").equals(\"custom\")).isISO8601(),\n];\n\
 const validateUserEmail = param(\"email\").isEmail();\n\
-const activityValidators = {\n  getReport: [validateUserEmail, validateTimeframe, ...validateDateRange],\n};\n\
+const activityValidators = {\n  getReport: [validateUserEmail, validateTenant, validateTimeframe, ...validateDateRange],\n};\n\
 module.exports = { activityValidators };\n";
         let mined = super::validator_query_fillers(route, 1, "email", &|name| {
             (name == "analyticsValidations").then(|| validator.to_owned())
@@ -7230,6 +8126,18 @@ module.exports = { activityValidators };\n";
         assert!(
             mined.is_empty(),
             "no query field is unconditionally required here, got {mined:?}"
+        );
+        let optional = super::validator_optional_query_fields(route, 1, &|name| {
+            (name == "analyticsValidations").then(|| validator.to_owned())
+        });
+        assert_eq!(
+            optional,
+            vec![
+                "tenant".to_owned(),
+                "timeframe".to_owned(),
+                "startDate".to_owned(),
+                "endDate".to_owned(),
+            ]
         );
 
         let parenthesized = "const validators = [(query(\"tenant\").notEmpty())];";
@@ -7466,6 +8374,37 @@ module.exports = { activityValidators };\n";
     }
 
     #[test]
+    fn import_source_path_bounds_its_window_on_utf8() {
+        let prefix = "import { target } from './target.js';";
+        let source = format!("{}{}─\n", prefix, "x".repeat(399 - prefix.len()));
+        assert_eq!(source.as_bytes()[399], 0xe2);
+        assert_eq!(
+            super::import_source_path(&source, "target").as_deref(),
+            Some("./target.js")
+        );
+    }
+
+    #[test]
+    fn import_source_path_rejects_an_unnamed_sink_receiver() {
+        let source = "import { User } from './user.js';\n";
+        assert_eq!(super::import_source_path(source, ""), None);
+        assert!(!super::contains_word(source, ""));
+    }
+
+    #[test]
+    fn a_registration_lookup_keeps_unique_probe_identities_and_observes_later_mutation() {
+        let source = "async function register(req) {\n\
+            await User.create({ username: req.body.username });\n\
+            const referrer = await User.findOne({ referralCode: req.body.referralCode });\n\
+            if (referrer) await User.findOneAndUpdate({ _id: referrer._id }, { $inc: { coin: 1 } });\n\
+            }\n";
+        assert_eq!(
+            super::nosql_handler_effects(source, 3, Some(1)),
+            (true, true)
+        );
+    }
+
+    #[test]
     fn url_query_fillers_satisfy_presence_and_object_key_guards() {
         // A URL-sourced SSRF handler reads two query parameters and reaches `fetch(url)` only when
         // both are present and `type` indexes an imported allow-list object. The payload rides `url`;
@@ -7582,6 +8521,12 @@ module.exports = { activityValidators };\n";
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -7589,6 +8534,59 @@ module.exports = { activityValidators };\n";
         assert_eq!(
             siblings,
             vec![("authorization".to_owned(), "jsspector".to_owned())]
+        );
+    }
+
+    #[test]
+    fn required_siblings_include_used_body_fields_destructured_from_request_json() {
+        // A Next.js App Router handler destructures its body from `request.json()`; the sibling fields
+        // the handler also consumes (passed to `User.create`) must be supplied, or the insert that
+        // precedes the sink rejects the request. The payload field itself is excluded.
+        let source = "const { username, password, referralCode } = await request.json();\n\
+                      await User.create({ username, password });\n\
+                      const r = await User.findOne({ referralCode });";
+        let siblings = required_siblings(source, "body", "referralCode");
+        let names: Vec<&str> = siblings.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&"username"), "{names:?}");
+        assert!(names.contains(&"password"), "{names:?}");
+        assert!(!names.contains(&"referralCode"), "{names:?}");
+    }
+
+    #[test]
+    fn handler_scoping_and_joi_defaults_keep_only_real_body_preconditions() {
+        let source = r#"
+          router.post('/search', (req, res) => {
+            use(req.body.artist, req.body.album, req.body.image);
+          });
+          router.post('/set-from-url', async (req, res) => {
+            const schema = Joi.object({
+              filepath: Joi.string().required(),
+              url: Joi.string().uri().required(),
+              writeToFolder: Joi.boolean().default(false),
+              writeToFile: Joi.boolean().default(false)
+            });
+            joiValidate(schema, req.body);
+            try {
+              const image = await httpGet(req.body.url);
+              await apply(req.body.filepath, image, req.body.writeToFolder, req.body.writeToFile);
+            } catch (error) {}
+          });
+        "#;
+        let route_line = source
+            .lines()
+            .position(|line| line.contains("router.post('/set-from-url'"))
+            .map(|line| line as u32 + 1)
+            .unwrap();
+        let line = source
+            .lines()
+            .position(|line| line.contains("httpGet(req.body.url)"))
+            .map(|line| line as u32 + 1)
+            .unwrap();
+        let handler = super::route_handler_source(source, route_line, line);
+        assert!(!handler.contains("req.body.artist"));
+        assert_eq!(
+            super::required_siblings(handler, "body", "url"),
+            vec![("filepath".to_owned(), "jsspector".to_owned())]
         );
     }
 
@@ -7646,6 +8644,53 @@ module.exports = { activityValidators };\n";
 
         let required = guard_required_fields(source, "body", "base", &[sink_line]);
         assert_eq!(required, vec![("agent".to_owned(), "jsspector".to_owned())]);
+    }
+
+    #[test]
+    fn shell_quote_context_reads_the_interpolated_quote() {
+        // The tainted value sits inside a double quote, a single quote, or unquoted; the payload must
+        // close the quote it is interpolated within before its separator.
+        assert_eq!(shell_quote_context(r#"'open "' + folder + '"'"#), Some('"'));
+        assert_eq!(shell_quote_context(r#"'ping -c1 ' + host"#), None);
+        assert_eq!(shell_quote_context("\"echo '\" + name + \"'\""), Some('\''));
+        assert_eq!(shell_quote_context("`open \"${folder}\"`"), Some('"'));
+        assert_eq!(shell_quote_context("`xdg-open ${folder}`"), None);
+        // The tainted value is not the first interpolation: a helper call (`${fnFile("ids.js")}`)
+        // precedes it, and the quote state is read at the tainted `${query}` — inside the single quote
+        // the template opens just before it.
+        assert_eq!(
+            shell_quote_context("`node ${fnFile(\"ids.js\")} '${query}'`"),
+            Some('\'')
+        );
+        // A bare variable argument (no literal prefix) is unquoted.
+        assert_eq!(shell_quote_context("folder"), None);
+    }
+
+    #[test]
+    fn diverting_guard_fields_drops_an_alternative_branch_selector() {
+        // `openFolderOnly` selects a branch that does not contain the tainted flow (the sink is reached
+        // only when it is absent); it must be dropped. `file` is read on the flow path, and `id` is a
+        // negated presence requirement — neither is diverting.
+        let source = r#"
+          router.get('/openFileFolder/', async (req, res) => {
+            let folder = null;
+            if (req.query.openFolderOnly) {
+              folder = path.join(root, 'ASSETS', req.query.openFolderOnly);
+            } else {
+              let relpath = req.query.file || '';
+              if (!req.query.id) return res.status(400).send('no');
+              folder = path.dirname(path.join(root, 'ASSETS', 'templates', relpath));
+            }
+            require('child_process').exec('open "' + folder + '"');
+          });
+        "#;
+        let flow_line = source
+            .lines()
+            .position(|l| l.contains("let relpath ="))
+            .map(|i| i as u32 + 1)
+            .unwrap();
+        let diverting = diverting_guard_fields(source, "query", &[flow_line]);
+        assert_eq!(diverting, vec!["openFolderOnly".to_owned()]);
     }
 
     #[test]
@@ -8402,6 +9447,10 @@ module.exports = { activityValidators };\n";
         assert!(!paths.iter().any(|p| p == "/ide/"), "{paths:?}");
         assert!(!paths.iter().any(|p| p == "./static/"), "{paths:?}");
         assert!(!paths.iter().any(|p| p == "alice"), "{paths:?}");
+        // A raw catch-all dispatch gates on a substring of the URL (`req.url.indexOf('/api/ids') !==
+        // -1`): the path it recognizes is mined so the payload rides a URL it accepts.
+        let substring = "if (request.url.indexOf('/api/ids') !== -1) {}\n";
+        assert!(super::gate_paths(substring).contains(&"/api/ids".to_owned()));
     }
 
     #[test]
@@ -8461,6 +9510,61 @@ module.exports = { activityValidators };\n";
         assert!(env.url_safe);
         // Without the handler source the coarse `req.params` stays unresolved, never guessed.
         assert!(Probe::from_finding(&f).is_err());
+    }
+
+    #[test]
+    fn a_base64_decoded_eval_input_is_marked_for_base64_encoding() {
+        // The handler base64-decodes its tainted query parameter into a raw string and evaluates it
+        // directly (not JSON.parsed into an envelope). The probe must record that the payload has to be
+        // base64-encoded so the decode reconstructs it at the sink, and must *not* mistake it for the
+        // JSON-envelope case.
+        let source = r#"
+          const requestHandler = (req, res) => {
+            const url = new URL(req.url, `http://${req.headers.host}`);
+            if (url.pathname === '/api') {
+              const c = url.searchParams.get('c');
+              const decoded = Buffer.from(c, 'base64').toString();
+              const result = eval(decoded);
+            }
+          };
+        "#;
+        let mut f = finding(
+            VulnClass::CodeInjection,
+            Auth::NoneDetected,
+            Some("GET /{wildcard}"),
+            "req.url",
+        );
+        f.sink.api = "eval".to_owned();
+        f.sink.arg = "decoded".to_owned();
+        f.trace = vec![
+            TraceStep {
+                file: None,
+                line: 1,
+                col: 1,
+                note: "assigned to `c`".to_owned(),
+            },
+            TraceStep {
+                file: None,
+                line: 1,
+                col: 1,
+                note: "assigned to `decoded`".to_owned(),
+            },
+        ];
+        let probe = Probe::from_finding_with_source(&f, Some(source)).unwrap();
+        assert_eq!(probe.decode_base64, Some(false));
+        assert!(probe.envelope.is_none());
+        // Without the base64 decode in the source, the flag stays unset.
+        let plain = "const result = eval(req.query.c);";
+        let mut g = finding(
+            VulnClass::CodeInjection,
+            Auth::NoneDetected,
+            Some("GET /x"),
+            "req.query.c",
+        );
+        g.sink.api = "eval".to_owned();
+        g.sink.arg = "c".to_owned();
+        let probe = Probe::from_finding_with_source(&g, Some(plain)).unwrap();
+        assert_eq!(probe.decode_base64, None);
     }
 
     #[test]
@@ -8734,7 +9838,8 @@ module.exports = { activityValidators };\n";
 
         // An identifier position (`FROM ${table}`) is driven by the identifier plan, not misread as a
         // value breakout.
-        let id_source = "db.query(`SELECT id FROM ${req.body.table} WHERE id = 1`)";
+        let id_source = "const { table } = req.body; \
+            db.query(`SELECT id FROM ${table} WHERE id = 1`)";
         let mut idf = finding(
             VulnClass::SqlInjection,
             Auth::NoneDetected,
@@ -8742,8 +9847,21 @@ module.exports = { activityValidators };\n";
             "req.body.table",
         );
         idf.sink.api = ".query".to_owned();
+        idf.sink.arg = "`SELECT id FROM ${table} WHERE id = 1`".to_owned();
         let idp = Probe::from_finding_with_source(&idf, Some(id_source)).unwrap();
         assert!(sql_value_plan_for(&idf, &idp.entry, id_source).is_none());
+
+        // A later destructive statement in the same handler does not turn this SELECT finding into
+        // a DELETE finding; the oracle is selected from the reported sink argument.
+        let mixed = "const { table } = req.body; \
+            db.query(`SELECT id FROM ${table} WHERE id = 1`); \
+            db.query(`DELETE FROM ${table} WHERE id = ?`)";
+        assert!(
+            sql_plan_for(&idf, &idp.entry, mixed)
+                .expect("the SELECT identifier remains driveable")
+                .delete
+                .is_none()
+        );
 
         // A non-SQL template carrying the same interpolation is not treated as a SQL value position.
         let html = "res.send(`<p>${req.body.email}</p>`)";
@@ -8932,5 +10050,35 @@ module.exports = { activityValidators };\n";
         // A value-position quote is not an identifier quote: no destructive plan is produced.
         let value = "db.prepare(`DELETE FROM items WHERE name = '${tableName}'`).run()";
         assert!(sql_delete_identifier(value, &["tableName".to_owned()]).is_none());
+    }
+
+    #[test]
+    fn mongoose_schema_types_produce_json_safe_sibling_fillers() {
+        let source = r#"
+const userSchema = new mongoose.Schema({
+  username: String,
+  coin: Number,
+  active: Boolean,
+  tags: [String],
+  scores: [Number],
+  nested: { type: String },
+  authProvider: {
+    type: String,
+    enum: ['local', 'google'],
+    default: 'local'
+  }
+})
+"#;
+        assert_eq!(
+            mongoose_schema_fillers(source),
+            vec![
+                ("username".to_owned(), "jsspector".to_owned()),
+                ("coin".to_owned(), "1".to_owned()),
+                ("active".to_owned(), "true".to_owned()),
+                ("tags".to_owned(), "[\"jsspector\"]".to_owned()),
+                ("scores".to_owned(), "[1]".to_owned()),
+                ("authProvider".to_owned(), "local".to_owned()),
+            ]
+        );
     }
 }

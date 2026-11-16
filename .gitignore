@@ -17,6 +17,8 @@
 # private companion repo, never here (see SECURITY.md)
 /corpus/findings/
 *.findings.json
+/.satori/reports/
+/.satori/exploitability-regressions.json
 
 # OS / editor
 .DS_Store

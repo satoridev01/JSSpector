@@ -13,7 +13,7 @@ mod payload;
 mod plan;
 mod sandbox;
 
-use jss_core::Finding;
+use jss_core::{Finding, VulnClass};
 use serde::Serialize;
 
 /// A negative-control request and the response it produced. Differential verifiers attach these to
@@ -171,18 +171,25 @@ pub fn run(
             && let Some((part, target)) = probe.entry_part().map(|(p, t)| (p, t.to_owned()))
             && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
         {
-            let mut siblings = plan::required_siblings(&source, part, &target);
+            let handler = finding
+                .entry_at
+                .as_ref()
+                .filter(|at| at.file == finding.file)
+                .map(|at| plan::route_handler_source(&source, at.line, finding.source.line))
+                .unwrap_or_else(|| plan::handler_source(&source, finding.source.line));
+            let mut siblings = plan::required_siblings(handler, part, &target);
             // A handler may reach its sink only on a guarded branch (`else if (agentKey)`,
             // `if (mode === 'raw')`); the member that gates it must be present, or the request takes
             // a different branch and never reaches the sink. Add any such field of the same part.
-            for (name, value) in plan::guard_required_fields(
+            let guard_siblings = plan::guard_required_fields(
                 &source,
                 part,
                 &target,
                 &plan::guard_anchor_lines(finding),
-            ) {
-                if siblings.iter().all(|(k, _)| *k != name) {
-                    siblings.push((name, value));
+            );
+            for (name, value) in &guard_siblings {
+                if siblings.iter().all(|(k, _)| k != name) {
+                    siblings.push((name.clone(), value.clone()));
                 }
             }
             // A handler that dispatches on the raw request URL (`if (req.originalUrl.indexOf(
@@ -195,6 +202,37 @@ pub fn run(
                 if siblings.iter().all(|(k, _)| *k != name) {
                     siblings.push((name, value));
                 }
+            }
+            // Drop any sibling that selects a branch the flow does not pass through: a field whose
+            // positive `if (req.<part>.<field>) { ... }` block holds none of the flow anchors reaches
+            // the sink only when the field is ABSENT (the handler falls through to the `else`). Setting
+            // it would divert control into the wrong branch and the sink would never run
+            // (`if (req.query.openFolderOnly) {...} else { <tainted flow> }`). A field whose branch
+            // does enclose the flow is a real gate kept by `guard_required_fields` above.
+            let diverting =
+                plan::diverting_guard_fields(&source, part, &plan::guard_anchor_lines(finding));
+            siblings.retain(|(name, _)| !diverting.contains(name));
+            if part == "body"
+                && finding.class == VulnClass::NosqlInjection
+                && let Some(model) = finding.sink.api.split('.').next()
+                && !model.is_empty()
+                && let Some(spec) = plan::import_source_path(&source, model)
+                && let Some(model_source) = resolve_import_source(root, &finding.file, &spec)
+            {
+                for (field, value) in plan::mongoose_schema_fillers(&model_source) {
+                    if let Some((_, current)) = siblings
+                        .iter_mut()
+                        .find(|(name, current)| *name == field && current == "jsspector")
+                    {
+                        *current = value;
+                    }
+                }
+            }
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] handler-siblings entry={:?} source={}:{} guards={guard_siblings:?} siblings={siblings:?}",
+                    probe.entry, finding.file, finding.source.line,
+                );
             }
             probe.siblings = siblings;
             if part == "body" {
@@ -275,9 +313,27 @@ pub fn run(
             };
             let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
             let mined = plan::validator_query_fillers(&route_src, at.line, payload_field, &resolve);
+            let optional = plan::validator_optional_query_fields(&route_src, at.line, &resolve);
+            let guarded = std::fs::read_to_string(root.join(&finding.file))
+                .ok()
+                .map(|source| {
+                    plan::guard_required_fields(
+                        &source,
+                        "query",
+                        payload_field,
+                        &plan::guard_anchor_lines(finding),
+                    )
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            probe.siblings.retain(|(field, _)| {
+                field == payload_field || !optional.contains(field) || guarded.contains(field)
+            });
             if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
                 eprintln!(
-                    "[verify] validator-query at={}:{} payload={payload_field:?} mined={mined:?}",
+                    "[verify] validator-query at={}:{} payload={payload_field:?} optional={optional:?} mined={mined:?}",
                     at.file, at.line
                 );
             }
@@ -331,6 +387,28 @@ pub fn run(
             let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
             let mined =
                 plan::validator_required_body_fields(&route_src, at.line, &payload_field, &resolve);
+            let optional = plan::validator_optional_body_fields(&route_src, at.line, &resolve);
+            // Handler-wide mining is deliberately generous, but an attached validator is more
+            // precise about request shape. Omit fields it explicitly marks optional instead of
+            // sending a scalar that may violate `.isArray()`/`.isObject()`. Keep a field when the
+            // sink's own guarded control-flow proves it is a real precondition.
+            let guarded = std::fs::read_to_string(root.join(&finding.file))
+                .ok()
+                .map(|source| {
+                    plan::guard_required_fields(
+                        &source,
+                        "body",
+                        &payload_field,
+                        &plan::guard_anchor_lines(finding),
+                    )
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            probe.siblings.retain(|(field, _)| {
+                field == &payload_field || !optional.contains(field) || guarded.contains(field)
+            });
             let payload_filler =
                 plan::validator_body_field_filler(&route_src, at.line, &payload_field, &resolve);
             if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
@@ -348,7 +426,7 @@ pub fn run(
                     })
                     .collect();
                 eprintln!(
-                    "[verify] validator-siblings entry={:?} at={}:{} payload={payload_field:?} idents={resolved:?} mined={mined:?}",
+                    "[verify] validator-siblings entry={:?} at={}:{} payload={payload_field:?} idents={resolved:?} optional={optional:?} mined={mined:?}",
                     probe.entry, at.file, at.line
                 );
             }
@@ -593,6 +671,21 @@ pub fn run(
                     let index = match http.iter().position(|(existing, _)| *existing == key) {
                         Some(index) => index,
                         None => {
+                            // Local verification plants process-global fixtures such as
+                            // the `/tmp/jss-canary-read` fixtures and launch shims. Unlike Docker sessions, two
+                            // local app sessions cannot safely coexist: the second would either
+                            // consume the first session's token or refuse to overwrite its files.
+                            // Tear the previous app down before switching packages. A later finding
+                            // for that package may rebuild it, which is slower but preserves isolation
+                            // and makes every verdict independent of finding order.
+                            if sandbox::local_runtime_requested() {
+                                for (_, session) in &mut http {
+                                    if let Ok(session) = session {
+                                        session.teardown();
+                                    }
+                                }
+                                http.clear();
+                            }
                             let gating = gating_env_sources(root, finding);
                             let session =
                                 sandbox::Session::start_in(root, &app, Some(declared), &gating);
@@ -660,7 +753,11 @@ fn apply_body_validator_fillers(
         siblings.push((payload_field.to_owned(), value));
     }
     for (field, value) in required {
-        if siblings.iter().all(|(name, _)| *name != field) {
+        if let Some((_, current)) = siblings.iter_mut().find(|(name, _)| *name == field) {
+            // Validator metadata is more precise than the handler-wide neutral filler: preserve the
+            // field but replace `jsspector` with the declared array/object/scalar shape.
+            *current = value;
+        } else {
             siblings.push((field, value));
         }
     }
@@ -746,6 +843,18 @@ fn resolve_middleware_source(
 fn resolve_import_source(root: &std::path::Path, from_file: &str, spec: &str) -> Option<String> {
     if spec.starts_with('.') {
         return resolve_relative_source(root, from_file, spec);
+    }
+    if let Some(rest) = spec.strip_prefix("@/") {
+        let mut dir = std::path::Path::new(from_file).parent();
+        while let Some(current) = dir {
+            if root.join(current).join("tsconfig.json").is_file() {
+                let rooted = current.join("src").join(rest);
+                if let Some(source) = resolve_rooted_source(root, &rooted.to_string_lossy()) {
+                    return Some(source);
+                }
+            }
+            dir = current.parent();
+        }
     }
     let rooted = resolve_module_alias(root, from_file, spec)?;
     resolve_rooted_source(root, &rooted)
@@ -906,7 +1015,24 @@ pub fn write_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_body_validator_fillers, resolve_middleware_source, resolve_module_source};
+    use super::{
+        apply_body_validator_fillers, resolve_import_source, resolve_middleware_source,
+        resolve_module_source,
+    };
+
+    #[test]
+    fn next_src_alias_resolves_model_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("app/src/api/register")).unwrap();
+        std::fs::create_dir_all(root.join("app/src/model")).unwrap();
+        std::fs::write(root.join("app/tsconfig.json"), "{}").unwrap();
+        std::fs::write(root.join("app/src/model/user.ts"), "export default User").unwrap();
+        assert_eq!(
+            resolve_import_source(root, "app/src/api/register/route.ts", "@/model/user").as_deref(),
+            Some("export default User")
+        );
+    }
 
     #[test]
     fn imported_transform_modules_cannot_escape_the_scan_root() {
@@ -1062,5 +1188,22 @@ module.exports = { completeEmailLogin };
             ]
         );
         assert_eq!(body_query_override.as_deref(), Some("jss@jsspector.test"));
+    }
+
+    #[test]
+    fn required_validator_shape_replaces_a_generic_handler_sibling() {
+        let mut siblings = vec![("device_names".to_owned(), "jsspector".to_owned())];
+        let mut body_query_override = None;
+        apply_body_validator_fillers(
+            &mut siblings,
+            &mut body_query_override,
+            "batch_name",
+            None,
+            vec![("device_names".to_owned(), "[\"jsspector\"]".to_owned())],
+        );
+        assert_eq!(
+            siblings,
+            vec![("device_names".to_owned(), "[\"jsspector\"]".to_owned())]
+        );
     }
 }

@@ -2144,6 +2144,61 @@ fn server_request_listeners_are_catch_all_entries() {
     );
 }
 
+/// `app.use((req, res, next) => ...)` with no mount path is a global middleware that runs on every
+/// request, so an inline handler reading `req.path`/`req.url` into a sink is a catch-all `ANY /`
+/// entry — the callback keeps its function and the entry covers its own lines. A path-prefixed
+/// `app.use('/mnt', child)` still mounts the child router (not shadowed by this), and a `use` whose
+/// sole argument is a mounted router is a mount, not an entry.
+#[test]
+fn path_less_use_middleware_is_a_catch_all_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/mounted.js",
+        "const express = require('express');\nconst fs = require('fs');\nconst router = express.Router();\n\
+         router.get('/read', (req, res) => { res.send(fs.readFileSync(req.query.p)); });\n\
+         module.exports = router;\n",
+    );
+    write(
+        root,
+        "src/app.js",
+        "const express = require('express');\nconst fs = require('fs');\nconst path = require('path');\n\
+         const app = express();\nconst mounted = require('./mounted');\n\
+         app.use((req, res, next) => { if (!req.path.endsWith('.html')) return next(); \
+         const html = fs.readFileSync(path.join(__dirname, '../public', req.path), 'utf8'); res.send(html); });\n\
+         app.use('/mnt', mounted);\n",
+    );
+    let scan = run(&[
+        "scan",
+        "--json",
+        "--min-severity",
+        "low",
+        root.to_str().unwrap(),
+    ]);
+    let findings = scan["findings"].as_array().unwrap();
+    // The global middleware's inline handler reads `req.path` into `fs.readFileSync`: a catch-all
+    // entry, with the finding kept on the module function the callback is walked in.
+    let global = findings
+        .iter()
+        .find(|f| f["file"].as_str() == Some("src/app.js") && f["source"]["expr"] == "req.path")
+        .unwrap_or_else(|| panic!("global middleware finding missing from {findings:?}"));
+    assert_eq!(global["class"], "path-traversal", "{global:?}");
+    assert!(
+        global["entry"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("ANY /")),
+        "{global:?}"
+    );
+    assert_eq!(global["auth"], "none-detected", "{global:?}");
+    // The path-prefixed `use` still mounts the child router, so its own route keeps its mounted path.
+    let mounted = findings
+        .iter()
+        .find(|f| f["file"].as_str() == Some("src/mounted.js"))
+        .unwrap_or_else(|| panic!("mounted route finding missing from {findings:?}"));
+    assert_eq!(mounted["entry"], "GET /mnt/read", "{mounted:?}");
+}
+
 /// `http.createServer(handle)` with a function of the file, or `http.createServer(make(rt))` with
 /// a local factory returning the handler, handles every request: the findings the handler reaches
 /// (here or in another file) get the catch-all entry. `http.createServer(app)` on something that

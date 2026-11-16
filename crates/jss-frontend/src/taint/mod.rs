@@ -11881,6 +11881,47 @@ impl Walker<'_> {
         if method_param.is_some() {
             return;
         }
+        // `app.use((req, res, next) => { ... })`: a global middleware registered with no mount path
+        // runs on every request, so it is an anonymous HTTP entry just like `http.createServer(handler)`
+        // or `server.on('request', ...)`. An inline function argument is unambiguously a handler (never a
+        // mountable router), so recording it as an entry cannot shadow a real mount. Findings inside it
+        // (a handler that reads `req.path`/`req.url` into a sink) then link to this entry instead of being
+        // left unreachable. A `use` that mounts a child, or lists named middleware before one, has no
+        // inline function as its sole argument and falls through to the path-less mount handling below.
+        if has(&m().mount_methods, &method)
+            && object.as_deref().is_some_and(|o| self.is_router(o))
+            && env.branch == 0
+            && !self.summarize
+            && !self.record_only
+            && call.arguments.len() == 1
+            && let Some(handler) = first
+        {
+            let span = match handler.get_inner_expression() {
+                Expression::ArrowFunctionExpression(f) => Some(f.span),
+                Expression::FunctionExpression(f) => Some(f.span),
+                _ => None,
+            };
+            // A pure authentication/authorization guard (`if (!req.user) return res.status(403)`) is
+            // already modeled as a router guard above and only gates the routes after it; it is not
+            // itself a useful request handler, so it is not recorded as an entry.
+            if let Some(span) = span.filter(|_| inline_guard_auth(handler).is_none()) {
+                self.facts.scoped_routes.push((
+                    RouteFact {
+                        at: None,
+                        receiver: None,
+                        receiver_file: None,
+                        method: "ANY".to_owned(),
+                        path: "*".to_owned(),
+                        handler: env.function.clone(),
+                        span: call.span,
+                        auth,
+                        kind: "http",
+                    },
+                    span,
+                ));
+                return;
+            }
+        }
         // `router.use(child)`, `app.use(requireAuth, api)`: path-less mounts.
         if has(&m().mount_methods, &method)
             && object.as_deref().is_some_and(|o| self.is_router(o))

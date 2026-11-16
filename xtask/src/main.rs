@@ -2,6 +2,7 @@
 
 mod corpus;
 mod replay;
+mod self_heal;
 
 use std::process::Command;
 
@@ -37,9 +38,9 @@ enum Task {
         #[arg(long)]
         binary: Option<std::path::PathBuf>,
     },
-    /// Fetch a corpus of repositories (shallow, sparse; nothing in them is run) and scan all of
-    /// it: per-repository reports, `summary.json`, and a table. Fails when the scanner crashes or
-    /// panics on any file.
+    /// Fetch a corpus of repositories and scan all of it: per-repository reports,
+    /// `summary.json`, and a table. With --verify, run each app in this disposable environment
+    /// and include dynamic exploitation evidence.
     Corpus {
         /// The repositories: a file with `owner/name[@commit]` per line (`#` comments).
         #[arg(long, required_unless_present = "repos")]
@@ -65,6 +66,12 @@ enum Task {
         /// Scanner threads per repository.
         #[arg(long, default_value_t = 8)]
         threads: usize,
+        /// Run `jsspector scan --verify=strict` and include exploitation/PoC evidence.
+        #[arg(long)]
+        verify: bool,
+        /// Lowest finding severity to report and dynamically verify.
+        #[arg(long, default_value = "low", value_parser = ["critical", "high", "medium", "low"])]
+        min_severity: String,
         /// Repositories fetched at once.
         #[arg(long, default_value_t = 8)]
         jobs: usize,
@@ -74,6 +81,48 @@ enum Task {
         /// A previous summary.json: print the repositories whose counts changed.
         #[arg(long, value_name = "SUMMARY")]
         compare: Option<std::path::PathBuf>,
+    },
+    /// Grow JSSpector against the historical exploitability benchmark. Missing detections and
+    /// failed reproductions are offered to Claude in an isolated scanner worktree; only repairs
+    /// that detect and exploit the exact pinned case are applied to this checkout.
+    SelfHeal {
+        /// Historical exploitability benchmark.
+        #[arg(long, default_value = ".satori/exploitability-regressions.json")]
+        bench: std::path::PathBuf,
+        /// Durable replay identities updated after successful verification.
+        #[arg(long, default_value = ".satori/exploitability-targets.json")]
+        targets: std::path::PathBuf,
+        /// Checkout, issue-snapshot and diagnostic cache.
+        #[arg(long, default_value = "target/self-heal")]
+        cache: std::path::PathBuf,
+        /// Only recover this historical finding ID.
+        #[arg(long)]
+        case: Option<String>,
+        /// Recover at most this many unresolved cases.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Validate and diagnose, but never invoke Claude or modify this checkout.
+        #[arg(long)]
+        no_repair: bool,
+        /// Push validated automatic commits to the configured upstream branch. If the remote moved,
+        /// rebase once, rerun all gates, and retry without overwriting remote work.
+        #[arg(long, conflicts_with = "no_repair")]
+        push: bool,
+        /// Maximum Claude attempts per case.
+        #[arg(long, default_value_t = 3)]
+        repair_attempts: usize,
+        /// Claude model used for generic scanner repairs.
+        #[arg(long, default_value = "claude-opus-5-5")]
+        repair_model: String,
+        /// Claude effort used for generic scanner repairs.
+        #[arg(long, default_value = "high")]
+        repair_effort: String,
+        /// Maximum Claude turns in one repair attempt.
+        #[arg(long, default_value_t = 160)]
+        repair_max_turns: usize,
+        /// Shared wall-clock repair budget per case, in seconds.
+        #[arg(long, default_value_t = 2400)]
+        repair_budget: u64,
     },
 }
 
@@ -114,6 +163,8 @@ fn main() -> Result<()> {
             binary,
             out,
             threads,
+            verify,
+            min_severity,
             jobs,
             show,
             compare,
@@ -147,9 +198,55 @@ fn main() -> Result<()> {
                 binary: absolute(binary.unwrap_or_else(|| "target/release/jsspector".into())),
                 out: absolute(out),
                 threads,
+                verify,
+                min_severity,
                 jobs,
                 show,
                 compare,
+            })
+        }
+        Task::SelfHeal {
+            bench,
+            targets,
+            cache,
+            case,
+            limit,
+            no_repair,
+            push,
+            repair_attempts,
+            repair_model,
+            repair_effort,
+            repair_max_turns,
+            repair_budget,
+        } => {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("workspace root")?
+                .to_path_buf();
+            let absolute = |path: std::path::PathBuf| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            };
+            let bench = absolute(bench);
+            let targets = absolute(targets);
+            let cache = absolute(cache);
+            self_heal::run(&self_heal::Options {
+                root,
+                bench,
+                targets,
+                cache,
+                case,
+                limit,
+                repair: !no_repair,
+                push,
+                repair_attempts,
+                repair_model,
+                repair_effort,
+                repair_max_turns,
+                repair_budget: std::time::Duration::from_secs(repair_budget),
             })
         }
     }
@@ -199,6 +296,31 @@ const ENGINE_LABELS: &[&str] = &[
     "last-callback",
     "object-of-functions",
     "resolver-map",
+    // Generic HTTP and handler vocabulary shared by many runtimes and packs.
+    "GET",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "request",
+    "handler",
+    "route",
+    "methods",
+    "middlewares",
+    "auth",
+    "protect",
+    "preHandler",
+    "upgrade",
+    "fetch",
+    // Built-in JavaScript collection and event method names.
+    "sort",
+    "reverse",
+    "filter",
+    "slice",
+    "concat",
+    "once",
+    "addListener",
 ];
 
 /// The plan's rule: all framework knowledge lives in the YAML packs. Fails when a string literal

@@ -32,23 +32,103 @@ const ENABLE_PROFILING_SCRIPT: &str = "db.getMongo().getDBNames().forEach(functi
     try{db.getSiblingDB(n).setProfilingLevel(2);}catch(e){}\
   });";
 
+/// A mongosh script that reads the profiler and, for every recorded query whose filter references
+/// the per-run sentinel `absent` (the injected field's benign `{$eq:<absent>}` value), inserts one
+/// document the query selects: each scalar equality is copied verbatim and the one operator field
+/// that references the sentinel is set to a present value, so the later match-all `{$ne:<absent>}`
+/// returns it while the `{$eq:<absent>}`/`{$in:[]}` controls do not. A filter field that is itself an
+/// object referencing the sentinel is the injected field; other operator fields (an earlier guard's
+/// `{verified:true}` does not reference the sentinel, so it is skipped and left off the document,
+/// keeping the planted record reachable past the guard). `absent` is 24 hex characters, so it needs
+/// no escaping. Collection resolution covers find/count/findAndModify/update/delete/distinct; the
+/// profiler is then disabled and its capped log dropped.
+fn nosql_lookup_seed_script(absent: &str) -> String {
+    format!(
+        "var ABSENT='{absent}';var planted=0;\
+         db.getMongo().getDBNames().forEach(function(n){{\
+           if(['admin','local','config'].indexOf(n)>=0)return;\
+           var d=db.getSiblingDB(n);\
+           try{{d.getCollection('system.profile').find({{}}).forEach(function(e){{\
+             if(!e.command)return;\
+             var c=e.command;\
+             var coll=c.find||c.count||c.findAndModify||c.findandmodify||c.update||c.delete||c.distinct;\
+             if(!coll&&e.ns){{var p=e.ns.split('.');p.shift();coll=p.join('.');}}\
+             if(typeof coll!=='string'||coll.indexOf('system.')===0)return;\
+             var filter=c.filter||c.query;\
+             if(!filter&&c.updates&&c.updates[0])filter=c.updates[0].q;\
+             if(!filter&&c.deletes&&c.deletes[0])filter=c.deletes[0].q;\
+             if(!filter||typeof filter!=='object')return;\
+             if(JSON.stringify(filter).indexOf(ABSENT)<0)return;\
+             var doc={{jss_seed:1}};var injected=false;\
+             Object.keys(filter).forEach(function(k){{\
+               if(k.charAt(0)==='$')return;\
+               var v=filter[k];\
+               if(v&&typeof v==='object'&&!Array.isArray(v)){{\
+                 if(JSON.stringify(v).indexOf(ABSENT)>=0){{\
+                   if(k==='_id'){{doc[k]=ObjectId();doc.id=doc[k].toString();\
+                     doc.mid='/u/'+doc.id;doc.pl=[];}}\
+                   else{{doc[k]='jss_lookup_seed';}}injected=true;}}\
+               }}else if(v!==null&&typeof v!=='object'){{doc[k]=v;}}\
+             }});\
+             if(injected){{try{{d.getCollection(coll).insertOne(doc);planted++;}}catch(e2){{}}}}\
+           }});}}catch(e){{}}\
+           try{{d.setProfilingLevel(0);}}catch(e){{}}\
+           try{{d.getCollection('system.profile').drop();}}catch(e){{}}\
+         }});print('planted='+planted);"
+    )
+}
+
 /// Read the profiler log, seed one document into every (otherwise empty) collection a profiled command
 /// targeted — resolving the collection from the command's own field first, falling back to the `ns` —
 /// then disable profiling and drop its capped log so only the seeded documents remain.
+///
+/// The seed document is shaped from the profiled command's own filter so it satisfies the query's
+/// non-injected constraints: a plain equality (`{status:"active"}`) is copied verbatim, a range
+/// (`{expires:{$gt:now}}`) is seeded with a value that satisfies it (a far-future date or a larger
+/// number), and any other operator field (the probed field, which the benign control sends as
+/// `{$eq:<absent>}`) is seeded with a neutral sentinel distinct from the injected token. Without this,
+/// a query with a second required clause (an unexpired-token window, an owner id) never matches the
+/// generic placeholder document and the match-all/match-none differential has nothing to observe. The
+/// sentinel and derived values come only from the observed query, so nothing is tied to a target.
 const SEED_PROFILED_SCRIPT: &str = "db.getMongo().getDBNames().forEach(function(n){\
     if(['admin','local','config'].indexOf(n)>=0)return;\
     var d=db.getSiblingDB(n);\
-    var names={};\
+    var seeds={};\
+    function satisfy(v){\
+      if(v&&typeof v==='object'&&!Array.isArray(v)&&!(v instanceof Date)){\
+        var ks=Object.keys(v);\
+        var isOp=ks.length>0&&ks.every(function(k){return k.charAt(0)==='$';});\
+        if(isOp){\
+          if('$gt' in v||'$gte' in v){var b=('$gt' in v)?v.$gt:v.$gte;\
+            if(b instanceof Date)return new Date(b.getTime()+31536000000);\
+            if(typeof b==='number')return b+1000000000;return b;}\
+          if('$lt' in v||'$lte' in v){var c2=('$lt' in v)?v.$lt:v.$lte;\
+            if(c2 instanceof Date)return new Date(c2.getTime()-31536000000);\
+            if(typeof c2==='number')return c2-1000000000;return c2;}\
+          if('$in' in v&&Array.isArray(v.$in)&&v.$in.length>0)return v.$in[0];\
+          return 'jss_seed';\
+        }\
+      }\
+      return v;\
+    }\
     try{d.getCollection('system.profile').find({}).forEach(function(e){\
-      var c=null;\
+      var c=null,f=null;\
       if(e.command){c=e.command.find||e.command.findAndModify||e.command.count||\
-        e.command.aggregate||e.command.distinct||e.command.update||e.command.delete;}\
+        e.command.aggregate||e.command.distinct||e.command.update||e.command.delete;\
+        f=e.command.filter||e.command.query;}\
       if(!c&&e.ns){var p=e.ns.split('.');p.shift();c=p.join('.');}\
-      if(typeof c==='string'&&c.indexOf('system.')!==0)names[c]=1;\
+      if(typeof c!=='string'||c.indexOf('system.')===0)return;\
+      var doc=seeds[c]||{jss_seed:1};\
+      if(f&&typeof f==='object'){Object.keys(f).forEach(function(k){\
+        if(k.charAt(0)==='$')return;\
+        if(!doc.hasOwnProperty(k)||doc[k]==='jss_seed'){\
+          try{doc[k]=satisfy(f[k]);}catch(e2){}}\
+      });}\
+      seeds[c]=doc;\
     });}catch(e){}\
-    Object.keys(names).forEach(function(c){\
+    Object.keys(seeds).forEach(function(c){\
       try{if(d.getCollection(c).countDocuments({})===0)\
-        d.getCollection(c).insertOne({jss_seed:1});}catch(e){}\
+        d.getCollection(c).insertOne(seeds[c]);}catch(e){}\
     });\
     try{d.setProfilingLevel(0);}catch(e){}\
     try{d.getCollection('system.profile').drop();}catch(e){}\
@@ -76,7 +156,82 @@ pub fn available() -> bool {
     output.status.success() && version.bytes().next().is_some_and(|b| b.is_ascii_digit())
 }
 
-fn local_runtime_requested() -> bool {
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn available_local_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("reserving a local marker port: {error}"))?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| format!("reading the local marker port: {error}"))
+}
+
+fn local_listening_ports() -> Vec<u16> {
+    let Ok(output) = Command::new("lsof")
+        .args(["-nP", "-iTCP", "-sTCP:LISTEN"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let mut ports = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            line.split_whitespace().find_map(|field| {
+                field
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+            })
+        })
+        .collect::<Vec<_>>();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn local_excluded_ports(
+    baseline: &[u16],
+    marker: Option<u16>,
+    has_db: bool,
+    has_redis: bool,
+) -> Vec<u16> {
+    let mut ports = baseline.to_vec();
+    ports.extend(marker);
+    ports.extend(has_db.then_some(27017));
+    ports.extend(has_redis.then_some(6379));
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn wait_local_service(child: &mut Child, port: u16, name: &str) -> Result<(), String> {
+    for _ in 0..80 {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "local {name} exited before it was ready ({status})"
+            ));
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "local {name} did not listen on port {port} within 20s"
+    ))
+}
+
+pub(super) fn local_runtime_requested() -> bool {
     std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
 }
 
@@ -107,7 +262,7 @@ pub struct Session {
     redis_env: Vec<(String, String)>,
     canary: Canary,
     /// The container port the app listens on: the one we ask for via `PORT`, or, for an app that
-    /// fixes its own, the one port it is found listening on (see [`listening_probe`]).
+    /// fixes its own, the one port it is found listening on (see [`listening_probe_excluding`]).
     port: u16,
     /// Bumped per probe, so one probe's write/service marker never confirms another's.
     nonce: u32,
@@ -159,16 +314,25 @@ pub struct Session {
     /// [`request_spec`]); it also falls back across protocols, so this is an ordering hint, not a
     /// security relaxation of the app.
     tls: bool,
+    local_marker_port: Option<u16>,
+    local_baseline_ports: Vec<u16>,
     torn_down: bool,
 }
 
 enum Runtime {
     Docker,
     Local {
+        /// Root of the disposable checkout being verified. This can be wider than `app_root`
+        /// when the runnable package lives in a workspace subdirectory but resolves startup
+        /// fixtures (for example TLS material) relative to the checkout root.
+        checkout_root: std::path::PathBuf,
         app_root: std::path::PathBuf,
         log: std::path::PathBuf,
         command: Vec<String>,
-        process: RefCell<Option<Child>>,
+        process: Box<RefCell<Option<Child>>>,
+        services: Box<RefCell<Vec<Child>>>,
+        service_dirs: Vec<std::path::PathBuf>,
+        marker_log: std::path::PathBuf,
         created_files: Vec<std::path::PathBuf>,
     },
 }
@@ -201,7 +365,8 @@ impl Session {
         }
         let id = run_id();
         let canary = Canary::new(format!("{id}{}", short_rand()))
-            .with_callback_host(configured_callback_host()?);
+            .with_callback_host(configured_callback_host()?)
+            .with_marker_host(Some(payload::MARKER_HOST.to_owned()));
         let tag = format!("jsspector-verify:{id}");
         let network = format!("jss-verify-net-{id}");
         let app = format!("jss-verify-app-{id}");
@@ -248,6 +413,8 @@ impl Session {
         let install_workdir = container_dir(&install_rel)
             .ok_or_else(|| format!("unsupported install directory `{}`", install_rel.display()))?;
 
+        let build_env: Vec<(String, String)> =
+            db_env.iter().chain(redis_env.iter()).cloned().collect();
         build_image(
             root,
             &app_root,
@@ -258,6 +425,7 @@ impl Session {
             &canary,
             &start_command,
             port,
+            &build_env,
         )?;
 
         // An internal network: DNS between its members, no route to the internet.
@@ -281,6 +449,23 @@ impl Session {
                 base_env.push(cred);
             }
         }
+        for cfg in config_source_env(gating_sources) {
+            if base_env.iter().all(|existing| existing.name != cfg.name) {
+                base_env.push(cfg);
+            }
+        }
+        let guarded_modules = guarded_modules(root, entry_file, gating_sources);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] launch plan app={} command={} env={:?} guarded-modules={guarded_modules:?}",
+                app_path.display(),
+                start_command,
+                base_env
+                    .iter()
+                    .map(|item| (&item.name, &item.value))
+                    .collect::<Vec<_>>()
+            );
+        }
 
         let mut session = Self {
             runtime: Runtime::Docker,
@@ -301,17 +486,25 @@ impl Session {
             node_sqlite: uses_node_sqlite(root, &app_root),
             omit_forwarding: std::cell::Cell::new(false),
             root: root.to_path_buf(),
-            guarded_modules: entry_file
-                .and_then(|entry| std::fs::read_to_string(root.join(entry)).ok())
-                .map(|src| guarded_bare_requires(&src).into_iter().collect())
-                .unwrap_or_default(),
+            guarded_modules,
             start_command: start_command.clone(),
             tls: false,
+            local_marker_port: None,
+            local_baseline_ports: Vec::new(),
             torn_down: false,
         };
         if let Err(err) = session.boot() {
             session.teardown();
             return Err(err);
+        }
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] launched app={} command={} port={} logs[{}]",
+                app_path.display(),
+                start_command,
+                session.port,
+                session.tail_logs(&session.app)
+            );
         }
         Ok(session)
     }
@@ -323,22 +516,35 @@ impl Session {
         gating_sources: &[String],
     ) -> Result<Self, String> {
         let id = run_id();
+        let callback_host = configured_callback_host()?;
+        let local_marker_port = Some(available_local_port()?);
+        // Use the canonical hexadecimal spelling of loopback for the URL driven through the
+        // application. Node resolves it to 127.0.0.1, while a verifier still exercises handlers
+        // that reject only the literal `127.*` hostname before making the request. The marker
+        // remains bound exclusively to loopback, so this never sends verification traffic outside
+        // the disposable sandbox.
+        let marker_host = local_marker_port.map(|port| format!("0x7f000001:{port}"));
         let canary = Canary::new(format!("{id}{}", short_rand()))
-            .with_callback_host(configured_callback_host()?);
+            .with_callback_host(callback_host)
+            .with_marker_host(marker_host);
         let app_root = root.join(app_path);
-        if db_service(&app_root) || redis_service(&app_root) {
-            return Err(
-                "the local verifier does not yet provide MongoDB or Redis sidecars".to_owned(),
-            );
+        let app_needs_db = db_service(&app_root);
+        let has_local_mongo = command_available("mongod") && command_available("mongosh");
+        let ephemeral_db_command = (!has_local_mongo)
+            .then(|| local_ephemeral_mongo_next_launch(&app_root))
+            .flatten();
+        let manages_ephemeral_db = app_needs_db && ephemeral_db_command.is_some();
+        let needs_db = app_needs_db && !manages_ephemeral_db && has_local_mongo;
+        let needs_redis = redis_service(&app_root);
+        if needs_redis && !command_available("redis-server") {
+            return Err("the local verifier needs `redis-server` on PATH for this app".to_owned());
         }
         let entry_rel = entry_file.and_then(|file| file.strip_prefix(app_path).ok());
-        let start_command = start_command(&app_root, entry_rel)
-            .ok_or_else(|| "no launchable script or `main` file in package.json".to_owned())?;
-        let local_command: Vec<String> = serde_json::from_str(&start_command)
-            .map_err(|error| format!("invalid generated start command: {error}"))?;
-        if local_command.is_empty() {
-            return Err("generated start command is empty".to_owned());
-        }
+        // Install and build before choosing the launch command. A package whose start script names
+        // generated output (`node dist/index.js`) must be evaluated after its `compile`/`build`
+        // script has had a chance to create that output; otherwise a fresh checkout incorrectly
+        // falls back to hosting one router module while a previously prepared checkout runs the real
+        // application.
         let mut install_rel = install_path(root, app_path);
         let node_path = entry_file
             .and_then(|module| dependency_provider(root, &install_rel, module))
@@ -351,10 +557,53 @@ impl Session {
             });
         let install_root = root.join(&install_rel);
         prepare_local_app(root, &install_root)?;
+        let start_command = if let Some(command) = ephemeral_db_command {
+            command
+        } else if app_needs_db
+            && !has_local_mongo
+            && let Some(file) = entry_rel
+                .and_then(|path| path.to_str())
+                .and_then(|path| package_file(&app_root, path))
+            && is_express_factory_module(&app_root.join(&file))
+        {
+            // Some applications make their production bootstrap wait for MongoDB before opening
+            // the HTTP listener, even though the route under test is independent of the database.
+            // Mount an exported Express factory through the existing host in that situation. This
+            // executes the application's real middleware, route and sink without inventing a DB or
+            // changing repository code.
+            express_host_command(&file)
+        } else {
+            start_command(&app_root, entry_rel)
+                .ok_or_else(|| "no launchable script or `main` file in package.json".to_owned())?
+        };
+        let mut local_command: Vec<String> = serde_json::from_str(&start_command)
+            .map_err(|error| format!("invalid generated start command: {error}"))?;
+        if local_command.is_empty() {
+            return Err("generated start command is empty".to_owned());
+        }
+        for argument in &mut local_command {
+            *argument = localize_helper_paths(argument);
+        }
         let created_files = plant_local_files(&canary)?;
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] local fixtures planted count={} canary={} exists={}",
+                created_files.len(),
+                canary.planted_file(),
+                std::path::Path::new(&canary.planted_file()).is_file(),
+            );
+        }
         let log = std::env::temp_dir().join(format!("jsspector-verify-{id}.log"));
+        let marker_log = std::env::temp_dir().join(format!("jsspector-marker-{id}.log"));
+        let mut service_dirs = Vec::new();
+        if needs_db {
+            service_dirs.push(std::env::temp_dir().join(format!("jsspector-mongo-{id}")));
+        }
+        if needs_redis {
+            service_dirs.push(std::env::temp_dir().join(format!("jsspector-redis-{id}")));
+        }
         let port = dockerfile_port(root).unwrap_or(3000);
-        let (run_as, mut base_env) = match privilege_drop_fixture(&app_root, port) {
+        let (run_as, mut base_env) = match local_privilege_drop_fixture(&app_root, port) {
             Some(fixture) => (Some(fixture.run_as), fixture.env),
             None => (None, Vec::new()),
         };
@@ -363,22 +612,47 @@ impl Session {
                 base_env.push(cred);
             }
         }
+        for cfg in config_source_env(gating_sources) {
+            if base_env.iter().all(|existing| existing.name != cfg.name) {
+                base_env.push(cfg);
+            }
+        }
+        let guarded_modules = guarded_modules(root, entry_file, gating_sources);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] local launch plan app={} command={} env={:?} db={} redis={} guarded-modules={guarded_modules:?}",
+                app_path.display(),
+                start_command,
+                base_env
+                    .iter()
+                    .map(|item| (&item.name, &item.value))
+                    .collect::<Vec<_>>(),
+                needs_db,
+                needs_redis,
+            );
+        }
         let mut session = Self {
             runtime: Runtime::Local {
+                checkout_root: root.to_path_buf(),
                 app_root,
                 log,
                 command: local_command,
-                process: RefCell::new(None),
+                process: Box::new(RefCell::new(None)),
+                services: Box::new(RefCell::new(Vec::new())),
+                service_dirs,
+                marker_log,
                 created_files,
             },
             tag: String::new(),
             network: String::new(),
             app: format!("jss-local-app-{id}"),
             marker: String::new(),
-            db: None,
-            db_env: Vec::new(),
-            redis: None,
-            redis_env: Vec::new(),
+            db: needs_db.then(|| "local-mongo".to_owned()),
+            db_env: needs_db.then(local_db_connection_env).unwrap_or_default(),
+            redis: needs_redis.then(|| "local-redis".to_owned()),
+            redis_env: needs_redis
+                .then(local_redis_connection_env)
+                .unwrap_or_default(),
             canary,
             port,
             nonce: 0,
@@ -388,27 +662,140 @@ impl Session {
             node_sqlite: uses_node_sqlite(root, &root.join(app_path)),
             omit_forwarding: std::cell::Cell::new(false),
             root: root.to_path_buf(),
-            guarded_modules: entry_file
-                .and_then(|entry| std::fs::read_to_string(root.join(entry)).ok())
-                .map(|src| guarded_bare_requires(&src).into_iter().collect())
-                .unwrap_or_default(),
+            guarded_modules,
             start_command: start_command.clone(),
             tls: false,
+            local_marker_port,
+            local_baseline_ports: Vec::new(),
             torn_down: false,
         };
+        session.start_local_services()?;
+        session.local_baseline_ports = local_listening_ports();
         session.boot_local()?;
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] local launched app={} command={} port={} logs[{}]",
+                app_path.display(),
+                start_command,
+                session.port,
+                session.tail_logs(&session.app)
+            );
+        }
         Ok(session)
+    }
+
+    fn start_local_services(&self) -> Result<(), String> {
+        let Runtime::Local {
+            services,
+            service_dirs,
+            marker_log,
+            ..
+        } = &self.runtime
+        else {
+            return Err("local sidecars requested for a Docker session".to_owned());
+        };
+        if let Some(port) = self.local_marker_port {
+            let log = std::fs::File::create(marker_log)
+                .map_err(|error| format!("creating local marker log: {error}"))?;
+            let stderr = log
+                .try_clone()
+                .map_err(|error| format!("opening local marker log: {error}"))?;
+            let mut marker = Command::new("node")
+                .arg("/tmp/jss-marker.js")
+                .env("JSS_MARKER_PORT", port.to_string())
+                .stdout(log)
+                .stderr(stderr)
+                .spawn()
+                .map_err(|error| format!("starting local marker service: {error}"))?;
+            wait_local_service(&mut marker, port, "marker")?;
+            services.borrow_mut().push(marker);
+        }
+        let mut directory = service_dirs.iter();
+        if self.db.is_some() {
+            let dir = directory
+                .next()
+                .ok_or_else(|| "missing local MongoDB directory".to_owned())?;
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("creating local MongoDB directory: {error}"))?;
+            let log = std::fs::File::create(dir.join("mongod.log"))
+                .map_err(|error| format!("creating local MongoDB log: {error}"))?;
+            let stderr = log
+                .try_clone()
+                .map_err(|error| format!("opening local MongoDB log: {error}"))?;
+            let mut child = Command::new("mongod")
+                .args([
+                    "--bind_ip",
+                    "127.0.0.1",
+                    "--port",
+                    "27017",
+                    "--nounixsocket",
+                    "--quiet",
+                ])
+                .arg("--dbpath")
+                .arg(dir)
+                .stdout(log)
+                .stderr(stderr)
+                .spawn()
+                .map_err(|error| format!("starting local MongoDB: {error}"))?;
+            wait_local_service(&mut child, 27017, "MongoDB")?;
+            services.borrow_mut().push(child);
+        }
+        if self.redis.is_some() {
+            let dir = directory
+                .next()
+                .ok_or_else(|| "missing local Redis directory".to_owned())?;
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("creating local Redis directory: {error}"))?;
+            let log = std::fs::File::create(dir.join("redis.log"))
+                .map_err(|error| format!("creating local Redis log: {error}"))?;
+            let stderr = log
+                .try_clone()
+                .map_err(|error| format!("opening local Redis log: {error}"))?;
+            let mut child = Command::new("redis-server")
+                .args([
+                    "--bind",
+                    "127.0.0.1",
+                    "--port",
+                    "6379",
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ])
+                .arg("--dir")
+                .arg(dir)
+                .stdout(log)
+                .stderr(stderr)
+                .spawn()
+                .map_err(|error| format!("starting local Redis: {error}"))?;
+            wait_local_service(&mut child, 6379, "Redis")?;
+            services.borrow_mut().push(child);
+        }
+        Ok(())
     }
 
     fn boot_local(&mut self) -> Result<(), String> {
         let mut env = self.base_env.clone();
         let mut stub_missing_modules = false;
+        let mut mongodb_callback_promises = false;
         let mut scratch_dirs = Vec::new();
-        for _ in 0..5 {
-            self.run_local_app(&env, stub_missing_modules, &scratch_dirs)?;
+        let mut cert_files: Vec<String> = Vec::new();
+        let mut dotenv_files: Vec<String> = Vec::new();
+        let mut generated_config_retry = false;
+        let mut next_development_retry = false;
+        for attempt in 1..=5 {
+            self.run_local_app(
+                &env,
+                stub_missing_modules,
+                mongodb_callback_promises,
+                next_development_retry,
+                &scratch_dirs,
+            )?;
             let err = match self.wait_until_listening() {
                 Ok(port) => {
                     self.port = port;
+                    restore_local_read_canaries(&self.canary)?;
+                    self.seed_db();
                     return Ok(());
                 }
                 Err(error) => error,
@@ -427,26 +814,131 @@ impl Session {
                 }
             }
             let enable_module_stub = !stub_missing_modules && missing_bare_module(&err);
+            let enable_mongodb_callback_promises =
+                !mongodb_callback_promises && missing_mongodb_collection_promise(&err);
             let new_dir = missing_write_dir(&err).filter(|dir| !scratch_dirs.contains(dir));
-            if missing.is_empty() && !enable_module_stub && new_dir.is_none() {
+            let new_cert = missing_tls_material(&err)
+                .filter(|(path, _)| !cert_files.iter().any(|have| have == path));
+            let new_dotenv = missing_dotenv_file(&err)
+                .filter(|path| !dotenv_files.iter().any(|have| have == path));
+            let retry_generated_config = !generated_config_retry && generated_startup_config(&err);
+            let next_development_available = match &self.runtime {
+                Runtime::Local { app_root, .. } => {
+                    next_development_command(app_root, self.port).is_some()
+                }
+                Runtime::Docker => false,
+            };
+            let retry_next_development = !next_development_retry
+                && missing_next_production_build(&err)
+                && next_development_available;
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] local startup attempt {attempt} failed; retry mongodb-collections={} module-stub={} generated-config={} next-dev={}",
+                    enable_mongodb_callback_promises,
+                    enable_module_stub,
+                    retry_generated_config,
+                    retry_next_development
+                );
+            }
+            if missing.is_empty()
+                && !enable_module_stub
+                && !enable_mongodb_callback_promises
+                && new_dir.is_none()
+                && new_cert.is_none()
+                && new_dotenv.is_none()
+                && !retry_generated_config
+                && !retry_next_development
+            {
                 return Err(err);
             }
             env.extend(missing);
             stub_missing_modules |= enable_module_stub;
+            mongodb_callback_promises |= enable_mongodb_callback_promises;
+            generated_config_retry |= retry_generated_config;
+            next_development_retry |= retry_next_development;
             if let Some(dir) = new_dir {
                 scratch_dirs.push(dir);
             }
+            if let Some((path, is_key)) = new_cert {
+                self.stage_local_tls_file(&path, is_key)?;
+                cert_files.push(path);
+                self.tls = true;
+            }
+            if let Some(path) = new_dotenv {
+                self.stage_local_dotenv_file(&path)?;
+                dotenv_files.push(path);
+            }
         }
         Err("the app still could not start after five launch attempts".to_owned())
+    }
+
+    /// Stages the verifier's throwaway matching TLS pair only at a path inside the disposable local
+    /// checkout. This mirrors the container retry without ever writing elsewhere on the host.
+    fn stage_local_tls_file(&mut self, path: &str, is_key: bool) -> Result<(), String> {
+        let contents = if is_key { MARKER_KEY } else { MARKER_CERT };
+        self.stage_local_checkout_file(path, contents.as_bytes(), "TLS material")
+    }
+
+    /// Uses the repository's documented dotenv template when present; otherwise an empty dotenv
+    /// file lets loaders proceed with their normal defaults without inventing configuration.
+    fn stage_local_dotenv_file(&mut self, path: &str) -> Result<(), String> {
+        let target = std::path::Path::new(path);
+        let parent = target
+            .parent()
+            .ok_or_else(|| format!("dotenv path has no parent: {path}"))?;
+        let contents = [".env.example", ".env.sample", ".env.template"]
+            .iter()
+            .map(|name| parent.join(name))
+            .find_map(|candidate| std::fs::read(candidate).ok())
+            .unwrap_or_default();
+        self.stage_local_checkout_file(path, &contents, "dotenv")
+    }
+
+    /// Writes a startup fixture only inside the disposable checkout and records it for teardown.
+    fn stage_local_checkout_file(
+        &mut self,
+        path: &str,
+        contents: &[u8],
+        kind: &str,
+    ) -> Result<(), String> {
+        let Runtime::Local {
+            checkout_root,
+            created_files,
+            ..
+        } = &mut self.runtime
+        else {
+            return Err("local startup-file staging requested for a Docker session".to_owned());
+        };
+        let root = checkout_root
+            .canonicalize()
+            .map_err(|error| format!("resolving local checkout root: {error}"))?;
+        let target = std::path::PathBuf::from(path);
+        let parent = target
+            .parent()
+            .ok_or_else(|| format!("startup-file path has no parent: {path}"))?
+            .canonicalize()
+            .map_err(|error| format!("resolving TLS parent for {path}: {error}"))?;
+        if !parent.starts_with(&root) {
+            return Err(format!(
+                "refusing to stage {kind} outside the local checkout: {path}"
+            ));
+        }
+        std::fs::write(&target, contents)
+            .map_err(|error| format!("staging local {kind} at {path}: {error}"))?;
+        created_files.push(target);
+        Ok(())
     }
 
     fn run_local_app(
         &self,
         env: &[RequiredEnv],
         stub_missing_modules: bool,
+        mongodb_callback_promises: bool,
+        next_development: bool,
         scratch_dirs: &[String],
     ) -> Result<(), String> {
         let Runtime::Local {
+            checkout_root,
             app_root,
             log,
             command,
@@ -456,31 +948,57 @@ impl Session {
         else {
             return Err("local application requested for a Docker session".to_owned());
         };
-        if self.run_as.is_some() {
-            return Err("local verification cannot emulate an application runtime user".to_owned());
-        }
         if let Some(mut previous) = process.borrow_mut().take() {
-            let _ = previous.kill();
-            let _ = previous.wait();
+            stop_local_process(&mut previous);
         }
         for var in env {
             if var.directory {
-                std::fs::create_dir_all(&var.value)
-                    .map_err(|error| format!("creating {}: {error}", var.value))?;
+                let value = localize_helper_paths(&var.value);
+                std::fs::create_dir_all(&value)
+                    .map_err(|error| format!("creating {value}: {error}"))?;
             }
         }
         for dir in scratch_dirs {
-            std::fs::create_dir_all(dir).map_err(|error| format!("creating {dir}: {error}"))?;
+            let dir = localize_helper_paths(dir);
+            std::fs::create_dir_all(&dir).map_err(|error| format!("creating {dir}: {error}"))?;
+        }
+        if self.run_as.is_some() {
+            Self::make_local_run_as_accessible(checkout_root, app_root, env, scratch_dirs)?;
         }
         let stdout = std::fs::File::create(log)
             .map_err(|error| format!("creating local verifier log: {error}"))?;
         let stderr = stdout
             .try_clone()
             .map_err(|error| format!("opening local verifier log: {error}"))?;
+        let next_command = next_development
+            .then(|| next_development_command(app_root, self.port))
+            .flatten();
+        let command = next_command.as_ref().unwrap_or(command);
         let (program, args) = command
             .split_first()
             .ok_or_else(|| "generated start command is empty".to_owned())?;
         let mut child = Command::new(program);
+        // Package-manager launchers (`npm start`, `yarn …`) keep the application as a child
+        // process. Give every launch its own process group so teardown removes that child too;
+        // otherwise it can keep the HTTP port and the next finding is accidentally tested against
+        // the preceding repository/service.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            child.process_group(0);
+            if let Some((uid, gid)) = self.run_as {
+                let current = current_unix_identity().ok_or_else(|| {
+                    "local verification could not determine its runtime user".to_owned()
+                })?;
+                if current == (0, 0) {
+                    child.gid(gid).uid(uid);
+                } else if current != (uid, gid) {
+                    return Err(format!(
+                        "local verification cannot run the application as uid {uid}, gid {gid}"
+                    ));
+                }
+            }
+        }
         child
             .args(args)
             .current_dir(app_root)
@@ -496,22 +1014,85 @@ impl Session {
         if self.node_sqlite {
             node_options.push("--experimental-sqlite");
         }
-        if stub_missing_modules {
-            node_options.push("--require=/jss-launch-shim.js");
-            if !self.guarded_modules.is_empty() {
-                child.env("JSS_GUARDED_MODULES", self.guarded_modules.join(","));
-            }
+        if stub_missing_modules || mongodb_callback_promises {
+            node_options.push("--require=/tmp/jss-launch-shim.js");
+        }
+        if stub_missing_modules && !self.guarded_modules.is_empty() {
+            child.env("JSS_GUARDED_MODULES", self.guarded_modules.join(","));
+        }
+        if mongodb_callback_promises {
+            child.env("JSS_MONGODB_CALLBACK_PROMISES", "1");
         }
         if !node_options.is_empty() {
             child.env("NODE_OPTIONS", node_options.join(" "));
         }
         for var in env {
-            child.env(&var.name, &var.value);
+            child.env(&var.name, localize_helper_paths(&var.value));
+        }
+        for (name, value) in self.db_env.iter().chain(&self.redis_env) {
+            child.env(name, value);
         }
         let child = child
             .spawn()
             .map_err(|error| format!("starting local application: {error}"))?;
         process.replace(Some(child));
+        Ok(())
+    }
+
+    /// A root-owned `mktemp -d` checkout is mode 0700, so an application deliberately launched as
+    /// an unprivileged uid cannot even traverse to its entry file. Add read/traverse permission only
+    /// to the disposable checkout chain and make verifier-created runtime directories writable. The
+    /// application still runs without privileges and receives no access outside those fixtures.
+    #[cfg(unix)]
+    fn make_local_run_as_accessible(
+        checkout_root: &std::path::Path,
+        app_root: &std::path::Path,
+        env: &[RequiredEnv],
+        scratch_dirs: &[String],
+    ) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let boundary = checkout_root.parent().unwrap_or(checkout_root);
+        let mut directories = app_root
+            .ancestors()
+            .take_while(|path| path.starts_with(boundary))
+            .map(std::path::Path::to_path_buf)
+            .collect::<Vec<_>>();
+        directories.push(boundary.to_path_buf());
+        directories.sort();
+        directories.dedup();
+        for directory in directories {
+            let metadata = std::fs::metadata(&directory)
+                .map_err(|error| format!("reading {} permissions: {error}", directory.display()))?;
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o055);
+            std::fs::set_permissions(&directory, permissions).map_err(|error| {
+                format!("opening {} to the app uid: {error}", directory.display())
+            })?;
+        }
+        for directory in env
+            .iter()
+            .filter(|var| var.directory)
+            .map(|var| localize_helper_paths(&var.value))
+            .chain(scratch_dirs.iter().map(|dir| localize_helper_paths(dir)))
+        {
+            let metadata = std::fs::metadata(&directory)
+                .map_err(|error| format!("reading {directory} permissions: {error}"))?;
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o777);
+            std::fs::set_permissions(&directory, permissions)
+                .map_err(|error| format!("making {directory} writable to the app uid: {error}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn make_local_run_as_accessible(
+        _checkout_root: &std::path::Path,
+        _app_root: &std::path::Path,
+        _env: &[RequiredEnv],
+        _scratch_dirs: &[String],
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -543,6 +1124,9 @@ impl Session {
 
         if self.db.is_some() {
             self.start_db()?;
+            // Load the app's own shipped database seed (a `mongodump` in the repo) before launch, so
+            // its startup initialization finds the configuration it reads out of its own collections.
+            self.restore_db_dump();
         }
         if self.redis.is_some() {
             self.start_redis()?;
@@ -553,6 +1137,7 @@ impl Session {
         // (see [`required_env`]), a few times at most.
         let mut env: Vec<RequiredEnv> = self.base_env.clone();
         let mut stub_missing_modules = false;
+        let mut mongodb_callback_promises = false;
         // Directories the app tried to write into on startup before their parent existed
         // (see [`missing_write_dir`]); mounted as empty writable scratch on the next attempt.
         let mut scratch_dirs: Vec<String> = Vec::new();
@@ -560,9 +1145,16 @@ impl Session {
         // (see [`missing_tls_material`]); staged from the self-signed marker pair on the next
         // attempt so the server can bind. Each entry is (container path, is_key).
         let mut cert_files: Vec<(String, bool)> = Vec::new();
+        let mut generated_config_retry = false;
         for _ in 0..5 {
             self.tls = !cert_files.is_empty();
-            self.run_app(&env, stub_missing_modules, &scratch_dirs, &cert_files)?;
+            self.run_app(
+                &env,
+                stub_missing_modules,
+                mongodb_callback_promises,
+                &scratch_dirs,
+                &cert_files,
+            )?;
             let err = match self.wait_until_listening() {
                 Ok(port) => {
                     self.port = port;
@@ -583,16 +1175,26 @@ impl Session {
                 }
             }
             let enable_module_stub = !stub_missing_modules && missing_bare_module(&err);
+            let enable_mongodb_callback_promises =
+                !mongodb_callback_promises && missing_mongodb_collection_promise(&err);
             let new_dir = missing_write_dir(&err).filter(|dir| !scratch_dirs.contains(dir));
             let new_cert = missing_tls_material(&err)
                 .filter(|(path, _)| cert_files.iter().all(|(have, _)| have != path));
-            if missing.is_empty() && !enable_module_stub && new_dir.is_none() && new_cert.is_none()
+            let retry_generated_config = !generated_config_retry && generated_startup_config(&err);
+            if missing.is_empty()
+                && !enable_module_stub
+                && !enable_mongodb_callback_promises
+                && new_dir.is_none()
+                && new_cert.is_none()
+                && !retry_generated_config
             {
                 return Err(err);
             }
             remove_container(&self.app);
             env.extend(missing);
             stub_missing_modules |= enable_module_stub;
+            mongodb_callback_promises |= enable_mongodb_callback_promises;
+            generated_config_retry |= retry_generated_config;
             if let Some(dir) = new_dir {
                 scratch_dirs.push(dir);
             }
@@ -610,6 +1212,7 @@ impl Session {
         &self,
         env: &[RequiredEnv],
         stub_missing_modules: bool,
+        mongodb_callback_promises: bool,
         scratch_dirs: &[String],
         cert_files: &[(String, bool)],
     ) -> Result<(), String> {
@@ -667,8 +1270,10 @@ impl Session {
         if self.node_sqlite {
             node_options.push("--experimental-sqlite".to_owned());
         }
-        if stub_missing_modules {
+        if stub_missing_modules || mongodb_callback_promises {
             node_options.push("--require=/jss-launch-shim.js".to_owned());
+        }
+        if stub_missing_modules {
             // Modules the entry file `require`s inside a `try`/`catch` are ones it tolerates the
             // absence of: let the shim re-throw their `MODULE_NOT_FOUND` so the app's own fallback
             // runs, instead of handing back an inert stub whose truthy value crashes that fallback.
@@ -679,6 +1284,10 @@ impl Session {
                     self.guarded_modules.join(",")
                 ));
             }
+        }
+        if mongodb_callback_promises {
+            args.push("-e".to_owned());
+            args.push("JSS_MONGODB_CALLBACK_PROMISES=1".to_owned());
         }
         if !node_options.is_empty() {
             args.push("-e".to_owned());
@@ -820,6 +1429,52 @@ impl Session {
         Err("the Redis sidecar did not become ready within 40s".to_owned())
     }
 
+    /// Load the application's own database seed into the sidecar before launch, when the repository
+    /// ships a `mongodump` (a directory of `<collection>.bson` files beside their `.metadata.json`).
+    /// A real deployment restores this dump, so the app's startup initialization — which reads
+    /// required configuration (a JWT signing secret, feature flags) out of its own collections and
+    /// crashes when they are absent — finds the data it needs and the server reaches `listen`. The
+    /// dump is restored into the verifier's application database, the one the app is pointed at, so
+    /// the running server reads it exactly as it would in production. Best-effort: a repository with
+    /// no dump, or a restore error, leaves the database empty — the same state as before.
+    fn restore_db_dump(&self) {
+        let Some(db) = self.db.as_deref() else {
+            return;
+        };
+        let Some(dump) = mongodump_dir(&self.root) else {
+            return;
+        };
+        let Some(dump_str) = dump.to_str() else {
+            return;
+        };
+        let dest = format!("{db}:/jss-db-dump");
+        if Command::new("docker")
+            .args(["cp", dump_str, &dest])
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let output = self.exec(
+            db,
+            &["mongorestore", "--drop", "--db", DB_NAME, "/jss-db-dump"],
+        );
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            let (code, message) = match output {
+                Ok(output) => (
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
+                Err(error) => (None, error),
+            };
+            eprintln!("[verify] db restore {dump_str} -> {code:?} {message}");
+        }
+    }
+
     fn seed_db(&self) {
         let Some(db) = self.db.as_deref() else {
             return;
@@ -891,12 +1546,66 @@ impl Session {
         let _ = self.exec(db, &["mongosh", "--quiet", "--eval", SEED_PROFILED_SCRIPT]);
     }
 
+    /// Plant a single record that a document-filtering NoSQL sink's own query selects, so the
+    /// match-all/match-none differential has a pre-existing document to move. Profiling is turned on,
+    /// one benign match-none request is sent — its injected field carries the per-run sentinel, so the
+    /// recorded query filter contains it — and the observed filter is turned into a document: each
+    /// scalar equality is copied verbatim (the `email` the handler ANDs in), and the one operator
+    /// field that references the sentinel is set to a present value that the match-all `{$ne:<sentinel>}`
+    /// selects while the match-none controls (`$eq`, `$in: []`) do not. Guard queries that do not
+    /// reference the sentinel — an earlier `{verified:true}` pre-check that must *not* match for the
+    /// sink to run — contribute no fields, so the planted record stays reachable. Every collection,
+    /// field and value comes from the query the app actually ran; nothing is derived from a name.
+    fn seed_nosql_lookup_record(&self, cases: &[payload::NosqlCase]) {
+        let Some(db) = self.db.as_deref() else {
+            return;
+        };
+        let Some(first) = cases.first() else {
+            return;
+        };
+        self.enable_db_profiling();
+        let _ = self.fetch(&first.match_none_eq);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let script = nosql_lookup_seed_script(&first.absent);
+        let output = self.exec(db, &["mongosh", "--quiet", "--eval", &script]);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            let (code, message) = match output {
+                Ok(output) => (
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+                ),
+                Err(error) => (None, error),
+            };
+            eprintln!("[verify] nosql lookup seed -> {code:?} {message}");
+        }
+    }
+
     /// Polls from inside the app's own container until the app answers on a port, or the
     /// deadline passes, and returns that port.
     fn wait_until_listening(&self) -> Result<u16, String> {
         // Up to ~90s: `npm start` may build first. The probe is one Node connect attempt.
-        let script = listening_probe(self.port);
+        // A local session shares its network namespace with its datastore sidecars. Their ports are
+        // already listening before the application starts and must not be mistaken for a hard-coded
+        // application HTTP port while `npm start` is still booting.
+        let excluded = match &self.runtime {
+            Runtime::Local { .. } => local_excluded_ports(
+                &self.local_baseline_ports,
+                self.local_marker_port,
+                self.db.is_some(),
+                self.redis.is_some(),
+            ),
+            Runtime::Docker => Vec::new(),
+        };
         for _ in 0..90 {
+            let candidates = if matches!(&self.runtime, Runtime::Local { .. }) {
+                local_listening_ports()
+                    .into_iter()
+                    .filter(|port| !self.local_baseline_ports.contains(port))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let script = listening_probe_excluding_candidates(self.port, &excluded, &candidates);
             let probe = self.exec(&self.app, &["node", "-e", &script]);
             if let Some(port) = probe.ok().filter(|o| o.status.success()).and_then(|o| {
                 String::from_utf8_lossy(&o.stdout)
@@ -910,12 +1619,15 @@ impl Session {
             if !self.container_running(&self.app) {
                 return Err(format!(
                     "the app exited before it listened:\n{}",
-                    self.tail_logs(&self.app)
+                    self.settled_tail_logs(&self.app)
                 ));
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        Err("the app did not listen within 90s".to_owned())
+        Err(format!(
+            "the app did not listen within 90s:\n{}",
+            self.tail_logs(&self.app)
+        ))
     }
 
     /// Sends every derived request for a probe and reports the first that reproduces, or that
@@ -1015,6 +1727,24 @@ impl Session {
                 None => self.plant_listing_canary("", self.nonce),
             }
         }
+        // Try the three-leg read differential before the broad reflected-content payload matrix for
+        // every anonymous traversal read. Besides being stronger evidence for a blind read, this
+        // keeps URL-sourced sinks tractable: a renderer can expose many query fields, and trying the
+        // full filename/encoding matrix for every field may perform hundreds of expensive renders
+        // before reaching the one field connected to the sink. The oracle follows the mined query
+        // fields in data-flow order and normally reaches that field in a handful of requests. If it
+        // cannot distinguish the found and missing branches, the broad matrix remains the fallback.
+        // Authenticated probes retain the normal order because the oracle requests do not yet carry
+        // bootstrapped sessions.
+        let read_oracle_tried_early = probe.class == jss_core::VulnClass::PathTraversal
+            && !probe.lists_dir
+            && probe.auth.is_none();
+        if read_oracle_tried_early && let Some(poc) = self.verify_read_oracle(probe) {
+            return Outcome::Verified {
+                how: format!("{} {}", poc.method, poc.target),
+                poc,
+            };
+        }
         let mut attempts = payload::attempts(probe, &self.canary, self.nonce);
         // A sink gated behind a session the handler looks up from a request cookie it reads itself is
         // an authenticated-user sink, not an anonymous one: mint a genuine session through the app's
@@ -1054,7 +1784,7 @@ impl Session {
                 if let Some(poc) = self.send(attempt) {
                     self.omit_forwarding.set(false);
                     return Outcome::Verified {
-                        how: format!("{} {}", attempt.verb, attempt.target),
+                        how: format!("{} {}", poc.method, poc.target),
                         poc,
                     };
                 }
@@ -1064,7 +1794,7 @@ impl Session {
         // Fallback for a read sink that consumes the planted file but never echoes it (the handler
         // reads it and then crashes or renders without reflecting its bytes): prove the traversal by
         // a differential file-found/not-found oracle instead of by content in the response.
-        if let Some(poc) = self.verify_read_oracle(probe) {
+        if !read_oracle_tried_early && let Some(poc) = self.verify_read_oracle(probe) {
             return Outcome::Verified {
                 how: format!("{} {}", poc.method, poc.target),
                 poc,
@@ -1090,9 +1820,13 @@ impl Session {
 
     /// Runs one read-oracle candidate's three-request differential; see [`Self::verify_read_oracle`].
     fn try_read_oracle(&self, oracle: &payload::ReadOracle) -> Option<Reproduction> {
-        let present = self.fetch(&oracle.present)?;
+        // Establish both controls before touching the planted path. Some vulnerable handlers enter
+        // the file-found branch and then crash in downstream processing of the loaded fixture; its
+        // response is still valid evidence, but sending it first would kill the process before the
+        // not-found controls can be observed.
         let absent = self.fetch(&oracle.absent)?;
         let absent_sub = self.fetch(&oracle.absent_sub)?;
+        let present = self.fetch(&oracle.present)?;
         if present.trim().is_empty() {
             return None;
         }
@@ -1152,12 +1886,34 @@ impl Session {
                 control = oracle.control_path,
             )
         };
-        let _ = self.exec(&self.app, &["sh", "-c", &plant]);
+        let planted = self.exec(&self.app, &["sh", "-c", &plant]);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] delete oracle plant={planted:?} target={} target-exists={} control={} control-exists={}",
+                oracle.target_path,
+                self.file_exists(&oracle.target_path),
+                oracle.control_path,
+                self.file_exists(&oracle.control_path)
+            );
+        }
         // Both planted entries must exist before the request, or the differential proves nothing.
         if !self.file_exists(&oracle.target_path) || !self.file_exists(&oracle.control_path) {
             return None;
         }
-        let _ = self.fetch(&oracle.present);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] delete oracle request={} {} target={} control={}",
+                oracle.present.verb, oracle.present.target, oracle.target_path, oracle.control_path
+            );
+        }
+        let response = self.fetch(&oracle.present);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] delete oracle response={response:?} target-exists={} control-exists={}",
+                self.file_exists(&oracle.target_path),
+                self.file_exists(&oracle.control_path)
+            );
+        }
         // The target must be gone (the traversal reached it) and the control must survive (the
         // removal was directed by the attacker-controlled path, not an indiscriminate wipe).
         if self.file_exists(&oracle.target_path) || !self.file_exists(&oracle.control_path) {
@@ -1309,7 +2065,7 @@ impl Session {
                 target,
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr).trim(),
-                response.trim(),
+                response_excerpt(&response),
             );
         }
         let _ = self.exec(
@@ -1780,6 +2536,12 @@ impl Session {
     fn verify_sql_destructive_oracle(&self, probe: &Probe) -> Option<Reproduction> {
         let oracle = payload::sql_delete_oracle(probe, &self.canary, self.nonce)?;
         let files = self.discover_sqlite_files();
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] SQL delete oracle tables={} sibling={} sqlite-files={:?}",
+                oracle.table, oracle.sibling, files
+            );
+        }
         if files.is_empty() {
             return None;
         }
@@ -1811,6 +2573,11 @@ impl Session {
             self.count_table_rows(&files, &oracle.table)?,
             self.count_table_rows(&files, &oracle.sibling)?,
         );
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] SQL delete oracle rows before={t0}/{s0} control={t1}/{s1} exploit={t2}/{s2}"
+            );
+        }
         if t2 < t1 && s2 == s1 {
             let attempt = &oracle.breakout;
             return Some(Reproduction {
@@ -1838,15 +2605,29 @@ impl Session {
         None
     }
 
-    /// Every SQLite database file inside the running app container (by extension), excluding virtual
-    /// filesystems and vendored packages. The destructive-delete oracle plants its canary tables in
-    /// each, so whichever file the sink's connection owns carries the planted rows the request then
-    /// deletes; the others are untouched.
+    /// SQLite database files owned by the isolated application. Docker's `/tmp` belongs to the
+    /// sandbox; local mode instead searches only the app tree and generated directory-valued
+    /// fixtures, never the host's shared temporary root.
     fn discover_sqlite_files(&self) -> Vec<String> {
-        let find = "find / -type f \\( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \\) \
-            -not -path '/proc/*' -not -path '/sys/*' -not -path '*/node_modules/*' 2>/dev/null \
-            | head -50";
-        let Ok(output) = self.exec(&self.app, &["sh", "-c", find]) else {
+        let mut roots = match &self.runtime {
+            Runtime::Docker => vec![".".to_owned(), "/tmp".to_owned()],
+            Runtime::Local { app_root, .. } => local_sqlite_search_roots(app_root, &self.base_env),
+        };
+        roots.sort();
+        roots.dedup();
+        let searches = roots
+            .iter()
+            .map(|root| {
+                format!(
+                    "find {} -type f \\( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \\) \
+                     -not -path '*/node_modules/*'",
+                    shell_quote(root)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let find = format!("{{ {searches}; }} 2>/dev/null | sort -u | head -50");
+        let Ok(output) = self.exec(&self.app, &["sh", "-c", &find]) else {
             return Vec::new();
         };
         String::from_utf8_lossy(&output.stdout)
@@ -1882,6 +2663,35 @@ impl Session {
     fn exercise_nosql(&self, probe: &Probe) -> Outcome {
         let cases = payload::nosql_cases(probe, &self.canary, self.nonce);
         let tried = cases.len();
+        // A document-filtering sink (`findOne`/`updateOne`/…) only lets the operator take effect
+        // against a record that already exists. When the query also ANDs in a scalar the handler reads
+        // from the request (`findOne({ email, code })`) and gates the sink behind an earlier lookup
+        // (`if (await User.findOne({ email, verified: true })) return`), no generic startup seed can
+        // supply a reachable record. Plant one derived from the sink's own query — observed by
+        // profiling a benign request — so the match-all/match-none differential has a document to move.
+        if probe.nosql_lookup && !probe.nosql_inserts_before_sink && self.db.is_some() {
+            self.seed_nosql_lookup_record(&cases);
+        }
+        // A write-after-find sink (`const r = await User.findOne({ code }); if (r) await
+        // User.updateOne({ _id: r._id }, ...)`) never varies its HTTP response on the lookup, so the
+        // response differential cannot see the operator take effect. Observe the database instead: the
+        // injected `{$ne}` matches a pre-existing document the benign `{$eq:<absent>}`/`{$in:[]}`
+        // controls do not, so only the match-all request mutates a pre-existing (non-probe) document.
+        // Tried first, against the app's pristine seeded state, before the response-differential setup
+        // pollutes it. Only confirms when the two negative controls leave that state unchanged.
+        if probe.nosql_mutates
+            && self.db.is_some()
+            && probe.nosql_inserts_before_sink
+            && let Some(outcome) = self.nosql_inserted_document_differential(&cases)
+        {
+            return outcome;
+        }
+        if probe.nosql_mutates
+            && self.db.is_some()
+            && let Some(outcome) = self.nosql_state_differential(&cases)
+        {
+            return outcome;
+        }
         // A match-all operator (`{$ne}`) only returns a record when the queried collection holds at
         // least one document. A read-only query sink never creates its collection on a driver that does
         // not auto-create on read (Mongoose 5's `autoCreate` defaults off), and a tenant-scoped factory
@@ -1946,6 +2756,233 @@ impl Session {
         Outcome::NotReproduced { tried }
     }
 
+    /// A registration/referral handler can insert the submitted account before the vulnerable
+    /// lookup and then mutate whichever account the operator selected. Compare the three inserted
+    /// accounts after normalizing their unique identities and generated database metadata: the two
+    /// match-none controls must be identical, while the match-all account must differ. This proves a
+    /// semantic mutation caused by the operator without treating the mere insertion as evidence.
+    fn nosql_inserted_document_differential(
+        &self,
+        cases: &[payload::NosqlCase],
+    ) -> Option<Outcome> {
+        for case in cases {
+            let [all_id, eq_id, in_id] = case.identity.as_slice() else {
+                continue;
+            };
+            let _ = self.fetch(&case.match_all);
+            let all = self.nosql_identity_document_digest(all_id, &case.identity)?;
+            let _ = self.fetch(&case.match_none_eq);
+            let eq = self.nosql_identity_document_digest(eq_id, &case.identity)?;
+            let _ = self.fetch(&case.match_none_in);
+            let in_empty = self.nosql_identity_document_digest(in_id, &case.identity)?;
+            if all.trim().is_empty() || eq.trim().is_empty() || eq != in_empty || all == eq {
+                continue;
+            }
+            let attempt = &case.match_all;
+            return Some(Outcome::Verified {
+                how: format!(
+                    "{} {} ({}[$ne], inserted-document differential)",
+                    attempt.verb, attempt.target, case.field
+                ),
+                poc: Reproduction {
+                    command: curl_command(attempt, self.port),
+                    method: attempt.verb.to_owned(),
+                    target: attempt.target.clone(),
+                    headers: attempt
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}"))
+                        .collect(),
+                    body: attempt.body.clone(),
+                    evidence: format!(
+                        "the match-all operator (`{}: {{$ne}}`) caused a semantic database mutation \
+                         on the newly registered record, while the independently registered `$eq` \
+                         and `$in: []` controls remained identical after generated identities and \
+                         metadata were normalized",
+                        case.field
+                    ),
+                    response: String::new(),
+                    controls: vec![
+                        ControlObservation {
+                            label: "match-none $eq (inserted record unchanged)".to_owned(),
+                            method: case.match_none_eq.verb.to_owned(),
+                            target: case.match_none_eq.target.clone(),
+                            body: case.match_none_eq.body.clone(),
+                            response:
+                                "normalized inserted record matched the other negative control"
+                                    .to_owned(),
+                        },
+                        ControlObservation {
+                            label: "match-none $in: [] (inserted record unchanged)".to_owned(),
+                            method: case.match_none_in.verb.to_owned(),
+                            target: case.match_none_in.target.clone(),
+                            body: case.match_none_in.body.clone(),
+                            response:
+                                "normalized inserted record matched the other negative control"
+                                    .to_owned(),
+                        },
+                    ],
+                },
+            });
+        }
+        None
+    }
+
+    /// The normalized database document containing one probe identity. Mongo-generated `_id` values,
+    /// dates, and the three per-probe identity values are replaced before comparison; application
+    /// fields such as balances, roles, flags, and relation arrays remain intact.
+    fn nosql_identity_document_digest(
+        &self,
+        identity: &str,
+        identities: &[String],
+    ) -> Option<String> {
+        let db = self.db.as_deref()?;
+        let identity = serde_json::to_string(identity).ok()?;
+        let identities = serde_json::to_string(identities).ok()?;
+        let script = format!(
+            "var WANT={identity};var IDS={identities};var out=[];\
+             function hasId(v){{if(v===null||v===undefined)return false;\
+               if(Array.isArray(v))return v.some(hasId);\
+               if(typeof v==='object')return Object.keys(v).some(function(k){{return hasId(v[k]);}});\
+               return String(v)===WANT;}}\
+             function norm(v,k){{if(k==='_id')return undefined;\
+               if(v instanceof Date)return '<date>';\
+               if(v&&typeof v==='object'&&v._bsontype)return '<bson>';\
+               if(Array.isArray(v))return v.map(function(x){{return norm(x,'');}});\
+               if(v&&typeof v==='object'){{var o={{}};Object.keys(v).sort().forEach(function(n){{\
+                 var x=norm(v[n],n);if(x!==undefined)o[n]=x;}});return o;}}\
+               if(IDS.indexOf(String(v))>=0)return '<identity>';return v;}}\
+             db.getMongo().getDBNames().forEach(function(n){{\
+               if(['admin','local','config'].indexOf(n)>=0)return;var d=db.getSiblingDB(n);\
+               d.getCollectionNames().forEach(function(c){{if(c.indexOf('system.')===0)return;\
+                 d.getCollection(c).find({{}}).forEach(function(doc){{if(hasId(doc))\
+                   out.push(n+'.'+c+':'+JSON.stringify(norm(doc,'')));}});}});}});\
+             out.sort();print(out.join('\\n'));"
+        );
+        let output = self
+            .exec(db, &["mongosh", "--quiet", "--eval", &script])
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Confirms a NoSQL operator injection whose effect is a database write the HTTP response never
+    /// reflects, by a database-state differential. For each case: snapshot the application documents
+    /// (excluding this case's own probe-inserted documents, keyed by the unique identity values it
+    /// stamps into the request), send the match-all `{$ne:<absent>}` request, and snapshot again. A
+    /// changed snapshot means the operator selected a pre-existing document that the handler then
+    /// mutated. It is only accepted when both negative controls (`{$eq:<absent>}`, `{$in:[]}`), which
+    /// a scalar value produces, leave the snapshot unchanged — so the change is attributable to the
+    /// operator and not to the request's own insert or to nondeterministic state.
+    fn nosql_state_differential(&self, cases: &[payload::NosqlCase]) -> Option<Outcome> {
+        for case in cases {
+            let exclude = &case.identity;
+            let before_all = self.nosql_state_digest(exclude)?;
+            let _ = self.fetch(&case.match_all);
+            let after_all = self.nosql_state_digest(exclude)?;
+            if after_all == before_all {
+                // The operator changed no pre-existing document for this case; nothing to attribute.
+                continue;
+            }
+            let before_eq = self.nosql_state_digest(exclude)?;
+            let _ = self.fetch(&case.match_none_eq);
+            let after_eq = self.nosql_state_digest(exclude)?;
+            let before_in = self.nosql_state_digest(exclude)?;
+            let _ = self.fetch(&case.match_none_in);
+            let after_in = self.nosql_state_digest(exclude)?;
+            if after_eq != before_eq || after_in != before_in {
+                // A control also changed state: the change is not attributable to the operator.
+                continue;
+            }
+            let attempt = &case.match_all;
+            return Some(Outcome::Verified {
+                how: format!(
+                    "{} {} ({}[$ne], database-state differential)",
+                    attempt.verb, attempt.target, case.field
+                ),
+                poc: Reproduction {
+                    command: curl_command(attempt, self.port),
+                    method: attempt.verb.to_owned(),
+                    target: attempt.target.clone(),
+                    headers: attempt
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}"))
+                        .collect(),
+                    body: attempt.body.clone(),
+                    evidence: format!(
+                        "a match-all operator (`{}: {{$ne}}`) mutated a pre-existing database \
+                         document that the match-none operators (`$eq`, `$in: []`) left unchanged, \
+                         proving the object was interpreted as a MongoDB query operator that \
+                         selected a record a scalar value could not",
+                        case.field
+                    ),
+                    response: String::new(),
+                    controls: vec![
+                        ControlObservation {
+                            label: "match-none $eq (database unchanged)".to_owned(),
+                            method: case.match_none_eq.verb.to_owned(),
+                            target: case.match_none_eq.target.clone(),
+                            body: case.match_none_eq.body.clone(),
+                            response: "no pre-existing document changed".to_owned(),
+                        },
+                        ControlObservation {
+                            label: "match-none $in: [] (database unchanged)".to_owned(),
+                            method: case.match_none_in.verb.to_owned(),
+                            target: case.match_none_in.target.clone(),
+                            body: case.match_none_in.body.clone(),
+                            response: "no pre-existing document changed".to_owned(),
+                        },
+                    ],
+                },
+            });
+        }
+        None
+    }
+
+    /// A stable digest of every application document, excluding this probe's own inserted documents.
+    /// Each database (other than `admin`/`local`/`config`) and non-system collection is read in `_id`
+    /// order and serialized; a document is skipped when any of its scalar fields holds one of the
+    /// `exclude` identity values (the unique per-request values a write probe stamps into its insert),
+    /// so a registration probe's own new rows do not count as a change — only a mutation to a document
+    /// that already existed does. `None` when the query cannot be run, so the caller abstains rather
+    /// than guesses.
+    fn nosql_state_digest(&self, exclude: &[String]) -> Option<String> {
+        let db = self.db.as_deref()?;
+        let excl_literal: String = exclude
+            .iter()
+            .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            "var EXCL=[{excl_literal}];var out=[];\
+             db.getMongo().getDBNames().forEach(function(n){{\
+               if(['admin','local','config'].indexOf(n)>=0)return;\
+               var d=db.getSiblingDB(n);\
+               d.getCollectionNames().forEach(function(c){{\
+                 if(c.indexOf('system.')===0)return;\
+                 d.getCollection(c).find({{}}).sort({{_id:1}}).forEach(function(doc){{\
+                   var skip=false;\
+                   for(var k in doc){{var v=doc[k];\
+                     if((typeof v==='string'||typeof v==='number')&&EXCL.indexOf(String(v))>=0){{skip=true;break;}}}}\
+                   if(skip)return;\
+                   out.push(n+'.'+c+':'+JSON.stringify(doc));\
+                 }});\
+               }});\
+             }});\
+             print(out.join('\\n'));"
+        );
+        let output = self
+            .exec(db, &["mongosh", "--quiet", "--eval", &script])
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     /// Mints a genuine authenticated session by exercising the app's own routes: registers a
     /// throwaway account on each candidate registration endpoint (failures ignored — the account may
     /// already exist, or the app may seed accounts), then logs in on each candidate login endpoint
@@ -1978,12 +3015,18 @@ impl Session {
         let body = String::from_utf8_lossy(&output.stdout).into_owned();
         if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
             eprintln!(
-                "[verify] {} {} body={:?} -> status {:?} body[{}]",
+                "[verify] {} {} body={:?} -> status {:?} stderr[{}] body[{}]{}",
                 attempt.verb,
                 attempt.target,
                 attempt.body,
                 output.status.code(),
-                body.trim()
+                String::from_utf8_lossy(&output.stderr).trim(),
+                response_excerpt(&body),
+                if body.is_empty() {
+                    format!(" app-logs[{}]", self.tail_logs(&self.app))
+                } else {
+                    String::new()
+                }
             );
         }
         Some(body)
@@ -2001,12 +3044,14 @@ impl Session {
         // did or did not reproduce.
         if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
             eprintln!(
-                "[verify] {} {} -> status {:?} stderr[{}] body[{}]",
+                "[verify] {} {} request-body={:?} -> status {:?} stderr[{}] body[{}] canary-exists={}",
                 attempt.verb,
                 attempt.target,
+                attempt.body,
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr).trim(),
-                body.trim()
+                response_excerpt(&body),
+                self.file_exists(&self.canary.planted_file()),
             );
         }
         let reproduced = match &attempt.signal {
@@ -2021,29 +3066,39 @@ impl Session {
                 payload::reproduced(attempt, &self.canary, &body, exists, false)
             }
             Signal::ServiceReached(token) => {
-                let reached = match &self.runtime {
-                    Runtime::Docker => {
-                        self.tail_logs(&self.marker).contains(token)
-                            && self.relay_public_callback(token)
-                    }
-                    Runtime::Local { .. } => self.public_callback_reached(token),
-                };
+                let local_reached = marker_hit(&self.tail_logs(&self.marker), token).is_some();
+                if local_reached {
+                    // The isolated marker hit is the exploitation proof. Mirroring that hit to
+                    // the public callback only records metadata; a transient callback/API failure
+                    // must not turn a reproduced vulnerability into a false negative.
+                    self.relay_public_callback(token);
+                }
+                let public_reached = !local_reached
+                    && self
+                        .canary
+                        .callback_host()
+                        .is_some_and(|host| attempt_mentions_host(attempt, host))
+                    && self.public_callback_reached(token);
+                let reached = local_reached || public_reached;
                 payload::reproduced(attempt, &self.canary, &body, false, reached)
             }
         };
-        reproduced.then(|| Reproduction {
-            command: curl_command(attempt, self.port),
-            method: attempt.verb.to_owned(),
-            target: attempt.target.clone(),
-            headers: attempt
-                .headers
-                .iter()
-                .map(|(name, value)| format!("{name}: {value}"))
-                .collect(),
-            body: attempt.body.clone(),
-            evidence: observed_evidence(&attempt.signal, self.canary.callback_host()),
-            response: body.trim().to_owned(),
-            controls: Vec::new(),
+        reproduced.then(|| {
+            let display = normalized_callback_attempt(attempt, self.canary.callback_host());
+            Reproduction {
+                command: curl_command(&display, self.port),
+                method: display.verb.to_owned(),
+                target: display.target.clone(),
+                headers: display
+                    .headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect(),
+                body: display.body.clone(),
+                evidence: observed_evidence(&attempt.signal, self.canary.callback_host()),
+                response: body.trim().to_owned(),
+                controls: Vec::new(),
+            }
         })
     }
 
@@ -2054,13 +3109,30 @@ impl Session {
                 let (program, args) = cmd
                     .split_first()
                     .ok_or_else(|| "empty local verifier command".to_owned())?;
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|argument| localize_helper_paths(argument))
+                    .collect();
                 Command::new(program)
                     .args(args)
                     .current_dir(app_root)
                     .output()
                     .map_err(|error| error.to_string())
             }
-            Runtime::Local { .. } => Err("local verifier sidecars are unavailable".to_owned()),
+            Runtime::Local { app_root, .. }
+                if self.db.as_deref() == Some(container)
+                    || self.redis.as_deref() == Some(container) =>
+            {
+                let (program, args) = cmd
+                    .split_first()
+                    .ok_or_else(|| "empty local sidecar command".to_owned())?;
+                Command::new(program)
+                    .args(args)
+                    .current_dir(app_root)
+                    .output()
+                    .map_err(|error| error.to_string())
+            }
+            Runtime::Local { .. } => Err("unknown local verifier service".to_owned()),
         }
     }
 
@@ -2068,21 +3140,22 @@ impl Session {
     /// The untrusted application container remains on its `--internal` network; only this fixed,
     /// validated Satori hostname is contacted. The relay carries the target request's method and
     /// user agent as metadata, so the public interaction cannot be mistaken for a direct `curl`
-    /// request from the verifier. A registered canary response is required.
-    fn relay_public_callback(&self, token: &str) -> bool {
+    /// request from the verifier. This is best-effort telemetry: the isolated marker hit remains
+    /// the authoritative exploitation signal.
+    fn relay_public_callback(&self, token: &str) {
         let Some(host) = self.canary.callback_host() else {
-            return true;
+            return;
         };
         let logs = self.tail_logs(&self.marker);
         let Some(hit) = marker_hit(&logs, token) else {
-            return false;
+            return;
         };
         let url = format!("https://{host}{}", hit.path);
         let Ok(output) = Command::new("curl")
             .args(callback_relay_args(&url, &hit))
             .output()
         else {
-            return false;
+            return;
         };
         let registered_token = host.split('.').next().unwrap_or_default();
         let confirmed = output.status.success()
@@ -2095,7 +3168,6 @@ impl Session {
                 output.status.code()
             );
         }
-        confirmed
     }
 
     fn public_callback_reached(&self, token: &str) -> bool {
@@ -2125,16 +3197,46 @@ impl Session {
             }
             if let Ok(output) = command.arg(&url).output()
                 && output.status.success()
+                && callback_response_contains(&output.stdout, token)
             {
-                let body = String::from_utf8_lossy(&output.stdout);
-                if body.contains("\"protocol\":\"http\"") && body.contains(token) {
-                    return true;
-                }
+                return true;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
         false
     }
+}
+
+fn attempt_mentions_host(attempt: &Attempt, host: &str) -> bool {
+    attempt.target.contains(host)
+        || attempt
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains(host))
+        || attempt
+            .headers
+            .iter()
+            .any(|(_, value)| value.contains(host))
+}
+
+fn callback_response_contains(body: &[u8], token: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("interactions")
+                .and_then(|value| value.as_array())
+                .cloned()
+        })
+        .is_some_and(|interactions| {
+            interactions.iter().any(|interaction| {
+                interaction.get("protocol").and_then(|value| value.as_str()) == Some("http")
+                    && interaction
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|path| path.split('/').any(|segment| segment == token))
+            })
+        })
 }
 
 fn valid_container_workdir(path: &str) -> bool {
@@ -2217,14 +3319,32 @@ fn observed_evidence(signal: &Signal, callback_host: Option<&str>) -> String {
             format!("the application created the canary file `{path}`")
         }
         Signal::ServiceReached(token) => {
-            if let Some(host) = callback_host {
+            if callback_host.is_some() {
                 format!(
-                    "the isolated request carrying `{token}` was confirmed by the registered Satori callback `{host}`"
+                    "the isolated request carrying `{token}` was confirmed by the registered Satori callback"
                 )
             } else {
                 format!("the isolated marker service received callback token `{token}`")
             }
         }
+    }
+}
+
+fn normalized_callback_attempt(attempt: &Attempt, callback_host: Option<&str>) -> Attempt {
+    let Some(host) = callback_host else {
+        return attempt.clone();
+    };
+    let replace = |value: &str| value.replace(host, "CALLBACK_HOST");
+    Attempt {
+        verb: attempt.verb,
+        target: replace(&attempt.target),
+        body: attempt.body.as_deref().map(replace),
+        headers: attempt
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), replace(value)))
+            .collect(),
+        signal: attempt.signal.clone(),
     }
 }
 
@@ -2260,7 +3380,10 @@ fn curl_command(attempt: &Attempt, port: u16) -> String {
             &format!("http%3A%2F%2Fjss-marker%2F{token}"),
             "http%3A%2F%2FCALLBACK_HOST",
         );
-        body = body.map(|value| value.replace(&private, callback));
+        target = replace_local_marker_url(&target, token, callback);
+        body = body.map(|value| {
+            replace_local_marker_url(&value.replace(&private, callback), token, callback)
+        });
     }
     let mut parts = vec![
         "curl -i -sS".to_owned(),
@@ -2310,6 +3433,32 @@ fn curl_command(attempt: &Attempt, port: u16) -> String {
     } else {
         command
     }
+}
+
+/// Rewrites the ephemeral loopback marker URL used by the local verifier to the same public
+/// placeholder emitted for Docker's `jss-marker` hostname. The port is intentionally discovered
+/// from the generated value: it is reserved per run and must never leak into a reusable PoC.
+fn replace_local_marker_url(value: &str, token: &str, replacement: &str) -> String {
+    let mut out = value.to_owned();
+    for (prefix, separator) in [
+        ("http://0x7f000001:", "/"),
+        ("http%3A%2F%2F0x7f000001%3A", "%2F"),
+    ] {
+        while let Some(start) = out.find(prefix) {
+            let tail = &out[start + prefix.len()..];
+            let Some(token_at) = tail.find(&format!("{separator}{token}")) else {
+                break;
+            };
+            let end = start + prefix.len() + token_at + separator.len() + token.len();
+            let encoded_replacement = if separator == "%2F" {
+                "http%3A%2F%2FCALLBACK_HOST"
+            } else {
+                replacement
+            };
+            out.replace_range(start..end, encoded_replacement);
+        }
+    }
+    out
 }
 
 struct CurlMultipart {
@@ -2404,10 +3553,15 @@ impl Session {
             Runtime::Docker => docker(&["inspect", "-f", "{{.State.Running}}", name])
                 .map(|out| out.trim() == "true")
                 .unwrap_or(false),
-            Runtime::Local { process, .. } if name == self.app => process
-                .borrow_mut()
-                .as_mut()
-                .is_some_and(|child| child.try_wait().is_ok_and(|status| status.is_none())),
+            Runtime::Local { process, .. } if name == self.app => {
+                let mut process = process.borrow_mut();
+                let Some(child) = process.as_mut() else {
+                    return false;
+                };
+                let group = child.id();
+                child.try_wait().is_ok_and(|status| status.is_none())
+                    || local_process_group_running(group)
+            }
             Runtime::Local { .. } => false,
         }
     }
@@ -2418,8 +3572,24 @@ impl Session {
             Runtime::Local { log, .. } if name == self.app => std::fs::read_to_string(log)
                 .map(|text| tail(&text, 50))
                 .unwrap_or_default(),
+            Runtime::Local { marker_log, .. } if name == self.marker => {
+                std::fs::read_to_string(marker_log)
+                    .map(|text| tail(&text, 50))
+                    .unwrap_or_default()
+            }
             Runtime::Local { .. } => String::new(),
         }
+    }
+
+    /// Reads a local process's final log only after its descendants have had a short opportunity to
+    /// flush their stack trace. Package-manager launchers can exit a few milliseconds before the
+    /// Node child finishes writing the error; classifying the partial log misses safe startup
+    /// retries that depend on stack frames and makes the same checkout timing-dependent under load.
+    fn settled_tail_logs(&self, name: &str) -> String {
+        if matches!(&self.runtime, Runtime::Local { .. }) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        self.tail_logs(name)
     }
 
     /// Removes the app, the marker service, the network and the image. Safe to call twice.
@@ -2444,16 +3614,26 @@ impl Session {
             Runtime::Local {
                 log,
                 process,
+                services,
+                service_dirs,
+                marker_log,
                 created_files,
                 ..
             } => {
                 if let Some(mut child) = process.borrow_mut().take() {
+                    stop_local_process(&mut child);
+                }
+                for mut child in services.borrow_mut().drain(..) {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
                 let _ = std::fs::remove_file(log);
+                let _ = std::fs::remove_file(marker_log);
                 for path in created_files {
                     let _ = std::fs::remove_file(path);
+                }
+                for dir in service_dirs {
+                    let _ = std::fs::remove_dir_all(dir);
                 }
             }
         }
@@ -2466,24 +3646,315 @@ impl Drop for Session {
     }
 }
 
-fn prepare_local_app(root: &std::path::Path, install_root: &std::path::Path) -> Result<(), String> {
-    let commands = dockerfile_setup_commands(root);
-    if commands.is_empty() {
-        run_local_setup(install_root, install_command(package_manager(install_root)))?;
-        if let Ok(manifest) = std::fs::read_to_string(install_root.join("package.json"))
-            && let Some(script) = build_script(&manifest, install_root)
-        {
-            run_local_setup(
-                install_root,
-                &build_command(package_manager(install_root), script),
-            )?;
-        }
+fn stop_local_process(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // `process_group(0)` makes the launcher pid the group id. A negative target tells `kill`
+        // to signal the complete group, including the Node process npm/yarn spawned.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .output();
+    }
+    // Also kill the direct child for non-Unix hosts and as a backstop if the group signal failed.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn local_process_group_running(group: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", "--", &format!("-{group}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn local_process_group_running(_group: u32) -> bool {
+    false
+}
+
+fn prepare_local_app(
+    _root: &std::path::Path,
+    install_root: &std::path::Path,
+) -> Result<(), String> {
+    let package_manager = package_manager(install_root);
+    let manifest_path = install_root.join("package.json");
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let original_manifest = if package_manager == PackageManager::Npm {
+        prepare_standalone_npm_manifest(&manifest_path)?
     } else {
-        for command in commands {
-            run_local_setup(root, &command)?;
+        None
+    };
+    let install_result = run_local_setup(install_root, install_command(package_manager));
+    if let Some(original) = original_manifest {
+        std::fs::write(&manifest_path, original)
+            .map_err(|error| format!("restoring {}: {error}", manifest_path.display()))?;
+    }
+    install_result?;
+    // A stale pnpm/yarn lockfile can report a successful install while omitting dependencies newly
+    // declared in package.json. The missing-module launch shim would then turn frameworks such as
+    // Express into inert proxies: the port opens, but no route can ever answer. Detect that state
+    // from the direct runtime dependency directories and repair it with a script-free npm install.
+    // This is a fallback only; a complete native package-manager install is left untouched.
+    let missing = missing_runtime_dependencies(install_root);
+    if !missing.is_empty() {
+        let blocked = direct_dependencies_with_non_registry_transitives(install_root, &missing);
+        let repairable = missing
+            .iter()
+            .filter(|name| !blocked.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !repairable.is_empty() {
+            let repair = runtime_dependency_repair_command(&manifest_path, &repairable)?;
+            let original_manifest = prepare_registry_only_npm_manifest(&manifest_path, &blocked)?;
+            // `--package-lock=false` prevents writes but npm still reads an existing lockfile. A lock
+            // can pin an otherwise ordinary transitive dependency to a prohibited remote tarball, so
+            // keep it out of this registry-only fallback and restore it byte-for-byte afterwards.
+            let original_locks = temporarily_remove_npm_lockfiles(install_root)?;
+            let repair_result = run_local_setup(install_root, &repair);
+            let manifest_restore = if let Some(original) = original_manifest {
+                std::fs::write(&manifest_path, original)
+                    .map_err(|error| format!("restoring {}: {error}", manifest_path.display()))
+            } else {
+                Ok(())
+            };
+            let lock_restore = restore_npm_lockfiles(original_locks);
+            manifest_restore?;
+            lock_restore?;
+            repair_result?;
         }
     }
+    if let Ok(manifest) = std::fs::read_to_string(&manifest_path)
+        && let Some(script) = build_script(&manifest, install_root)
+    {
+        run_local_setup(install_root, &build_command(package_manager, script))?;
+    }
     Ok(())
+}
+
+fn missing_runtime_dependencies(root: &std::path::Path) -> Vec<String> {
+    let Ok(source) = std::fs::read(root.join("package.json")) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&source) else {
+        return Vec::new();
+    };
+    let Some(dependencies) = manifest
+        .get("dependencies")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    dependencies
+        .iter()
+        .filter(|(_, version)| version.as_str().is_some_and(registry_dependency_spec))
+        .map(|(name, _)| name)
+        .filter(|name| !root.join("node_modules").join(name.as_str()).exists())
+        .cloned()
+        .collect()
+}
+
+/// Direct registry dependencies whose pinned package metadata itself reaches outside the registry.
+/// Hardened runners reject those transitives (`pkg@https://…`, Git URLs) even though the direct
+/// dependency looks ordinary. Installing the entire missing set then rolls back every safe package.
+/// Package-lock v2/v3 records each direct package's dependency map, so exclude only the direct
+/// package proven to introduce the prohibited edge and let startup determine whether that optional
+/// capability was actually needed by the vulnerable route.
+fn direct_dependencies_with_non_registry_transitives(
+    root: &std::path::Path,
+    missing: &[String],
+) -> std::collections::BTreeSet<String> {
+    let Ok(source) = std::fs::read(root.join("package-lock.json")) else {
+        return std::collections::BTreeSet::new();
+    };
+    let Ok(lock) = serde_json::from_slice::<serde_json::Value>(&source) else {
+        return std::collections::BTreeSet::new();
+    };
+    let Some(packages) = lock.get("packages").and_then(serde_json::Value::as_object) else {
+        return std::collections::BTreeSet::new();
+    };
+    missing
+        .iter()
+        .filter(|name| {
+            let key = format!("node_modules/{name}");
+            packages
+                .get(&key)
+                .and_then(|package| package.get("dependencies"))
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|dependencies| {
+                    dependencies
+                        .values()
+                        .any(|version| !version.as_str().is_some_and(registry_dependency_spec))
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn runtime_dependency_repair_command(
+    manifest_path: &std::path::Path,
+    missing: &[String],
+) -> Result<String, String> {
+    let source = std::fs::read(manifest_path)
+        .map_err(|error| format!("reading {}: {error}", manifest_path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&source)
+        .map_err(|error| format!("parsing {}: {error}", manifest_path.display()))?;
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "runtime dependency repair has no dependency map".to_owned())?;
+    let packages = missing
+        .iter()
+        .map(|name| {
+            let version = dependencies
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|version| registry_dependency_spec(version))
+                .ok_or_else(|| {
+                    format!("runtime dependency `{name}` is not registry-installable")
+                })?;
+            Ok(shell_quote(&format!("{name}@{version}")))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let install = format!(
+        "npm install --no-save --package-lock=false --workspaces=false --omit=dev --ignore-scripts --legacy-peer-deps --no-audit --no-fund -- {}",
+        packages.join(" ")
+    );
+    Ok(format!(
+        "{install} || (sleep 2; {install}) || (sleep 5; {install})"
+    ))
+}
+
+fn registry_dependency_spec(version: &str) -> bool {
+    (version.starts_with("npm:") || !version.contains('/'))
+        && ![
+            "git:",
+            "git+",
+            "github:",
+            "gitlab:",
+            "bitbucket:",
+            "ssh:",
+            "http:",
+            "https:",
+            "file:",
+            "link:",
+            "workspace:",
+        ]
+        .iter()
+        .any(|prefix| version.starts_with(prefix))
+}
+
+fn prepare_registry_only_npm_manifest(
+    manifest_path: &std::path::Path,
+    excluded: &std::collections::BTreeSet<String>,
+) -> Result<Option<Vec<u8>>, String> {
+    let original = std::fs::read(manifest_path)
+        .map_err(|error| format!("reading {}: {error}", manifest_path.display()))?;
+    let mut manifest: serde_json::Value = serde_json::from_slice(&original)
+        .map_err(|error| format!("parsing {}: {error}", manifest_path.display()))?;
+    let mut changed = false;
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
+        let Some(entries) = manifest
+            .get_mut(section)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let blocked = entries
+            .iter()
+            .filter(|(name, version)| {
+                excluded.contains(name.as_str())
+                    || !version.as_str().is_some_and(registry_dependency_spec)
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        changed |= !blocked.is_empty();
+        for name in blocked {
+            entries.remove(&name);
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let patched = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("serializing {}: {error}", manifest_path.display()))?;
+    std::fs::write(manifest_path, patched)
+        .map_err(|error| format!("patching {}: {error}", manifest_path.display()))?;
+    Ok(Some(original))
+}
+
+fn temporarily_remove_npm_lockfiles(
+    root: &std::path::Path,
+) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>, String> {
+    let mut originals = Vec::new();
+    for name in ["package-lock.json", "npm-shrinkwrap.json"] {
+        let path = root.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let contents =
+            std::fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("hiding {}: {error}", path.display()))?;
+        originals.push((path, contents));
+    }
+    Ok(originals)
+}
+
+fn restore_npm_lockfiles(originals: Vec<(std::path::PathBuf, Vec<u8>)>) -> Result<(), String> {
+    for (path, contents) in originals {
+        std::fs::write(&path, contents)
+            .map_err(|error| format!("restoring {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// npm cannot install a package extracted from a monorepo when its development-only sibling
+/// dependencies use the `workspace:` protocol. The verifier only needs the package's registry
+/// runtime dependencies, so temporarily remove those development entries for installation and
+/// restore the checkout byte-for-byte afterwards. Yarn and pnpm understand the protocol natively.
+fn prepare_standalone_npm_manifest(
+    manifest_path: &std::path::Path,
+) -> Result<Option<Vec<u8>>, String> {
+    let original = std::fs::read(manifest_path)
+        .map_err(|error| format!("reading {}: {error}", manifest_path.display()))?;
+    let mut manifest: serde_json::Value = serde_json::from_slice(&original)
+        .map_err(|error| format!("parsing {}: {error}", manifest_path.display()))?;
+    let Some(dev_dependencies) = manifest
+        .get_mut("devDependencies")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(None);
+    };
+    let workspace_dependencies: Vec<String> = dev_dependencies
+        .iter()
+        .filter(|(_, value)| {
+            value
+                .as_str()
+                .is_some_and(|version| version.starts_with("workspace:"))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    if workspace_dependencies.is_empty() {
+        return Ok(None);
+    }
+    for name in workspace_dependencies {
+        dev_dependencies.remove(&name);
+    }
+    let patched = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("serializing {}: {error}", manifest_path.display()))?;
+    std::fs::write(manifest_path, patched)
+        .map_err(|error| format!("patching {}: {error}", manifest_path.display()))?;
+    Ok(Some(original))
 }
 
 fn run_local_setup(root: &std::path::Path, script: &str) -> Result<(), String> {
@@ -2502,32 +3973,6 @@ fn run_local_setup(root: &std::path::Path, script: &str) -> Result<(), String> {
             tail(&String::from_utf8_lossy(&output.stderr), 50)
         ))
     }
-}
-
-/// Package preparation explicitly declared by the repository Dockerfile. Filesystem cleanup,
-/// ownership changes and image-only metadata are intentionally ignored: the Satori job already is
-/// the disposable filesystem boundary, while package installation and compilation are required to
-/// reproduce the application runtime.
-fn dockerfile_setup_commands(root: &std::path::Path) -> Vec<String> {
-    let Ok(source) = std::fs::read_to_string(root.join("Dockerfile")) else {
-        return Vec::new();
-    };
-    source
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("RUN "))
-        .filter(|command| {
-            let command = command.trim();
-            (command.starts_with("npm install")
-                || command.starts_with("npm ci")
-                || command.starts_with("npm dedupe")
-                || command.starts_with("yarn install")
-                || command.starts_with("pnpm install")
-                || command.starts_with("corepack "))
-                && !command.contains("cyclonedx")
-                && !command.contains("sbom")
-        })
-        .map(str::to_owned)
-        .collect()
 }
 
 fn dockerfile_port(root: &std::path::Path) -> Option<u16> {
@@ -2553,46 +3998,58 @@ fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String>
             )
         })
         .collect();
+    files.push((
+        std::path::PathBuf::from(canary.planted_image_file()),
+        payload::PLANTED_IMAGE_PNG.to_vec(),
+    ));
     files.extend([
         (
-            std::path::PathBuf::from("/jss-driver.js"),
+            std::path::PathBuf::from("/tmp/jss-driver.js"),
             DRIVER_JS.as_bytes().to_vec(),
         ),
         (
-            std::path::PathBuf::from("/jss-launch-shim.js"),
-            LAUNCH_SHIM_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-marker.js"),
+            MARKER_JS.as_bytes().to_vec(),
         ),
         (
-            std::path::PathBuf::from("/jss-esm-hook.mjs"),
+            std::path::PathBuf::from("/tmp/jss-launch-shim.js"),
+            local_helper_source(LAUNCH_SHIM_JS),
+        ),
+        (
+            std::path::PathBuf::from("/tmp/jss-esm-hook.mjs"),
             LAUNCH_ESM_HOOK_JS.as_bytes().to_vec(),
         ),
         (
-            std::path::PathBuf::from("/jss-plugin-host.mjs"),
-            PLUGIN_HOST_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-plugin-host.mjs"),
+            local_helper_source(PLUGIN_HOST_JS),
         ),
         (
-            std::path::PathBuf::from("/jss-express-host.mjs"),
-            EXPRESS_HOST_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-db-bootstrap.mjs"),
+            DB_BOOTSTRAP_JS.as_bytes().to_vec(),
         ),
         (
-            std::path::PathBuf::from("/jss-lifecycle-host.mjs"),
-            LIFECYCLE_HOST_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-express-host.mjs"),
+            local_helper_source(EXPRESS_HOST_JS),
         ),
         (
-            std::path::PathBuf::from("/jss-route-host.mjs"),
-            ROUTE_HOST_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-lifecycle-host.mjs"),
+            local_helper_source(LIFECYCLE_HOST_JS),
         ),
         (
-            std::path::PathBuf::from("/jss-node-red-host.mjs"),
-            NODE_RED_HOST_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-route-host.mjs"),
+            local_helper_source(ROUTE_HOST_JS),
         ),
         (
-            std::path::PathBuf::from("/jss-azure-func-host.cjs"),
-            AZURE_FUNC_HOST_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-node-red-host.mjs"),
+            local_helper_source(NODE_RED_HOST_JS),
         ),
         (
-            std::path::PathBuf::from("/jss-worker-host.mjs"),
-            WORKER_HOST_JS.as_bytes().to_vec(),
+            std::path::PathBuf::from("/tmp/jss-azure-func-host.cjs"),
+            local_helper_source(AZURE_FUNC_HOST_JS),
+        ),
+        (
+            std::path::PathBuf::from("/tmp/jss-worker-host.mjs"),
+            local_helper_source(WORKER_HOST_JS),
         ),
     ]);
     let mut created = Vec::new();
@@ -2620,6 +4077,63 @@ fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String>
     Ok(created)
 }
 
+/// Restore read-oracle fixtures removed by an application's startup cleanup between local launch
+/// attempts. Only files this verifier created and now finds missing are recreated; an existing path
+/// is never overwritten. This runs after the listener is ready and before the first probe.
+fn restore_local_read_canaries(canary: &Canary) -> Result<(), String> {
+    for path in canary.planted_files() {
+        let path = std::path::PathBuf::from(path);
+        if path.exists() {
+            continue;
+        }
+        std::fs::write(&path, format!("\"{}\"", canary.token)).map_err(|error| {
+            format!(
+                "restoring local verifier fixture {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn local_helper_source(source: &str) -> Vec<u8> {
+    localize_helper_paths(source).into_bytes()
+}
+
+/// Translate image-root helper paths for the local runtime exactly once. Request specs also contain
+/// already-localized canary payloads, so a plain textual replacement would corrupt
+/// `/tmp/jss-canary-read` into `/tmp/tmp/jss-canary-read` on every `exec`.
+fn localize_helper_paths(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 4);
+    let mut rest = input;
+    while let Some(at) = rest.find("/jss-") {
+        out.push_str(&rest[..at]);
+        let root_path = out.chars().next_back().is_none_or(|c| {
+            c.is_whitespace() || matches!(c, '\'' | '"' | '=' | ':' | '(' | '[' | '{')
+        });
+        if root_path {
+            out.push_str("/tmp/jss-");
+        } else {
+            out.push_str("/jss-");
+        }
+        rest = &rest[at + "/jss-".len()..];
+    }
+    out.push_str(rest);
+    out.replace("/tmp/tmp/jss-", "/tmp/jss-")
+}
+
+fn local_sqlite_search_roots(app_root: &std::path::Path, base_env: &[RequiredEnv]) -> Vec<String> {
+    let mut roots = vec![app_root.display().to_string()];
+    roots.extend(
+        base_env
+            .iter()
+            .filter(|item| item.directory)
+            .map(|item| localize_helper_paths(&item.value)),
+    );
+    roots.push("/tmp/jss-ws".to_owned());
+    roots
+}
+
 /// Builds the verify image: the repo copied in, dependencies installed, the marker file planted,
 /// the driver and marker scripts added, and the app's start command set. The install step is the
 /// only one with network access.
@@ -2634,6 +4148,7 @@ fn build_image(
     canary: &Canary,
     start_command: &str,
     port: u16,
+    build_env: &[(String, String)],
 ) -> Result<(), String> {
     let context = root
         .to_str()
@@ -2666,6 +4181,7 @@ fn build_image(
         pm,
         has_build,
         native_build,
+        build_env,
     );
     build_from_dockerfile(&dockerfile, tag, context)
 }
@@ -2999,6 +4515,25 @@ fn guarded_bare_requires(src: &str) -> std::collections::BTreeSet<String> {
     out
 }
 
+/// Optional packages guarded by the finding module or any imported source the planner already
+/// collected for its runtime gates. A platform bridge is commonly required in a utility imported by
+/// the route rather than in the route itself; limiting this to the entry file makes the missing-module
+/// shim turn that optional dependency into a truthy fake and disables the application's real fallback.
+fn guarded_modules(
+    root: &std::path::Path,
+    entry_file: Option<&std::path::Path>,
+    gating_sources: &[String],
+) -> Vec<String> {
+    let mut guarded = std::collections::BTreeSet::new();
+    if let Some(src) = entry_file.and_then(|entry| std::fs::read_to_string(root.join(entry)).ok()) {
+        guarded.extend(guarded_bare_requires(&src));
+    }
+    for src in gating_sources {
+        guarded.extend(guarded_bare_requires(src));
+    }
+    guarded.into_iter().collect()
+}
+
 /// Every registry package name imported anywhere in a source subtree (bounded by [`app_source_files`]).
 fn subtree_specifiers(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
@@ -3218,13 +4753,21 @@ fn db_service(app_root: &std::path::Path) -> bool {
 }
 
 fn db_connection_env() -> Vec<(String, String)> {
-    let host = DB_ALIASES[0];
-    let url = format!("mongodb://{host}:27017/{DB_NAME}");
+    db_connection_env_for(DB_ALIASES[0], 27017)
+}
+
+fn local_db_connection_env() -> Vec<(String, String)> {
+    db_connection_env_for("127.0.0.1", 27017)
+}
+
+fn db_connection_env_for(host: &str, port: u16) -> Vec<(String, String)> {
+    let port = port.to_string();
+    let url = format!("mongodb://{host}:{port}/{DB_NAME}");
     [
         ("MONGODB_HOST", host.to_owned()),
         ("MONGO_HOST", host.to_owned()),
-        ("MONGODB_PORT", "27017".to_owned()),
-        ("MONGO_PORT", "27017".to_owned()),
+        ("MONGODB_PORT", port.clone()),
+        ("MONGO_PORT", port),
         ("MONGODB_DATABASE", DB_NAME.to_owned()),
         ("MONGODB_DB", DB_NAME.to_owned()),
         ("MONGO_DB", DB_NAME.to_owned()),
@@ -3237,6 +4780,40 @@ fn db_connection_env() -> Vec<(String, String)> {
     .into_iter()
     .map(|(name, value)| (name.to_owned(), value))
     .collect()
+}
+
+/// The directory of a `mongodump` export shipped in the repository: a directory that directly holds
+/// at least one `<name>.bson` file beside its `<name>.metadata.json` sibling, the exact layout
+/// `mongodump` writes. Returns the richest such directory (the most collection files) so a dump that
+/// spans several databases selects the application database rather than an incidental one, and `None`
+/// when the repository ships no dump. The walk skips `node_modules` and `.git`; the match is on the
+/// generic mongodump file shape, never on a directory or repository name.
+fn mongodump_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut best: Option<(usize, std::path::PathBuf)> = None;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut collections = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                if name != "node_modules" && name != ".git" {
+                    stack.push(path);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "bson")
+                && path.with_extension("metadata.json").is_file()
+            {
+                collections += 1;
+            }
+        }
+        if collections > 0 && best.as_ref().is_none_or(|(n, _)| collections > *n) {
+            best = Some((collections, dir));
+        }
+    }
+    best.map(|(_, dir)| dir)
 }
 
 fn redis_service(app_root: &std::path::Path) -> bool {
@@ -3257,11 +4834,19 @@ fn redis_service(app_root: &std::path::Path) -> bool {
 }
 
 fn redis_connection_env() -> Vec<(String, String)> {
-    let host = REDIS_ALIASES[0];
-    let url = format!("redis://{host}:6379");
+    redis_connection_env_for(REDIS_ALIASES[0], 6379)
+}
+
+fn local_redis_connection_env() -> Vec<(String, String)> {
+    redis_connection_env_for("127.0.0.1", 6379)
+}
+
+fn redis_connection_env_for(host: &str, port: u16) -> Vec<(String, String)> {
+    let port = port.to_string();
+    let url = format!("redis://{host}:{port}");
     [
         ("REDIS_HOST", host.to_owned()),
-        ("REDIS_PORT", "6379".to_owned()),
+        ("REDIS_PORT", port),
         ("REDIS_URL", url.clone()),
         ("CACHE_REDIS_URL", url.clone()),
         ("RATE_LIMIT_REDIS_URL", url),
@@ -3312,12 +4897,19 @@ fn package_manager(root: &std::path::Path) -> PackageManager {
 /// The shell command that installs dependencies for a package manager. `corepack` provisions the
 /// yarn/pnpm shim that ships with Node. Each prefers the lockfile-exact path and falls back to a
 /// plain install, and tolerates total failure (`|| true`) so a broken install becomes a launch skip
-/// rather than a build error. The npm fallback accepts legacy peer dependencies, which the
-/// ecosystem's strict default otherwise rejects.
+/// rather than a build error. The npm fallback first attempts a peer-aware install, so a runtime
+/// dependency a package declares only as an (unbundled) peer — the classic `request-promise` ->
+/// `request` split, where `require('request-promise')` throws `Cannot find module 'request'` at load
+/// and the server never listens — is actually installed, as modern npm does by default. Only if the
+/// peer graph cannot be satisfied does it retry with `--legacy-peer-deps`, which the ecosystem's
+/// strict default otherwise rejects. A final runtime-only, script-free pass recovers applications
+/// whose development graph or postinstall is broken while their declared production dependencies
+/// are installable; without it the missing-module shim can leave an inert HTTP listener that looks
+/// ready but can never execute the real route.
 fn install_command(pm: PackageManager) -> &'static str {
     match pm {
         PackageManager::Npm => {
-            "npm ci --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps || true"
+            "npm ci --no-audit --no-fund || npm install --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps || npm install --omit=dev --ignore-scripts --legacy-peer-deps --no-audit --no-fund || true"
         }
         PackageManager::Yarn => {
             "corepack enable && (yarn install --frozen-lockfile || yarn install) || true"
@@ -3538,6 +5130,7 @@ fn dockerfile(
     pm: PackageManager,
     has_build: Option<&str>,
     native_build: bool,
+    build_env: &[(String, String)],
 ) -> String {
     let token = &canary.token;
     // Plant the canary under every path it may be read through in one pass. The content is a JSON
@@ -3550,7 +5143,7 @@ fn dockerfile(
     // A valid image planted beside the text canary, so a read sink that re-encodes the file instead
     // of echoing it still has an observably successful file-found branch (see [`payload::PLANTED_IMAGE`]).
     let canary_image_path = canary.planted_image_file();
-    let canary_image_b64 = payload::PLANTED_IMAGE_PNG_BASE64;
+    let canary_image_b64 = base64(payload::PLANTED_IMAGE_PNG);
     let install = install_command(pm);
     // npm cannot resolve the `workspace:` protocol a monorepo uses to pin its sibling packages, and
     // aborts the whole install the moment it parses one — so even unrelated registry dependencies
@@ -3578,6 +5171,18 @@ fn dockerfile(
         Some(script) => format!("RUN {}\n", build_command(pm, script)),
         None => String::new(),
     };
+    // Service connection variables (the MongoDB/Redis URL and friends) a real deployment exports
+    // before it builds, set at image-build time as well as run time. A production build step
+    // (`next build`, a bundler's data collection) imports the app's own modules, and a module that
+    // reads a required service URL at load time (`if (!process.env.MONGODB_URL) throw`) aborts the
+    // build when the variable is absent — leaving no production output for `next start` to serve, so
+    // the sink is never reachable. The build never connects (the sidecar is a run-time peer); it only
+    // needs the variable present. These are the same values the container gets at run time, so nothing
+    // app-specific is introduced. Empty for an app with no detected datastore.
+    let build_env_lines: String = build_env
+        .iter()
+        .map(|(name, value)| format!("ENV {name}={value}\n"))
+        .collect();
     // Install and build in the directory that owns the manifest and lockfile, then move to the
     // launch directory so the app's `.env` seeding and `CMD` run with its own working directory.
     // When they coincide (an app launched from its own package) this is one directory throughout.
@@ -3586,6 +5191,7 @@ fn dockerfile(
          ENV CI=true\n\
          ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n\
          ENV TS_NODE_TRANSPILE_ONLY=true\n\
+         {build_env_lines}\
          WORKDIR /app\n\
          COPY . /app\n\
          WORKDIR {install_workdir}\n\
@@ -3605,6 +5211,7 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-launch-shim.js\n\
          RUN echo {} | base64 -d > /jss-esm-hook.mjs\n\
          RUN echo {} | base64 -d > /jss-plugin-host.mjs\n\
+         RUN echo {} | base64 -d > /jss-db-bootstrap.mjs\n\
          RUN echo {} | base64 -d > /jss-express-host.mjs\n\
          RUN echo {} | base64 -d > /jss-lifecycle-host.mjs\n\
          RUN echo {} | base64 -d > /jss-route-host.mjs\n\
@@ -3622,6 +5229,7 @@ fn dockerfile(
         base64(LAUNCH_SHIM_JS.as_bytes()),
         base64(LAUNCH_ESM_HOOK_JS.as_bytes()),
         base64(PLUGIN_HOST_JS.as_bytes()),
+        base64(DB_BOOTSTRAP_JS.as_bytes()),
         base64(EXPRESS_HOST_JS.as_bytes()),
         base64(LIFECYCLE_HOST_JS.as_bytes()),
         base64(ROUTE_HOST_JS.as_bytes()),
@@ -3711,6 +5319,53 @@ fn missing_bare_module(log: &str) -> bool {
             })
         })
     })
+}
+
+/// Whether an application awaited MongoDB's historical callback-only `Db.collections()` API and
+/// then tried to iterate the resulting `undefined`. On a retry the launch shim adapts that one API
+/// to a Promise while still executing the real driver operation against the verifier's MongoDB.
+fn missing_mongodb_collection_promise(log: &str) -> bool {
+    log.contains("TypeError: collections is not iterable")
+}
+
+/// Whether the application's first launch deliberately wrote its default configuration and exited.
+/// Retrying once executes the documented second-start path against that generated file; unlike a
+/// generic clean exit, the explicit generation message proves that another launch can make progress.
+fn generated_startup_config(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    (lower.contains("config file not found") || lower.contains("configuration file not found"))
+        && (lower.contains("generating default") || lower.contains("creating default"))
+}
+
+/// Whether a Next production launcher reached the framework but could not serve because the build
+/// artifact is absent. This is narrower than a generic build/start failure: Next itself confirms
+/// that the application is installed and that its production launcher is the only blocker.
+fn missing_next_production_build(log: &str) -> bool {
+    log.contains("Could not find a production build in the '.next' directory")
+        || log.contains("Could not find a production build in the `.next` directory")
+}
+
+/// The repository's own Next development launcher, used only after
+/// [`missing_next_production_build`] proves that its production wrapper cannot start. Keeping the
+/// manifest's `dev` script preserves project-specific flags and configuration while the explicit
+/// host/port keep the verifier's listener deterministic.
+fn next_development_command(root: &std::path::Path, port: u16) -> Option<Vec<String>> {
+    let manifest = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    let dev = json.get("scripts")?.get("dev")?.as_str()?;
+    if !contains_command(dev, "next", "dev") {
+        return None;
+    }
+    Some(vec![
+        "npm".to_owned(),
+        "run".to_owned(),
+        "dev".to_owned(),
+        "--".to_owned(),
+        "--hostname".to_owned(),
+        "127.0.0.1".to_owned(),
+        "--port".to_owned(),
+        port.to_string(),
+    ])
 }
 
 /// When startup fails because the app tried to create or extend a file (or make a directory) but an
@@ -3827,6 +5482,37 @@ fn missing_tls_material(log: &str) -> Option<(String, bool)> {
     Some((path.to_owned(), is_key))
 }
 
+/// Returns a missing dotenv file that a startup loader explicitly refused to run without. An empty
+/// file preserves normal dotenv semantics (no configuration is invented) while allowing the app to
+/// continue to its own defaults and subsequent, more specific startup checks.
+fn missing_dotenv_file(log: &str) -> Option<String> {
+    if !log.contains("ENOENT")
+        || !(log.contains("Failed to load .env file")
+            || log.to_ascii_lowercase().contains("dotenv"))
+    {
+        return None;
+    }
+    let line = log
+        .lines()
+        .find(|line| line.contains("ENOENT: no such file or directory"))?;
+    let mut path: Option<&str> = None;
+    let mut rest = line;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('\'') else {
+            break;
+        };
+        path = Some(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    let path = path?;
+    if !path.starts_with('/') {
+        return None;
+    }
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    (name == ".env" || name.starts_with(".env.")).then(|| path.to_owned())
+}
+
 /// External-service credential environment variables a sink is gated on, read by name from the
 /// sink's own module and the modules it imports (`gating_sources`). Each is given a strong random
 /// filler so the handler's "a credential is configured" branch — the one the sink sits behind — is
@@ -3843,6 +5529,35 @@ fn credential_env(gating_sources: &[String]) -> Vec<RequiredEnv> {
                     name,
                     value: STRONG_FILLER_SECRET.to_owned(),
                     directory: false,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Typed configuration variables the handler/sink source reads that must hold a usable value for the
+/// request to reach the sink rather than crash before it. The handler here builds a path from a
+/// deployment variable (`path.join(process.env.PROJECT_PATH, 'dist', ...)` inside the branch that
+/// shells out); with the variable unset, `path.join(undefined, ...)` throws and the request handler
+/// dies before the sink runs. Only names whose kind is inferable from the name
+/// ([`typed_env_value`] — `_PATH`/`_DIR`/`_ROOT`/`_HOME`/`_URL`/`_URI` and secret-like suffixes) get a
+/// neutral filler (a fresh empty directory, a nowhere URL, a random secret); a name with no inferable
+/// kind (`INLINE_API`, a mode toggle whose value would divert the branch) is left unset, so the
+/// vulnerable branch the finding reported stays the one that runs. This is a runtime-environment
+/// precondition satisfied honestly, never an input neutralization. Mined from the gating sources only.
+fn config_source_env(gating_sources: &[String]) -> Vec<RequiredEnv> {
+    let mut out: Vec<RequiredEnv> = Vec::new();
+    for src in gating_sources {
+        for name in env_var_names(src) {
+            if fillable_config_name(&name)
+                && out.iter().all(|existing| existing.name != name)
+                && let Some((value, directory)) = typed_env_value(&name)
+            {
+                out.push(RequiredEnv {
+                    name,
+                    value,
+                    directory,
                 });
             }
         }
@@ -3868,7 +5583,7 @@ fn credential_name(name: &str) -> bool {
         "APIKEY",
     ];
     let upper = name.to_ascii_uppercase();
-    if upper.starts_with("NODE_") || upper.starts_with("NPM_") {
+    if upper.starts_with("NODE_") || upper.starts_with("NODEJS_") || upper.starts_with("NPM_") {
         return false;
     }
     let segments = upper.split('_').collect::<Vec<_>>();
@@ -3908,6 +5623,7 @@ fn required_env(log: &str) -> Vec<RequiredEnv> {
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             && !word.starts_with("ERR_")
             && !word.starts_with("NODE_")
+            && !word.starts_with("NODEJS_")
             && !word.starts_with("NPM_")
             && !matches!(word, "PORT" | "HOST" | "NODE_ENV")
     };
@@ -3916,6 +5632,8 @@ fn required_env(log: &str) -> Vec<RequiredEnv> {
         // ASCII lowercasing keeps byte offsets, and a word is ASCII, so offsets stay on
         // character boundaries.
         let lower = line.to_ascii_lowercase();
+        let missing_list =
+            lower.contains("missing env vars") || lower.contains("missing environment variables");
         let bytes = line.as_bytes();
         let word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
         let mut words: Vec<(usize, &str)> = Vec::new();
@@ -3946,7 +5664,8 @@ fn required_env(log: &str) -> Vec<RequiredEnv> {
             });
             let demanded = AFTER.iter().any(|p| after.starts_with(p))
                 || BEFORE.iter().any(|p| before.ends_with(p))
-                || after_noun_demand;
+                || after_noun_demand
+                || missing_list;
             if demanded && out.iter().all(|e| e.name != word) {
                 let (value, directory) =
                     typed_env_value(word).unwrap_or_else(|| ("jsspector".to_owned(), false));
@@ -3979,7 +5698,7 @@ fn typed_env_value(name: &str) -> Option<(String, bool)> {
 /// Credential/resource variables read by the app file at the top of a startup crash stack.
 fn config_env(log: &str, root: &std::path::Path) -> Vec<RequiredEnv> {
     let mut out: Vec<RequiredEnv> = Vec::new();
-    for rel in stack_app_files(log) {
+    for rel in stack_app_files(log, root) {
         let path = root.join(&rel);
         if !std::fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= 512 * 1024) {
             continue;
@@ -3999,6 +5718,72 @@ fn config_env(log: &str, root: &std::path::Path) -> Vec<RequiredEnv> {
                 });
             }
         }
+        for (name, key) in dynamic_setting_env_names(&src) {
+            if out.iter().any(|existing| existing.name == name) {
+                continue;
+            }
+            let typed_name = format!("SETTING_{}", key.to_ascii_uppercase());
+            let value = typed_env_value(&typed_name)
+                .map(|(value, _)| value)
+                .unwrap_or_else(|| "jsspector".to_owned());
+            let Ok(value) = serde_json::to_string(&value) else {
+                continue;
+            };
+            out.push(RequiredEnv {
+                name,
+                value,
+                directory: false,
+            });
+        }
+    }
+    out
+}
+
+/// Environment-backed settings read through a common three-part helper:
+/// `getSetting('auth', 'token', 'secret_key')` resolves to
+/// `global_auth_token_secret_key`. The helper JSON-parses the environment value, so the caller wraps
+/// the neutral typed filler as JSON before injecting it. Only literal, identifier-shaped segments are
+/// accepted; dynamic setting names are left for the application to resolve normally.
+fn dynamic_setting_env_names(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = source[from..].find("getSetting(") {
+        let start = from + relative + "getSetting(".len();
+        let mut rest = &source[start..];
+        let mut parts = Vec::new();
+        for index in 0..3 {
+            rest = rest.trim_start();
+            let Some(quote) = rest.chars().next().filter(|ch| matches!(ch, '\'' | '"')) else {
+                break;
+            };
+            let quoted = &rest[quote.len_utf8()..];
+            let Some(end) = quoted.find(quote) else {
+                break;
+            };
+            let value = &quoted[..end];
+            if value.is_empty()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                break;
+            }
+            parts.push(value.to_owned());
+            rest = &quoted[end + quote.len_utf8()..];
+            if index < 2 {
+                let Some(next) = rest.trim_start().strip_prefix(',') else {
+                    break;
+                };
+                rest = next;
+            }
+        }
+        if let [kind, subtype, key] = parts.as_slice() {
+            let name = format!("global_{kind}_{subtype}_{key}");
+            if out.iter().all(|(existing, _)| existing != &name) {
+                out.push((name, key.clone()));
+            }
+        }
+        from = start;
     }
     out
 }
@@ -4013,7 +5798,11 @@ fn fillable_config_name(name: &str) -> bool {
     {
         return false;
     }
-    if name.starts_with("NODE_") || name.starts_with("NPM_") || name.starts_with("ERR_") {
+    if name.starts_with("NODE_")
+        || name.starts_with("NODEJS_")
+        || name.starts_with("NPM_")
+        || name.starts_with("ERR_")
+    {
         return false;
     }
     if matches!(name, "PORT" | "HOST" | "NODE_ENV" | "CI") {
@@ -4031,34 +5820,36 @@ fn fillable_config_name(name: &str) -> bool {
 }
 
 /// App-owned JavaScript files named by Node stack frames under the image's `/app` root.
-fn stack_app_files(log: &str) -> Vec<String> {
-    const PREFIX: &str = "/app/";
+fn stack_app_files(log: &str, root: &std::path::Path) -> Vec<String> {
     let bytes = log.as_bytes();
     let mut out: Vec<String> = Vec::new();
-    let mut from = 0;
-    while let Some(rel) = log[from..].find(PREFIX) {
-        let start = from + rel + PREFIX.len();
-        let mut end = start;
-        while bytes.get(end).is_some_and(|byte| {
-            !matches!(
-                byte,
-                b':' | b')' | b'(' | b'\'' | b'"' | b' ' | b'\n' | b'\r' | b'\t'
-            )
-        }) {
-            end += 1;
-        }
-        from = start;
-        let Some(path) = log.get(start..end) else {
-            continue;
-        };
-        if (path.ends_with(".js") || path.ends_with(".mjs") || path.ends_with(".cjs"))
-            && !path.starts_with("node_modules/")
-            && !path.contains("/node_modules/")
-            && !path.split('/').any(|segment| segment == "..")
-            && out.len() < 64
-            && out.iter().all(|existing| existing != path)
-        {
-            out.push(path.to_owned());
+    let prefixes = ["/app/".to_owned(), format!("{}/", root.display())];
+    for prefix in prefixes {
+        let mut from = 0;
+        while let Some(rel) = log[from..].find(&prefix) {
+            let start = from + rel + prefix.len();
+            let mut end = start;
+            while bytes.get(end).is_some_and(|byte| {
+                !matches!(
+                    byte,
+                    b':' | b')' | b'(' | b'\'' | b'"' | b' ' | b'\n' | b'\r' | b'\t'
+                )
+            }) {
+                end += 1;
+            }
+            from = start;
+            let Some(path) = log.get(start..end) else {
+                continue;
+            };
+            if (path.ends_with(".js") || path.ends_with(".mjs") || path.ends_with(".cjs"))
+                && !path.starts_with("node_modules/")
+                && !path.contains("/node_modules/")
+                && !path.split('/').any(|segment| segment == "..")
+                && out.len() < 64
+                && out.iter().all(|existing| existing != path)
+            {
+                out.push(path.to_owned());
+            }
         }
     }
     out
@@ -4120,6 +5911,53 @@ fn privilege_drop_fixture(app_root: &std::path::Path, port: u16) -> Option<Privi
         run_as: (SANDBOX_RUN_UID, SANDBOX_RUN_GID),
         env,
     })
+}
+
+/// Local verification has no container-level `--user`. When it already runs unprivileged, point the
+/// application's uid/gid variables at that real identity so its privilege drop is a legal no-op. A
+/// root local runner (the Satori container) keeps the isolated fixed identity and spawns only the
+/// application child under it in [`Session::run_local_app`].
+fn local_privilege_drop_fixture(app_root: &std::path::Path, port: u16) -> Option<PrivilegeDrop> {
+    let fixture = privilege_drop_fixture(app_root, port)?;
+    let identity = current_unix_identity()?;
+    Some(adapt_privilege_drop_to_local_identity(fixture, identity))
+}
+
+fn adapt_privilege_drop_to_local_identity(
+    mut fixture: PrivilegeDrop,
+    identity: (u32, u32),
+) -> PrivilegeDrop {
+    if identity != (0, 0) {
+        fixture.run_as = identity;
+        for var in &mut fixture.env {
+            let upper = var.name.to_ascii_uppercase();
+            if upper.contains("UID") {
+                var.value = identity.0.to_string();
+            } else if upper.contains("GID") {
+                var.value = identity.1.to_string();
+            }
+        }
+    }
+    fixture
+}
+
+#[cfg(unix)]
+fn current_unix_identity() -> Option<(u32, u32)> {
+    let read = |flag: &str| {
+        let output = Command::new("id").arg(flag).output().ok()?;
+        output.status.success().then(|| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })?
+    };
+    Some((read("-u")?, read("-g")?))
+}
+
+#[cfg(not(unix))]
+fn current_unix_identity() -> Option<(u32, u32)> {
+    None
 }
 
 /// The app's own JavaScript source (never `node_modules` or build output), bounded in breadth and
@@ -4227,13 +6065,34 @@ fn env_var_names(src: &str) -> Vec<String> {
 /// candidate is probed with a plain `GET /`; the one that answers as a real HTTP server is chosen,
 /// skipping a WebSocket-only endpoint (standalone `ws` answers a non-upgrade request with
 /// `426 Upgrade Required`). The lowest such port wins when more than one serves HTTP.
-fn listening_probe(wanted: u16) -> String {
+#[cfg(test)]
+fn listening_probe_excluding(wanted: u16, excluded: &[u16]) -> String {
+    listening_probe_excluding_candidates(wanted, excluded, &[])
+}
+
+fn listening_probe_excluding_candidates(
+    wanted: u16,
+    excluded: &[u16],
+    candidates: &[u16],
+) -> String {
+    let excluded = excluded
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let candidates = candidates
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "const fs=require('fs'),net=require('net');const ports=new Set();\
+        "const fs=require('fs'),net=require('net');const ports=new Set([{candidates}]);\
+         const excluded=new Set([{excluded}]);\
          for(const f of ['/proc/net/tcp','/proc/net/tcp6']){{let t='';try{{t=fs.readFileSync(f,'utf8')}}catch{{}}\
          for(const l of t.split('\\n').slice(1)){{const c=l.trim().split(/\\s+/);\
          const [a,p]=(c[1]||'').split(':');\
-         if(c[3]==='0A'&&p&&(/^0+$/.test(a)||a==='0100007F'||a==='00000000000000000000000001000000'))ports.add(parseInt(p,16))}}}}\
+         const port=parseInt(p,16);\
+         if(c[3]==='0A'&&p&&!excluded.has(port)&&(/^0+$/.test(a)||a==='0100007F'||a==='00000000000000000000000001000000'))ports.add(port)}}}}\
          const list=[...ports];const hosts=['127.0.0.1','::1'];\
          const direct=ports.has({wanted})||!list.length;\
          const single=direct?{wanted}:(list.length===1?list[0]:0);\
@@ -4245,7 +6104,7 @@ fn listening_probe(wanted: u16) -> String {
          s.setTimeout(2000);\
          s.on('connect',()=>s.write('GET / HTTP/1.0\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n'));\
          s.on('data',(d)=>{{buf+=d;const m=/^HTTP\\/\\d\\.\\d (\\d{{3}})/.exec(buf.split('\\r\\n')[0]);\
-         if(m)fin(m[1]!=='426')}});\
+         if(m)fin(m[1]!=='426'&&!/MongoDB|native driver port/i.test(buf))}});\
          s.on('timeout',()=>fin(false));s.on('error',()=>fin(false));s.on('close',()=>fin(false));}})();}}\
          if(single){{const ready=direct?tcpOk:httpOk;ready(single,ok=>{{\
          if(ok){{console.log(single);process.exit(0)}}process.exit(1)}})}}\
@@ -4273,6 +6132,17 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
         && is_module_worker(&root.join(&file))
     {
         return Some(worker_host_command(&file));
+    }
+    // A package can expose several independent servers from one manifest: its ordinary `start`
+    // entry may bind one port while the file that owns this finding constructs and listens on a
+    // different Express/HTTP app. Running the manifest then makes port discovery select a healthy
+    // but unrelated server. A self-contained finding file needs no host scaffolding, so launch that
+    // exact server directly before considering the package-wide command.
+    if let Some(rel) = entry.and_then(|path| path.to_str())
+        && let Some(file) = package_file(root, rel)
+        && is_standalone_server(&root.join(&file))
+    {
+        return Some(node_file_command(&file));
     }
     if let Some(command) = manifest_start_command(root) {
         // A manifest whose only launch is the Azure Functions host (`func start`) depends on the Azure
@@ -4309,6 +6179,18 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
             && is_standalone_server(&root.join(&file))
         {
             return Some(format!("[\"node\",\"{file}\"]"));
+        }
+        // A start script that runs `node <file>` for a file absent from the package can never
+        // launch (`MODULE_NOT_FOUND`). When the finding's own file exports an Express app or router
+        // without listening (the start script was meant to serve it), mount it through the Express
+        // host shim so the route under test is served by the module's own handlers.
+        if manifest_start_file_missing(root)
+            && let Some(rel) = entry.and_then(|path| path.to_str())
+            && let Some(file) = package_file(root, rel)
+            && (is_express_router_module(&root.join(&file))
+                || is_express_app_module(&root.join(&file)))
+        {
+            return Some(express_host_command(&file));
         }
         return Some(command);
     }
@@ -4432,6 +6314,81 @@ fn is_express_router_module(path: &std::path::Path) -> bool {
         return false;
     }
     src.contains("express") && src.contains(".Router(") && src.contains("export")
+}
+
+/// Whether a JavaScript file exports an unstarted Express app: it constructs one (`express()`),
+/// exports it (`module.exports` / `export default`), and never calls `.listen(` itself.
+fn is_express_app_module(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    !src.contains(".listen(")
+        && src.contains("express(")
+        && (src.contains("module.exports") || src.contains("export default"))
+}
+
+/// Whether a module exports a factory that constructs an Express application. The Express host can
+/// invoke such a factory and mount the returned real app directly; this is useful when a separate
+/// production bootstrap performs mandatory infrastructure initialization before it starts listening.
+fn is_express_factory_module(path: &std::path::Path) -> bool {
+    let is_js = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs"));
+    if !is_js {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    if src.contains(".listen(") || !src.contains("express(") {
+        return false;
+    }
+    (src.contains("export function ")
+        || src.contains("export async function ")
+        || src.contains("export const ")
+        || src.contains("exports.")
+        || src.contains("module.exports"))
+        && (src.contains("createApp") || src.contains("createServer") || src.contains("buildApp"))
+}
+
+/// Whether the manifest's `start` script is a plain `node <file>` launch whose file does not exist
+/// in the package, so `npm start` can only fail with `MODULE_NOT_FOUND`.
+fn manifest_start_file_missing(root: &std::path::Path) -> bool {
+    let Some(start) = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|manifest| serde_json::from_str::<serde_json::Value>(&manifest).ok())
+        .and_then(|json| {
+            json.get("scripts")?
+                .get("start")?
+                .as_str()
+                .map(str::to_owned)
+        })
+    else {
+        return false;
+    };
+    if ["&&", "|", ";", "&"].iter().any(|op| start.contains(op)) {
+        return false;
+    }
+    let mut words = start.split_whitespace();
+    if words.next() != Some("node") {
+        return false;
+    }
+    let Some(file) = words.next() else {
+        return false;
+    };
+    [".js", ".cjs", ".mjs"]
+        .iter()
+        .any(|ext| file.ends_with(ext))
+        && !file.starts_with('/')
+        && !root.join(file).exists()
 }
 
 /// The launch command that mounts a lifecycle server module through the lifecycle host shim
@@ -4894,6 +6851,40 @@ fn manifest_start_command(root: &std::path::Path) -> Option<String> {
                     .to_owned(),
             );
         }
+        // A start/dev launcher that boots an ephemeral `mongodb-memory-server` only to mint a
+        // connection URL and then execs the app's real Next server (`node scripts/dev.js` →
+        // `MongoMemoryServer.create()` then `next dev <dir>`). The in-process MongoDB download is a
+        // dev-time convenience and fails with no network, so the container exits before it listens.
+        // The honest equivalent — and the app's own production mode, where `instrumentation` reads
+        // `MONGO_URI` from the environment — is to run the Next server directly against the MongoDB
+        // sidecar the verifier already provides and injects as `MONGO_URI`. Checked before the plain
+        // npm fallback, which would re-run the failing launcher. General: triggered by the launcher's
+        // own `mongodb-memory-server` + Next usage, never by a name or path.
+        if let Some(command) = ephemeral_mongo_next_launch(root, scripts) {
+            return Some(command);
+        }
+        // A start script that hands the server to a Node process manager (`pm2 start server.js
+        // --name GC`, `pm2-runtime server.js`, `forever start server.js`) launches the same entry
+        // file but through deployment tooling that is not a dependency of the app itself: pm2/forever
+        // daemonize (the launcher returns and the container exits) and are usually absent from the
+        // image. The honest equivalent is to run the very file the manager would run directly with
+        // `node`, which binds the identical listener. Checked before the detached form and the plain
+        // npm fallback.
+        let managed = start
+            .and_then(process_manager_script)
+            .and_then(|file| package_file(root, file))
+            .filter(|file| is_standalone_server(&root.join(file)));
+        if let Some(file) = managed {
+            return Some(format!("[\"node\",\"{file}\"]"));
+        }
+        // `npm start` is only a shell launcher for a plain `node <file> [args...]` script. Running
+        // that argv directly keeps the real server as the observed process: npm can otherwise exit
+        // while a re-parented Node child is still initializing, making the verifier classify a live
+        // application as a failed launch. The parser rejects shell syntax and preserves literal
+        // arguments, so compound scripts retain npm's normal behavior.
+        if let Some(command) = start.and_then(|script| direct_node_command(script, root)) {
+            return Some(command);
+        }
         // A start script that only detaches the server (`./server.js > log 2>&1 & disown`)
         // returns at once, and the container with it: run the detached file in the foreground.
         let detached = json
@@ -5046,19 +7037,40 @@ fn is_standalone_server(path: &std::path::Path) -> bool {
         || src.contains("fastify(")
         || src.contains("polka(")
         || src.contains("new Server");
-    listens && constructs
+    listens && constructs && !only_exports_uninvoked_server_start(&src)
 }
 
-/// A file of the package by a relative path its manifest gives (`./server.js`), when it exists
-/// and its name is plain enough to place in the image `CMD` unquoted: never outside the package.
+fn only_exports_uninvoked_server_start(src: &str) -> bool {
+    ["export async function ", "export function "]
+        .into_iter()
+        .filter_map(|prefix| src.find(prefix).map(|at| (prefix, at)))
+        .any(|(prefix, at)| {
+            let after = &src[at + prefix.len()..];
+            let name = after
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+                .next()
+                .unwrap_or_default();
+            !name.is_empty()
+                && src.match_indices(name).count() == 1
+                && after.contains("createServer")
+                && after.contains(".listen(")
+        })
+}
+
+fn node_file_command(file: &str) -> String {
+    serde_json::json!(["node", file]).to_string()
+}
+
+/// A UTF-8 file inside the package, never an absolute path or one containing `..`. Commands that
+/// consume the returned name serialize it as JSON, so ordinary non-ASCII repository filenames are
+/// safe and do not need to be rejected.
 fn package_file(root: &std::path::Path, path: &str) -> Option<String> {
     let path = path.trim_start_matches("./");
+    let candidate = std::path::Path::new(path);
     let safe = !path.is_empty()
-        && !path.starts_with('/')
-        && !path.split('/').any(|part| part == "..")
-        && path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@'));
+        && candidate
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
     (safe && root.join(path).is_file()).then(|| path.to_owned())
 }
 
@@ -5106,6 +7118,187 @@ fn detached_script(script: &str) -> Option<&str> {
         }
     }
     Some(file)
+}
+
+/// The JavaScript entry file a start script hands to a Node process manager, when that is all it
+/// does: `pm2 start server.js --name GC`, `pm2-runtime server.js`, `pm2-runtime start app.js`,
+/// `forever start server.js`, or `nodemon index.js`. Production managers daemonize and a development
+/// watcher can keep its parent alive while repeatedly restarting a failed child; neither behavior is
+/// useful to a one-shot verifier. The honest equivalent is to run the same entry directly with
+/// `node`. The launcher name may carry a path prefix (`./node_modules/.bin/pm2`); an optional `start`
+/// subcommand is skipped, and the entry is the first following non-flag token, which must be a plain
+/// `.js`/`.cjs`/`.mjs` filename. A manager pointed at an ecosystem/config file is excluded by the
+/// caller requiring the resolved file to be a standalone server. Anything else (a chained command,
+/// `&&`, a pipe) yields `None`.
+fn process_manager_script(script: &str) -> Option<&str> {
+    const MANAGERS: [&str; 5] = ["pm2", "pm2-runtime", "pm2-dev", "forever", "nodemon"];
+    let script = script.trim();
+    if script.contains("&&") || script.contains('|') || script.contains(';') {
+        return None;
+    }
+    let mut words = script.split_whitespace();
+    let program = words.next()?;
+    let program = program.rsplit('/').next().unwrap_or(program);
+    if !MANAGERS.contains(&program) {
+        return None;
+    }
+    let mut next = words.next()?;
+    if next == "start" {
+        next = words.next()?;
+    }
+    // Skip leading flags (`forever -a server.js`); the entry is the first non-flag token.
+    while next.starts_with('-') {
+        next = words.next()?;
+    }
+    let plain = !next.is_empty()
+        && next
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'@'));
+    let is_js = [".js", ".mjs", ".cjs"]
+        .iter()
+        .any(|ext| next.ends_with(ext));
+    (plain && is_js).then_some(next)
+}
+
+/// A package script that consists solely of `node <local-js-file> [literal arguments...]`, encoded
+/// as the exec-form JSON argv used by the verifier. Shell operators, expansions, quoting and
+/// redirections are rejected rather than reinterpreted. npm's conventional trailing `$@` forwarding
+/// placeholder is omitted because the verifier supplies no forwarded arguments.
+fn direct_node_command(script: &str, root: &std::path::Path) -> Option<String> {
+    let mut words = script.split_whitespace();
+    if words.next()? != "node" {
+        return None;
+    }
+    let file = package_file(root, words.next()?)?;
+    if ![".js", ".cjs", ".mjs"]
+        .iter()
+        .any(|extension| file.ends_with(extension))
+    {
+        return None;
+    }
+    let mut argv = vec!["node".to_owned(), file];
+    let mut arguments = words.peekable();
+    while let Some(word) = arguments.next() {
+        if word == "$@" && arguments.peek().is_none() {
+            continue;
+        }
+        let literal = !word.is_empty()
+            && word.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'.' | b'_' | b'-' | b'/' | b':' | b'=' | b'@' | b',' | b'+'
+                    )
+            });
+        if !literal {
+            return None;
+        }
+        argv.push(word.to_owned());
+    }
+    serde_json::to_string(&argv).ok()
+}
+
+/// The JavaScript launcher file a `start`/`dev` script runs directly with `node`, when that is all
+/// the script does (`node scripts/dev.js`). An optional trailing argument list is allowed (the
+/// launcher's own `argv`); a chained command (`&&`, `;`, a pipe, a background `&`) is not a plain
+/// launcher and yields `None`. The file must resolve inside the package.
+fn node_launcher_file(script: &str, root: &std::path::Path) -> Option<String> {
+    let script = script.trim();
+    if script.contains("&&") || script.contains('|') || script.contains(';') || script.contains('&')
+    {
+        return None;
+    }
+    let mut words = script.split_whitespace();
+    if words.next()? != "node" {
+        return None;
+    }
+    let file = words.next()?;
+    if !["js", "cjs", "mjs"]
+        .iter()
+        .any(|ext| file.ends_with(&format!(".{ext}")))
+    {
+        return None;
+    }
+    package_file(root, file)
+}
+
+/// The Next.js project directory of a package, relative to its root: the directory holding a
+/// `next.config.*` together with an `app/` or `pages/` routes directory. Checked at the package root
+/// and under `src/` (a launcher that runs `next dev src` keeps the Next project under `src/`).
+/// Returns `""` for a root-level project (no directory argument needed) or the subdirectory name.
+fn next_app_dir(root: &std::path::Path) -> Option<String> {
+    for candidate in ["", "src"] {
+        let dir = if candidate.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(candidate)
+        };
+        let has_config = [
+            "next.config.ts",
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.cjs",
+        ]
+        .iter()
+        .any(|name| dir.join(name).is_file());
+        let has_routes = dir.join("app").is_dir() || dir.join("pages").is_dir();
+        if has_config && has_routes {
+            return Some(candidate.to_owned());
+        }
+    }
+    None
+}
+
+/// The direct Next launch command for an app whose `start`/`dev` script delegates to a launcher that
+/// boots an ephemeral `mongodb-memory-server` and then execs the Next server. See the caller: the
+/// in-process MongoDB download fails offline, so run Next directly against the sidecar MongoDB the
+/// verifier supplies (`MONGO_URI`), which is the app's own production mode. `None` unless a launcher
+/// script genuinely uses `mongodb-memory-server` and runs Next, and the Next project directory is
+/// found — so this never fires for an app that does not bundle an ephemeral MongoDB.
+fn ephemeral_mongo_next_launch(
+    root: &std::path::Path,
+    scripts: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let scripts = scripts?;
+    let launcher = ["start", "dev"]
+        .iter()
+        .filter_map(|key| scripts.get(*key).and_then(serde_json::Value::as_str))
+        .find_map(|script| node_launcher_file(script, root))?;
+    let src = std::fs::read_to_string(root.join(&launcher)).ok()?;
+    if !src.contains("mongodb-memory-server") {
+        return None;
+    }
+    let runs_next = src.contains("next dev") || src.contains("next start");
+    if !runs_next {
+        return None;
+    }
+    let dir = next_app_dir(root)?;
+    let dir_arg = if dir.is_empty() {
+        String::new()
+    } else {
+        format!(" {dir}")
+    };
+    // Next reads `PORT` from the environment (the verifier exports it); `-p "$PORT"` makes it
+    // explicit. `exec` hands the container's signal handling to Next directly.
+    Some(format!(
+        "[\"sh\",\"-c\",\"exec npx next dev{dir_arg} --hostname 0.0.0.0 -p \\\"$PORT\\\"\"]"
+    ))
+}
+
+fn local_ephemeral_mongo_next_launch(root: &std::path::Path) -> Option<String> {
+    let Ok(manifest) = std::fs::read_to_string(root.join("package.json")) else {
+        return None;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return None;
+    };
+    let scripts = json.get("scripts").and_then(serde_json::Value::as_object);
+    ephemeral_mongo_next_launch(root, scripts)?;
+    let dir = next_app_dir(root)?;
+    let dir = if dir.is_empty() { "." } else { &dir };
+    Some(format!(
+        "[\"sh\",\"-c\",\"exec npm start -- {dir} \\\"$PORT\\\"\"]"
+    ))
 }
 
 /// A cheap check for a `"start"` key under a `"scripts"` object. Good enough to decide launch;
@@ -5172,6 +7365,13 @@ pub fn session_key(
     app_path: &std::path::Path,
     entry_file: &std::path::Path,
 ) -> std::path::PathBuf {
+    if let Ok(entry) = entry_file.strip_prefix(app_path)
+        && let Some(entry) = entry.to_str()
+        && let Some(file) = package_file(&root.join(app_path), entry)
+        && is_standalone_server(&root.join(app_path).join(file))
+    {
+        return entry_file.to_path_buf();
+    }
     if manifest_start_command(&root.join(app_path)).is_some() {
         app_path.to_path_buf()
     } else {
@@ -5512,6 +7712,47 @@ const LAUNCH_SHIM_JS: &str = r#"
 'use strict';
 const Module = require('module');
 const origLoad = Module._load;
+
+if (process.env.JSS_MONGODB_CALLBACK_PROMISES === '1') {
+  try {
+    const mongodb = require('mongodb');
+    const proto = mongodb && mongodb.Db && mongodb.Db.prototype;
+    const originalCollections = proto && proto.collections;
+    if (typeof originalCollections === 'function') {
+      proto.collections = function (options, callback) {
+        if (typeof options === 'function' || typeof callback === 'function') {
+          return originalCollections.apply(this, arguments);
+        }
+        const db = this;
+        return new Promise(function (resolve, reject) {
+          let settled = false;
+          const done = function (error, collections) {
+            if (settled) return;
+            settled = true;
+            if (error) reject(error);
+            else resolve(collections);
+          };
+          let returned;
+          try {
+            returned = originalCollections.call(db, options || {}, done);
+          } catch (error) {
+            done(error);
+            return;
+          }
+          // MongoDB 3.x completes through `done`; 4.x and newer ignore the callback and return a
+          // Promise. Follow whichever contract the installed driver actually implements instead
+          // of replacing the real operation or leaving the compatibility Promise pending.
+          if (returned && typeof returned.then === 'function') {
+            returned.then(function (collections) { done(null, collections); }, done);
+          } else if (returned !== undefined) {
+            done(null, returned);
+          }
+        });
+      };
+    }
+  } catch (error) {}
+}
+
 const handler = {
   get: function (target, prop) {
     if (prop === 'then') return undefined;
@@ -5636,6 +7877,7 @@ export async function load(url, context, nextLoad) {
 /// `http`); imports the target with dynamic `import()`, so it mounts ESM and CommonJS modules alike.
 const PLUGIN_HOST_JS: &str = r#"
 import http from 'node:http';
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -5725,12 +7967,60 @@ http.createServer((req, res) => {
 /// directory — mounts them all on a fresh Express app, and serves it over HTTP on `PORT`. It
 /// fabricates nothing: a verification still requires the real canary to flow through the module's own
 /// route into the real sink. Loaded with dynamic `import()`, so it mounts ESM and CommonJS alike.
+const DB_BOOTSTRAP_JS: &str = r#"
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+// Router modules can rely on process-wide state initialized by the real application entrypoint.
+// When a mounted module references a local DB global, locate a conventional database module and
+// invoke only an initializer the application itself exports. This preserves its adapter and schema;
+// it neither invents records nor mocks the sink that verification must reach.
+export async function initializeLocalDatabase(target, logPrefix) {
+  try {
+    const source = fs.readFileSync(target, 'utf8');
+    if (!/global\.(?:db|mappingDb)\b/.test(source)) return;
+    const routeDir = path.dirname(target);
+    const roots = [routeDir, path.dirname(routeDir), process.cwd()];
+    const relatives = ['db', 'database', 'utils/db', 'utils/database', 'backend/utils/db', 'backend/utils/database'];
+    const extensions = ['.js', '.cjs', '.mjs'];
+    const candidates = [];
+    for (const root of roots) {
+      for (const relative of relatives) {
+        for (const extension of extensions) candidates.push(path.resolve(root, relative + extension));
+      }
+    }
+    for (const candidate of [...new Set(candidates)]) {
+      if (candidate === target || !candidate.startsWith(process.cwd() + path.sep) || !fs.existsSync(candidate)) continue;
+      try {
+        const dbMod = await import(pathToFileURL(candidate).href);
+        const exports = (dbMod && dbMod.default && typeof dbMod.default === 'object')
+          ? { ...dbMod.default, ...dbMod }
+          : dbMod;
+        const initialize = ['initDatabase', 'initializeDatabase', 'initDb', 'initializeDb', 'openDb']
+          .map((name) => exports && exports[name])
+          .find((fn) => typeof fn === 'function');
+        if (!initialize) continue;
+        await initialize();
+        console.error('[' + logPrefix + '] initialized local database through ' + path.relative(process.cwd(), candidate));
+        return;
+      } catch (e) {
+        console.error('[' + logPrefix + '] database init skipped for ' + path.relative(process.cwd(), candidate) + ': ' + (e && e.message));
+      }
+    }
+  } catch (e) {
+    console.error('[' + logPrefix + '] database discovery skipped: ' + (e && e.message));
+  }
+}
+"#;
+
 const EXPRESS_HOST_JS: &str = r#"
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+import { initializeLocalDatabase } from '/jss-db-bootstrap.mjs';
 
 process.on('unhandledRejection', () => {});
 process.on('uncaughtException', () => {});
@@ -5776,6 +8066,8 @@ try {
 } catch (e) {
   console.error('[express-host] load error: ' + (e && e.message));
 }
+
+await initializeLocalDatabase(target, 'express-host');
 
 const app = express();
 app.use((req, res, next) => { express.json({ limit: '5mb' })(req, res, () => next()); });
@@ -5996,8 +8288,10 @@ http.createServer((req, res) => {
 /// target with dynamic `import()`, so it mounts ESM and CommonJS modules alike.
 const ROUTE_HOST_JS: &str = r#"
 import http from 'node:http';
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { initializeLocalDatabase } from '/jss-db-bootstrap.mjs';
 
 process.on('unhandledRejection', () => {});
 process.on('uncaughtException', () => {});
@@ -6018,6 +8312,8 @@ try {
   console.error('[route-host] load error: ' + (e && e.message));
 }
 if (!handler) console.error('[route-host] no handler export found');
+
+await initializeLocalDatabase(target, 'route-host');
 
 // A permissive context stub: every property access yields another stub, and calling any stubbed
 // method yields `undefined` (so a cache/lookup read is falsy and the handler takes its real
@@ -6244,6 +8540,15 @@ try {
   }
 } catch (e) {
   console.error('[node-red-host] load error: ' + (e && e.message));
+}
+
+// Do not expose a healthy-looking listener when the target never registered a route. In
+// particular, a missing bare dependency must make the launch fail so the verifier's normal second
+// attempt can enable its missing-module shim; otherwise every probe receives the host's synthetic
+// `no route` response and the real node handler is never exercised.
+if (routes.length === 0) {
+  console.error('[node-red-host] no routes registered');
+  process.exit(1);
 }
 
 function decorate(res) {
@@ -6676,8 +8981,9 @@ const mods = spec.tls ? [['https',https],['http',http]] : [['http',http],['https
 const combos = [];
 for(const m of mods){for(const h of hosts){combos.push([m[0],m[1],h]);}}
 let ci = 0;
+const errors = [];
 function attempt(){
-  if(ci>=combos.length){process.exit(0);}
+  if(ci>=combos.length){if(errors.length){console.error(errors.join('; '));} process.exit(0);}
   const [name,mod,host] = combos[ci++];
   const options = {host,port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:10000};
   if(name==='https'){options.rejectUnauthorized=false;}
@@ -6696,8 +9002,8 @@ function attempt(){
   req.on('upgrade',(res,socket)=>{try{socket.destroy();}catch(e){}process.exit(0);});
   // A connection or protocol-mismatch error (the wrong scheme for this port) falls through to the
   // next combo so the right protocol is still tried.
-  req.on('error',()=>attempt());
-  req.on('timeout',()=>{req.destroy();attempt();});
+  req.on('error',(e)=>{errors.push(name+'://'+host+': '+e.message);attempt();});
+  req.on('timeout',()=>{errors.push(name+'://'+host+': timeout');req.destroy();attempt();});
   const body = spec.bodyBase64 ? Buffer.from(spec.bodyBase64, 'base64') : spec.body;
   if(body){req.write(body);}
   req.end();
@@ -6713,6 +9019,7 @@ attempt();
 /// instead of being disabled.
 const MARKER_JS: &str = r#"
 const http = require('http');
+const port = Number(process.env.JSS_MARKER_PORT || 80);
 const record = (req) => console.log('MARKER ' + JSON.stringify({
   method: req.method,
   path: req.url,
@@ -6725,7 +9032,7 @@ const log = (req, res) => { record(req); res.end('ok'); };
 const logUpgrade = (req, socket) => { record(req); try { socket.destroy(); } catch (e) {} };
 const httpServer = http.createServer(log);
 httpServer.on('upgrade', logUpgrade);
-httpServer.listen(80, '0.0.0.0');
+httpServer.listen(port, '0.0.0.0');
 try {
   const fs = require('fs');
   const https = require('https');
@@ -6805,8 +9112,54 @@ SqwRqIrWiDKu9S43xShSlHI=
 /// dependencies. Pinned.
 const BROWSER_IMAGE: &str = "mcr.microsoft.com/playwright:v1.49.1-jammy";
 
+fn local_browser_executable() -> Option<std::path::PathBuf> {
+    let candidates = vec![
+        std::path::PathBuf::from("chromium"),
+        std::path::PathBuf::from("chromium-browser"),
+        std::path::PathBuf::from("google-chrome"),
+    ];
+    #[cfg(target_os = "macos")]
+    let candidates = {
+        let mut candidates = candidates;
+        candidates.push(std::path::PathBuf::from(
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ));
+        candidates
+    };
+    candidates.into_iter().find(|candidate| {
+        Command::new(candidate)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+fn spawn_process_group(command: &mut Command, name: &str) -> Result<Child, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .spawn()
+        .map_err(|error| format!("starting {name}: {error}"))
+}
+
 /// A built browser-phase image, a private network, a marker service, a static file server for the
 /// repo, and a browser container — one per `--verify` run that has DOM findings.
+enum BrowserRuntime {
+    Docker,
+    Local {
+        app: Child,
+        marker: Child,
+        marker_log: std::path::PathBuf,
+        helper_dir: std::path::PathBuf,
+        executable: std::path::PathBuf,
+    },
+}
+
 pub struct BrowserSession {
     tag: String,
     network: String,
@@ -6817,6 +9170,7 @@ pub struct BrowserSession {
     port: u16,
     nonce: u32,
     root: std::path::PathBuf,
+    runtime: BrowserRuntime,
     torn_down: bool,
 }
 
@@ -6824,6 +9178,9 @@ impl BrowserSession {
     /// Builds the browser-phase image from `root` and starts the marker service, the static file
     /// server and the browser, or returns why it could not.
     pub fn start(root: &std::path::Path) -> Result<Self, String> {
+        if local_runtime_requested() {
+            return Self::start_local(root);
+        }
         let id = run_id();
         let canary = Canary::new(format!("{id}{}", short_rand()));
         let session = Self {
@@ -6836,6 +9193,7 @@ impl BrowserSession {
             port: 3000,
             nonce: 0,
             root: root.to_path_buf(),
+            runtime: BrowserRuntime::Docker,
             torn_down: false,
         };
         build_browser_image(root, &session.tag, session.port)?;
@@ -6847,6 +9205,83 @@ impl BrowserSession {
             return Err(err);
         }
         Ok(session)
+    }
+
+    fn start_local(root: &std::path::Path) -> Result<Self, String> {
+        let executable = local_browser_executable().ok_or_else(|| {
+            "no Chromium/Chrome executable is available for local browser verification".to_owned()
+        })?;
+        let id = run_id();
+        let app_port = available_local_port()?;
+        let marker_port = available_local_port()?;
+        let helper_dir = std::env::temp_dir().join(format!("jss-browser-{id}"));
+        std::fs::create_dir_all(&helper_dir)
+            .map_err(|error| format!("creating local browser helper directory: {error}"))?;
+        let serve = helper_dir.join("serve.js");
+        let marker_script = helper_dir.join("marker.js");
+        let marker_log = helper_dir.join("marker.log");
+        std::fs::write(&serve, SERVE_JS)
+            .map_err(|error| format!("writing local browser server: {error}"))?;
+        std::fs::write(&marker_script, MARKER_JS)
+            .map_err(|error| format!("writing local browser marker: {error}"))?;
+        let marker_stdout = std::fs::File::create(&marker_log)
+            .map_err(|error| format!("creating local browser marker log: {error}"))?;
+        let marker_stderr = marker_stdout
+            .try_clone()
+            .map_err(|error| format!("opening local browser marker log: {error}"))?;
+
+        let mut marker_command = Command::new("node");
+        marker_command
+            .arg(&marker_script)
+            .env("JSS_MARKER_PORT", marker_port.to_string())
+            .stdout(marker_stdout)
+            .stderr(marker_stderr);
+        let mut marker = spawn_process_group(&mut marker_command, "local browser marker")?;
+
+        let mut app_command = Command::new("node");
+        app_command
+            .arg(&serve)
+            .arg(root)
+            .arg(app_port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut app = match spawn_process_group(&mut app_command, "local browser server") {
+            Ok(app) => app,
+            Err(error) => {
+                stop_local_process(&mut marker);
+                let _ = std::fs::remove_dir_all(&helper_dir);
+                return Err(error);
+            }
+        };
+        if let Err(error) = wait_local_service(&mut marker, marker_port, "browser marker")
+            .and_then(|_| wait_local_service(&mut app, app_port, "browser server"))
+        {
+            stop_local_process(&mut app);
+            stop_local_process(&mut marker);
+            let _ = std::fs::remove_dir_all(&helper_dir);
+            return Err(error);
+        }
+
+        Ok(Self {
+            tag: String::new(),
+            network: String::new(),
+            app: String::new(),
+            marker: String::new(),
+            browser: String::new(),
+            canary: Canary::new(format!("{id}{}", short_rand()))
+                .with_marker_host(Some(format!("0x7f000001:{marker_port}"))),
+            port: app_port,
+            nonce: 0,
+            root: root.to_path_buf(),
+            runtime: BrowserRuntime::Local {
+                app,
+                marker,
+                marker_log,
+                helper_dir,
+                executable,
+            },
+            torn_down: false,
+        })
     }
 
     fn boot(&self) -> Result<(), String> {
@@ -6939,29 +9374,56 @@ impl BrowserSession {
             .then(|| super::browser::referrer_payload(probe, &self.canary, self.nonce));
         let tried = attempts.len();
         for attempt in &attempts {
-            let url = format!("http://jss-app:{}{}", self.port, attempt.url);
-            let mut cmd = vec!["node".to_owned(), "/jss-browser.js".to_owned(), url.clone()];
-            if let Some((payload, _)) = &referrer {
-                cmd.push(payload.clone());
-            }
-            let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            let _ = exec_in(&self.browser, &args);
             let hit = referrer
                 .as_ref()
                 .map_or(attempt.token.as_str(), |(_, t)| t.as_str());
-            if tail_logs(&self.marker).contains(hit) {
+            let reached = match &self.runtime {
+                BrowserRuntime::Docker => {
+                    let url = format!("http://jss-app:{}{}", self.port, attempt.url);
+                    let mut cmd =
+                        vec!["node".to_owned(), "/jss-browser.js".to_owned(), url.clone()];
+                    if let Some((payload, _)) = &referrer {
+                        cmd.push(payload.clone());
+                    }
+                    let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+                    let _ = exec_in(&self.browser, &args);
+                    marker_hit(&tail_logs(&self.marker), hit).is_some()
+                }
+                BrowserRuntime::Local {
+                    executable,
+                    marker_log,
+                    helper_dir,
+                    ..
+                } => {
+                    let url = format!("http://127.0.0.1:{}{}", self.port, attempt.url);
+                    let referer = referrer.as_ref().map(|(payload, _)| payload.as_str());
+                    let browser_result = run_local_browser(executable, &url, referer, helper_dir);
+                    let logs = std::fs::read_to_string(marker_log).unwrap_or_default();
+                    let reached = marker_hit(&logs, hit).is_some();
+                    if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                        eprintln!(
+                            "[verify] browser load {} -> result={:?} marker={} logs[{}]",
+                            attempt.url,
+                            browser_result.as_ref().err(),
+                            reached,
+                            tail(&logs, 8)
+                        );
+                    }
+                    reached
+                }
+            };
+            if reached {
+                let public_url =
+                    replace_local_marker_url(&attempt.url, hit, "http://CALLBACK_HOST");
                 return Outcome::Verified {
-                    how: format!("browser load {}", attempt.url),
+                    how: format!("browser load {public_url}"),
                     poc: Reproduction {
                         command: format!(
                             "Open {} in a browser",
-                            shell_quote(&format!(
-                                "http://TARGET_HOST:{}{}",
-                                self.port, attempt.url
-                            ))
+                            shell_quote(&format!("http://TARGET_HOST:3000{public_url}"))
                         ),
                         method: "BROWSER".to_owned(),
-                        target: attempt.url.clone(),
+                        target: public_url,
                         headers: Vec::new(),
                         body: None,
                         evidence: format!(
@@ -7022,12 +9484,64 @@ impl BrowserSession {
             return;
         }
         self.torn_down = true;
-        remove_container(&self.app);
-        remove_container(&self.marker);
-        remove_container(&self.browser);
-        let _ = docker(&["network", "rm", &self.network]);
-        let _ = docker(&["rmi", "-f", &self.tag]);
+        match &mut self.runtime {
+            BrowserRuntime::Docker => {
+                remove_container(&self.app);
+                remove_container(&self.marker);
+                remove_container(&self.browser);
+                let _ = docker(&["network", "rm", &self.network]);
+                let _ = docker(&["rmi", "-f", &self.tag]);
+            }
+            BrowserRuntime::Local {
+                app,
+                marker,
+                helper_dir,
+                ..
+            } => {
+                stop_local_process(app);
+                stop_local_process(marker);
+                let _ = std::fs::remove_dir_all(helper_dir);
+            }
+        }
     }
+}
+
+fn run_local_browser(
+    executable: &std::path::Path,
+    url: &str,
+    referer: Option<&str>,
+    helper_dir: &std::path::Path,
+) -> Result<(), String> {
+    let profile = helper_dir.join(format!("profile-{}", short_rand()));
+    let mut command = Command::new(executable);
+    command
+        .arg("--headless=new")
+        .arg("--no-sandbox")
+        .arg("--disable-gpu")
+        .arg("--disable-dev-shm-usage")
+        .arg("--disable-background-networking")
+        .arg("--virtual-time-budget=4000")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--dump-dom");
+    if let Some(referer) = referer {
+        command.arg(format!("--referer={referer}"));
+    }
+    command.arg(url).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = spawn_process_group(&mut command, "local headless browser")?;
+    for _ in 0..120 {
+        if child
+            .try_wait()
+            .map_err(|error| format!("waiting for local headless browser: {error}"))?
+            .is_some()
+        {
+            let _ = std::fs::remove_dir_all(&profile);
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    stop_local_process(&mut child);
+    let _ = std::fs::remove_dir_all(&profile);
+    Err("local headless browser did not exit within 12s".to_owned())
 }
 
 impl Drop for BrowserSession {
@@ -7153,7 +9667,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_runtime_reads_package_setup_and_port_from_dockerfile() {
+    fn local_runtime_reads_port_from_dockerfile() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Dockerfile"),
@@ -7168,14 +9682,30 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            dockerfile_setup_commands(dir.path()),
-            vec![
-                "npm install -g typescript@^6".to_owned(),
-                "npm install --omit=dev".to_owned()
-            ]
-        );
         assert_eq!(dockerfile_port(dir.path()), Some(3000));
+    }
+
+    #[test]
+    fn standalone_npm_install_temporarily_drops_only_workspace_dev_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("package.json");
+        let original = br#"{
+  "dependencies": { "runtime-sibling": "workspace:*", "fastify": "5.4.0" },
+  "devDependencies": { "test-util": "workspace:*", "typescript": "5.6.3" }
+}
+"#;
+        std::fs::write(&manifest_path, original).unwrap();
+
+        let saved = prepare_standalone_npm_manifest(&manifest_path)
+            .unwrap()
+            .expect("workspace dev dependency is patched");
+        let patched: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(patched["dependencies"]["runtime-sibling"], "workspace:*");
+        assert_eq!(patched["dependencies"]["fastify"], "5.4.0");
+        assert!(patched["devDependencies"].get("test-util").is_none());
+        assert_eq!(patched["devDependencies"]["typescript"], "5.6.3");
+        assert_eq!(saved, original);
     }
 
     #[test]
@@ -7191,12 +9721,14 @@ mod tests {
             "has an ns fallback"
         );
         assert!(
-            s.contains("indexOf('system.')!==0"),
+            s.contains("indexOf('system.')===0"),
             "skips profiler/system collections"
         );
         assert!(
-            s.contains("countDocuments({})===0") && s.contains("insertOne({jss_seed:1})"),
-            "seeds only empty collections with the shared seed marker"
+            s.contains("countDocuments({})===0")
+                && s.contains("insertOne(seeds[c])")
+                && s.contains("{jss_seed:1}"),
+            "seeds only empty collections, shaping the document from the observed filter"
         );
         assert!(
             s.contains("setProfilingLevel(0)")
@@ -7211,7 +9743,7 @@ mod tests {
         // An app that fixes its own HTTP port and also stands up a WebSocket sidecar binds two ports;
         // the probe must still become ready by choosing the one that serves plain HTTP, not give up as
         // ambiguous. The requested `PORT` is still preferred when the app honors it.
-        let s = listening_probe(3000);
+        let s = listening_probe_excluding_candidates(3000, &[], &[]);
         assert!(
             s.contains("ports.has(3000)"),
             "prefers the requested PORT when present"
@@ -7225,12 +9757,73 @@ mod tests {
             "skips a WebSocket-only endpoint that answers 426 Upgrade Required"
         );
         assert!(
+            s.contains("MongoDB|native driver port"),
+            "does not mistake MongoDB's HTTP diagnostic response for the application"
+        );
+        assert!(
             s.contains("const ready=direct?tcpOk:httpOk"),
             "requires HTTP on a discovered alternate port but retains the requested-port fallback"
         );
         assert!(
             s.contains("sort((a,b)=>a-b)"),
             "scans candidate ports in a deterministic order"
+        );
+        let local = listening_probe_excluding_candidates(3000, &[4000], &[8080]);
+        assert!(local.contains("new Set([8080])"), "{local}");
+        assert!(local.contains("new Set([4000])"), "{local}");
+    }
+
+    #[test]
+    fn local_readiness_never_selects_marker_or_preexisting_service_ports() {
+        assert_eq!(
+            local_excluded_ports(&[3000, 4000], Some(44447), true, true),
+            [3000, 4000, 6379, 27017, 44447]
+        );
+    }
+
+    #[test]
+    fn local_helper_path_translation_is_idempotent() {
+        assert_eq!(
+            localize_helper_paths("node /jss-driver.js /tmp/jss-canary-read.json"),
+            "node /tmp/jss-driver.js /tmp/jss-canary-read.json"
+        );
+        assert_eq!(
+            localize_helper_paths("node /tmp/jss-driver.js /tmp/jss-canary-read.json"),
+            "node /tmp/jss-driver.js /tmp/jss-canary-read.json"
+        );
+        assert_eq!(
+            localize_helper_paths("/jss-env/upload_dir"),
+            "/tmp/jss-env/upload_dir"
+        );
+        assert_eq!(
+            localize_helper_paths(
+                "mkdir -p '/tmp/jss-canary-read.d/jss-del-token' && : > '/tmp/jss-canary-read.d/jss-del-token/jss-del-keep'"
+            ),
+            "mkdir -p '/tmp/jss-canary-read.d/jss-del-token' && : > '/tmp/jss-canary-read.d/jss-del-token/jss-del-keep'"
+        );
+    }
+
+    #[test]
+    fn local_sqlite_discovery_is_limited_to_app_owned_directories() {
+        let env = vec![
+            RequiredEnv {
+                name: "APP_DATA_DIR".to_owned(),
+                value: "/jss-env/app_data_dir".to_owned(),
+                directory: true,
+            },
+            RequiredEnv {
+                name: "API_TOKEN".to_owned(),
+                value: "not-a-directory".to_owned(),
+                directory: false,
+            },
+        ];
+        assert_eq!(
+            local_sqlite_search_roots(std::path::Path::new("/checkout/app"), &env),
+            [
+                "/checkout/app".to_owned(),
+                "/tmp/jss-env/app_data_dir".to_owned(),
+                "/tmp/jss-ws".to_owned(),
+            ]
         );
     }
 
@@ -7287,6 +9880,124 @@ mod tests {
         ));
         assert!(!missing_bare_module(
             "Error [ERR_MODULE_NOT_FOUND]: an import failed"
+        ));
+    }
+
+    #[test]
+    fn mongodb_collection_promise_retry_uses_the_exact_runtime_error() {
+        let openwhyd = "TypeError: collections is not iterable\n\
+            at exports.cacheCollections (/app/app/models/mongodb.js:72:22)\n\
+            at async exports.initCollections (/app/app/models/mongodb.js:112:3)";
+        assert!(missing_mongodb_collection_promise(openwhyd));
+        assert!(missing_mongodb_collection_promise(
+            "[db] Successfully connected to mongodb://127.0.0.1:27017/app\n\
+             [app] error from main(): TypeError: collections is not iterable"
+        ));
+        assert!(missing_mongodb_collection_promise(
+            "TypeError: collections is not iterable at renderCollections (/app/view.js:72:22)"
+        ));
+        assert!(!missing_mongodb_collection_promise(
+            "Error: MongoDB connection failed at cacheCollections (/app/app/models/mongodb.js:72:22)"
+        ));
+    }
+
+    #[test]
+    fn a_missing_next_build_retries_the_repository_dev_server() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts":{"start":"node custom-server.js","dev":"next dev --webpack"}}"#,
+        );
+        let error = "Error: Could not find a production build in the '.next' directory. Try building your app with 'next build' before starting the production server.";
+        assert!(missing_next_production_build(error));
+        assert!(!missing_next_production_build(
+            "Error: the application failed to build"
+        ));
+        assert_eq!(
+            next_development_command(dir.path(), 20127),
+            Some(vec![
+                "npm".to_owned(),
+                "run".to_owned(),
+                "dev".to_owned(),
+                "--".to_owned(),
+                "--hostname".to_owned(),
+                "127.0.0.1".to_owned(),
+                "--port".to_owned(),
+                "20127".to_owned(),
+            ])
+        );
+
+        write(dir.path(), "package.json", r#"{"scripts":{"dev":"vite"}}"#);
+        assert_eq!(next_development_command(dir.path(), 3000), None);
+    }
+
+    #[test]
+    fn mongodb_collection_shim_follows_callback_and_promise_drivers() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Production stages the ESM hook at `/jss-esm-hook.mjs`. This unit exercise only targets
+        // the CommonJS MongoDB adapter, so keep Node from registering that unrelated absolute hook.
+        write(
+            dir.path(),
+            "disable-register.js",
+            "require('module').register = undefined;",
+        );
+        write(dir.path(), "launch-shim.js", LAUNCH_SHIM_JS);
+        write(
+            dir.path(),
+            "app.js",
+            "const { Db } = require('mongodb'); new Db().collections().then((xs) => console.log(xs[0]));",
+        );
+        for (implementation, expected) in [
+            (
+                "function Db() {}\nDb.prototype.collections = function (_, done) { done(null, ['callback']); };\nmodule.exports = { Db };",
+                "callback",
+            ),
+            (
+                "function Db() {}\nDb.prototype.collections = function () { return Promise.resolve(['promise']); };\nmodule.exports = { Db };",
+                "promise",
+            ),
+        ] {
+            write(dir.path(), "node_modules/mongodb/index.js", implementation);
+            let output = Command::new("node")
+                .arg("app.js")
+                .current_dir(dir.path())
+                .env("JSS_MONGODB_CALLBACK_PROMISES", "1")
+                .env(
+                    "NODE_OPTIONS",
+                    format!(
+                        "--require={} --require={}",
+                        dir.path().join("disable-register.js").display(),
+                        dir.path().join("launch-shim.js").display()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "status={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
+    }
+
+    #[test]
+    fn generated_configuration_retry_requires_an_explicit_generation_message() {
+        assert!(generated_startup_config(
+            "Config file not found, generating defaults.\nSPX exit!"
+        ));
+        assert!(generated_startup_config(
+            "Configuration file not found; creating default configuration"
+        ));
+        assert!(!generated_startup_config("Config file not found"));
+        assert!(!generated_startup_config(
+            "Generating defaults for the response payload"
         ));
     }
 
@@ -7357,6 +10068,20 @@ mod tests {
         assert_eq!(missing_tls_material(json_log), None);
     }
 
+    #[test]
+    fn missing_dotenv_file_requires_an_explicit_dotenv_startup_failure() {
+        let log = "[dotenv] injected env (0) from .env\n\
+            Error: Failed to load .env file: ENOENT: no such file or directory, open '/app/.env'\n";
+        assert_eq!(missing_dotenv_file(log), Some("/app/.env".to_owned()));
+
+        let ordinary_missing =
+            "Error: ENOENT: no such file or directory, open '/app/config.json'\n";
+        assert_eq!(missing_dotenv_file(ordinary_missing), None);
+        let unrelated_env =
+            "Error: ENOENT: no such file or directory, open '/app/runtime.env'\n dotenv\n";
+        assert_eq!(missing_dotenv_file(unrelated_env), None);
+    }
+
     /// Only external-service credential names are set to a filler, and only from the sink's import
     /// graph; the sandbox's own variables and non-credential names (including `PATH`) are left alone.
     #[test]
@@ -7402,6 +10127,7 @@ mod tests {
             Error: NOOBOT_WORKSPACE_ROOT is required\n\
             Missing required environment variable: DATABASE_URL\n\
             Missing env var(s): REDIS_URL\n\
+            Error: missing env vars: AUTH0_SECRET, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET\n\
             AIRQO_ENV environment variable not set\n\
             \"SESSION_SECRET\" must be set\n\
             Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'x' is missing\n\
@@ -7417,6 +10143,9 @@ mod tests {
                 "NOOBOT_WORKSPACE_ROOT",
                 "DATABASE_URL",
                 "REDIS_URL",
+                "AUTH0_SECRET",
+                "AUTH0_CLIENT_ID",
+                "AUTH0_CLIENT_SECRET",
                 "AIRQO_ENV",
                 "SESSION_SECRET"
             ]
@@ -7432,8 +10161,11 @@ mod tests {
         assert_eq!(env[1].value, "http://jss-filler.test/");
         assert!(!env[1].directory);
         assert_eq!(env[2].value, "http://jss-filler.test/");
-        assert_eq!(env[3].value, "jsspector");
-        assert_eq!(env[4].value, STRONG_FILLER_SECRET);
+        assert_eq!(env[3].value, STRONG_FILLER_SECRET);
+        assert_eq!(env[4].value, "jsspector");
+        assert_eq!(env[5].value, STRONG_FILLER_SECRET);
+        assert_eq!(env[6].value, "jsspector");
+        assert_eq!(env[7].value, STRONG_FILLER_SECRET);
         assert!(STRONG_FILLER_SECRET.len() >= 64);
         assert!(required_env("the app did not listen within 90s").is_empty());
     }
@@ -7456,6 +10188,76 @@ mod tests {
         let names: Vec<&str> = env.iter().map(|item| item.name.as_str()).collect();
         assert_eq!(names, ["RAZORPAY_KEY", "RAZORPAY_SECRET"]);
         assert!(env.iter().all(|item| item.value == STRONG_FILLER_SECRET));
+
+        let local_log = format!(
+            "Error: `key_id` is mandatory\n    at {}/config/razorpay.js:1:1",
+            dir.path().display()
+        );
+        let local_names: Vec<String> = config_env(&local_log, dir.path())
+            .into_iter()
+            .map(|item| item.name)
+            .collect();
+        assert_eq!(local_names, ["RAZORPAY_KEY", "RAZORPAY_SECRET"]);
+    }
+
+    #[test]
+    fn startup_stack_fills_a_literal_environment_backed_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "helper/passport.js",
+            "const secret = await getSetting('auth', 'token', 'secret_key');\n",
+        );
+        let log = format!(
+            "TypeError: JwtStrategy requires a secret or key\n    at {}/helper/passport.js:1:1",
+            dir.path().display()
+        );
+        let env = config_env(&log, dir.path());
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "global_auth_token_secret_key");
+        assert_eq!(
+            serde_json::from_str::<String>(&env[0].value).unwrap(),
+            STRONG_FILLER_SECRET
+        );
+        assert!(!env[0].directory);
+    }
+
+    #[test]
+    fn config_source_env_fills_a_typed_path_variable_the_handler_needs_without_diverting_the_branch()
+     {
+        // The handler builds a path from a deployment variable before the sink
+        // (`path.join(process.env.PROJECT_PATH, ...)`); unset, `path.join(undefined, ...)` throws and
+        // the request dies before the sink. The `_PATH` name gets a fresh directory, while the mode
+        // toggle (`INLINE_API`, no inferable kind) and the fallback name (`PROJECT_NAME`) are left
+        // unset so the vulnerable branch the finding reported still runs.
+        let source = "const base = path.join(process.env.PROJECT_PATH, 'dist', \
+             process.env.PROJECT_NAME || '', 'functions');\n\
+             const mobile = process.env.NODEJS_MOBILE_DATA_DIR;\n\
+             if (!process.env.INLINE_API) { require('child_process').exec(cmd); }\n";
+        let env = config_source_env(&[source.to_owned()]);
+        let names: Vec<&str> = env.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["PROJECT_PATH"]);
+        assert!(env[0].directory);
+        assert!(env[0].value.starts_with('/'));
+    }
+
+    #[test]
+    fn guarded_optional_modules_are_collected_from_imported_runtime_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "route.js",
+            "try { require('entry-optional'); } catch (_) {}",
+        );
+        let imported = "let channel; try { ({ channel } = require('bridge')); } catch (_) {}";
+        assert_eq!(
+            guarded_modules(
+                dir.path(),
+                Some(std::path::Path::new("route.js")),
+                &[imported.to_owned()],
+            ),
+            ["bridge", "entry-optional"]
+        );
     }
 
     #[test]
@@ -7508,6 +10310,22 @@ mod tests {
         assert!(command.contains("--path-as-is"));
         assert!(command.contains("--url 'http://TARGET_HOST:8000/x?u=1'"));
         assert!(!command.contains("--request-target"));
+    }
+
+    #[test]
+    fn a_local_marker_port_never_leaks_into_the_copyable_poc() {
+        let token = "run-1".to_owned();
+        let attempt = Attempt {
+            verb: "POST",
+            target: "/fetch".to_owned(),
+            body: Some(format!("{{\"url\":\"http://0x7f000001:43210/{token}\"}}")),
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            signal: Signal::ServiceReached(token),
+        };
+        let command = curl_command(&attempt, 8000);
+        assert!(command.contains("http://CALLBACK_HOST"), "{command}");
+        assert!(!command.contains("0x7f000001"), "{command}");
+        assert!(!command.contains("43210"), "{command}");
     }
 
     #[test]
@@ -7751,6 +10569,37 @@ mod tests {
     }
 
     #[test]
+    fn public_callback_evidence_requires_an_exact_token_path() {
+        let body = br#"{"interactions":[
+            {"protocol":"dns","path":null},
+            {"protocol":"http","path":"/wrong-token"},
+            {"protocol":"http","path":"/prefix/run-token-2"}
+        ]}"#;
+        assert!(callback_response_contains(body, "run-token-2"));
+        assert!(!callback_response_contains(body, "run-token"));
+        assert!(!callback_response_contains(b"not json", "run-token-2"));
+    }
+
+    #[test]
+    fn public_callback_polling_is_limited_to_attempts_that_name_its_host() {
+        let attempt = Attempt {
+            verb: "POST",
+            target: "/fetch".to_owned(),
+            body: Some("{\"url\":\"https://abc.callback.satori.ci/probe\"}".to_owned()),
+            headers: Vec::new(),
+            signal: Signal::ServiceReached("probe".to_owned()),
+        };
+        assert!(attempt_mentions_host(&attempt, "abc.callback.satori.ci"));
+        assert!(!attempt_mentions_host(&attempt, "other.callback.satori.ci"));
+        let normalized = normalized_callback_attempt(&attempt, Some("abc.callback.satori.ci"));
+        assert_eq!(
+            normalized.body.as_deref(),
+            Some("{\"url\":\"https://CALLBACK_HOST/probe\"}")
+        );
+        assert!(!format!("{normalized:?}").contains("abc.callback.satori.ci"));
+    }
+
+    #[test]
     fn marker_certificate_validates_private_and_callback_hostnames_only() {
         let dir = tempfile::tempdir().unwrap();
         let cert = dir.path().join("marker.crt");
@@ -7813,6 +10662,9 @@ mod tests {
         assert!(env.iter().any(|(name, value)| {
             name == "MONGODB_URI" && value == "mongodb://mongo:27017/jssverifydb"
         }));
+        assert!(local_db_connection_env().iter().any(|(name, value)| {
+            name == "MONGODB_URI" && value == "mongodb://127.0.0.1:27017/jssverifydb"
+        }));
     }
 
     #[test]
@@ -7834,6 +10686,11 @@ mod tests {
         assert!(
             env.iter()
                 .any(|(name, value)| name == "REDIS_URL" && value == "redis://redis:6379")
+        );
+        assert!(
+            local_redis_connection_env()
+                .iter()
+                .any(|(name, value)| { name == "REDIS_URL" && value == "redis://127.0.0.1:6379" })
         );
     }
 
@@ -7941,6 +10798,179 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_but_incomplete_lockfile_install_exposes_missing_runtime_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "package.json",
+            r#"{"dependencies":{"express":"^4","@scope/runtime":"^1","legacy-git":"git+ssh://git@github.com/example/legacy.git","git-shorthand":"owner/repository#v1","local-only":"file:../local"},"devDependencies":{"vite":"^6"}}"#,
+        );
+        std::fs::create_dir_all(root.join("node_modules/express")).unwrap();
+
+        assert_eq!(
+            missing_runtime_dependencies(root),
+            vec!["@scope/runtime".to_owned()]
+        );
+        std::fs::create_dir_all(root.join("node_modules/@scope/runtime")).unwrap();
+        assert!(missing_runtime_dependencies(root).is_empty());
+    }
+
+    #[test]
+    fn runtime_dependency_repair_retries_but_never_hides_total_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"dependencies":{"next":"^15","remote":"https://mirror.invalid/remote.tgz","sibling":"workspace:*"}}"#,
+        );
+        let command = runtime_dependency_repair_command(&manifest, &["next".to_owned()]).unwrap();
+        assert_eq!(command.matches("npm install").count(), 3);
+        assert!(command.contains("--package-lock=false"));
+        assert!(command.contains("--workspaces=false"));
+        assert!(command.contains("'next@^15'"));
+        assert!(!command.contains("mirror.invalid"));
+        assert!(!command.contains("workspace:*"));
+        assert!(!command.contains("|| true"));
+    }
+
+    #[test]
+    fn runtime_dependency_repair_temporarily_hides_non_registry_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let original = br#"{"dependencies":{"next":"^15","sibling":"workspace:*","archive":"https://mirror.invalid/a.tgz"},"devDependencies":{"tool":"file:../tool","typescript":"^5"}}"#;
+        std::fs::write(&manifest, original).unwrap();
+        let saved =
+            prepare_registry_only_npm_manifest(&manifest, &std::collections::BTreeSet::new())
+                .unwrap()
+                .expect("non-registry specs are patched");
+        let patched: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(patched["dependencies"]["next"], "^15");
+        assert_eq!(patched["devDependencies"]["typescript"], "^5");
+        assert!(patched["dependencies"].get("sibling").is_none());
+        assert!(patched["dependencies"].get("archive").is_none());
+        assert!(patched["devDependencies"].get("tool").is_none());
+        assert_eq!(saved, original);
+    }
+
+    #[test]
+    fn runtime_dependency_repair_excludes_direct_packages_with_remote_transitives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "package.json",
+            r#"{"dependencies":{"express":"^4","spreadsheet-wrapper":"^1"}}"#,
+        );
+        write(
+            root,
+            "package-lock.json",
+            r#"{
+              "lockfileVersion": 3,
+              "packages": {
+                "node_modules/express": {"dependencies":{"body-parser":"^1"}},
+                "node_modules/spreadsheet-wrapper": {
+                  "dependencies":{"sheet":"https://cdn.invalid/sheet.tgz"}
+                }
+              }
+            }"#,
+        );
+        let missing = vec!["express".to_owned(), "spreadsheet-wrapper".to_owned()];
+        let blocked = direct_dependencies_with_non_registry_transitives(root, &missing);
+        assert_eq!(
+            blocked,
+            std::collections::BTreeSet::from(["spreadsheet-wrapper".to_owned()])
+        );
+
+        let manifest = root.join("package.json");
+        let saved = prepare_registry_only_npm_manifest(&manifest, &blocked)
+            .unwrap()
+            .expect("the blocked direct dependency is patched");
+        let patched: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(patched["dependencies"]["express"], "^4");
+        assert!(patched["dependencies"].get("spreadsheet-wrapper").is_none());
+        let original: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(original["dependencies"]["spreadsheet-wrapper"], "^1");
+    }
+
+    #[test]
+    fn runtime_dependency_repair_temporarily_hides_npm_lockfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let package_lock = br#"{"lockfileVersion":3,"packages":{}}"#;
+        let shrinkwrap = br#"{"lockfileVersion":2}"#;
+        std::fs::write(dir.path().join("package-lock.json"), package_lock).unwrap();
+        std::fs::write(dir.path().join("npm-shrinkwrap.json"), shrinkwrap).unwrap();
+
+        let saved = temporarily_remove_npm_lockfiles(dir.path()).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(!dir.path().join("package-lock.json").exists());
+        assert!(!dir.path().join("npm-shrinkwrap.json").exists());
+
+        restore_npm_lockfiles(saved).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("package-lock.json")).unwrap(),
+            package_lock
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("npm-shrinkwrap.json")).unwrap(),
+            shrinkwrap
+        );
+    }
+
+    #[test]
+    fn the_npm_install_prefers_a_peer_aware_install_before_the_legacy_fallback() {
+        // A runtime dependency a package declares only as a peer (the classic `request-promise` ->
+        // `request` split) is installed by a plain `npm install`, as modern npm does, but *not* by
+        // `--legacy-peer-deps`. So the peer-aware install must be attempted before the legacy fallback.
+        let command = install_command(PackageManager::Npm);
+        let plain = command
+            .find("npm install --no-audit --no-fund |")
+            .expect("a peer-aware npm install is attempted");
+        let legacy = command
+            .find("--legacy-peer-deps")
+            .expect("the legacy install remains as a fallback");
+        assert!(
+            plain < legacy,
+            "the peer-aware install must come before the legacy one"
+        );
+    }
+
+    #[test]
+    fn a_mongodump_in_the_repository_is_discovered_for_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A standard `mongodump` export: `<collection>.bson` beside `<collection>.metadata.json`.
+        write(root, "database/dump/app/settings.bson", "\x00\x00\x00\x00");
+        write(root, "database/dump/app/settings.metadata.json", "{}");
+        write(root, "database/dump/app/users.bson", "\x00\x00\x00\x00");
+        write(root, "database/dump/app/users.metadata.json", "{}");
+        // Noise that is not a dump: a lone `.bson` with no metadata sibling, under node_modules.
+        write(root, "node_modules/x/stray.bson", "\x00");
+        let found = mongodump_dir(root).expect("the dump directory is found");
+        assert!(found.ends_with("database/dump/app"));
+    }
+
+    #[test]
+    fn the_nosql_lookup_seed_plants_a_record_the_sink_query_selects() {
+        // The script carries the per-run sentinel, inserts for a filter that references it, copies a
+        // scalar equality verbatim, and sets the injected operator field to a present value — while an
+        // unrelated field is not forced, so an earlier guard query stays unmatched.
+        let script = nosql_lookup_seed_script("deadbeefdeadbeefdeadbeef");
+        assert!(script.contains("var ABSENT='deadbeefdeadbeefdeadbeef'"));
+        assert!(script.contains("insertOne(doc)"));
+        assert!(script.contains("jss_lookup_seed"));
+        assert!(script.contains("doc[k]=ObjectId()"));
+        assert!(script.contains("doc.id=doc[k].toString()"));
+        // Only a filter that references the sentinel is planted.
+        assert!(script.contains("JSON.stringify(filter).indexOf(ABSENT)<0"));
+        // System collections are never seeded.
+        assert!(script.contains("system."));
+    }
+
+    #[test]
     fn a_yarn_project_installs_with_corepack_and_runs_its_build() {
         // yarn/pnpm are provisioned by corepack; npm keeps its reproducible `ci` path.
         assert!(install_command(PackageManager::Yarn).contains("corepack enable"));
@@ -7963,6 +10993,7 @@ mod tests {
             PackageManager::Yarn,
             Some("build"),
             false,
+            &[],
         );
         assert!(file.contains("RUN corepack enable"), "{file}");
         assert!(file.contains("yarn run build"), "{file}");
@@ -7972,7 +11003,7 @@ mod tests {
         );
         // The canary is planted under its extension variants, so a handler that appends a known
         // extension to the tainted path (`input + '.md'`) still reads the token.
-        assert!(file.contains("/jss-canary-read.md"), "{file}");
+        assert!(file.contains("/tmp/jss-canary-read.md"), "{file}");
         // No build step emitted for a package without one.
         let no_build = dockerfile(
             "node:22-slim",
@@ -7984,6 +11015,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            &[],
         );
         assert!(!no_build.contains("build"), "{no_build}");
         assert!(!build_command(PackageManager::Npm, "compile").contains("next build"));
@@ -8086,6 +11118,136 @@ mod tests {
     }
 
     #[test]
+    fn a_process_manager_start_runs_the_wrapped_entry_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // `pm2 start server.js --name GC` daemonizes a process manager that is not a dependency of the
+        // app and is absent from the image; the honest launch is the very file it would run.
+        write(
+            root,
+            "server.js",
+            "require('http').createServer(()=>{}).listen(3000);\n",
+        );
+        for start in [
+            r#"{"scripts":{"start":"pm2 start server.js --name GC"}}"#,
+            r#"{"scripts":{"start":"pm2-runtime start server.js"}}"#,
+            r#"{"scripts":{"start":"forever server.js"}}"#,
+            r#"{"scripts":{"start":"nodemon server.js"}}"#,
+        ] {
+            write(root, "package.json", start);
+            assert_eq!(
+                manifest_start_command(root).as_deref(),
+                Some(r#"["node","server.js"]"#),
+                "{start}"
+            );
+        }
+        // A process manager pointed at an ecosystem/config file (not a server) is left to npm.
+        write(
+            root,
+            "ecosystem.config.js",
+            "module.exports = { apps: [] };\n",
+        );
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"pm2 start ecosystem.config.js"}}"#,
+        );
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["npm","start"]"#)
+        );
+    }
+
+    #[test]
+    fn a_plain_node_start_runs_the_server_process_directly_with_its_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "app.js",
+            "require('http').createServer(()=>{}).listen(3000);\n",
+        );
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"node app.js --fakeEmail --digestInterval -1 $@"}}"#,
+        );
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["node","app.js","--fakeEmail","--digestInterval","-1"]"#)
+        );
+
+        for start in [
+            "node app.js && echo done",
+            "node app.js | tee output.log",
+            "node app.js > output.log",
+            "node app.js $(whoami)",
+            "node app.js '$HOME'",
+            "node app.js $@ --after",
+        ] {
+            write(
+                root,
+                "package.json",
+                &format!(
+                    r#"{{"scripts":{{"start":{}}}}}"#,
+                    serde_json::to_string(start).unwrap()
+                ),
+            );
+            assert_eq!(
+                manifest_start_command(root).as_deref(),
+                Some(r#"["npm","start"]"#),
+                "{start}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ephemeral_mongo_launcher_runs_next_directly_against_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // `node scripts/dev.js` boots an in-process `mongodb-memory-server` (which downloads a binary
+        // and fails offline) only to mint a URL, then execs `next dev src`. The honest launch runs Next
+        // directly against the verifier's MongoDB sidecar, the app's own `MONGO_URI` production mode.
+        write(
+            root,
+            "scripts/dev.js",
+            "const { MongoMemoryServer } = require('mongodb-memory-server')\n\
+             ;(async () => { const m = await MongoMemoryServer.create();\n\
+             require('child_process').exec(`npx next dev ${process.argv[2]||'src'} -p 3005`); })()\n",
+        );
+        write(root, "src/next.config.ts", "export default {}\n");
+        write(
+            root,
+            "src/app/page.tsx",
+            "export default function P(){return null}\n",
+        );
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"node scripts/dev.js","dev":"node scripts/dev.js"},"dependencies":{"next":"15","mongoose":"8"}}"#,
+        );
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["sh","-c","exec npx next dev src --hostname 0.0.0.0 -p \"$PORT\""]"#)
+        );
+        assert_eq!(
+            local_ephemeral_mongo_next_launch(root).as_deref(),
+            Some(r#"["sh","-c","exec npm start -- src \"$PORT\""]"#)
+        );
+        // A plain launcher that does not provision an ephemeral MongoDB is executed directly.
+        write(
+            root,
+            "scripts/dev.js",
+            "require('child_process').exec('npx next dev src')\n",
+        );
+        assert_eq!(
+            manifest_start_command(root).as_deref(),
+            Some(r#"["node","scripts/dev.js"]"#)
+        );
+        assert!(local_ephemeral_mongo_next_launch(root).is_none());
+    }
+
+    #[test]
     fn a_frontend_manifest_launches_the_findings_own_backend_server() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -8160,6 +11322,28 @@ mod tests {
             Some(SANDBOX_RUN_GID.to_string().as_str())
         );
         assert_eq!(value("ASYMPTOTE_PORT"), Some("3000"));
+
+        let local = adapt_privilege_drop_to_local_identity(
+            privilege_drop_fixture(root, 3000).expect("a privilege drop is detected"),
+            (501, 20),
+        );
+        assert_eq!(local.run_as, (501, 20));
+        assert_eq!(
+            local
+                .env
+                .iter()
+                .find(|env| env.name == "ASYMPTOTE_UID")
+                .map(|env| env.value.as_str()),
+            Some("501")
+        );
+        assert_eq!(
+            local
+                .env
+                .iter()
+                .find(|env| env.name == "ASYMPTOTE_GID")
+                .map(|env| env.value.as_str()),
+            Some("20")
+        );
 
         // An app that never drops privileges gets no forced runtime user.
         let plain = tempfile::tempdir().unwrap();
@@ -8248,6 +11432,7 @@ mod tests {
             PackageManager::Npm,
             Some("build"),
             false,
+            &[],
         );
         assert!(file.contains(NPM_WORKSPACE_FIXUP), "{file}");
         assert!(file.contains("/jss-lifecycle-host.mjs"), "{file}");
@@ -8262,6 +11447,7 @@ mod tests {
             PackageManager::Yarn,
             Some("build"),
             false,
+            &[],
         );
         assert!(!yarn.contains(NPM_WORKSPACE_FIXUP), "{yarn}");
     }
@@ -8312,6 +11498,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            &[],
         );
         assert!(file.contains("/jss-node-red-host.mjs"), "{file}");
     }
@@ -8396,6 +11583,47 @@ mod tests {
         // The non-server helper, even though it exists, is never launched this way.
         assert_eq!(app_dir(root, path("tools/viewer/app.js")), path(""));
         assert_eq!(start_command(&root.join(&app), Some(path("app.js"))), None);
+    }
+
+    #[test]
+    fn an_uninvoked_exported_server_start_uses_the_manifest_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"node entry.js"}}"#,
+        );
+        write(
+            root,
+            "src/server.js",
+            "import http from 'node:http';\n\
+             export async function startServer() {\n\
+               const server = http.createServer((_req, res) => res.end('ok'));\n\
+               server.listen(3000);\n\
+             }\n",
+        );
+        write(
+            root,
+            "entry.js",
+            "import { startServer } from './src/server.js';\nawait startServer();\n",
+        );
+        assert!(!is_standalone_server(&root.join("src/server.js")));
+        assert_eq!(
+            start_command(root, Some(std::path::Path::new("src/server.js"))).as_deref(),
+            Some(r#"["node","entry.js"]"#)
+        );
+
+        write(
+            root,
+            "src/server.js",
+            "import http from 'node:http';\n\
+             export async function startServer() {\n\
+               http.createServer((_req, res) => res.end('ok')).listen(3000);\n\
+             }\n\
+             await startServer();\n",
+        );
+        assert!(is_standalone_server(&root.join("src/server.js")));
     }
 
     #[test]
@@ -8595,6 +11823,87 @@ mod tests {
     }
 
     #[test]
+    fn start_script_naming_missing_file_mounts_exported_express_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        write(
+            root,
+            "package.json",
+            r#"{"main":"srv.js","scripts":{"start":"node srv.js"}}"#,
+        );
+        write(
+            root,
+            "my-srv.js",
+            "const express = require('express');\nconst app = express();\n\
+             app.get('/x', (req, res) => res.end());\nmodule.exports = app;\n",
+        );
+        assert_eq!(
+            start_command(root, Some(path("my-srv.js"))).as_deref(),
+            Some(r#"["node","/jss-express-host.mjs","my-srv.js"]"#)
+        );
+        // When the start script's file exists, the manifest launch still wins.
+        write(root, "srv.js", "require('./my-srv').listen(3000);\n");
+        assert_eq!(
+            start_command(root, Some(path("my-srv.js"))).as_deref(),
+            Some(r#"["node","srv.js"]"#)
+        );
+    }
+
+    #[test]
+    fn exported_express_factory_is_mountable_without_the_infrastructure_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "app.js",
+            "import express from 'express';\n\
+             export function createApp() {\n\
+               const app = express();\n\
+               app.get('/x', (_req, res) => res.end('ok'));\n\
+               return app;\n\
+             }\n",
+        );
+        assert!(is_express_factory_module(&root.join("app.js")));
+
+        write(
+            root,
+            "server.js",
+            "import express from 'express';\nconst app = express();\napp.listen(3000);\n",
+        );
+        assert!(!is_express_factory_module(&root.join("server.js")));
+    }
+
+    #[test]
+    fn a_findings_standalone_server_wins_over_an_unrelated_manifest_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        write(
+            root,
+            "package.json",
+            r#"{"scripts":{"start":"node index.js"},"dependencies":{"express":"4"}}"#,
+        );
+        write(
+            root,
+            "index.js",
+            "require('http').createServer((q,r)=>r.end('other')).listen(3000);\n",
+        );
+        write(
+            root,
+            "☁︎.js",
+            "const express=require('express'); const app=express();\n\
+             app.post('/api/run',(req,res)=>res.json({ok:true}));\n\
+             app.listen(9000);\n",
+        );
+        assert_eq!(
+            start_command(root, Some(path("☁︎.js"))).as_deref(),
+            Some(r#"["node","☁︎.js"]"#)
+        );
+        assert_eq!(session_key(root, path(""), path("☁︎.js")), path("☁︎.js"));
+    }
+
+    #[test]
     fn two_standalone_servers_in_one_directory_get_separate_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -8617,8 +11926,8 @@ mod tests {
             session_key(root, &two, path("src/web/dashboard.js")),
         );
 
-        // Findings launched from a shared package manifest keep sharing one session: the directory
-        // identifies the single server, and the entry file does not split it.
+        // Even with a shared package manifest, independently listening finding files need separate
+        // sessions: the manifest starts `a.js`, but a finding owned by `b.js` is launched directly.
         write(
             root,
             "svc/package.json",
@@ -8627,7 +11936,7 @@ mod tests {
         write(root, "svc/a.js", server);
         write(root, "svc/b.js", server);
         let svc = path("svc");
-        assert_eq!(
+        assert_ne!(
             session_key(root, svc, path("svc/a.js")),
             session_key(root, svc, path("svc/b.js")),
         );
@@ -8669,6 +11978,7 @@ mod tests {
             PackageManager::Pnpm,
             None,
             false,
+            &[],
         );
         let install = file.find("pnpm install").unwrap();
         let run_workdir = file.find("WORKDIR /app/src/web\n").unwrap();
@@ -8707,6 +12017,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            &[],
         );
         assert!(file.contains(r#"printf '"%s"' 'cafed00d'"#), "{file}");
     }
@@ -8757,6 +12068,7 @@ mod tests {
             PackageManager::Npm,
             None,
             true,
+            &[],
         );
         let toolchain = with.find(NATIVE_TOOLCHAIN_INSTALL).expect("toolchain step");
         let install = with.find("npm ci").expect("install step");
@@ -8773,6 +12085,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            &[],
         );
         assert!(!without.contains(NATIVE_TOOLCHAIN_INSTALL), "{without}");
     }
@@ -8849,7 +12162,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let out = Command::new("node")
-            .args(["-e", &listening_probe(port)])
+            .args(["-e", &listening_probe_excluding(port, &[])])
             .output()
             .unwrap();
         assert!(
@@ -8863,10 +12176,66 @@ mod tests {
         );
         drop(listener);
         let out = Command::new("node")
-            .args(["-e", &listening_probe(port)])
+            .args(["-e", &listening_probe_excluding(port, &[])])
             .output()
             .unwrap();
         assert!(!out.status.success() || std::path::Path::new("/proc/net/tcp").exists());
+    }
+
+    #[test]
+    fn the_local_listening_probe_excludes_sidecar_ports() {
+        let probe = listening_probe_excluding(3000, &[27017, 6379]);
+        assert!(probe.contains("new Set([27017,6379])"));
+        assert!(probe.contains("!excluded.has(port)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_launcher_keeps_the_local_app_running_while_its_group_has_children() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10 &"]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let group = child.id();
+        assert!(child.wait().unwrap().success());
+        assert!(local_process_group_running(group));
+        stop_local_process(&mut child);
+        assert!(!local_process_group_running(group));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_local_launcher_stops_its_server_child() {
+        use std::os::unix::process::CommandExt;
+
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let script = format!(
+            "node -e \"require('http').createServer((q,s)=>s.end('ok')).listen({port},'127.0.0.1')\" & wait"
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        stop_local_process(&mut child);
+        for _ in 0..50 {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the launched server child still owns port {port}");
     }
 
     #[test]
@@ -8912,6 +12281,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            &[],
         );
         let copy = file.find("COPY . /app\n").unwrap();
         let workdir = file.find("WORKDIR /app/svc\n").unwrap();
@@ -9030,6 +12400,12 @@ http.createServer((req, res) => {
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
         };
         let confined = Probe {
             method: Method::Get,
@@ -9060,6 +12436,12 @@ http.createServer((req, res) => {
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
         };
         let command = Probe {
             method: Method::Get,
@@ -9090,6 +12472,12 @@ http.createServer((req, res) => {
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -9124,6 +12512,12 @@ http.createServer((req, res) => {
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);
@@ -9142,14 +12536,32 @@ http.createServer((req, res) => {
         );
         match &visible_injected {
             Outcome::Verified { poc, .. } => {
-                assert!(poc.command.contains("id%20%23"), "{}", poc.command);
+                // The payload is space-free (`x;id;#`), so the query carries the shell separator and
+                // the injected `id`, percent-encoded, with no `%20` to break a raw request target.
+                assert!(poc.command.contains("%3Bid"), "{}", poc.command);
                 assert!(poc.response.contains("uid="), "{}", poc.response);
             }
             other => panic!("command injection should verify, got {other:?}"),
         }
+        // A blind command injection (the handler discards the child's output) is proved out of band:
+        // the injected command makes an HTTP callback to the isolated marker carrying this probe's
+        // unique token. That is an unmistakable observable consequence with an implicit negative
+        // control (a benign request never carries the token) — never a filesystem side effect.
         match &injected {
-            Outcome::NotReproduced { .. } => {}
-            other => panic!("blind command injection must not use a side effect, got {other:?}"),
+            Outcome::Verified { poc, .. } => {
+                assert!(
+                    poc.evidence
+                        .contains("marker service received callback token"),
+                    "blind command injection must verify via the out-of-band callback, got {}",
+                    poc.evidence
+                );
+                assert!(
+                    poc.target.contains("jss-marker"),
+                    "the injected command must reach the marker, got {}",
+                    poc.target
+                );
+            }
+            other => panic!("blind command injection should verify out of band, got {other:?}"),
         }
         assert!(
             matches!(forged, Outcome::Verified { .. }),

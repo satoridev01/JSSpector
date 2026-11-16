@@ -25,6 +25,7 @@ jss-frontend = { path = "crates/jss-frontend" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
 # Exclude patterns in .jsspector.yml and --exclude (the matcher behind `ignore`).
 globset = "0.4.21"
 # File discovery: .gitignore-aware directory walking (same engine as ripgrep).

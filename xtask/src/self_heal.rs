@@ -194,6 +194,10 @@ pub fn run(options: &Options) -> Result<()> {
     // Ordinary single-repository runs do not set this environment variable and keep their existing
     // per-checkout lock semantics.
     let _integration_lock = acquire_integration_lock()?;
+    synchronize_integration_checkout(
+        &options.root,
+        std::env::var_os("JSSPECTOR_INTEGRATION_LOCK").is_some(),
+    )?;
     if let Some(repair) = workspace {
         let generation = git_output(&repair.path, &["rev-parse", "HEAD"])?;
         if generation.trim() != repair.base {
@@ -217,6 +221,29 @@ pub fn run(options: &Options) -> Result<()> {
             blocked.len(),
             blocked.join("\n")
         );
+    }
+    Ok(())
+}
+
+fn synchronize_integration_checkout(root: &Path, parallel: bool) -> Result<()> {
+    if !parallel {
+        return Ok(());
+    }
+    if !git_output(root, &["status", "--porcelain"])?
+        .trim()
+        .is_empty()
+    {
+        bail!("parallel integration checkout became dirty before synchronization");
+    }
+    eprintln!("self-heal: synchronizing the integration checkout with upstream");
+    command_ok(
+        Command::new("git")
+            .current_dir(root)
+            .args(["pull", "--ff-only"]),
+        "fast-forward parallel integration checkout".to_owned(),
+    )?;
+    if git_output(root, &["rev-list", "--count", "@{upstream}..HEAD"])?.trim() != "0" {
+        bail!("parallel integration checkout has unpublished commits before applying a repair");
     }
     Ok(())
 }
@@ -1290,6 +1317,82 @@ fn at<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_integration_fast_forwards_before_applying_a_repair() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let remote = directory.path().join("remote.git");
+        let writer = directory.path().join("writer");
+        let worker = directory.path().join("worker");
+        command_ok(
+            Command::new("git").args(["init", "--bare"]).arg(&remote),
+            "initialize test remote".to_owned(),
+        )?;
+        command_ok(
+            Command::new("git")
+                .args(["clone"])
+                .arg(&remote)
+                .arg(&writer),
+            "clone test writer".to_owned(),
+        )?;
+        for (key, value) in [
+            ("user.name", "JSSpector test"),
+            ("user.email", "test@localhost.invalid"),
+        ] {
+            command_ok(
+                Command::new("git")
+                    .current_dir(&writer)
+                    .args(["config", key, value]),
+                format!("configure test writer {key}"),
+            )?;
+        }
+        std::fs::write(writer.join("version"), "one\n")?;
+        command_ok(
+            Command::new("git")
+                .current_dir(&writer)
+                .args(["add", "version"]),
+            "stage initial test revision".to_owned(),
+        )?;
+        command_ok(
+            Command::new("git")
+                .current_dir(&writer)
+                .args(["commit", "-m", "initial"]),
+            "commit initial test revision".to_owned(),
+        )?;
+        command_ok(
+            Command::new("git")
+                .current_dir(&writer)
+                .args(["push", "-u", "origin", "HEAD:main"]),
+            "push initial test revision".to_owned(),
+        )?;
+        command_ok(
+            Command::new("git")
+                .args(["clone", "--branch", "main"])
+                .arg(&remote)
+                .arg(&worker),
+            "clone parallel test worker".to_owned(),
+        )?;
+        std::fs::write(writer.join("version"), "two\n")?;
+        command_ok(
+            Command::new("git")
+                .current_dir(&writer)
+                .args(["commit", "-am", "advance"]),
+            "commit concurrent test revision".to_owned(),
+        )?;
+        command_ok(
+            Command::new("git").current_dir(&writer).args(["push"]),
+            "push concurrent test revision".to_owned(),
+        )?;
+
+        synchronize_integration_checkout(&worker, true)?;
+
+        assert_eq!(
+            git_output(&worker, &["rev-parse", "HEAD"])?,
+            git_output(&writer, &["rev-parse", "HEAD"])?
+        );
+        assert_eq!(std::fs::read_to_string(worker.join("version"))?, "two\n");
+        Ok(())
+    }
 
     fn case() -> Case {
         Case {

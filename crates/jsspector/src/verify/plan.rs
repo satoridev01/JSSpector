@@ -9208,8 +9208,13 @@ module.exports = { activityValidators };\n";
         );
         xss.sink.api = "res.send".to_owned();
         xss.sink.arg = "render(text)".to_owned();
-        let skip = plan_with_source(&xss, None).expect_err("a body-only reflected XSS is not driven");
-        assert!(skip.0.contains("URL-placed input"), "reason was: {}", skip.0);
+        let skip =
+            plan_with_source(&xss, None).expect_err("a body-only reflected XSS is not driven");
+        assert!(
+            skip.0.contains("URL-placed input"),
+            "reason was: {}",
+            skip.0
+        );
     }
 
     #[test]
@@ -9217,10 +9222,7 @@ module.exports = { activityValidators };\n";
         // Routing reflected (HTTP-source) XSS to its own plan must not divert a DOM-source XSS away
         // from the existing static-page browser phase.
         let dom = dom_finding("location.search", "el.innerHTML", "web/app.js");
-        assert!(matches!(
-            plan_with_source(&dom, None),
-            Ok(Plan::Browser(_))
-        ));
+        assert!(matches!(plan_with_source(&dom, None), Ok(Plan::Browser(_))));
     }
 
     #[test]

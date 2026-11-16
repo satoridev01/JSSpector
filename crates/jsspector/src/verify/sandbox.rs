@@ -1830,9 +1830,10 @@ impl Session {
                 Some(executable) => executable,
                 None => {
                     return Outcome::Skipped {
-                        reason: "reflected XSS verification needs a Chromium/Chrome browser on the \
+                        reason:
+                            "reflected XSS verification needs a Chromium/Chrome browser on the \
                                  host; none was found"
-                            .to_owned(),
+                                .to_owned(),
                     };
                 }
             },
@@ -9868,7 +9869,10 @@ fn reflected_dom_excerpt(dom: &str, token: &str) -> String {
         .chars()
         .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
         .collect();
-    format!("…{}…", window.split_whitespace().collect::<Vec<_>>().join(" "))
+    format!(
+        "…{}…",
+        window.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
 }
 
 impl Drop for BrowserSession {
@@ -10997,7 +11001,10 @@ mod tests {
              export default { async fetch(request, env, ctx) { return app.fetch(request, env, ctx); } };\n",
         );
         assert_eq!(
-            app_dir(root, std::path::Path::new("workers/newsletter/src/index.ts")),
+            app_dir(
+                root,
+                std::path::Path::new("workers/newsletter/src/index.ts")
+            ),
             std::path::Path::new("workers/newsletter"),
         );
     }

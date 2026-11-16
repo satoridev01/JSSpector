@@ -34,9 +34,7 @@ type Breakout = (&'static str, fn(&str) -> String);
 /// neutralized by the server (escaped or re-encoded) and simply never executes.
 const BREAKOUTS: &[Breakout] = &[
     ("html-script", |call| format!("<script>{call}</script>")),
-    ("html-img", |call| {
-        format!("<img src=x onerror={call}>")
-    }),
+    ("html-img", |call| format!("<img src=x onerror={call}>")),
     ("html-attr-double", |call| {
         format!("\"><script>{call}</script>")
     }),
@@ -165,12 +163,20 @@ mod tests {
 
     #[test]
     fn a_query_probe_places_an_encoded_payload_in_the_named_parameter() {
-        let attempts = reflected_xss_attempts(&probe(Entry::Query("t".to_owned()), "/unsubscribe"), 1);
+        let attempts =
+            reflected_xss_attempts(&probe(Entry::Query("t".to_owned()), "/unsubscribe"), 1);
         assert_eq!(attempts.len(), BREAKOUTS.len());
-        assert!(attempts.iter().all(|a| a.request_target.starts_with("/unsubscribe?t=")));
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.request_target.starts_with("/unsubscribe?t="))
+        );
         // The single-quote breakout — the one that survives `encodeURIComponent` — is present and its
         // payload is a string-concatenation break-out carrying the write canary.
-        let js = attempts.iter().find(|a| a.context == "js-single-quote").unwrap();
+        let js = attempts
+            .iter()
+            .find(|a| a.context == "js-single-quote")
+            .unwrap();
         assert!(js.payload.starts_with("'-document.write(") && js.payload.ends_with(")-'"));
         // The percent-encoded single quote precedes the canary in the request target.
         assert!(js.request_target.contains("%27-document.write"));

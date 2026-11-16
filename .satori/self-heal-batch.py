@@ -96,6 +96,8 @@ def worker_loop(
         print(f"[worker {index}] starting {repository}", flush=True)
         environment = os.environ.copy()
         environment["JSSPECTOR_INTEGRATION_LOCK"] = str(integration_lock)
+        target_before = target.with_suffix(".before.json")
+        shutil.copyfile(target, target_before)
         try:
             run(
                 [
@@ -111,11 +113,24 @@ def worker_loop(
                 environment,
             )
         except subprocess.CalledProcessError as error:
+            shutil.copyfile(target_before, target)
             print(f"[worker {index}] FAILED {repository}: exit {error.returncode}", file=sys.stderr, flush=True)
             results.append((repository, "failed"))
+            dirty = output(["git", "status", "--porcelain"], worker)
+            ahead = output(["git", "rev-list", "--count", "@{upstream}..HEAD"], worker)
+            if dirty or ahead != "0":
+                print(
+                    f"[worker {index}] HALTED after {repository}: "
+                    f"checkout needs reconciliation (dirty={bool(dirty)} ahead={ahead})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return results
         else:
             print(f"[worker {index}] completed {repository}", flush=True)
             results.append((repository, "completed"))
+        finally:
+            target_before.unlink(missing_ok=True)
 
 
 def merge_targets(paths: list[Path]) -> dict:

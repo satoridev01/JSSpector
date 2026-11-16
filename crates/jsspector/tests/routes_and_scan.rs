@@ -1376,6 +1376,64 @@ fn next_middleware_auth_guards_file_routes_and_honors_public_prefixes() {
     assert_eq!(public["auth"], "none-detected");
 }
 
+/// Express registration methods return their router, so a module exporting the result of
+/// `router.all(...)` (or a chain rooted at a router variable) exports that router, and its
+/// routes take the prefix the importing app mounts it under.
+#[test]
+fn exported_registration_call_is_the_router_under_its_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "app.js",
+        "const express = require('express');\nconst app = express();\n\
+         app.use('/v1', require('./routes/v1'));\napp.use('/v2', require('./routes/v2'));\n\
+         module.exports = app;\n",
+    );
+    write(
+        root,
+        "routes/v1.js",
+        "const router = require('express').Router();\nconst request = require('request');\n\
+         module.exports = router.all('/fetch', (req, res) => {\n  const url = req.query.url;\n  \
+         request({ url: url }, (error, response, body) => res.send(body));\n});\n",
+    );
+    write(
+        root,
+        "routes/v2.js",
+        "const router = require('express').Router();\n\
+         module.exports = router.get('/a', (req, res) => res.end()).post('/b', (req, res) => res.end());\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for expected in ["ALL /v1/fetch", "GET /v2/a", "POST /v2/b"] {
+        assert!(
+            list.contains(&expected.to_owned()),
+            "{expected} not in {list:?}"
+        );
+    }
+    assert!(!list.iter().any(|r| r == "ALL /fetch"), "{list:?}");
+
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let ssrf = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["class"] == "ssrf")
+        .expect("ssrf finding");
+    assert_eq!(ssrf["entry"], "ALL /v1/fetch");
+}
+
 #[test]
 fn route_shapes_array_paths_verb_first_chains_and_prefixes() {
     let dir = tempfile::tempdir().unwrap();

@@ -6877,6 +6877,8 @@ impl Walker<'_> {
                                 .or_else(|| property.clone())
                         }
                         Expression::ArrowFunctionExpression(_) => property.clone(),
+                        // `module.exports = router.all('/cors', h)`: exports `router`.
+                        right @ Expression::CallExpression(_) => self.registration_receiver(right),
                         _ => None,
                     };
                     let (head, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
@@ -6892,6 +6894,7 @@ impl Walker<'_> {
                             .map(str::to_owned),
                     };
                     if export.is_some()
+                        && local.is_none()
                         && let Expression::CallExpression(c) = assign.right.get_inner_expression()
                         && self.chain_base(&c.callee, env).is_some()
                     {
@@ -11445,6 +11448,34 @@ impl Walker<'_> {
                             return Some((self.chain_receiver.clone(), path, prefix));
                         }
                     }
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The router variable a registration call returns: `router.all('/cors', h)` and
+    /// `router.get('/a', h).post('/b', h)` evaluate to `router`, since registration and mount
+    /// methods return their receiver. `.route('/book')` returns a route, not the router.
+    fn registration_receiver(&self, expr: &Expression<'_>) -> Option<String> {
+        let model = m();
+        let mut object = expr.get_inner_expression();
+        for _ in 0..32 {
+            match object {
+                Expression::Identifier(id) => {
+                    let name = id.name.as_str();
+                    return self.is_router(name).then(|| name.to_owned());
+                }
+                Expression::CallExpression(c) => {
+                    let link = c.callee.get_inner_expression().as_member_expression()?;
+                    let method = link.static_property_name().and_then(|n| n.as_str())?;
+                    if !(has(&model.route_methods, method) || has(&model.mount_methods, method))
+                        || has(&model.route_chain_methods, method)
+                    {
+                        return None;
+                    }
+                    object = link.object().get_inner_expression();
                 }
                 _ => return None,
             }

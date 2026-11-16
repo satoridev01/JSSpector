@@ -104,12 +104,16 @@ pub fn referrer_payload(probe: &BrowserProbe, canary: &Canary, nonce: u32) -> (S
 
 /// A canary that, if executed, calls the marker service carrying `token` — and does nothing else.
 /// HTML context uses an image's error handler (runs even though `<script>` in `innerHTML` does
-/// not); a navigation sink uses a `javascript:` URL.
+/// not); a navigation sink uses a `javascript:` URL. A code-from-URL sink (a dynamic `import()`)
+/// takes a plain module URL aimed at the marker: whatever specifier the app derives from it
+/// (`${base}/x/y.mjs`) is then fetched from the marker, which records the token — no markup, because
+/// the value is used directly as a URL, not parsed as HTML or JS.
 fn canary_payload(sink: BrowserSink, canary: &Canary, token: &str) -> String {
-    let call = format!("fetch('{}')", canary.service_url_for_token(token));
+    let service = canary.service_url_for_token(token);
     match sink {
-        BrowserSink::Html => format!("<img src=x onerror=\"{call}\">"),
-        BrowserSink::Navigation => format!("javascript:{call}"),
+        BrowserSink::Html => format!("<img src=x onerror=\"fetch('{service}')\">"),
+        BrowserSink::Navigation => format!("javascript:fetch('{service}')"),
+        BrowserSink::Import => service,
     }
 }
 
@@ -208,6 +212,40 @@ mod tests {
         let a = browser_attempts(&probe(UrlVector::Href, BrowserSink::Html), "/p", &canary, 1);
         assert!(a.iter().any(|x| x.url.contains('?')));
         assert!(a.iter().any(|x| x.url.contains('#')));
+    }
+
+    #[test]
+    fn an_import_probe_places_a_marker_module_url_in_the_mined_param() {
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(UrlVector::Href, BrowserSink::Import);
+        // A harness that reads an attacker-controlled module base off its own URL.
+        p.params = vec!["base".to_owned()];
+        let a = browser_attempts(&p, "/harness.html", &canary, 1);
+        // The mined parameter is driven first, carrying the marker service URL (percent-encoded) as a
+        // plain value — no HTML/JS markup, because the app uses it directly as a module URL.
+        let first = &a[0];
+        assert!(
+            first.url.starts_with("/harness.html?base="),
+            "{}",
+            first.url
+        );
+        assert_eq!(first.token, "tok-1");
+        assert!(!first.url.contains("onerror") && !first.url.contains("javascript"));
+        // The decoded payload is exactly the marker URL for this probe's token.
+        let expected = encode(&canary.service_url_for_token("tok-1"));
+        assert!(
+            first.url.contains(&expected),
+            "{} missing {}",
+            first.url,
+            expected
+        );
+    }
+
+    #[test]
+    fn an_import_canary_payload_is_a_bare_marker_url() {
+        let canary = Canary::new("t".to_owned());
+        let payload = canary_payload(BrowserSink::Import, &canary, "t-1");
+        assert_eq!(payload, canary.service_url_for_token("t-1"));
     }
 
     #[test]

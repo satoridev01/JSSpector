@@ -476,6 +476,11 @@ pub enum BrowserSink {
     Html,
     /// Used to navigate (`location =`, `location.href =`, `window.open`, `location.assign`).
     Navigation,
+    /// Loaded as code from a URL: a dynamic `import()` of a computed module specifier (or a worker's
+    /// `importScripts`). The attacker value is itself a URL — the origin the module is fetched from —
+    /// so the payload is a module URL pointing at the marker, not an HTML/JS snippet. The page
+    /// fetching the module from the marker origin is the reproduction.
+    Import,
 }
 
 /// The sandbox's decision for a finding: drive it, or skip it with a reason. The source-free
@@ -550,24 +555,38 @@ fn reflected_xss_probe(finding: &Finding, source: Option<&str>) -> Result<Reflec
     })
 }
 
-/// A DOM-source XSS or client-side redirect the browser phase can drive, or why not.
+/// A DOM-source XSS, client-side redirect, or code-loaded-from-a-URL finding the browser phase can
+/// drive, or why not.
 fn browser_probe(finding: &Finding, source: Option<&str>) -> Result<BrowserProbe, Skip> {
-    if finding.class != VulnClass::Xss {
-        return Err(Skip(format!(
-            "{} from a DOM source is not driven by verify v1 (DOM XSS and client-side redirects only)",
-            finding.class.name()
-        )));
-    }
+    let sink = match finding.class {
+        VulnClass::Xss => browser_sink(&finding.sink.api).ok_or_else(|| {
+            Skip(format!(
+                "the sink `{}` is not an HTML or navigation sink the browser phase recognizes",
+                finding.sink.api
+            ))
+        })?,
+        // A DOM-source code injection whose sink loads code from a URL (a dynamic `import()` of a
+        // computed specifier) runs attacker-chosen code in the victim's browser when the attacker
+        // controls where the module is fetched from. The browser phase drives it by pointing the
+        // URL at the marker origin and confirming the page fetches the module from there.
+        VulnClass::CodeInjection => code_url_sink(&finding.sink.api).ok_or_else(|| {
+            Skip(format!(
+                "the sink `{}` does not load code from a URL the browser phase can repoint",
+                finding.sink.api
+            ))
+        })?,
+        other => {
+            return Err(Skip(format!(
+                "{} from a DOM source is not driven by verify v1 (DOM XSS, client-side redirect \
+                 and code loaded from a URL only)",
+                other.name()
+            )));
+        }
+    };
     let vector = url_vector(&finding.source.expr).ok_or_else(|| {
         Skip(format!(
             "the DOM source `{}` is not a URL input the browser phase can place a payload in",
             finding.source.expr
-        ))
-    })?;
-    let sink = browser_sink(&finding.sink.api).ok_or_else(|| {
-        Skip(format!(
-            "the sink `{}` is not an HTML or navigation sink the browser phase recognizes",
-            finding.sink.api
         ))
     })?;
     Ok(BrowserProbe {
@@ -688,6 +707,16 @@ fn url_vector(expr: &str) -> Option<UrlVector> {
     } else {
         None
     }
+}
+
+/// Classifies a browser code sink that loads executable code from a URL the browser phase can
+/// repoint at the marker: a dynamic `import()` of a computed specifier, or a worker's
+/// `importScripts`. Returns the `Import` sink so the payload is delivered as a module URL rather
+/// than an HTML/JS snippet. Nothing here is tied to a particular app — it keys off the sink API the
+/// static engine already names.
+fn code_url_sink(api: &str) -> Option<BrowserSink> {
+    let last = api.trim().rsplit('.').next().unwrap_or(api).trim();
+    matches!(last, "import" | "importScripts").then_some(BrowserSink::Import)
 }
 
 /// Classifies a browser sink as writing HTML or navigating.
@@ -9629,6 +9658,48 @@ module.exports = { activityValidators };\n";
         f.source.kind = "dom";
         let err = plan(&f).unwrap_err();
         assert!(err.0.contains("not a URL input"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_dom_code_injection_into_a_dynamic_import_is_a_browser_import_probe() {
+        // A harness reads an attacker-controlled URL off its own page URL and builds the module
+        // specifier a dynamic `import()` loads from it (`import(`${base}/pdfjs/pdf.mjs`)`). The source
+        // is a DOM URL input and the sink loads code from that URL, so the browser phase drives it by
+        // repointing the URL at the marker origin.
+        let src = "const BASE = new URL(new URL(window.location.href).searchParams.get('base') \
+                   || './out', window.location.href).href;\n\
+                   const pdfjsLib = await import(`${BASE}/pdfjs/pdf.mjs`);";
+        let mut f = dom_finding("window.location.href", "import", "harness.js");
+        f.class = VulnClass::CodeInjection;
+        f.entry = Some("PAGE harness.js".to_owned());
+        let plan = plan_with_source(&f, Some(src)).expect("a DOM import injection should plan");
+        let Plan::Browser(probe) = plan else {
+            panic!("expected a browser probe, got {plan:?}");
+        };
+        assert_eq!(probe.vector, UrlVector::Href);
+        assert_eq!(probe.sink, BrowserSink::Import);
+        assert_eq!(probe.file, "harness.js");
+        // The exact parameter the harness reads off its URL is mined, so the real vector is driven.
+        assert_eq!(probe.params, vec!["base".to_owned()]);
+    }
+
+    #[test]
+    fn code_url_sinks_are_classified_and_non_url_code_sinks_are_not() {
+        assert_eq!(code_url_sink("import"), Some(BrowserSink::Import));
+        assert_eq!(code_url_sink("importScripts"), Some(BrowserSink::Import));
+        // A string-evaluating sink does not load code from a URL the browser phase can repoint.
+        assert_eq!(code_url_sink("eval"), None);
+        assert_eq!(code_url_sink("new Function"), None);
+    }
+
+    #[test]
+    fn a_dom_code_injection_into_a_string_eval_sink_is_skipped_with_a_reason() {
+        // `eval` of a DOM value is a real code injection, but it is not a URL the browser phase can
+        // repoint at the marker, so it is skipped with a reason rather than driven incorrectly.
+        let mut f = dom_finding("location.hash.slice(1)", "eval", "app.js");
+        f.class = VulnClass::CodeInjection;
+        let err = plan_with_source(&f, None).unwrap_err();
+        assert!(err.0.contains("does not load code from a URL"), "{}", err.0);
     }
 
     #[test]

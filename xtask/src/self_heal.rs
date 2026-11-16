@@ -100,7 +100,7 @@ pub fn run(options: &Options) -> Result<()> {
             options
                 .repo
                 .as_ref()
-                .is_none_or(|wanted| wanted.eq_ignore_ascii_case(&case.repository))
+                .is_none_or(|wanted| repository_selection_matches(wanted, case))
         })
         .filter(|case| {
             options.case.is_some()
@@ -252,13 +252,32 @@ fn validate_options(options: &Options) -> Result<()> {
     if options.repair && options.repair_budget < Duration::from_secs(60) {
         bail!("--repair-budget must be at least 60 seconds");
     }
-    if options.repo.as_deref().is_some_and(|repo| {
+    if options.repo.as_deref().is_some_and(|selection| {
+        let repo = selection
+            .rsplit_once('@')
+            .map_or(selection, |(repo, _)| repo);
         repo.split_once('/')
             .is_none_or(|(owner, name)| owner.is_empty() || name.is_empty())
     }) {
-        bail!("--repo must be an owner/repository name");
+        bail!("--repo must be an owner/repository[@revision] name");
     }
     Ok(())
+}
+
+fn repository_selection_matches(selection: &str, case: &Case) -> bool {
+    let (repository, revision) = selection
+        .rsplit_once('@')
+        .map_or((selection, None), |(repository, revision)| {
+            (repository, Some(revision))
+        });
+    repository.eq_ignore_ascii_case(&case.repository)
+        && revision.is_none_or(|wanted| {
+            !wanted.is_empty()
+                && case
+                    .revision
+                    .to_ascii_lowercase()
+                    .starts_with(&wanted.to_ascii_lowercase())
+        })
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -1338,5 +1357,18 @@ mod tests {
 
         assert!(!has_dynamic_proof(&incomplete));
         assert!(has_dynamic_proof(&complete));
+    }
+
+    #[test]
+    fn repository_selection_accepts_head_full_revision_and_prefix() {
+        let case = case();
+        assert!(repository_selection_matches("OWNER/REPO", &case));
+        assert!(repository_selection_matches(
+            "owner/repo@0123456789abcdef",
+            &case
+        ));
+        assert!(repository_selection_matches("owner/repo@012345", &case));
+        assert!(!repository_selection_matches("owner/other", &case));
+        assert!(!repository_selection_matches("owner/repo@abcdef", &case));
     }
 }

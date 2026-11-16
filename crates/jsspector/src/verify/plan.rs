@@ -5887,6 +5887,28 @@ fn matching_close_paren(text: &str, open: usize) -> Option<usize> {
     delimiter_close(text, open, b'(', b')')
 }
 
+/// The index of the `(` matching the `)` at `close` in `text`, scanning backward and honoring nesting.
+/// The mirror of [`matching_close_paren`].
+fn matching_open_paren(text: &str, close: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = close as isize;
+    while i >= 0 {
+        match bytes.get(i as usize).copied()? {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i as usize);
+                }
+            }
+            _ => {}
+        }
+        i -= 1;
+    }
+    None
+}
+
 /// Forward-match an open delimiter to its close, honoring nesting. String- and comment-naive, as the
 /// rest of this module's brace handling is: the handler bodies it reads keep their delimiters
 /// balanced within string and template literals.
@@ -6390,7 +6412,10 @@ fn presence_guard_fields(source: &str, anchors: &[u32]) -> Vec<String> {
     let (Some(&lo), Some(&hi)) = (offsets.iter().min(), offsets.iter().max()) else {
         return Vec::new();
     };
-    let Some((open, close)) = enclosing_block(source, lo) else {
+    // Scope to the enclosing *function* body, not the innermost brace block: the lowest flow anchor can
+    // sit inside a non-scope brace pair (a multi-line `{ ... } = req.query` destructure), which would
+    // otherwise hide the handler's early-return presence guards from the scan.
+    let Some((open, close)) = enclosing_function_block(source, lo) else {
         return Vec::new();
     };
     let upper = hi.min(close);
@@ -6434,6 +6459,66 @@ fn enclosing_block(source: &str, offset: usize) -> Option<(usize, usize)> {
     }
     let open = *stack.last()?;
     Some((open, matching_close_brace(source, open)?))
+}
+
+/// The nearest ancestor brace block of `offset` whose open brace begins a *function body* — an arrow
+/// `=> {` or a `function (...) {` / method `name(...) {` — rather than a control block, object literal
+/// or destructuring pattern. Handler-wide guard mining needs the whole function body as its scope, but
+/// the innermost enclosing block can be a non-scope brace pair: a multi-line `{ ... } = req.query`
+/// destructuring whose interior lines are flow anchors, or an object literal. Walking out to the
+/// enclosing function recovers the real handler body in those cases. Falls back to the innermost
+/// enclosing block when no function body encloses the offset (top-level code), preserving the prior
+/// behavior. Mined by brace/paren matching; nothing here is tied to a specific app.
+fn enclosing_function_block(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let mut opens = Vec::new();
+    for (at, byte) in source.bytes().enumerate().take(offset) {
+        match byte {
+            b'{' => opens.push(at),
+            b'}' => {
+                opens.pop();
+            }
+            _ => {}
+        }
+    }
+    for &open in opens.iter().rev() {
+        if is_function_body_open(source, open) {
+            return matching_close_brace(source, open).map(|close| (open, close));
+        }
+    }
+    opens
+        .last()
+        .and_then(|&open| matching_close_brace(source, open).map(|close| (open, close)))
+}
+
+/// Whether the `{` at `open` begins a function body: it directly follows an arrow (`=> {`) or a `)`
+/// that closes a parameter list — a `)` whose matching `(` is not preceded by a control keyword
+/// (`if`/`for`/`while`/`switch`/`catch`/`with`), whose `(...)` is a condition rather than parameters.
+/// String/comment-naive, like the rest of this module's brace handling.
+fn is_function_body_open(source: &str, open: usize) -> bool {
+    let pre = source[..open].trim_end();
+    if pre.ends_with("=>") {
+        return true;
+    }
+    if pre.ends_with(')') {
+        let close_paren = pre.len() - 1;
+        if let Some(open_paren) = matching_open_paren(source, close_paren) {
+            let before = source[..open_paren].trim_end();
+            let word: String = before
+                .bytes()
+                .rev()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            return !matches!(
+                word.as_str(),
+                "if" | "for" | "while" | "switch" | "catch" | "with"
+            );
+        }
+    }
+    false
 }
 
 /// The source of the braced block that encloses `line` (a route handler's body), used to resolve a
@@ -8879,6 +8964,66 @@ module.exports = { activityValidators };\n";
                 &[line("const { email"), line("User.findOne")],
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_multiline_destructure_anchor_still_finds_the_handlers_presence_guards() {
+        // A query SSRF where the handler destructures its query over several lines and the payload
+        // field (`umamiUrl`) is one of the inner lines, so a flow anchor falls *inside* the `{ ... } =
+        // req.query` braces. The sink `fetch` sits in a helper the handler calls. The two other query
+        // fields (`website`, `token`) are required by early-return presence guards (`if (!website)
+        // return ...`). The guard scan must scope to the whole handler body — not the destructuring
+        // braces the lowest anchor lands in — or neither required sibling is supplied and the handler
+        // redirects before the sink.
+        let source = r#"
+          app.get("/api/:metric", async (req, res) => {
+            const {
+              website,
+              token,
+              style = "for-the-badge",
+              umamiUrl,
+            } = req.query;
+            if (!website) {
+              return res.redirect("https://img.shields.io/badge/Error-red");
+            }
+            if (!token) {
+              return res.redirect("https://img.shields.io/badge/Error-red");
+            }
+            const data = await fetchUmamiData(umamiUrl, website, token, metric);
+            res.send(data);
+          });
+          async function fetchUmamiData(umamiUrl, websiteId, token, metric) {
+            const baseUrl = umamiUrl.replace(/\/$/, "");
+            const url = `${baseUrl}/realtime/${websiteId}`;
+            const response = await fetch(url, { headers: { "x-api-key": token } });
+            return await response.json();
+          }
+        "#;
+        let line = |needle: &str| {
+            source
+                .lines()
+                .position(|text| text.contains(needle))
+                .map(|index| index as u32 + 1)
+                .unwrap()
+        };
+        // Anchors mirror a real finding: the source read sits on `umamiUrl,` inside the destructure,
+        // the call site, and the sink in the helper.
+        let anchors = [
+            line("umamiUrl,"),
+            line("} = req.query;"),
+            line("await fetchUmamiData("),
+            line("const url = `${baseUrl}"),
+            line("const response = await fetch"),
+        ];
+        let required = guard_required_fields(source, "query", "umamiUrl", &anchors);
+        assert!(
+            required.contains(&("website".to_owned(), "jsspector".to_owned())),
+            "{required:?}"
+        );
+        assert!(
+            required.contains(&("token".to_owned(), "jsspector".to_owned())),
+            "{required:?}"
         );
     }
 

@@ -7574,9 +7574,74 @@ pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::Pat
         || is_route_handler_module(&root.join(file)))
         && let Some(parent) = file.parent()
     {
-        return parent.to_path_buf();
+        return working_dir_for_cwd_paths(root, file, parent);
     }
     std::path::PathBuf::new()
+}
+
+/// The launch directory for a server file that is run in place. Normally its own directory, but a
+/// file that opens working-directory-relative paths at startup (`readFileSync("config.json")`,
+/// `resolve(process.cwd(), "public")`) was written to be run from an enclosing directory — a
+/// `scripts/serve.mjs` invoked as `node scripts/serve.mjs` from the project root. When those paths
+/// are missing beside the file but all present in an enclosing directory of the checkout, launch
+/// from the nearest such directory; otherwise the server aborts on `ENOENT` before it listens.
+fn working_dir_for_cwd_paths(
+    root: &std::path::Path,
+    file: &std::path::Path,
+    own: &std::path::Path,
+) -> std::path::PathBuf {
+    let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+        return own.to_path_buf();
+    };
+    let paths = cwd_relative_literals(&src);
+    let all_exist =
+        |dir: &std::path::Path| paths.iter().all(|path| root.join(dir).join(path).exists());
+    if paths.is_empty() || all_exist(own) {
+        return own.to_path_buf();
+    }
+    own.ancestors()
+        .skip(1)
+        .find(|dir| all_exist(dir))
+        .map_or_else(|| own.to_path_buf(), std::path::Path::to_path_buf)
+}
+
+/// Plain relative path literals a module resolves against the process working directory: the
+/// first string argument of a synchronous/stream `fs` read, and a literal joined onto
+/// `process.cwd()`. Paths anchored to `__dirname`/`import.meta` are not literals here, so they are
+/// never counted; absolute, parent-escaping and templated paths are ignored.
+fn cwd_relative_literals(src: &str) -> Vec<String> {
+    const CALLS: [&str; 7] = [
+        "readFileSync(",
+        "readFile(",
+        "existsSync(",
+        "statSync(",
+        "readdirSync(",
+        "createReadStream(",
+        "process.cwd(),",
+    ];
+    let mut out = Vec::new();
+    for call in CALLS {
+        for (at, _) in src.match_indices(call) {
+            let rest = src[at + call.len()..].trim_start();
+            let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+                continue;
+            };
+            let Some(literal) = rest[1..].split(quote).next() else {
+                continue;
+            };
+            let literal = literal.trim_start_matches("./");
+            let candidate = std::path::Path::new(literal);
+            let plain = !literal.is_empty()
+                && !literal.contains(['\\', '\n', '$'])
+                && candidate
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)));
+            if plain && !out.iter().any(|seen| seen == literal) {
+                out.push(literal.to_owned());
+            }
+        }
+    }
+    out
 }
 
 /// The identity of the server process that serves a finding's route, used to decide when two
@@ -12450,6 +12515,73 @@ mod tests {
         // The non-server helper, even though it exists, is never launched this way.
         assert_eq!(app_dir(root, path("tools/viewer/app.js")), path(""));
         assert_eq!(start_command(&root.join(&app), Some(path("app.js"))), None);
+    }
+
+    #[test]
+    fn a_standalone_server_reading_cwd_relative_files_runs_from_the_enclosing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = std::path::Path::new;
+        // A preview server kept under `scripts/` that loads its config and static root relative to
+        // the working directory: it is meant to run as `node scripts/preview.mjs` from the project.
+        write(root, "package.json", r#"{"private":true}"#);
+        write(root, "site.json", "{}");
+        write(root, "public/index.html", "<p>hi</p>");
+        write(
+            root,
+            "scripts/preview.mjs",
+            "import { createServer } from 'node:http';\n\
+             import { readFileSync } from 'node:fs';\n\
+             import { resolve } from 'node:path';\n\
+             const ROOT = resolve(process.cwd(), \"public\");\n\
+             const cfg = JSON.parse(readFileSync(\"site.json\", \"utf8\"));\n\
+             createServer((req, res) => res.end(readFileSync(ROOT + req.url))).listen(8000);\n",
+        );
+        let app = app_dir(root, path("scripts/preview.mjs"));
+        assert_eq!(app, path(""));
+        assert_eq!(
+            start_command(&root.join(&app), Some(path("scripts/preview.mjs"))).as_deref(),
+            Some(r#"["node","scripts/preview.mjs"]"#)
+        );
+        assert_eq!(
+            session_key(root, &app, path("scripts/preview.mjs")),
+            path("scripts/preview.mjs")
+        );
+
+        // When the files are beside the server (or nowhere in the checkout), its own directory is
+        // still the launch directory.
+        write(
+            root,
+            "tools/local/server.js",
+            "const http=require('http');const fs=require('fs');\n\
+             const t=fs.readFileSync('./page.html');\n\
+             http.createServer((q,s)=>s.end(t)).listen(8000);\n",
+        );
+        write(root, "tools/local/page.html", "x");
+        write(root, "page.html", "x");
+        assert_eq!(
+            app_dir(root, path("tools/local/server.js")),
+            path("tools/local")
+        );
+        write(
+            root,
+            "tools/missing/server.js",
+            "const http=require('http');const fs=require('fs');\n\
+             const t=fs.readFileSync('nowhere.txt');\n\
+             http.createServer((q,s)=>s.end(t)).listen(8000);\n",
+        );
+        assert_eq!(
+            app_dir(root, path("tools/missing/server.js")),
+            path("tools/missing")
+        );
+        // `__dirname`-anchored and parent-escaping paths are not working-directory literals.
+        assert_eq!(
+            cwd_relative_literals(
+                "readFileSync(join(__dirname,'a.json'));existsSync('../b');readFile(`${x}`);\
+                 readFileSync('/etc/c');statSync(\"d/e.txt\")"
+            ),
+            vec!["d/e.txt".to_owned()]
+        );
     }
 
     #[test]

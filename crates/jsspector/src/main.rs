@@ -121,11 +121,24 @@ enum Format {
 #[derive(Args)]
 struct ScanArgs {
     /// File or directory to scan.
-    #[arg(required_unless_present = "repo", conflicts_with = "repo")]
+    #[arg(
+        required_unless_present_any = ["repo", "repos"],
+        conflicts_with_all = ["repo", "repos"]
+    )]
     path: Option<PathBuf>,
     /// Clone and scan a GitHub repository, optionally pinned as OWNER/REPO@REVISION.
-    #[arg(long, value_name = "OWNER/REPO[@REVISION]", conflicts_with = "path")]
+    #[arg(
+        long,
+        value_name = "OWNER/REPO[@REVISION]",
+        conflicts_with_all = ["path", "repos"]
+    )]
     repo: Option<String>,
+    /// Complete the repositories listed in FILE (`OWNER/REPO[@REVISION]`, one per line).
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["path", "repo"])]
+    repos: Option<PathBuf>,
+    /// Repository workers used with --repos.
+    #[arg(long, value_name = "N", requires = "repos")]
+    parallel: Option<NonZeroUsize>,
     /// Number of threads [default: all available cores, or RAYON_NUM_THREADS].
     #[arg(long, value_name = "N")]
     threads: Option<NonZeroUsize>,
@@ -801,7 +814,62 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
     ))
 }
 
+fn self_heal_repository_batch(
+    repositories: &Path,
+    parallel: NonZeroUsize,
+) -> Result<ExitCode, String> {
+    let compiled_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "the compiled JSSpector source root is unavailable".to_owned())?;
+    let source_root = std::env::var_os("JSSPECTOR_SOURCE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| compiled_root.to_path_buf());
+    let workflow = source_root.join(".satori/self-heal-batch.py");
+    if !workflow.is_file() {
+        return Err(format!(
+            "parallel scanner repair needs a JSSpector source checkout; set \
+             JSSPECTOR_SOURCE_ROOT (looked for {})",
+            workflow.display()
+        ));
+    }
+    let repositories = if repositories.is_absolute() {
+        repositories.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("read current directory: {error}"))?
+            .join(repositories)
+    };
+    eprintln!(
+        "jsspector: completing repositories from {} with {} workers",
+        repositories.display(),
+        parallel
+    );
+    let status = ProcessCommand::new("python3")
+        .arg(workflow)
+        .args(["--repos", repositories.to_string_lossy().as_ref()])
+        .args(["--parallel", &parallel.to_string()])
+        .current_dir(&source_root)
+        .status()
+        .map_err(|error| format!("start parallel scanner repair: {error}"))?;
+    Ok(ExitCode::from(
+        status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(EXIT_ENGINE),
+    ))
+}
+
 fn scan(args: &ScanArgs) -> ExitCode {
+    if let Some(repositories) = args.repos.as_deref() {
+        return match self_heal_repository_batch(
+            repositories,
+            args.parallel.unwrap_or(NonZeroUsize::MIN),
+        ) {
+            Ok(code) => code,
+            Err(error) => fail(EXIT_ENGINE, error),
+        };
+    }
     if let Some(repository) = args.repo.as_deref()
         && std::env::var_os("JSSPECTOR_SELF_HEAL_ACTIVE").is_none()
     {

@@ -99,10 +99,21 @@ jsspector scan --repo owner/repository
 jsspector scan --repo owner/repository@revision
 ```
 
+To complete a pinned corpus with two independent workers:
+
+```sh
+python3 .satori/pending-repos.py --output .satori/pending-repos.txt
+jsspector scan --repos .satori/pending-repos.txt --parallel 2
+```
+
+The list contains one `owner/repository@revision` per line. Workers diagnose and prepare repairs in
+independent JSSpector clones. Integration, exact dynamic revalidation, commits and pushes are
+serialized, and the pending list is regenerated after recovered identities are merged.
+
 The repair agent works in an isolated JSSpector worktree and cannot edit the scanned repository,
 benchmark or trusted controller. A candidate is incorporated only after the controller independently
-rebuilds the scanner, reproduces the exact finding with a structured PoC and replays the accumulated
-verified corpus. Validated generations are committed and pushed so another computer starts from the
-new capability. This standalone flow requires authenticated Satori, repair-agent and GitHub CLIs;
+rebuilds the scanner and reproduces the exact finding with a structured PoC. Validated generations
+are committed and pushed so another computer starts from the new capability. This standalone flow
+requires authenticated Satori, repair-agent and GitHub CLIs;
 it does not require a supervising agent. Organization 12 is the default and can be overridden with
 `SATORI_ORGANIZATION`.

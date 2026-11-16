@@ -189,6 +189,11 @@ pub fn run(options: &Options) -> Result<()> {
         }
     }
 
+    // Batch workers diagnose and repair in independent full clones. They may do that expensive work
+    // concurrently, but only one worker at a time may integrate and push a validated generation.
+    // Ordinary single-repository runs do not set this environment variable and keep their existing
+    // per-checkout lock semantics.
+    let _integration_lock = acquire_integration_lock()?;
     if let Some(repair) = workspace {
         let generation = git_output(&repair.path, &["rev-parse", "HEAD"])?;
         if generation.trim() != repair.base {
@@ -214,6 +219,31 @@ pub fn run(options: &Options) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn acquire_integration_lock() -> Result<Option<RepositoryLock>> {
+    let Some(path) = std::env::var_os("JSSPECTOR_INTEGRATION_LOCK").map(PathBuf::from) else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create integration lock directory {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open integration lock {}", path.display()))?;
+    eprintln!(
+        "self-heal: waiting to integrate the validated generation ({})",
+        path.display()
+    );
+    file.lock_exclusive()
+        .with_context(|| format!("lock integration coordinator {}", path.display()))?;
+    eprintln!("self-heal: integration turn acquired");
+    Ok(Some(RepositoryLock { _file: file }))
 }
 
 fn acquire_repository_lock(options: &Options) -> Result<RepositoryLock> {

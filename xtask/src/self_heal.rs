@@ -24,6 +24,7 @@ pub struct Options {
     pub targets: PathBuf,
     pub cache: PathBuf,
     pub case: Option<String>,
+    pub repo: Option<String>,
     pub limit: Option<usize>,
     pub repair: bool,
     pub push: bool,
@@ -96,7 +97,14 @@ pub fn run(options: &Options) -> Result<()> {
                 .is_none_or(|wanted| wanted == &case.finding_id)
         })
         .filter(|case| {
+            options
+                .repo
+                .as_ref()
+                .is_none_or(|wanted| wanted.eq_ignore_ascii_case(&case.repository))
+        })
+        .filter(|case| {
             options.case.is_some()
+                || options.repo.is_some()
                 || (case
                     .scanner_fingerprint
                     .as_deref()
@@ -243,6 +251,12 @@ fn validate_options(options: &Options) -> Result<()> {
     }
     if options.repair && options.repair_budget < Duration::from_secs(60) {
         bail!("--repair-budget must be at least 60 seconds");
+    }
+    if options.repo.as_deref().is_some_and(|repo| {
+        repo.split_once('/')
+            .is_none_or(|(owner, name)| owner.is_empty() || name.is_empty())
+    }) {
+        bail!("--repo must be an owner/repository name");
     }
     Ok(())
 }

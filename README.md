@@ -113,6 +113,12 @@ Use `cargo xtask self-heal --no-repair --case FINDING_ID` to diagnose one case w
 JSSpector. Repair mode requires a clean checkout plus authenticated `satori-v2` and `claude` CLIs.
 It is a standalone workflow: Codex or another supervising agent is not required.
 
+To exercise only the unresolved findings from one repository:
+
+```sh
+SATORI_ORGANIZATION=12 .satori/self-heal.sh --repo owner/repository
+```
+
 For shared learning from different computers, use the synchronized entry point:
 
 ```sh

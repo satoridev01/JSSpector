@@ -96,8 +96,11 @@ enum Task {
         #[arg(long, default_value = "target/self-heal")]
         cache: std::path::PathBuf,
         /// Only recover this historical finding ID.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "repo")]
         case: Option<String>,
+        /// Recover unresolved historical findings only for this owner/repository.
+        #[arg(long, value_name = "OWNER/REPO", conflicts_with = "case")]
+        repo: Option<String>,
         /// Recover at most this many unresolved cases.
         #[arg(long)]
         limit: Option<usize>,
@@ -210,6 +213,7 @@ fn main() -> Result<()> {
             targets,
             cache,
             case,
+            repo,
             limit,
             no_repair,
             push,
@@ -239,6 +243,7 @@ fn main() -> Result<()> {
                 targets,
                 cache,
                 case,
+                repo,
                 limit,
                 repair: !no_repair,
                 push,

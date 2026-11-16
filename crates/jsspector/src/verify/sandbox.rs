@@ -9898,7 +9898,15 @@ impl BrowserSession {
         self.nonce += 1;
         let page = match self.find_page(&probe.file) {
             Ok(page) => page,
-            Err(reason) => return Outcome::Skipped { reason },
+            Err(reason) => {
+                // A bookmarklet (a `javascript:` script) has no host page: the victim runs it on an
+                // attacker-chosen page, so the attacker controls the URL the script reads. Drive it
+                // as such — synthesize the host and carry the payload in the URL — before giving up.
+                if let Some(source) = self.bookmarklet_source(&probe.file) {
+                    return self.exercise_bookmarklet(probe, &source);
+                }
+                return Outcome::Skipped { reason };
+            }
         };
         let attempts = super::browser::browser_attempts(probe, &page, &self.canary, self.nonce);
         let referrer = super::browser::via_referrer(probe)
@@ -9930,6 +9938,38 @@ impl BrowserSession {
                         return browser_verified(&attempt.url, &attempt.token);
                     }
                 }
+            }
+        }
+        Outcome::NotReproduced { tried }
+    }
+
+    /// The bookmarklet body of `script` if it is one: a script whose first non-space bytes are
+    /// `javascript:`. Returns the full source (the leading `javascript:` is stripped server-side
+    /// when the body is served). `None` for an ordinary script, which the normal host-page flow
+    /// handles.
+    fn bookmarklet_source(&self, script: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.root.join(script)).ok()?;
+        let trimmed = text.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+        let lead: String = trimmed.chars().take("javascript:".len()).collect();
+        lead.eq_ignore_ascii_case("javascript:").then_some(text)
+    }
+
+    /// Drives a bookmarklet: for each mined URL shape, loads the synthesized `/__jss/bm` host with
+    /// the payload in the fragment and reports verified on the first marker hit. The reproduction is
+    /// the attacker-crafted page URL the victim runs the bookmarklet on (the fragment), not the
+    /// driver.
+    fn exercise_bookmarklet(
+        &self,
+        probe: &super::plan::BrowserProbe,
+        source: &str,
+    ) -> Outcome {
+        let attempts =
+            super::browser::bookmarklet_attempts(&probe.file, source, &self.canary, self.nonce);
+        let mut tried = 0usize;
+        for attempt in attempts.iter().take(MAX_HARNESS_PAGES * MAX_HARNESS_ATTEMPTS_PER_PAGE) {
+            tried += 1;
+            if self.drive(&attempt.url, &attempt.token, None) {
+                return bookmarklet_verified(&probe.file, &attempt.url, &attempt.token);
             }
         }
         Outcome::NotReproduced { tried }
@@ -10327,6 +10367,35 @@ fn browser_verified(attempt_url: &str, hit: &str) -> Outcome {
     }
 }
 
+/// The verified outcome for a bookmarklet whose canary reached the marker: the reproduction is the
+/// attacker-crafted page URL the victim runs the bookmarklet on — the driver's fragment, not the
+/// `/__jss/bm` driver page itself.
+fn bookmarklet_verified(script: &str, attempt_url: &str, hit: &str) -> Outcome {
+    let crafted = attempt_url
+        .split_once('#')
+        .map(|(_, fragment)| fragment)
+        .unwrap_or(attempt_url);
+    let public = replace_local_marker_url(crafted, hit, "http://CALLBACK_HOST");
+    let victim_url = format!("http://TARGET_HOST:3000/{}", public.trim_start_matches('/'));
+    Outcome::Verified {
+        how: format!("bookmarklet {script} run on {victim_url}"),
+        poc: Reproduction {
+            command: format!(
+                "Run the {} bookmarklet on a page whose URL is {}",
+                script,
+                shell_quote(&victim_url)
+            ),
+            method: "BROWSER".to_owned(),
+            target: victim_url,
+            headers: Vec::new(),
+            body: None,
+            evidence: format!("the isolated marker service received callback token `{hit}`"),
+            response: String::new(),
+            controls: Vec::new(),
+        },
+    }
+}
+
 /// The served URL that drives `attempt_url` through the harness, carrying the `localStorage` seeds.
 /// Both values are whole-component percent-encoded so the harness recovers them exactly (the inner
 /// payload keeps its own encoding, which the framed page decodes when it reads the parameter).
@@ -10534,6 +10603,57 @@ const port = Number(process.argv[3] || 3000);
 const types = {'.html':'text/html','.htm':'text/html','.js':'text/javascript','.mjs':'text/javascript','.cjs':'text/javascript','.css':'text/css','.json':'application/json','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.webp':'image/webp','.ico':'image/x-icon','.map':'application/json','.woff2':'font/woff2','.woff':'font/woff','.ttf':'font/ttf'};
 const API_STUB = {ok:true,success:true,authenticated:true,loggedIn:true,isAuthenticated:true,user:{id:'1',name:'jss',username:'jss',email:'jss@example.test',role:'admin',roles:['admin']},data:[],items:[],results:[],collections:[],rows:[]};
 const API_PREFIXES = ['/api/','/auth/','/session','/graphql','/oauth/'];
+// A permissive, reflecting network shim for the bookmarklet host. Every fetch resolves
+// successfully; property access on the parsed body yields a non-empty collection for list-like use
+// (`.map`/`.forEach`) and, for scalars, reflects the request URL — so a value a bookmarklet
+// round-trips through its own API (e.g. a handle it resolves to an id) still carries attacker input
+// and reaches the sink. It installs only on the synthesized host, never changing how real pages load.
+const BM_SHIM = `
+(function(){
+  function make(reflect){
+    return new Proxy(function(){}, {
+      get:function(t,p){
+        if(p===Symbol.toPrimitive||p==='toString'||p==='valueOf')return function(){return reflect;};
+        if(p==='length')return 1;
+        if(p==='then'||p==='catch'||p==='finally')return undefined;
+        if(p==='split')return function(){return [reflect];};
+        if(p==='pop'||p==='shift'||p==='substring'||p==='slice'||p==='trim'||p==='toLowerCase'||p==='toUpperCase'||p==='toLocaleDateString'||p==='toLocaleString'||p==='toISOString')return function(){return reflect;};
+        if(p==='map')return function(fn){return [fn(make(reflect),0,[make(reflect)])];};
+        if(p==='forEach')return function(fn){fn(make(reflect),0,[make(reflect)]);};
+        if(p==='filter')return function(){return [make(reflect)];};
+        return make(reflect);
+      },
+      apply:function(){return make(reflect);},
+      has:function(){return true;}
+    });
+  }
+  function resp(reflect){
+    return { ok:true, status:200, statusText:'OK', redirected:false, type:'basic', url:reflect,
+      headers:{get:function(){return null;},has:function(){return false;}},
+      clone:function(){return resp(reflect);},
+      json:function(){return Promise.resolve(make(reflect));},
+      text:function(){return Promise.resolve(reflect);},
+      blob:function(){return Promise.resolve(make(reflect));},
+      arrayBuffer:function(){return Promise.resolve(make(reflect));} };
+  }
+  try { window.fetch = function(u){ var s=''; try{ s=(typeof u==='string')?u:((u&&u.url)||String(u)); }catch(e){} return Promise.resolve(resp(s)); }; } catch(e){}
+})();
+`;
+// After the bookmarklet runs, fire the handlers that reach a DOM sink only on interaction (an inline
+// `onclick`) and re-dispatch route events, so a sink gated behind a click still executes. It only
+// drives the app's own handlers; the canary is written into the DOM by the application, never by us.
+const BM_DRIVER = `
+(function(){
+  var n=0;
+  var iv=setInterval(function(){
+    n++;
+    try { document.querySelectorAll('[onclick]').forEach(function(e){ try{ e.click(); }catch(x){} try{ e.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true})); }catch(x){} }); } catch(e){}
+    try { window.dispatchEvent(new Event('hashchange')); } catch(e){}
+    if(n>8) clearInterval(iv);
+  }, 300);
+})();
+`;
+function bmQuery(url){ var qi = url.indexOf('?'); if (qi === -1) return ''; try { return new URLSearchParams(url.slice(qi+1)).get('s') || ''; } catch (e) { return ''; } }
 const HARNESS = `<!doctype html><meta charset="utf-8"><body><script>
 (function(){
   var q = new URLSearchParams(location.search);
@@ -10560,6 +10680,22 @@ http.createServer((req, res) => {
   try {
     let p = decodeURIComponent(req.url.split('?')[0].split('#')[0]);
     if (p === '/__jss/harness') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(HARNESS); }
+    if (p === '/__jss/bm') {
+      let s = bmQuery(req.url);
+      let html = '<!doctype html><meta charset="utf-8"><body>'
+        + '<script>' + BM_SHIM + '</scr' + 'ipt>'
+        + '<script src="/__jss/bmbody?s=' + encodeURIComponent(s) + '"></scr' + 'ipt>'
+        + '<script>' + BM_DRIVER + '</scr' + 'ipt>';
+      res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(html);
+    }
+    if (p === '/__jss/bmbody') {
+      let s = bmQuery(req.url);
+      let bf = path.join(root, s);
+      if (!bf.startsWith(root)) { res.writeHead(403); return res.end('x'); }
+      let code; try { code = fs.readFileSync(bf, 'utf8'); } catch (e) { res.writeHead(404); return res.end('x'); }
+      code = code.replace(/^[﻿\s]*javascript:/i, '');
+      res.writeHead(200, { 'Content-Type': 'text/javascript' }); return res.end(code);
+    }
     let f = path.join(root, p);
     if (!f.startsWith(root)) { res.writeHead(403); return res.end('x'); }
     let st; try { st = fs.statSync(f); } catch (e) {

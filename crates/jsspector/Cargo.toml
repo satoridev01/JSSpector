@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+fs2.workspace = true
 globset.workspace = true
 jss-core.workspace = true
 jss-frontend.workspace = true

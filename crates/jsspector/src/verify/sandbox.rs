@@ -7,8 +7,10 @@
 use super::payload::{self, Attempt, Canary, Signal};
 use super::plan::Probe;
 use super::{ControlObservation, Outcome, Reproduction};
+use fs2::FileExt;
 use serde::Deserialize;
 use std::cell::RefCell;
+use std::fs::{File, OpenOptions};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -134,6 +136,8 @@ const SEED_PROFILED_SCRIPT: &str = "db.getMongo().getDBNames().forEach(function(
     try{d.getCollection('system.profile').drop();}catch(e){}\
   });";
 const REDIS_ALIASES: [&str; 2] = ["redis", "cache"];
+const LOCAL_FIXTURE_LOCK: &str = "jsspector-local-verify.lock";
+const LOCAL_FIXTURE_MANIFEST: &str = "jsspector-local-fixtures.json";
 
 /// Whether a Docker daemon is reachable. The CLI on some platforms exits 0 even when it cannot
 /// connect, so this checks that `docker info` actually printed a server version, not an error.
@@ -334,6 +338,10 @@ enum Runtime {
         service_dirs: Vec<std::path::PathBuf>,
         marker_log: std::path::PathBuf,
         created_files: Vec<std::path::PathBuf>,
+        /// Serializes the fixed `/tmp/jss-*` helper namespace across scanner processes. The OS
+        /// releases this lock even when a scan is interrupted, allowing the next run to recover
+        /// fixtures recorded in the ownership manifest without touching unrelated files.
+        _fixture_lock: File,
     },
 }
 
@@ -584,6 +592,7 @@ impl Session {
         for argument in &mut local_command {
             *argument = localize_helper_paths(argument);
         }
+        let fixture_lock = acquire_local_fixture_lock()?;
         let created_files = plant_local_files(&canary)?;
         if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
             eprintln!(
@@ -642,6 +651,7 @@ impl Session {
                 service_dirs,
                 marker_log,
                 created_files,
+                _fixture_lock: fixture_lock,
             },
             tag: String::new(),
             network: String::new(),
@@ -3987,6 +3997,39 @@ fn dockerfile_port(root: &std::path::Path) -> Option<u16> {
     })
 }
 
+fn acquire_local_fixture_lock() -> Result<File, String> {
+    let path = std::env::temp_dir().join(LOCAL_FIXTURE_LOCK);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("opening local verifier lock {}: {error}", path.display()))?;
+    file.lock_exclusive().map_err(|error| {
+        format!(
+            "locking local verifier fixtures {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+fn is_recognizable_local_fixture(path: &std::path::Path, expected: &[u8], existing: &[u8]) -> bool {
+    if existing == expected {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("jss-canary-read") {
+        return false;
+    }
+    serde_json::from_slice::<String>(existing).is_ok_and(|token| {
+        (16..=128).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String> {
     let mut files: Vec<(std::path::PathBuf, Vec<u8>)> = canary
         .planted_files()
@@ -4052,16 +4095,61 @@ fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String>
             local_helper_source(WORKER_HOST_JS),
         ),
     ]);
+    let manifest = std::env::temp_dir().join(LOCAL_FIXTURE_MANIFEST);
+    let allowed: std::collections::BTreeSet<&std::path::Path> =
+        files.iter().map(|(path, _)| path.as_path()).collect();
+    if manifest.exists() {
+        let contents = std::fs::read(&manifest).map_err(|error| {
+            format!(
+                "reading local verifier ownership manifest {}: {error}",
+                manifest.display()
+            )
+        })?;
+        let previous =
+            serde_json::from_slice::<Vec<std::path::PathBuf>>(&contents).map_err(|error| {
+                format!(
+                    "local verifier refuses to replace invalid ownership manifest {}: {error}",
+                    manifest.display()
+                )
+            })?;
+        for path in previous {
+            if allowed.contains(path.as_path()) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        std::fs::remove_file(&manifest).map_err(|error| {
+            format!(
+                "removing stale local verifier ownership manifest {}: {error}",
+                manifest.display()
+            )
+        })?;
+    }
+
     let mut created = Vec::new();
     for (path, contents) in files {
         if path.exists() {
-            for written in &created {
-                let _ = std::fs::remove_file(written);
+            let existing = std::fs::read(&path).map_err(|error| {
+                format!(
+                    "reading existing local verifier fixture {}: {error}",
+                    path.display()
+                )
+            })?;
+            if is_recognizable_local_fixture(&path, &contents, &existing) {
+                std::fs::remove_file(&path).map_err(|error| {
+                    format!(
+                        "removing stale local verifier fixture {}: {error}",
+                        path.display()
+                    )
+                })?;
+            } else {
+                for written in &created {
+                    let _ = std::fs::remove_file(written);
+                }
+                return Err(format!(
+                    "local verifier refuses to overwrite existing `{}`",
+                    path.display()
+                ));
             }
-            return Err(format!(
-                "local verifier refuses to overwrite existing `{}`",
-                path.display()
-            ));
         }
         if let Err(error) = std::fs::write(&path, contents) {
             for written in &created {
@@ -4074,6 +4162,18 @@ fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBuf>, String>
         }
         created.push(path);
     }
+    let encoded = serde_json::to_vec(&created)
+        .map_err(|error| format!("encoding local verifier ownership manifest: {error}"))?;
+    if let Err(error) = std::fs::write(&manifest, encoded) {
+        for written in &created {
+            let _ = std::fs::remove_file(written);
+        }
+        return Err(format!(
+            "writing local verifier ownership manifest {}: {error}",
+            manifest.display()
+        ));
+    }
+    created.push(manifest);
     Ok(created)
 }
 
@@ -9706,6 +9806,31 @@ const { chromium } = require('playwright');
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_local_fixtures_are_recognized_without_claiming_arbitrary_files() {
+        let path = std::path::Path::new("/tmp/jss-canary-read.json");
+        assert!(is_recognizable_local_fixture(
+            path,
+            br#""new-token""#,
+            br#""18e885c6937a34481e587""#,
+        ));
+        assert!(!is_recognizable_local_fixture(
+            path,
+            br#""new-token""#,
+            b"user data",
+        ));
+        assert!(is_recognizable_local_fixture(
+            std::path::Path::new("/tmp/jss-driver.js"),
+            b"known helper",
+            b"known helper",
+        ));
+        assert!(!is_recognizable_local_fixture(
+            std::path::Path::new("/tmp/jss-driver.js"),
+            b"known helper",
+            b"different helper",
+        ));
+    }
 
     #[test]
     fn local_runtime_reads_port_from_dockerfile() {

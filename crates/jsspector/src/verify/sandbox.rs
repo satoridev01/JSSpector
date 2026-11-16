@@ -9612,6 +9612,15 @@ impl BrowserSession {
     }
 
     /// Loads the app in the browser with the probe's canary and reports whether it executed.
+    ///
+    /// Two passes. First a direct load of each attempt URL on the primary host page — the plain,
+    /// fast path that drives a DOM sink reached on page load. Then, for an HTML/navigation sink
+    /// whose payload rides the URL (not the referrer), a harness pass across every host page that
+    /// loads the script: each load goes through `/__jss/harness`, which seeds the app's own
+    /// `localStorage` feature flags and re-dispatches a client-side navigation at the framed page,
+    /// so a sink reached only after the single-page app routes (a `popstate`/navigation handler, or
+    /// a widget that only the right page and feature flag build) still runs. The harness only drives
+    /// the app's own code; the canary is written into the DOM by the application, never by us.
     pub fn exercise(&mut self, probe: &super::plan::BrowserProbe) -> Outcome {
         self.nonce += 1;
         let page = match self.find_page(&probe.file) {
@@ -9621,70 +9630,85 @@ impl BrowserSession {
         let attempts = super::browser::browser_attempts(probe, &page, &self.canary, self.nonce);
         let referrer = super::browser::via_referrer(probe)
             .then(|| super::browser::referrer_payload(probe, &self.canary, self.nonce));
-        let tried = attempts.len();
+        let mut tried = 0usize;
         for attempt in &attempts {
             let hit = referrer
                 .as_ref()
                 .map_or(attempt.token.as_str(), |(_, t)| t.as_str());
-            let reached = match &self.runtime {
-                BrowserRuntime::Docker => {
-                    let url = format!("http://jss-app:{}{}", self.port, attempt.url);
-                    let mut cmd =
-                        vec!["node".to_owned(), "/jss-browser.js".to_owned(), url.clone()];
-                    if let Some((payload, _)) = &referrer {
-                        cmd.push(payload.clone());
+            tried += 1;
+            if self.drive(&attempt.url, hit, referrer.as_ref()) {
+                return browser_verified(&attempt.url, hit);
+            }
+        }
+        // Harness pass: only a URL-delivered HTML/navigation probe can be driven this way (a
+        // referrer probe needs the header set per load, which the harness frame does not carry).
+        if referrer.is_none() {
+            let seeds = self.local_storage_seeds();
+            let seeds_json = seeds_json(&seeds);
+            let pages = self.find_pages(&probe.file);
+            for host in pages.iter().take(MAX_HARNESS_PAGES) {
+                let host_attempts =
+                    super::browser::browser_attempts(probe, host, &self.canary, self.nonce);
+                for attempt in host_attempts.iter().take(MAX_HARNESS_ATTEMPTS_PER_PAGE) {
+                    let url = harness_url(&attempt.url, &seeds_json);
+                    tried += 1;
+                    if self.drive(&url, &attempt.token, None) {
+                        // The reproduction is the real page URL the victim opens, not our driver.
+                        return browser_verified(&attempt.url, &attempt.token);
                     }
-                    let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                    let _ = exec_in(&self.browser, &args);
-                    marker_hit(&tail_logs(&self.marker), hit).is_some()
                 }
-                BrowserRuntime::Local {
-                    executable,
-                    marker_log,
-                    helper_dir,
-                    ..
-                } => {
-                    let url = format!("http://127.0.0.1:{}{}", self.port, attempt.url);
-                    let referer = referrer.as_ref().map(|(payload, _)| payload.as_str());
-                    let browser_result = run_local_browser(executable, &url, referer, helper_dir);
-                    let logs = std::fs::read_to_string(marker_log).unwrap_or_default();
-                    let reached = marker_hit(&logs, hit).is_some();
-                    if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
-                        eprintln!(
-                            "[verify] browser load {} -> result={:?} marker={} logs[{}]",
-                            attempt.url,
-                            browser_result.as_ref().err(),
-                            reached,
-                            tail(&logs, 8)
-                        );
-                    }
-                    reached
-                }
-            };
-            if reached {
-                let public_url =
-                    replace_local_marker_url(&attempt.url, hit, "http://CALLBACK_HOST");
-                return Outcome::Verified {
-                    how: format!("browser load {public_url}"),
-                    poc: Reproduction {
-                        command: format!(
-                            "Open {} in a browser",
-                            shell_quote(&format!("http://TARGET_HOST:3000{public_url}"))
-                        ),
-                        method: "BROWSER".to_owned(),
-                        target: public_url,
-                        headers: Vec::new(),
-                        body: None,
-                        evidence: format!(
-                            "the isolated marker service received callback token `{hit}`"
-                        ),
-                        response: String::new(),
-                        controls: Vec::new(),
-                    },
-                };
             }
         }
         Outcome::NotReproduced { tried }
+    }
+
+    /// Loads one URL (relative to the served app) in the browser and reports whether the canary
+    /// reached the marker service with `hit`. `referrer`, when set, carries the payload as the
+    /// Referer header for a referrer-sourced probe.
+    fn drive(&self, attempt_url: &str, hit: &str, referrer: Option<&(String, String)>) -> bool {
+        match &self.runtime {
+            BrowserRuntime::Docker => {
+                let url = format!("http://jss-app:{}{}", self.port, attempt_url);
+                let mut cmd = vec!["node".to_owned(), "/jss-browser.js".to_owned(), url];
+                if let Some((payload, _)) = referrer {
+                    cmd.push(payload.clone());
+                }
+                let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+                let _ = exec_in(&self.browser, &args);
+                marker_hit(&tail_logs(&self.marker), hit).is_some()
+            }
+            BrowserRuntime::Local {
+                executable,
+                marker_log,
+                helper_dir,
+                ..
+            } => {
+                let url = format!("http://127.0.0.1:{}{}", self.port, attempt_url);
+                let referer = referrer.map(|(payload, _)| payload.as_str());
+                let browser_result = run_local_browser(executable, &url, referer, helper_dir);
+                let logs = std::fs::read_to_string(marker_log).unwrap_or_default();
+                let reached = marker_hit(&logs, hit).is_some();
+                if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                    eprintln!(
+                        "[verify] browser load {} -> result={:?} marker={} logs[{}]",
+                        attempt_url,
+                        browser_result.as_ref().err(),
+                        reached,
+                        tail(&logs, 8)
+                    );
+                }
+                reached
+            }
+        }
+    }
+
+    /// The `localStorage` feature flags the app sets itself, mined from its own scripts as
+    /// `localStorage.getItem('key') === 'value'` comparisons. Seeded before a harness load so a
+    /// code path the app gates behind a stored preference (a theme, a layout mode) is taken, which
+    /// can be what builds the element a DOM sink writes into. First-seen per key; nothing here is
+    /// tied to a particular app.
+    fn local_storage_seeds(&self) -> Vec<(String, String)> {
+        local_storage_flags(&self.root)
     }
 
     /// The served path of an HTML document that loads the vulnerable script with a plain
@@ -9726,6 +9750,54 @@ impl BrowserSession {
                  module behind the app entry; verify v1 drives directly-loadable pages)"
             )
         })
+    }
+
+    /// Every host page the harness pass should try, best first: the pages that load the script,
+    /// ranked so a page the script names (its stem appears as a string literal in the script — the
+    /// hint that the sink only runs on that page, e.g. `pg === 'entries'`) comes before a page in
+    /// the script's own directory, before the rest. A sink gated on `location.pathname` only fires
+    /// on the right page, and which page that is cannot be known ahead of time, so the candidates
+    /// are driven in likelihood order rather than guessed at.
+    fn find_pages(&self, script: &str) -> Vec<String> {
+        let script_path = std::path::Path::new(script);
+        if matches!(
+            script_path.extension().and_then(|e| e.to_str()),
+            Some("html" | "htm")
+        ) {
+            return vec![format!("/{}", script.trim_start_matches('/'))];
+        }
+        let Some(base) = script_path.file_name().and_then(|n| n.to_str()) else {
+            return Vec::new();
+        };
+        let source = self.root.join(script_path);
+        let source = std::fs::read_to_string(&source).unwrap_or_default();
+        let same_parent = self.root.join(script_path).parent().map(|p| p.to_owned());
+        let mut ranked: Vec<(u8, String)> = Vec::new();
+        for html in html_files(&self.root) {
+            let Ok(text) = std::fs::read_to_string(&html) else {
+                continue;
+            };
+            if !html_loads_script(&text, base) {
+                continue;
+            }
+            let rel = html
+                .strip_prefix(&self.root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let stem = html.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            // Rank 0: the script name-checks this page. Rank 1: same directory. Rank 2: rest.
+            let rank = if !stem.is_empty() && script_names_page(&source, stem) {
+                0
+            } else if html.parent().map(std::path::Path::to_owned) == same_parent {
+                1
+            } else {
+                2
+            };
+            ranked.push((rank, format!("/{}", rel.trim_start_matches('/'))));
+        }
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.dedup_by(|a, b| a.1 == b.1);
+        ranked.into_iter().map(|(_, page)| page).collect()
     }
 
     pub fn teardown(&mut self) {
@@ -9953,7 +10025,233 @@ fn html_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// Host pages the harness pass drives at most, and attempts per page: enough to cover a page's real
+/// parameter (mined names come first) across query and hash without turning one finding into a long
+/// crawl.
+const MAX_HARNESS_PAGES: usize = 10;
+const MAX_HARNESS_ATTEMPTS_PER_PAGE: usize = 8;
+
+/// The verified outcome for a browser probe whose canary reached the marker with `hit`, loaded via
+/// `attempt_url` (the real page URL a victim opens — a harness wrapper, when used, is only our
+/// driver and never appears here).
+fn browser_verified(attempt_url: &str, hit: &str) -> Outcome {
+    let public_url = replace_local_marker_url(attempt_url, hit, "http://CALLBACK_HOST");
+    Outcome::Verified {
+        how: format!("browser load {public_url}"),
+        poc: Reproduction {
+            command: format!(
+                "Open {} in a browser",
+                shell_quote(&format!("http://TARGET_HOST:3000{public_url}"))
+            ),
+            method: "BROWSER".to_owned(),
+            target: public_url,
+            headers: Vec::new(),
+            body: None,
+            evidence: format!("the isolated marker service received callback token `{hit}`"),
+            response: String::new(),
+            controls: Vec::new(),
+        },
+    }
+}
+
+/// The served URL that drives `attempt_url` through the harness, carrying the `localStorage` seeds.
+/// Both values are whole-component percent-encoded so the harness recovers them exactly (the inner
+/// payload keeps its own encoding, which the framed page decodes when it reads the parameter).
+fn harness_url(attempt_url: &str, seeds_json: &str) -> String {
+    format!(
+        "/__jss/harness?p={}&s={}",
+        encode_component(attempt_url),
+        encode_component(seeds_json)
+    )
+}
+
+/// A JSON array of `[key, value]` pairs for the harness to replay into `localStorage`.
+fn seeds_json(seeds: &[(String, String)]) -> String {
+    let mut out = String::from("[");
+    for (i, (k, v)) in seeds.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('[');
+        json_string(&mut out, k);
+        out.push(',');
+        json_string(&mut out, v);
+        out.push(']');
+    }
+    out.push(']');
+    out
+}
+
+/// Appends `value` as a JSON string literal (quotes and the control characters that matter).
+fn json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Percent-encodes every byte outside the unreserved set, so an arbitrary URL (itself containing
+/// `?`, `#`, `%`, `&`) survives as a single query-parameter value.
+fn encode_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Whether `source` refers to a page by its stem as a quoted string literal (`'entries'`,
+/// `"editor"`) — the signal that a DOM sink is gated to that page (`pathname` compared to the name).
+fn script_names_page(source: &str, stem: &str) -> bool {
+    source.contains(&format!("'{stem}'")) || source.contains(&format!("\"{stem}\""))
+}
+
+/// The `localStorage` feature flags an app sets for itself, mined from its scripts as
+/// `localStorage.getItem('key') === 'value'` (or `==`) comparisons across the served tree. First
+/// value seen per key wins; the scan is bounded and skips `node_modules`/dot-directories.
+fn local_storage_flags(root: &std::path::Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for path in script_like_files(root).into_iter().take(400) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        mine_local_storage_flags(&text, &mut out);
+    }
+    out
+}
+
+/// Pushes each `localStorage.getItem('key') === 'value'` flag found in `text` into `out`, keeping
+/// the first value seen per key.
+fn mine_local_storage_flags(text: &str, out: &mut Vec<(String, String)>) {
+    const NEEDLE: &str = "localStorage.getItem(";
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(NEEDLE) {
+        let open = from + rel + NEEDLE.len();
+        from = open;
+        let Some((key, after_key)) = read_quoted(text, open) else {
+            continue;
+        };
+        // Expect `)` then an equality operator then a quoted value.
+        let mut i = after_key;
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b')') {
+            continue;
+        }
+        i += 1;
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        if !(text[i..].starts_with("===") || text[i..].starts_with("==")) {
+            continue;
+        }
+        i += if text[i..].starts_with("===") { 3 } else { 2 };
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        let Some((value, _)) = read_quoted(text, i) else {
+            continue;
+        };
+        if !key.is_empty() && !out.iter().any(|(k, _)| k == &key) {
+            out.push((key, value));
+        }
+    }
+}
+
+/// Reads a single- or double-quoted string literal starting at `at` (the opening quote), returning
+/// its unescaped-enough contents and the index just past the closing quote.
+fn read_quoted(text: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let quote = *bytes.get(at)?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let mut i = at + 1;
+    let mut value = String::new();
+    while let Some(&b) = bytes.get(i) {
+        if b == b'\\' {
+            if let Some(&n) = bytes.get(i + 1) {
+                value.push(n as char);
+                i += 2;
+                continue;
+            }
+            return None;
+        }
+        if b == quote {
+            return Some((value, i + 1));
+        }
+        if b == b'\n' {
+            return None;
+        }
+        value.push(b as char);
+        i += 1;
+    }
+    None
+}
+
+/// The `.js`/`.mjs`/`.cjs`/`.html` files under `root`, skipping `node_modules` and dot-directories,
+/// bounded in breadth and depth. Used to mine client-side feature flags.
+fn script_like_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+        if depth > 12 || out.len() > 5000 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, out, depth + 1);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("js" | "mjs" | "cjs" | "html" | "htm")
+            ) {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out, 0);
+    out
+}
+
 /// A static file server for the repo, dependency-free (core `http`).
+///
+/// Beyond serving files it offers two things the browser phase needs to drive single-page apps
+/// whose vulnerable code runs only after the page is set up:
+///   * `/__jss/harness` — a tiny driver page (same origin as the app, so it shares `localStorage`
+///     and can reach into the frame it hosts). It seeds the `localStorage` flags passed in `s`,
+///     loads the real page passed in `p` inside a frame, and then re-dispatches `popstate` /
+///     `pushState` navigations at it, so a DOM sink reached only through a client-side route change
+///     (a `popstate`/navigation handler, not module-load) still runs.
+///   * a benign JSON stub for otherwise-missing `/api`, `/auth`, `/session`, `/graphql` requests,
+///     with a signed-in `user`, so a client-side guard that redirects to a login page when its
+///     `fetch('/api/auth/me')` returns nothing does not tear the page down before the sink runs.
+///
+/// Neither forges the finding: the real page is what renders, and only the app's own code writes
+/// the canary into the DOM.
 const SERVE_JS: &str = r#"
 const http = require('http');
 const fs = require('fs');
@@ -9961,12 +10259,43 @@ const path = require('path');
 const root = path.resolve(process.argv[2] || '/app');
 const port = Number(process.argv[3] || 3000);
 const types = {'.html':'text/html','.htm':'text/html','.js':'text/javascript','.mjs':'text/javascript','.cjs':'text/javascript','.css':'text/css','.json':'application/json','.svg':'image/svg+xml','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.webp':'image/webp','.ico':'image/x-icon','.map':'application/json','.woff2':'font/woff2','.woff':'font/woff','.ttf':'font/ttf'};
+const API_STUB = {ok:true,success:true,authenticated:true,loggedIn:true,isAuthenticated:true,user:{id:'1',name:'jss',username:'jss',email:'jss@example.test',role:'admin',roles:['admin']},data:[],items:[],results:[],collections:[],rows:[]};
+const API_PREFIXES = ['/api/','/auth/','/session','/graphql','/oauth/'];
+const HARNESS = `<!doctype html><meta charset="utf-8"><body><script>
+(function(){
+  var q = new URLSearchParams(location.search);
+  try { (JSON.parse(q.get('s') || '[]')).forEach(function(kv){ localStorage.setItem(kv[0], kv[1]); }); } catch (e) {}
+  var page = q.get('p') || '/';
+  var f = document.createElement('iframe');
+  f.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;border:0';
+  f.src = page;
+  document.body.appendChild(f);
+  function kick(){
+    try {
+      var w = f.contentWindow; if (!w) return;
+      try { w.history.pushState(null, '', w.location.href); } catch (e) {}
+      try { w.dispatchEvent(new w.PopStateEvent('popstate')); }
+      catch (e) { try { w.dispatchEvent(new PopStateEvent('popstate')); } catch (e2) {} }
+      try { w.dispatchEvent(new w.Event('hashchange')); } catch (e) {}
+    } catch (e) {}
+  }
+  f.addEventListener('load', function(){ setTimeout(kick, 100); setTimeout(kick, 500); setTimeout(kick, 1400); });
+  setTimeout(kick, 900); setTimeout(kick, 2400);
+})();
+</script>`;
 http.createServer((req, res) => {
   try {
     let p = decodeURIComponent(req.url.split('?')[0].split('#')[0]);
+    if (p === '/__jss/harness') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(HARNESS); }
     let f = path.join(root, p);
     if (!f.startsWith(root)) { res.writeHead(403); return res.end('x'); }
-    let st; try { st = fs.statSync(f); } catch (e) { res.writeHead(404); return res.end('x'); }
+    let st; try { st = fs.statSync(f); } catch (e) {
+      if (API_PREFIXES.some(function(x){ return p.indexOf(x) !== -1; })) {
+        let b = JSON.stringify(API_STUB);
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(b);
+      }
+      res.writeHead(404); return res.end('x');
+    }
     if (st.isDirectory()) { f = path.join(f, 'index.html'); try { st = fs.statSync(f); } catch (e) { res.writeHead(404); return res.end('x'); } }
     res.writeHead(200, { 'Content-Type': types[path.extname(f).toLowerCase()] || 'application/octet-stream' });
     fs.createReadStream(f).pipe(res);
@@ -13010,6 +13339,63 @@ http.createServer((req, res) => {
             r#"<script>import './app.js'</script>"#,
             "app.js"
         ));
+    }
+
+    #[test]
+    fn mines_local_storage_feature_flags_first_value_per_key() {
+        let source = r#"
+            if (localStorage.getItem('orb_style') === 'xfce') boot();
+            var dark = localStorage.getItem("orb-dark") == "1";
+            if (localStorage.getItem('orb_style') === 'other') never();
+            var x = map.get('ignored');
+        "#;
+        let mut flags = Vec::new();
+        mine_local_storage_flags(source, &mut flags);
+        assert_eq!(
+            flags,
+            vec![
+                ("orb_style".to_owned(), "xfce".to_owned()),
+                ("orb-dark".to_owned(), "1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn harness_url_encodes_the_attempt_as_one_component() {
+        // The attempt URL carries its own `?`, `#`, `&` and percent-escapes; the harness must
+        // receive it verbatim, so none of those structural characters may leak unencoded.
+        let attempt = "/entries.html?col=%3Cimg%20src%3Dx%3E&a=1#frag";
+        let seeds = seeds_json(&[("orb_style".to_owned(), "xfce".to_owned())]);
+        let url = harness_url(attempt, &seeds);
+        let p = url
+            .strip_prefix("/__jss/harness?p=")
+            .and_then(|r| r.split("&s=").next())
+            .expect("harness url shape");
+        assert!(!p.contains('?'));
+        assert!(!p.contains('#'));
+        assert!(!p.contains('&'));
+        // The payload's own `%` escapes are themselves escaped, so a single decode recovers them.
+        assert!(p.contains("%253C"));
+        assert_eq!(encode_component("/a?b#c&d"), "%2Fa%3Fb%23c%26d");
+    }
+
+    #[test]
+    fn seeds_json_is_well_formed_and_escaped() {
+        let json = seeds_json(&[
+            ("a".to_owned(), "b".to_owned()),
+            ("q\"x".to_owned(), "v\\y".to_owned()),
+        ]);
+        assert_eq!(json, r#"[["a","b"],["q\"x","v\\y"]]"#);
+    }
+
+    #[test]
+    fn script_names_page_matches_quoted_stem_only() {
+        let source = "var pg = path.pop(); if (pg === 'entries' || pg === 'editor') {}";
+        assert!(script_names_page(source, "entries"));
+        assert!(script_names_page(source, "editor"));
+        assert!(!script_names_page(source, "dashboard"));
+        // A bare, unquoted occurrence is not a name-check.
+        assert!(!script_names_page("entriesController()", "entries"));
     }
 
     /// Confirms a reflected DOM XSS in a headless browser and clears a page that escapes. Needs

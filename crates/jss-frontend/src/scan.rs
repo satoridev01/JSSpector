@@ -932,6 +932,53 @@ pub fn finalize(findings: &mut Vec<Finding>) {
     // Linking can discover the same cross-file witness through equivalent summary paths. They
     // describe one vulnerability and must not consume separate ordinals/fingerprints.
     findings.dedup();
+    // One tainted source expression can reach the same sink location through more than one entry
+    // path — e.g. a DOM handler invoked both at module load and again from a `popstate`/navigation
+    // handler, each carrying `location.href` into the same `innerHTML =`. These witnesses describe
+    // one vulnerability at one sink; keep only the most direct one (the shortest trace) so a single
+    // finding and fingerprint represent it rather than one per entry path. The sink position is part
+    // of the collapse key, so genuinely distinct sinks that merely share a source expression keep
+    // their separate findings and ordinals.
+    fn collapse_key(
+        f: &Finding,
+    ) -> (
+        jss_core::VulnClass,
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        u32,
+        u32,
+    ) {
+        (
+            f.class,
+            &f.file,
+            &f.function,
+            &f.sink.api,
+            &f.source.expr,
+            f.source.kind,
+            f.sink.file.as_deref(),
+            f.sink.line,
+            f.sink.col,
+        )
+    }
+    // Equal collapse keys are contiguous: the sort above orders by identity (which includes the
+    // source expression) and then by sink position, the leading components of the key.
+    let mut collapsed: Vec<Finding> = Vec::with_capacity(findings.len());
+    for finding in findings.drain(..) {
+        if let Some(last) = collapsed.last_mut()
+            && collapse_key(last) == collapse_key(&finding)
+        {
+            if finding.trace.len() < last.trace.len() {
+                *last = finding;
+            }
+            continue;
+        }
+        collapsed.push(finding);
+    }
+    *findings = collapsed;
     let mut previous: Option<String> = None;
     let mut ordinal = 0u32;
     for finding in findings.iter_mut() {
@@ -1022,6 +1069,67 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(findings[0].key.ends_with("|0"));
         assert_eq!(findings[0].fingerprint.len(), 16);
+    }
+
+    #[test]
+    fn same_source_into_one_sink_via_two_paths_collapses_to_shortest() {
+        // One DOM source expression reaches the same sink location through two entry paths: a
+        // direct module-load call (short trace) and a longer popstate -> navigate chain. They are
+        // one vulnerability at one sink; the most direct witness survives.
+        let mut direct = finding();
+        direct.class = VulnClass::Xss;
+        direct.source = SourceLoc {
+            kind: "dom",
+            expr: "location.href".to_owned(),
+            line: 193,
+            col: 19,
+        };
+        direct.sink = SinkLoc {
+            file: Some("router.js".to_owned()),
+            api: ".innerHTML =".to_owned(),
+            arg: "el.innerHTML".to_owned(),
+            line: 79,
+            col: 7,
+        };
+        direct.function = "<module>".to_owned();
+        direct.trace = vec![TraceStep {
+            file: Some("router.js".to_owned()),
+            line: 51,
+            col: 9,
+            note: "read by .get()".to_owned(),
+        }];
+
+        let mut indirect = direct.clone();
+        indirect.source.line = 188;
+        indirect.source.col = 14;
+        indirect.trace = vec![
+            TraceStep {
+                file: Some("router.js".to_owned()),
+                line: 114,
+                col: 21,
+                note: "assigned to `href`".to_owned(),
+            },
+            TraceStep {
+                file: Some("router.js".to_owned()),
+                line: 144,
+                col: 7,
+                note: "passed to `updateActiveNav()`".to_owned(),
+            },
+            TraceStep {
+                file: Some("router.js".to_owned()),
+                line: 51,
+                col: 9,
+                note: "read by .get()".to_owned(),
+            },
+        ];
+
+        let mut findings = vec![indirect, direct];
+        finalize(&mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].source.line, 193);
+        assert_eq!(findings[0].trace.len(), 1);
+        assert!(findings[0].key.ends_with("|0"));
     }
 
     #[test]

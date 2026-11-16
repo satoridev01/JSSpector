@@ -121,4 +121,6 @@ For shared learning from different computers, use the synchronized entry point:
 
 It fast-forwards to the newest upstream controller before starting and pushes only commits that
 passed the full gate. If another user pushes during the run, JSSpector rebases once, repeats CI and
-the accumulated dynamic corpus, and only then retries the push.
+the accumulated dynamic corpus, and only then retries the push. On a fresh clone it reconstructs
+the ignored private benchmark through the authenticated `satori-v2` CLI; organization 12 is the
+default and can be overridden with `SATORI_ORGANIZATION`.

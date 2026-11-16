@@ -92,7 +92,7 @@ Routes are followed through router mounts across files (`app.use('/api', require
 ### Scanning a GitHub repository
 
 `scan --repo` accepts either the repository HEAD or a pinned revision. Remote scans dynamically
-verify findings by default and automatically repair missing scanner capabilities with Claude:
+verify findings by default and automatically repair missing scanner capabilities:
 
 ```sh
 jsspector scan --repo owner/repository
@@ -103,6 +103,6 @@ The repair agent works in an isolated JSSpector worktree and cannot edit the sca
 benchmark or trusted controller. A candidate is incorporated only after the controller independently
 rebuilds the scanner, reproduces the exact finding with a structured PoC and replays the accumulated
 verified corpus. Validated generations are committed and pushed so another computer starts from the
-new capability. This standalone flow requires authenticated `satori-v2`, `claude` and `gh` CLIs; it
-does not require Codex. Organization 12 is the default and can be overridden with
+new capability. This standalone flow requires authenticated Satori, repair-agent and GitHub CLIs;
+it does not require a supervising agent. Organization 12 is the default and can be overridden with
 `SATORI_ORGANIZATION`.

@@ -83,7 +83,7 @@ enum Task {
         compare: Option<std::path::PathBuf>,
     },
     /// Grow JSSpector against the historical exploitability benchmark. Missing detections and
-    /// failed reproductions are offered to Claude in an isolated scanner worktree; only repairs
+    /// failed reproductions are offered to a repair agent in an isolated scanner worktree; only repairs
     /// that detect and exploit the exact pinned case are applied to this checkout.
     SelfHeal {
         /// Historical exploitability benchmark.
@@ -104,24 +104,24 @@ enum Task {
         /// Recover at most this many unresolved cases.
         #[arg(long)]
         limit: Option<usize>,
-        /// Validate and diagnose, but never invoke Claude or modify this checkout.
+        /// Validate and diagnose, but never invoke the repair agent or modify this checkout.
         #[arg(long)]
         no_repair: bool,
         /// Push validated automatic commits to the configured upstream branch. If the remote moved,
         /// rebase once, rerun all gates, and retry without overwriting remote work.
         #[arg(long, conflicts_with = "no_repair")]
         push: bool,
-        /// Maximum Claude attempts per case.
+        /// Maximum repair attempts per case.
         #[arg(long, default_value_t = 3)]
         repair_attempts: usize,
-        /// Claude model used for generic scanner repairs.
-        #[arg(long, default_value = "claude-opus-5-5")]
+        /// Model used for generic scanner repairs.
+        #[arg(long, default_value = "claude-opus-5-5", hide = true)]
         repair_model: String,
-        /// Claude effort used for generic scanner repairs.
-        #[arg(long, default_value = "high")]
+        /// Effort used for generic scanner repairs.
+        #[arg(long, default_value = "high", hide = true)]
         repair_effort: String,
-        /// Maximum Claude turns in one repair attempt.
-        #[arg(long, default_value_t = 160)]
+        /// Maximum agent turns in one repair attempt.
+        #[arg(long, default_value_t = 160, hide = true)]
         repair_max_turns: usize,
         /// Shared wall-clock repair budget per case, in seconds.
         #[arg(long, default_value_t = 2400)]

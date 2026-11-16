@@ -606,19 +606,19 @@ fn repair_case(
         std::fs::write(&diagnostic_path, serde_json::to_vec_pretty(&diagnostic)?)?;
         let check = validation_command(options, workspace, case);
         let prompt = repair_prompt(case, target, &diagnostic_path, &check);
-        let claude_log = diagnostic_path.with_extension("claude.jsonl");
-        let claude_error_log = diagnostic_path.with_extension("claude.stderr.log");
+        let agent_log = diagnostic_path.with_extension("agent.jsonl");
+        let agent_error_log = diagnostic_path.with_extension("agent.stderr.log");
         eprintln!(
-            "self-heal: Claude repair attempt {attempt}/{} for {} (transcript: {})",
+            "self-heal: repair attempt {attempt}/{} for {} (transcript: {})",
             options.repair_attempts,
             case.finding_id,
-            claude_log.display()
+            agent_log.display()
         );
         let remaining = deadline.saturating_duration_since(Instant::now());
         let mut command = Command::new("claude");
         command
             .current_dir(&workspace.path)
-            // Claude Code's authenticated local session must not be shadowed by stale API
+            // The repair agent's authenticated local session must not be shadowed by stale API
             // overrides inherited from a developer shell. ANTHROPIC_AUTH_TOKEN is intentionally
             // retained: headless environments may provide that supported credential explicitly.
             .env_remove("ANTHROPIC_API_KEY")
@@ -664,11 +664,11 @@ fn repair_case(
             // stream-json is useful forensic/debug data but can contain hundreds of thousands of
             // tokens. Keep the complete transcript as an artifact while the stable controller
             // messages remain readable on the terminal.
-            .stdout(Stdio::from(File::create(&claude_log)?))
-            .stderr(Stdio::from(File::create(&claude_error_log)?));
+            .stdout(Stdio::from(File::create(&agent_log)?))
+            .stderr(Stdio::from(File::create(&agent_error_log)?));
         let status = status_with_timeout(&mut command, remaining)?;
         if !status.success() {
-            evaluation.reason = format!("Claude repair attempt exited with {status}");
+            evaluation.reason = format!("repair attempt exited with {status}");
             continue;
         }
         match evaluate(options, &workspace.path, case, issue, target, ordinal) {
@@ -753,7 +753,7 @@ the target repository or expected benchmark data.";
 
 fn create_repair_workspace(options: &Options) -> Result<RepairWorkspace> {
     if Command::new("claude").arg("--version").status().is_err() {
-        bail!("Claude CLI is required for repair mode");
+        bail!("the configured repair-agent CLI is required for repair mode");
     }
     let base = git_output(&options.root, &["rev-parse", "HEAD"])?
         .trim()
@@ -807,7 +807,7 @@ fn commit_repair(workspace: &RepairWorkspace, case: &Case) -> Result<()> {
         .args(["diff", "--cached", "--quiet"])
         .status()?;
     if staged.success() {
-        bail!("Claude reported success without changing JSSpector");
+        bail!("the repair agent reported success without changing JSSpector");
     }
     if staged.code() != Some(1) {
         bail!("could not inspect the staged scanner repair");
@@ -840,7 +840,7 @@ fn validate_repair_paths(workspace: &RepairWorkspace) -> Result<()> {
         .filter(|path| !path.is_empty())
         .collect();
     if changed.is_empty() {
-        bail!("Claude produced no scanner repair");
+        bail!("the repair agent produced no scanner repair");
     }
     let outside: Vec<&str> = changed
         .iter()
@@ -974,14 +974,24 @@ fn push_validated_changes(options: &Options) -> Result<()> {
     if !options.push {
         return Ok(());
     }
-    let push = || {
-        Command::new("git")
-            .current_dir(&options.root)
-            .arg("push")
-            .status()
-            .context("start git push")
+    let push = |ignore_environment_token: bool| {
+        let mut command = Command::new("git");
+        command.current_dir(&options.root).arg("push");
+        if ignore_environment_token {
+            command.env_remove("GITHUB_TOKEN");
+        }
+        command.status().context("start git push")
     };
-    if push()?.success() {
+    let push_with_configured_credentials = || -> Result<bool> {
+        if push(false)?.success() {
+            return Ok(true);
+        }
+        // A read-only discovery token can shadow a writable account in the system credential
+        // store. Retrying without that override is safe: Git still performs an ordinary,
+        // non-forced push and rejects remote races.
+        Ok(std::env::var_os("GITHUB_TOKEN").is_some() && push(true)?.success())
+    };
+    if push_with_configured_credentials()? {
         eprintln!("self-heal: validated commits pushed");
         return Ok(());
     }
@@ -1008,7 +1018,7 @@ fn push_validated_changes(options: &Options) -> Result<()> {
         "validate the rebased JSSpector workspace".to_owned(),
     )?;
     validate_accumulated_targets(options, &options.root, &[])?;
-    if !push()?.success() {
+    if !push_with_configured_credentials()? {
         bail!("upstream advanced again after revalidation; rerun self-heal to retry safely");
     }
     eprintln!("self-heal: rebased, revalidated, and pushed commits");

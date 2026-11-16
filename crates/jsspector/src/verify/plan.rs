@@ -409,6 +409,26 @@ impl Probe {
 pub enum Plan {
     Http(Box<Probe>),
     Browser(BrowserProbe),
+    /// A server-reflected XSS: the attacker value arrives over HTTP and the server writes it into the
+    /// HTML response it renders (`c.html`, a template string), so it runs in the victim's browser.
+    /// Driven by running the app and loading its response in a headless browser (see
+    /// [`ReflectedXss`]).
+    ReflectedXss(ReflectedXss),
+}
+
+/// A server-reflected (reflected, not DOM-based) XSS the sandbox can drive: run the app, request the
+/// route with a context-breakout canary placed in a URL input, and load the rendered response in a
+/// headless browser to confirm the injected script executed. Unlike [`BrowserProbe`] (a DOM XSS whose
+/// script already ships in a static page), the dangerous HTML here is produced by the server from the
+/// request, so the live application must serve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectedXss {
+    pub method: Method,
+    /// The route path, `{param}` slots kept; always leads with `/`.
+    pub path: String,
+    /// Where the payload rides into the request. Only URL-placed inputs (a query parameter, a path
+    /// segment, or the raw URL) are driven, since the browser reaches the sink by navigating to a URL.
+    pub entry: Entry,
 }
 
 /// A finding whose attacker input is the page's own URL and whose sink runs in the browser: the
@@ -461,6 +481,13 @@ pub fn plan(finding: &Finding) -> Result<Plan, Skip> {
 /// header the handler reads in a URL/host position. `None` source falls back to finding fields
 /// alone.
 pub fn plan_with_source(finding: &Finding, source: Option<&str>) -> Result<Plan, Skip> {
+    // A reflected XSS whose tainted value arrives over HTTP and is written into the server's HTML
+    // response runs in the victim's browser, not on the server, so neither the server-side HTTP
+    // oracle nor the static-page browser phase drives it: the live app must render the response and a
+    // headless browser must load it. Route it to the dedicated reflected-XSS plan.
+    if finding.class == VulnClass::Xss && finding.source.kind == "http" {
+        return reflected_xss_probe(finding, source).map(Plan::ReflectedXss);
+    }
     // Server-side HTTP findings first.
     match Probe::from_finding_with_source(finding, source) {
         Ok(probe) => return Ok(Plan::Http(Box::new(probe))),
@@ -473,6 +500,45 @@ pub fn plan_with_source(finding: &Finding, source: Option<&str>) -> Result<Plan,
         }
     }
     browser_probe(finding, source).map(Plan::Browser)
+}
+
+/// A server-reflected XSS the sandbox can drive, or why not. The payload must enter through a
+/// URL-placed input (a query parameter, a path segment, or the raw URL) reachable without
+/// authentication, so a headless browser can deliver it by navigating to a single URL. A body-only
+/// reflection, an authenticated route, or an entry that is not a routable HTTP path is skipped with
+/// a reason, never guessed at.
+fn reflected_xss_probe(finding: &Finding, source: Option<&str>) -> Result<ReflectedXss, Skip> {
+    if finding.auth != Auth::NoneDetected {
+        return Err(Skip(format!(
+            "reaching it needs {} authentication, which verify v1 does not perform",
+            finding.auth.name()
+        )));
+    }
+    let Some(entry_point) = finding.entry.as_deref() else {
+        return Err(Skip(
+            "no entry point maps to this sink; nothing to send".to_owned(),
+        ));
+    };
+    let (method, path) = parse_entry(entry_point)
+        .ok_or_else(|| Skip(format!("entry `{entry_point}` is not a routable HTTP path")))?;
+    let entry = best_entry(finding, &path, source).ok_or_else(|| {
+        Skip(format!(
+            "cannot tell which request input reaches the sink (source `{}`, argument `{}`)",
+            finding.source.expr, finding.sink.arg
+        ))
+    })?;
+    if !matches!(entry, Entry::Query(_) | Entry::PathParam(_) | Entry::Url) {
+        return Err(Skip(
+            "verify v1 drives a reflected XSS only through a URL-placed input (query, path segment \
+             or raw URL), which a browser can deliver by navigation"
+                .to_owned(),
+        ));
+    }
+    Ok(ReflectedXss {
+        method,
+        path,
+        entry,
+    })
 }
 
 /// A DOM-source XSS or client-side redirect the browser phase can drive, or why not.
@@ -8960,6 +9026,56 @@ module.exports = { activityValidators };\n";
             key: "k".to_owned(),
             fingerprint: "f".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_reflected_xss_over_http_plans_a_browser_driven_reflected_probe() {
+        // A Hono handler reflects a query parameter into the HTML response (`c.html(unsubscribePage(
+        // token))`). The source is an HTTP request, so it is neither a DOM XSS (the static-page browser
+        // phase) nor a server-side HTTP oracle; it must be driven as a reflected XSS.
+        let mut xss = finding(
+            VulnClass::Xss,
+            Auth::NoneDetected,
+            Some("GET /unsubscribe"),
+            "c.req.query(\"t\")",
+        );
+        xss.sink.api = "c.html".to_owned();
+        xss.sink.arg = "unsubscribePage(token)".to_owned();
+        match plan_with_source(&xss, None).expect("reflected XSS should plan") {
+            Plan::ReflectedXss(probe) => {
+                assert_eq!(probe.method, Method::Get);
+                assert_eq!(probe.path, "/unsubscribe");
+                assert_eq!(probe.entry, Entry::Query("t".to_owned()));
+            }
+            other => panic!("expected a reflected-XSS plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reflected_xss_with_a_body_only_source_is_skipped_with_a_reason() {
+        // A browser navigation can only place the payload in the URL; a body-only reflection is not
+        // driven, and the skip explains why rather than guessing at a request.
+        let mut xss = finding(
+            VulnClass::Xss,
+            Auth::NoneDetected,
+            Some("POST /comment"),
+            "req.body.text",
+        );
+        xss.sink.api = "res.send".to_owned();
+        xss.sink.arg = "render(text)".to_owned();
+        let skip = plan_with_source(&xss, None).expect_err("a body-only reflected XSS is not driven");
+        assert!(skip.0.contains("URL-placed input"), "reason was: {}", skip.0);
+    }
+
+    #[test]
+    fn a_dom_sourced_xss_still_uses_the_static_browser_phase() {
+        // Routing reflected (HTTP-source) XSS to its own plan must not divert a DOM-source XSS away
+        // from the existing static-page browser phase.
+        let dom = dom_finding("location.search", "el.innerHTML", "web/app.js");
+        assert!(matches!(
+            plan_with_source(&dom, None),
+            Ok(Plan::Browser(_))
+        ));
     }
 
     #[test]

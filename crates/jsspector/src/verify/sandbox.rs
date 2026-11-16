@@ -1816,6 +1816,91 @@ impl Session {
         Outcome::NotReproduced { tried }
     }
 
+    /// Drives a server-reflected XSS: the live app has already been launched, so request its route
+    /// with each context-breakout canary placed in the tainted URL input, load the rendered response
+    /// in a headless browser, and confirm the injected script executed by finding the value the canary
+    /// computes at runtime (the product of two factors) in the final DOM. A reflection the app escapes
+    /// never computes that product, so a hit is unambiguous execution — the same thing a victim's
+    /// browser would do. Runs in the local browser runtime; Docker reflected-XSS is skipped with a
+    /// reason.
+    pub fn exercise_reflected_xss(&mut self, probe: &super::plan::ReflectedXss) -> Outcome {
+        self.nonce += 1;
+        let executable = match &self.runtime {
+            Runtime::Local { .. } => match local_browser_executable() {
+                Some(executable) => executable,
+                None => {
+                    return Outcome::Skipped {
+                        reason: "reflected XSS verification needs a Chromium/Chrome browser on the \
+                                 host; none was found"
+                            .to_owned(),
+                    };
+                }
+            },
+            Runtime::Docker => {
+                return Outcome::Skipped {
+                    reason: "reflected XSS verification runs in the local browser runtime \
+                             (JSS_VERIFY_RUNTIME=local)"
+                        .to_owned(),
+                };
+            }
+        };
+        let attempts = super::reflected::reflected_xss_attempts(probe, self.nonce);
+        let tried = attempts.len();
+        let helper_dir = std::env::temp_dir().join(format!("jss-reflected-{}", run_id()));
+        if let Err(error) = std::fs::create_dir_all(&helper_dir) {
+            return Outcome::Skipped {
+                reason: format!("could not create the browser profile directory: {error}"),
+            };
+        }
+        let mut outcome = Outcome::NotReproduced { tried };
+        for attempt in &attempts {
+            let url = format!("http://127.0.0.1:{}{}", self.port, attempt.request_target);
+            let dom = match run_local_browser_capture(&executable, &url, &helper_dir) {
+                Ok(dom) => dom,
+                Err(error) => {
+                    if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                        eprintln!("[verify] reflected-xss browser load {url} failed: {error}");
+                    }
+                    continue;
+                }
+            };
+            let hit = dom.contains(&attempt.exec_token);
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] reflected-xss {} payload={} token={} hit={hit}",
+                    attempt.context, attempt.payload, attempt.exec_token
+                );
+            }
+            if hit {
+                let target = attempt.request_target.clone();
+                outcome = Outcome::Verified {
+                    how: format!("browser load {target} ({})", attempt.context),
+                    poc: Reproduction {
+                        command: format!(
+                            "open {}",
+                            shell_quote(&format!("http://TARGET_HOST{target}"))
+                        ),
+                        method: "BROWSER".to_owned(),
+                        target,
+                        headers: Vec::new(),
+                        body: None,
+                        evidence: format!(
+                            "a headless browser rendered the application's HTTP response and executed \
+                             the reflected payload `{}` (context: {}): the script computed and wrote \
+                             `{}` into the page, which a correctly escaped reflection never does",
+                            attempt.payload, attempt.context, attempt.exec_token
+                        ),
+                        response: reflected_dom_excerpt(&dom, &attempt.exec_token),
+                        controls: Vec::new(),
+                    },
+                };
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&helper_dir);
+        outcome
+    }
+
     /// Confirms a path-traversal read whose content is not reflected, by a differential oracle: a
     /// canary planted only outside the base directory makes the handler take its file-found branch,
     /// while two equivalent unplanted out-of-base paths take its not-found branch. URL reflection
@@ -7460,6 +7545,14 @@ pub fn app_dir(root: &std::path::Path, file: &std::path::Path) -> std::path::Pat
         }
         dir = current.parent();
     }
+    // A module worker (`export default { fetch }`) is launched by the worker-host shim, not a package
+    // start script, and its dependencies (`hono`, …) are declared in its nearest enclosing package.
+    // Install and run there so its bare imports resolve, even though the package declares no `start`.
+    if is_module_worker(&root.join(file))
+        && let Some(nearest) = packages.first()
+    {
+        return nearest.clone();
+    }
     if let Some(nearest) = packages.first()
         && manifest_start_command(&root.join(nearest)).is_some()
     {
@@ -9012,9 +9105,32 @@ const WORKER_HOST_JS: &str = r#"
 import http from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { register } from 'node:module';
 
 process.on('unhandledRejection', () => {});
 process.on('uncaughtException', () => {});
+
+// A TypeScript module worker (`src/index.ts` with `export default { fetch }`) imports its sibling
+// modules without a file extension (`import { x } from './email'`), which Node's ESM loader rejects
+// even though it strips the types. Register a resolve hook that, only when the default resolution
+// fails for a relative specifier, retries with the real source extensions (and an `index.*`), so the
+// worker's own `.ts`/`.tsx` graph loads the same way its deployment bundler would wire it. A no-op
+// for a `.js` worker: the default resolution already succeeds and the hook is never consulted.
+const RESOLVE_HOOK =
+  "import{existsSync}from'node:fs';import{fileURLToPath,pathToFileURL}from'node:url';" +
+  "const E=['.ts','.tsx','.mts','.cts','.js','.mjs','.cjs','.jsx','.json'];" +
+  "export async function resolve(s,c,n){" +
+  "if(s[0]==='.'||s[0]==='/'||s.startsWith('file:')){" +
+  "try{return await n(s,c);}catch(err){" +
+  "let b;try{b=s.startsWith('file:')?fileURLToPath(s):fileURLToPath(new URL(s,c.parentURL));}catch(e){throw err;}" +
+  "for(const x of E)if(existsSync(b+x))return n(pathToFileURL(b+x).href,c);" +
+  "for(const x of E)if(existsSync(b+'/index'+x))return n(pathToFileURL(b+'/index'+x).href,c);" +
+  "throw err;}}return n(s,c);}";
+try {
+  register('data:text/javascript,' + encodeURIComponent(RESOLVE_HOOK));
+} catch (e) {
+  console.error('[worker-host] resolve hook registration failed: ' + (e && (e.message || e)));
+}
 
 const port = Number(process.env.PORT || 3000);
 const target = path.resolve(process.cwd(), process.argv[2] || '');
@@ -9674,6 +9790,85 @@ fn run_local_browser(
     stop_local_process(&mut child);
     let _ = std::fs::remove_dir_all(&profile);
     Err("local headless browser did not exit within 12s".to_owned())
+}
+
+/// Loads `url` in a headless browser and returns the rendered DOM (`--dump-dom`) after scripts have
+/// run. Used by reflected-XSS verification to observe whether the injected script executed. A fresh
+/// throwaway profile per load keeps each attempt independent; stdout is read on a thread so a large
+/// DOM can never deadlock the wait.
+fn run_local_browser_capture(
+    executable: &std::path::Path,
+    url: &str,
+    helper_dir: &std::path::Path,
+) -> Result<String, String> {
+    use std::io::Read;
+    let profile = helper_dir.join(format!("profile-{}", short_rand()));
+    let mut command = Command::new(executable);
+    command
+        .arg("--headless=new")
+        .arg("--no-sandbox")
+        .arg("--disable-gpu")
+        .arg("--disable-dev-shm-usage")
+        .arg("--disable-background-networking")
+        .arg("--virtual-time-budget=5000")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--dump-dom")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = spawn_process_group(&mut command, "local headless browser")?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut buffer = String::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_string(&mut buffer);
+        }
+        buffer
+    });
+    let mut exited = false;
+    for _ in 0..150 {
+        if child
+            .try_wait()
+            .map_err(|error| format!("waiting for local headless browser: {error}"))?
+            .is_some()
+        {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if !exited {
+        stop_local_process(&mut child);
+    }
+    let dom = reader.join().unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&profile);
+    if !exited {
+        return Err("local headless browser did not exit within 15s".to_owned());
+    }
+    Ok(dom)
+}
+
+/// A one-line excerpt of the rendered DOM around the first occurrence of the canary's computed token,
+/// for the reproduction's `response`: enough context to show the executed write in the page without
+/// dumping the whole document.
+fn reflected_dom_excerpt(dom: &str, token: &str) -> String {
+    let Some(at) = dom.find(token) else {
+        return String::new();
+    };
+    let start = dom[..at]
+        .char_indices()
+        .rev()
+        .nth(120)
+        .map_or(0, |(index, _)| index);
+    let end = dom[at..]
+        .char_indices()
+        .nth(token.len() + 120)
+        .map_or(dom.len(), |(index, _)| at + index);
+    let window: String = dom[start..end]
+        .chars()
+        .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+        .collect();
+    format!("…{}…", window.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 impl Drop for BrowserSession {
@@ -10779,6 +10974,32 @@ mod tests {
         assert!(!validates(
             "nested.0123456789abcdef0123456789abcdef.callback.satori.ci"
         ));
+    }
+
+    #[test]
+    fn a_module_worker_installs_in_its_own_package_not_the_repo_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A monorepo whose worker package declares its runtime dependency (`hono`) but no `start`
+        // script: its `fetch` default export is served through the worker-host shim. `app_dir` must
+        // select the worker package so `npm install` installs `hono` where the shim loads it, not the
+        // repo root where it is never declared.
+        write(root, "package.json", r#"{"private":true}"#);
+        write(
+            root,
+            "workers/newsletter/package.json",
+            r#"{"private":true,"dependencies":{"hono":"^4"}}"#,
+        );
+        write(
+            root,
+            "workers/newsletter/src/index.ts",
+            "import { Hono } from 'hono';\nconst app = new Hono();\n\
+             export default { async fetch(request, env, ctx) { return app.fetch(request, env, ctx); } };\n",
+        );
+        assert_eq!(
+            app_dir(root, std::path::Path::new("workers/newsletter/src/index.ts")),
+            std::path::Path::new("workers/newsletter"),
+        );
     }
 
     #[test]

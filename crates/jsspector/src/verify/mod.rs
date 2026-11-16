@@ -11,6 +11,7 @@
 mod browser;
 mod payload;
 mod plan;
+mod reflected;
 mod sandbox;
 
 use jss_core::{Finding, VulnClass};
@@ -603,7 +604,11 @@ pub fn run(
         }
     }
 
-    let needs_http = plans.iter().any(|p| matches!(p, Ok(plan::Plan::Http(_))));
+    // A reflected XSS runs the app (like an HTTP finding) and additionally drives a headless browser
+    // against the live response, so it needs the HTTP app session.
+    let needs_http = plans
+        .iter()
+        .any(|p| matches!(p, Ok(plan::Plan::Http(_)) | Ok(plan::Plan::ReflectedXss(_))));
     let needs_browser = plans
         .iter()
         .any(|p| matches!(p, Ok(plan::Plan::Browser(_))));
@@ -661,40 +666,21 @@ pub fn run(
                     reason: skip.0.clone(),
                 },
                 Ok(plan::Plan::Http(probe)) => {
-                    let declared = finding
-                        .entry_at
-                        .as_ref()
-                        .map_or(&finding.file, |at| &at.file);
-                    let declared = std::path::Path::new(declared);
-                    let app = sandbox::app_dir(root, declared);
-                    let key = sandbox::session_key(root, &app, declared);
-                    let index = match http.iter().position(|(existing, _)| *existing == key) {
-                        Some(index) => index,
-                        None => {
-                            // Local verification plants process-global fixtures such as
-                            // the `/tmp/jss-canary-read` fixtures and launch shims. Unlike Docker sessions, two
-                            // local app sessions cannot safely coexist: the second would either
-                            // consume the first session's token or refuse to overwrite its files.
-                            // Tear the previous app down before switching packages. A later finding
-                            // for that package may rebuild it, which is slower but preserves isolation
-                            // and makes every verdict independent of finding order.
-                            if sandbox::local_runtime_requested() {
-                                for (_, session) in &mut http {
-                                    if let Ok(session) = session {
-                                        session.teardown();
-                                    }
-                                }
-                                http.clear();
-                            }
-                            let gating = gating_env_sources(root, finding);
-                            let session =
-                                sandbox::Session::start_in(root, &app, Some(declared), &gating);
-                            http.push((key, session));
-                            http.len() - 1
-                        }
-                    };
+                    let index = acquire_http_session(&mut http, root, finding);
                     match http.get_mut(index).map(|(_, session)| session) {
                         Some(Ok(session)) => session.exercise(probe),
+                        Some(Err(err)) => Outcome::Skipped {
+                            reason: format!("the app could not be launched: {err}"),
+                        },
+                        None => Outcome::Skipped {
+                            reason: "not attempted".to_owned(),
+                        },
+                    }
+                }
+                Ok(plan::Plan::ReflectedXss(probe)) => {
+                    let index = acquire_http_session(&mut http, root, finding);
+                    match http.get_mut(index).map(|(_, session)| session) {
+                        Some(Ok(session)) => session.exercise_reflected_xss(probe),
                         Some(Err(err)) => Outcome::Skipped {
                             reason: format!("the app could not be launched: {err}"),
                         },
@@ -726,6 +712,43 @@ pub fn run(
         session.teardown();
     }
     Ok(verdicts)
+}
+
+/// The index into `http` of the app session that serves `finding`'s route, launching it on first use
+/// and reusing it afterwards. Shared by the HTTP and reflected-XSS dispatch, which both run the live
+/// application; the latter additionally drives a browser against its response.
+fn acquire_http_session(
+    http: &mut Vec<(std::path::PathBuf, Result<sandbox::Session, String>)>,
+    root: &std::path::Path,
+    finding: &Finding,
+) -> usize {
+    let declared = finding
+        .entry_at
+        .as_ref()
+        .map_or(&finding.file, |at| &at.file);
+    let declared = std::path::Path::new(declared);
+    let app = sandbox::app_dir(root, declared);
+    let key = sandbox::session_key(root, &app, declared);
+    if let Some(index) = http.iter().position(|(existing, _)| *existing == key) {
+        return index;
+    }
+    // Local verification plants process-global fixtures such as the `/tmp/jss-canary-read` fixtures
+    // and launch shims. Unlike Docker sessions, two local app sessions cannot safely coexist: the
+    // second would either consume the first session's token or refuse to overwrite its files. Tear the
+    // previous app down before switching packages. A later finding for that package may rebuild it,
+    // which is slower but preserves isolation and makes every verdict independent of finding order.
+    if sandbox::local_runtime_requested() {
+        for (_, session) in http.iter_mut() {
+            if let Ok(session) = session {
+                session.teardown();
+            }
+        }
+        http.clear();
+    }
+    let gating = gating_env_sources(root, finding);
+    let session = sandbox::Session::start_in(root, &app, Some(declared), &gating);
+    http.push((key, session));
+    http.len() - 1
 }
 
 /// Applies the express-validator body requirements mined for one route. The payload field's own

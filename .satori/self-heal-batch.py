@@ -134,19 +134,28 @@ def merge_targets(paths: list[Path]) -> dict:
                     "cases": [],
                 },
             )
-            merged["fingerprints"] = sorted(
-                set(merged["fingerprints"]) | set(target.get("fingerprints", []))
-            )
-            cases = {case["finding_id"]: case for case in merged["cases"]}
-            cases.update(
-                (case["finding_id"], case)
-                for case in target.get("cases", [])
-                if case.get("finding_id")
-            )
-            merged["cases"] = sorted(cases.values(), key=lambda case: case["finding_id"])
+            for fingerprint in target.get("fingerprints", []):
+                if fingerprint not in merged["fingerprints"]:
+                    merged["fingerprints"].append(fingerprint)
+            for incoming in target.get("cases", []):
+                finding_id = incoming.get("finding_id")
+                fingerprint = incoming.get("fingerprint")
+                match = next(
+                    (
+                        index
+                        for index, existing in enumerate(merged["cases"])
+                        if (finding_id and existing.get("finding_id") == finding_id)
+                        or (fingerprint and existing.get("fingerprint") == fingerprint)
+                    ),
+                    None,
+                )
+                if match is None:
+                    merged["cases"].append(incoming)
+                else:
+                    merged["cases"][match] = {**merged["cases"][match], **incoming}
     return {
         "schema_version": 1,
-        "targets": [targets[key] for key in sorted(targets, key=lambda item: (item[0].lower(), item[1]))],
+        "targets": list(targets.values()),
     }
 
 
@@ -155,6 +164,12 @@ def push(root: Path) -> None:
     first = subprocess.run(["git", "push"], cwd=root, env=environment)
     if first.returncode == 0:
         return
+    if "GITHUB_TOKEN" in environment:
+        print(
+            "self-heal: configured GITHUB_TOKEN could not push; retrying with Git credentials",
+            file=sys.stderr,
+            flush=True,
+        )
     environment.pop("GITHUB_TOKEN", None)
     run(["git", "push"], root, environment)
 

@@ -1044,7 +1044,13 @@ fn push_validated_changes(options: &Options, recovered: &[(Case, String)]) -> Re
         // A read-only discovery token can shadow a writable account in the system credential
         // store. Retrying without that override is safe: Git still performs an ordinary,
         // non-forced push and rejects remote races.
-        Ok(std::env::var_os("GITHUB_TOKEN").is_some() && push(true)?.success())
+        if std::env::var_os("GITHUB_TOKEN").is_none() {
+            return Ok(false);
+        }
+        eprintln!(
+            "self-heal: configured GITHUB_TOKEN could not push; retrying with Git credentials"
+        );
+        Ok(push(true)?.success())
     };
     if push_with_configured_credentials()? {
         eprintln!("self-heal: validated commits pushed");

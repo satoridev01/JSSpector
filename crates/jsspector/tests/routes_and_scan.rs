@@ -171,6 +171,56 @@ fn scan_links_a_route_to_a_sink_two_files_away() {
 }
 
 #[test]
+fn a_middleware_factory_mount_links_its_sink_to_the_use_entry() {
+    // `app.use('/mcp', createMcpProxy(base))` mounts the request handler the factory *returns*
+    // (`return function mcpProxy(req, res) { ... }`), not a sub-router. The SSRF sink inside that
+    // handler must be attributed to a drivable `USE /mcp` entry, otherwise verification has no entry
+    // point to send to and the finding is only reported statically.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "src/app.js",
+        "const express = require('express');\n\
+         const { createMcpProxy } = require('./middlewares/mcp-proxy');\n\
+         const app = express();\n\
+         app.use('/mcp', createMcpProxy(process.env.MCP_URL));\n\
+         module.exports = app;\n",
+    );
+    write(
+        root,
+        "src/middlewares/mcp-proxy.js",
+        "const http = require('http');\n\
+         function createMcpProxy(targetBase) {\n\
+           const base = new URL(targetBase);\n\
+           return function mcpProxy(req, res) {\n\
+             const target = new URL(req.originalUrl, base);\n\
+             const upstream = http.request(target, { method: req.method }, (r) => r.pipe(res));\n\
+             req.pipe(upstream);\n\
+           };\n\
+         }\n\
+         module.exports = { createMcpProxy };\n",
+    );
+
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let has_use = routes.as_array().unwrap().iter().any(|r| {
+        r["method"] == "USE" && r["path"] == "/mcp"
+    });
+    assert!(has_use, "no USE /mcp entry: {routes:?}");
+
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = report["findings"].as_array().unwrap();
+    let ssrf = findings
+        .iter()
+        .find(|f| f["class"] == "ssrf")
+        .unwrap_or_else(|| panic!("no SSRF finding: {findings:?}"));
+    assert_eq!(ssrf["file"], "src/middlewares/mcp-proxy.js");
+    assert_eq!(ssrf["entry"], "USE /mcp", "{ssrf:?}");
+    assert_eq!(ssrf["source"]["expr"], "req.originalUrl");
+    assert_eq!(ssrf["sink"]["api"], "http.request");
+}
+
+#[test]
 fn versioned_dynamic_mounts_link_anonymous_default_routers_and_class_instances() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

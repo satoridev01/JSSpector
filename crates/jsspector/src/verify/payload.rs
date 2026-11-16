@@ -371,8 +371,17 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                 // way too; the path form stays first for a handler that appends the path to a
                 // URL of its own.
                 let as_path = place(probe, verb, &value, signal.clone());
+                // A middleware mounted at a path prefix (`app.use('/mcp', ...)`) runs only for
+                // requests whose path begins with that prefix, and resolves the *original* URL
+                // (prefix included) against its base. An absolute-form or protocol-relative target
+                // overrides the host, but the router dispatches on the target's *path*, so the
+                // request reaches the handler only while that path still starts with the mount
+                // prefix. Carry the prefix ahead of the marker's token path so the host-override
+                // request both routes to the handler and lands at the marker. A non-mount entry
+                // leaves the marker URL unchanged.
+                let host_override = mount_marker_url(&value, probe);
                 let absolute = Attempt {
-                    target: value.clone(),
+                    target: host_override.clone(),
                     ..as_path.clone()
                 };
                 // `Entry::Url` means the raw request target itself is the tainted value. Try the
@@ -386,7 +395,7 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                 // reference) overrides it: the resolved URL takes the attacker's host while inheriting
                 // the base's scheme. Send the marker host that way so a path-only proxy still lands at
                 // the marker. Carries the probe token so its hit is told from any other request.
-                if let Some((_, authority_and_path)) = value.split_once("://") {
+                if let Some((_, authority_and_path)) = host_override.split_once("://") {
                     out.push(Attempt {
                         verb,
                         target: format!("//{authority_and_path}"),
@@ -1840,6 +1849,33 @@ fn url_raw_gates(probe: &Probe) -> Vec<String> {
 }
 
 /// Puts `value` where the probe said it enters, returning the full request.
+/// Insert a mounted middleware's path prefix ahead of a marker URL's path, keeping its scheme,
+/// authority (any userinfo included) and token. A middleware registered with `app.use('/mcp', ...)`
+/// runs only for requests whose path begins with `/mcp`, and a forward proxy inside it resolves the
+/// full original URL (prefix included) against a base; an absolute-form or protocol-relative
+/// request-target overrides the host but the router still dispatches on its path, so the request
+/// reaches the handler only while that path keeps the mount prefix. For a non-mount entry, or a
+/// value that is not an absolute URL, the value is returned unchanged.
+fn mount_marker_url(value: &str, probe: &Probe) -> String {
+    if probe.method != Method::Use {
+        return value.to_owned();
+    }
+    let prefix = probe.path.trim_end_matches('/');
+    if prefix.is_empty() {
+        return value.to_owned();
+    }
+    match value.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.split_once('/') {
+                Some((authority, path)) => (authority, format!("/{path}")),
+                None => (rest, String::new()),
+            };
+            format!("{scheme}://{authority}{prefix}{path}")
+        }
+        None => value.to_owned(),
+    }
+}
+
 fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Attempt {
     let mut target = probe.path.clone();
     let mut body = None;
@@ -3378,6 +3414,46 @@ mod tests {
             "a climbing payload reaches outside the mount: {:?}",
             a.iter().map(|x| &x.target).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_use_mount_url_ssrf_overrides_the_host_under_the_mount_prefix() {
+        // A proxy middleware mounted at `/mcp` resolves the full original URL against a base
+        // (`new URL(req.originalUrl, base)`). The router dispatches on the request-target's path,
+        // so a host-override request reaches the handler only while its path keeps the `/mcp`
+        // prefix. The absolute-form and protocol-relative marker targets must carry the prefix
+        // ahead of the probe token, while a plain path payload still rides under the mount.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(VulnClass::Ssrf, "/mcp", Entry::Url);
+        p.method = Method::Use;
+        let a = attempts(&p, &canary, 1);
+        let token = canary.service_token(1);
+        let targets: Vec<&str> = a.iter().map(|x| x.target.as_str()).collect();
+        // Absolute-form host override, routed under the mount: `http://jss-marker/mcp/<token>`.
+        let absolute = format!("http://{MARKER_HOST}/mcp/{token}");
+        assert!(
+            a.iter()
+                .any(|x| x.target == absolute
+                    && x.signal == Signal::ServiceReached(token.clone())),
+            "no mounted absolute-form host override in {targets:?}"
+        );
+        // Protocol-relative host override, also under the mount: `//jss-marker/mcp/<token>`.
+        let protocol_relative = format!("//{MARKER_HOST}/mcp/{token}");
+        assert!(
+            a.iter()
+                .any(|x| x.target == protocol_relative
+                    && x.signal == Signal::ServiceReached(token.clone())),
+            "no mounted protocol-relative host override in {targets:?}"
+        );
+        // A host-override target whose path dropped the mount prefix would never route to the
+        // handler, so none is emitted bare.
+        assert!(
+            !a.iter()
+                .any(|x| x.target == format!("http://{MARKER_HOST}/{token}")
+                    || x.target == format!("//{MARKER_HOST}/{token}")),
+            "a host override lost the mount prefix: {targets:?}"
+        );
+        assert!(a.iter().all(|x| x.verb == "GET" && x.body.is_none()));
     }
 
     #[test]

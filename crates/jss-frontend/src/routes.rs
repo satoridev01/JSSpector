@@ -176,6 +176,43 @@ fn raise_auth(finding: &mut jss_core::Finding, auth: Auth) {
 /// A router: a variable in a file.
 type RouterId = (String, String);
 
+/// A `use` registration whose mounted value is a middleware the factory returns rather than a
+/// sub-router (`app.use('/mcp', createMcpProxy(base))`). Turned into a `USE` route entry on the
+/// returned handler.
+struct HandlerMount {
+    /// The router the middleware is registered on (file, variable).
+    parent: RouterId,
+    /// The path prefix it is mounted under.
+    prefix: String,
+    /// Authentication middleware applied alongside the mount.
+    auth: Auth,
+    /// The file defining the returned handler.
+    handler_file: String,
+    /// The returned handler's function name.
+    handler: String,
+    /// The handler's definition line.
+    line: u32,
+    /// The `app.use(...)` registration site (file, line) — where the route, and any config gate
+    /// enabling it, is written.
+    at: (String, u32),
+}
+
+/// Whether a mount's resolved child is a request-handler function (middleware) rather than a
+/// sub-router, with its definition line. A `use` mount's value is either a router or a middleware;
+/// a router is always a *variable* (`const r = Router()`, or what a factory returns), never one of
+/// the module's own functions, so a child that names a defined function is middleware. This covers a
+/// handler mounted directly (`app.use('/mcp', mcpProxy)`) and one a factory returns
+/// (`app.use('/mcp', createMcpProxy(base))`, which resolves through the factory's returned function).
+fn middleware_handler(by_file: &BTreeMap<&str, &ScanReport>, child: &RouterId) -> Option<u32> {
+    by_file
+        .get(child.0.as_str())?
+        .module
+        .functions
+        .iter()
+        .find(|f| f.name == child.1)
+        .map(|f| f.line)
+}
+
 /// Builds the inventory from scan reports.
 pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
     let by_file: BTreeMap<&str, &ScanReport> = reports
@@ -189,6 +226,11 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
 
     // Mount edges: child router -> (parent router, prefix).
     let mut parents: BTreeMap<RouterId, Vec<(RouterId, String, Auth)>> = BTreeMap::new();
+    // `app.use('/mcp', createMcpProxy(base))`: a mount whose "child" is not a sub-router but the
+    // request handler a factory returns (`return function mcpProxy(req, res) { ... }`). Recorded
+    // as a `USE` entry on that returned handler once the parent's own prefixes are known, so the
+    // sink inside the handler has a drivable entry instead of being lost as an empty router mount.
+    let mut handler_mounts: Vec<HandlerMount> = Vec::new();
     for (file, report) in &by_file {
         for mount in &report.module.mounts {
             let Some(parent) = &mount.receiver else {
@@ -205,6 +247,18 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
                 (None, None) => None,
             };
             if let Some(child) = child {
+                if let Some(line) = middleware_handler(&by_file, &child) {
+                    handler_mounts.push(HandlerMount {
+                        parent: (file.to_string(), parent.clone()),
+                        prefix: mount.prefix.clone(),
+                        auth: mount.auth,
+                        handler: child.1,
+                        handler_file: child.0,
+                        line,
+                        at: (file.to_string(), mount.line),
+                    });
+                    continue;
+                }
                 parents.entry(child).or_default().push((
                     (file.to_string(), parent.clone()),
                     mount.prefix.clone(),
@@ -216,6 +270,27 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
 
     let mut routes = BTreeSet::new();
     let mut memo = BTreeMap::new();
+    // A middleware-factory mount (`app.use('/mcp', createMcpProxy(base))`) becomes a `USE` entry on
+    // the handler the factory returns, under every prefix the parent router is itself reachable at.
+    for hm in &handler_mounts {
+        for (prefix, mount_auth) in prefixes(&parents, &hm.parent, &mut memo) {
+            routes.insert(Route {
+                method: "USE".to_owned(),
+                path: join(&prefix, &hm.prefix),
+                file: hm.handler_file.clone(),
+                line: hm.line,
+                // Report the entry at the `app.use(...)` registration site, not the handler body.
+                at: Some(hm.at.clone()),
+                handler: hm.handler.clone(),
+                handler_ref: hm.handler.clone(),
+                handler_refs: Vec::new(),
+                auth: hm.auth.max(mount_auth),
+                kind: "http".to_owned(),
+                inputs: Vec::new(),
+                lines: None,
+            });
+        }
+    }
     for (file, report) in &by_file {
         for entry in &report.module.entries {
             let prefixes = match &entry.receiver {

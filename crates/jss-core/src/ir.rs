@@ -160,6 +160,10 @@ pub struct Mount {
     pub target_export: Option<String>,
     /// Authentication middleware applied at the mount.
     pub auth: Auth,
+    /// Line of the registration call, so a middleware-factory mount recovered as an entry locates
+    /// at the `app.use(...)` site.
+    #[serde(default)]
+    pub line: u32,
 }
 
 /// A function, by module and name.

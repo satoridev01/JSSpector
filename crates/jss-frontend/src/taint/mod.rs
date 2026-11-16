@@ -677,6 +677,9 @@ pub struct MountFact {
     pub target_export: Option<String>,
     /// Authentication middleware on the mount (`app.use('/admin', requireAdmin, router)`).
     pub auth: Auth,
+    /// The registration call's span, so a middleware-factory mount turned into an entry points at
+    /// the `app.use(...)` site (where the route — and any config gate enabling it — is written).
+    pub span: Span,
 }
 
 /// A named function's parameter that reaches a sink in its body.
@@ -3736,6 +3739,18 @@ impl Walker<'_> {
                     self.record_returned(argument, taint, env);
                     // `return router`: a factory's product (for mounts of `require('./x')()`).
                     if let Expression::Identifier(id) = argument.get_inner_expression() {
+                        self.facts
+                            .returned_locals
+                            .entry(env.function.clone())
+                            .or_insert_with(|| id.name.as_str().to_owned());
+                    }
+                    // `return function mcpProxy(req, res) { ... }`: a middleware factory's
+                    // product — the request handler it returns, named so it is its own function.
+                    // Recorded like a returned router so a `app.use(path, factory())` registration
+                    // can be linked to the handler the factory returns (not a sub-router).
+                    if let Expression::FunctionExpression(f) = argument.get_inner_expression()
+                        && let Some(id) = &f.id
+                    {
                         self.facts
                             .returned_locals
                             .entry(env.function.clone())
@@ -11611,6 +11626,7 @@ impl Walker<'_> {
                     target_file,
                     target_export,
                     auth,
+                    span: call.span,
                 });
                 continue;
             }
@@ -11992,6 +12008,7 @@ impl Walker<'_> {
                     target_file,
                     target_export,
                     auth,
+                    span: call.span,
                 });
             }
             return;
@@ -12030,7 +12047,7 @@ impl Walker<'_> {
                     // `./apis/v${v}/router.js`: one mount per matching file, each under its own
                     // concrete version prefix. Resolves the versioned-API loop a single string
                     // prefix cannot express.
-                    if self.record_versioned_mount(first, last, object.as_deref(), auth) {
+                    if self.record_versioned_mount(first, last, object.as_deref(), auth, call.span) {
                         return;
                     }
                     let (target, target_file, target_export) = match last {
@@ -12044,6 +12061,7 @@ impl Walker<'_> {
                         target_file,
                         target_export,
                         auth,
+                        span: call.span,
                     });
                     return;
                 }
@@ -12314,6 +12332,7 @@ impl Walker<'_> {
         router_expr: Option<&Expression<'_>>,
         receiver: Option<&str>,
         auth: Auth,
+        span: Span,
     ) -> bool {
         let Some((pfx_pre, pfx_var, pfx_suf)) = prefix_expr.and_then(single_interpolation) else {
             return false;
@@ -12344,6 +12363,7 @@ impl Walker<'_> {
                 target_file: Some(file),
                 target_export: export.clone(),
                 auth,
+                span,
             });
             recorded = true;
         }
@@ -12685,6 +12705,7 @@ impl Walker<'_> {
                     target_file,
                     target_export,
                     auth: template.auth.max(auth),
+                    span: call.span,
                 });
             }
             return;

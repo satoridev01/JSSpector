@@ -961,9 +961,16 @@ fn gating_env_sources(root: &std::path::Path, finding: &Finding) -> Vec<String> 
         .file
         .as_deref()
         .unwrap_or(finding.file.as_str());
+    // The route may be registered in a third module (`app.use('/mcp', createMcpProxy(base))` in
+    // `app.js`, whose `if (process.env.MCP_SERVER_URL)` gate must be satisfied for the handler to be
+    // mounted at all), distinct from both the sink's module and the handler's. Scan it too.
+    let entry_file = finding.entry_at.as_ref().map(|at| at.file.as_str());
     let mut sources = Vec::new();
     let mut seen_files = Vec::new();
-    for file in [sink_file, finding.file.as_str()] {
+    for file in [Some(sink_file), Some(finding.file.as_str()), entry_file]
+        .into_iter()
+        .flatten()
+    {
         if seen_files.iter().any(|f| f == file) {
             continue;
         }

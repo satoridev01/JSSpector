@@ -815,6 +815,7 @@ fn analyze(
                 target_file: mount.target_file,
                 target_export: mount.target_export,
                 auth: mount.auth,
+                line: line(mount.span.start),
             })
             .collect(),
     };

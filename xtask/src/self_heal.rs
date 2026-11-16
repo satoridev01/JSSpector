@@ -192,7 +192,7 @@ pub fn run(options: &Options) -> Result<()> {
     if let Some(repair) = workspace {
         let generation = git_output(&repair.path, &["rev-parse", "HEAD"])?;
         if generation.trim() != repair.base {
-            validate_accumulated_targets(options, &repair.path, &recovered)?;
+            validate_repaired_targets(options, &repair.path, &recovered)?;
         }
         apply_repair_workspace(options, &repair)?;
     }
@@ -200,7 +200,7 @@ pub fn run(options: &Options) -> Result<()> {
         persist_identity(&options.targets, case, fingerprint)?;
     }
     commit_recovered_identities(options, &recovered)?;
-    push_validated_changes(options)?;
+    push_validated_changes(options, &recovered)?;
     eprintln!(
         "\nself-heal: verified={passed} blocked={} total={}",
         blocked.len(),
@@ -771,7 +771,13 @@ bypass, forge or special-case the controller, matcher, benchmark or proof requir
 the target repository or expected benchmark data.";
 
 fn create_repair_workspace(options: &Options) -> Result<RepairWorkspace> {
-    if Command::new("claude").arg("--version").status().is_err() {
+    if Command::new("claude")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
         bail!("the configured repair-agent CLI is required for repair mode");
     }
     let base = git_output(&options.root, &["rev-parse", "HEAD"])?
@@ -989,7 +995,7 @@ fn commit_recovered_identities(options: &Options, recovered: &[(Case, String)]) 
     )
 }
 
-fn push_validated_changes(options: &Options) -> Result<()> {
+fn push_validated_changes(options: &Options, recovered: &[(Case, String)]) -> Result<()> {
     if !options.push {
         return Ok(());
     }
@@ -1036,7 +1042,7 @@ fn push_validated_changes(options: &Options) -> Result<()> {
             .args(["xtask", "ci"]),
         "validate the rebased JSSpector workspace".to_owned(),
     )?;
-    validate_accumulated_targets(options, &options.root, &[])?;
+    validate_repaired_targets(options, &options.root, recovered)?;
     if !push_with_configured_credentials()? {
         bail!("upstream advanced again after revalidation; rerun self-heal to retry safely");
     }
@@ -1044,54 +1050,30 @@ fn push_validated_changes(options: &Options) -> Result<()> {
     Ok(())
 }
 
-fn validate_accumulated_targets(
+fn validate_repaired_targets(
     options: &Options,
     source: &Path,
     recovered: &[(Case, String)],
 ) -> Result<()> {
-    eprintln!("self-heal: running the accumulated dynamic regression gate");
-    let mut index = if options.targets.is_file() {
-        read_json::<Value>(&options.targets)?
-    } else {
-        json!({"schema_version": 1, "targets": []})
-    };
-    for (case, fingerprint) in recovered {
-        persist_identity_value(&mut index, case, fingerprint)?;
+    if recovered.is_empty() {
+        return Ok(());
     }
+    eprintln!("self-heal: independently revalidating repaired benchmark cases");
     build_scanner(source)?;
     let scanner = source.join("target/release/jsspector");
-    let targets = at(&index, &["targets"])
-        .as_array()
-        .context("target index needs a targets array")?;
-    for (ordinal, target_spec) in targets.iter().enumerate() {
-        let repository = at(target_spec, &["repository"])
-            .as_str()
-            .context("regression target has no repository")?;
-        let revision = at(target_spec, &["revision"])
-            .as_str()
-            .context("regression target has no revision")?;
+    for (ordinal, (case, expected_fingerprint)) in recovered.iter().enumerate() {
         eprintln!(
-            "self-heal: regression {}/{} {}@{}",
+            "self-heal: validation {}/{} {}@{}",
             ordinal + 1,
-            targets.len(),
-            repository,
-            revision.get(..12).unwrap_or(revision)
+            recovered.len(),
+            case.repository,
+            case.revision.get(..12).unwrap_or(&case.revision)
         );
-        let placeholder = Case {
-            finding_id: format!("regression-{ordinal}"),
-            repository: repository.to_owned(),
-            revision: revision.to_owned(),
-            class: String::new(),
-            file: None,
-            title: String::new(),
-            expected_exploitability: "exploitable".to_owned(),
-            scanner_fingerprint: None,
-        };
-        let checkout = checkout_target(options, &placeholder)?;
-        let directory = options.cache.join("regression").join(format!(
+        let checkout = checkout_target(options, case)?;
+        let directory = options.cache.join("validation").join(format!(
             "{:03}-{}",
             ordinal + 1,
-            repository.replace('/', "__")
+            case.repository.replace('/', "__")
         ));
         std::fs::create_dir_all(&directory)?;
         let static_report = directory.join("static.json");
@@ -1106,68 +1088,42 @@ fn validate_accumulated_targets(
         let findings = at(&report, &["findings"])
             .as_array()
             .context("scanner report needs findings")?;
-        let mut fingerprints = Vec::new();
-        for expected in at(target_spec, &["cases"]).as_array().into_iter().flatten() {
-            let fingerprint = at(expected, &["fingerprint"])
-                .as_str()
-                .context("regression case has no fingerprint")?;
-            let mut candidates: Vec<&Value> = findings
-                .iter()
-                .filter(|finding| at(finding, &["fingerprint"]).as_str() == Some(fingerprint))
-                .collect();
-            if candidates.is_empty() {
-                let class = at(expected, &["class"]).as_str();
-                let file = at(expected, &["file"]).as_str();
-                let title = at(expected, &["title"]).as_str();
-                candidates = findings
-                    .iter()
-                    .filter(|finding| {
-                        at(finding, &["class"]).as_str() == class
-                            && at(finding, &["file"]).as_str() == file
-                            && at(finding, &["title"]).as_str() == title
-                    })
-                    .collect();
-            }
-            if candidates.len() != 1 {
-                bail!(
-                    "regression identity {} in {} resolved to {} findings",
-                    fingerprint,
-                    repository,
-                    candidates.len()
-                );
-            }
-            let current = at(
-                candidates.first().context("unique regression candidate")?,
-                &["fingerprint"],
-            )
-            .as_str()
-            .context("regression finding has no current fingerprint")?;
-            if !fingerprints.iter().any(|item| item == current) {
-                fingerprints.push(current.to_owned());
-            }
+        let matches = findings
+            .iter()
+            .filter(|finding| {
+                at(finding, &["fingerprint"]).as_str() == Some(expected_fingerprint.as_str())
+            })
+            .count();
+        if matches != 1 {
+            bail!(
+                "repaired identity {} in {} resolved to {} findings",
+                expected_fingerprint,
+                case.repository,
+                matches
+            );
         }
         let dynamic_report = directory.join("dynamic.json");
         scan(
             &scanner,
             &checkout,
             &dynamic_report,
-            &fingerprints,
+            std::slice::from_ref(expected_fingerprint),
             Duration::from_secs(1800),
         )?;
         let dynamic: Value = read_json(&dynamic_report)?;
-        for fingerprint in &fingerprints {
-            let finding = at(&dynamic, &["findings"])
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|finding| at(finding, &["fingerprint"]).as_str() == Some(fingerprint));
-            if !finding.is_some_and(has_dynamic_proof) {
-                bail!(
-                    "accepted repair regressed dynamic proof {} in {}",
-                    fingerprint,
-                    repository
-                );
-            }
+        let finding = at(&dynamic, &["findings"])
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|finding| {
+                at(finding, &["fingerprint"]).as_str() == Some(expected_fingerprint.as_str())
+            });
+        if !finding.is_some_and(has_dynamic_proof) {
+            bail!(
+                "accepted repair lost dynamic proof {} in {}",
+                expected_fingerprint,
+                case.repository
+            );
         }
     }
     Ok(())

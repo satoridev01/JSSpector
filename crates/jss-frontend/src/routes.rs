@@ -1027,7 +1027,10 @@ fn path_stem(s: &str) -> &str {
 pub fn file_route_path(file: &str, kind: &str) -> Option<String> {
     let segments: Vec<&str> = file.split('/').collect();
     if kind == "file-route" {
-        if !segments.last().is_some_and(|last| path_stem(last) == "route") {
+        if !segments
+            .last()
+            .is_some_and(|last| path_stem(last) == "route")
+        {
             return None;
         }
         // The app directory: `src/app`, else the first `app` that is not a package named `app`
@@ -1068,9 +1071,9 @@ pub fn file_route_path(file: &str, kind: &str) -> Option<String> {
 pub fn vercel_api_route_path(file: &str) -> Option<String> {
     let segments: Vec<&str> = file.split('/').collect();
     let at = segments.iter().position(|s| *s == "api")?;
-    let before = &segments[..at];
-    let is_deployment_root = before.is_empty()
-        || matches!(before, ["packages", _] | ["apps", _] | ["services", _]);
+    let before = segments.get(..at)?;
+    let is_deployment_root =
+        before.is_empty() || matches!(before, ["packages", _] | ["apps", _] | ["services", _]);
     if !is_deployment_root {
         return None;
     }

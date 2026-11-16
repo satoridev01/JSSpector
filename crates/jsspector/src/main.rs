@@ -15,7 +15,7 @@ use std::fmt::Display;
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -121,7 +121,11 @@ enum Format {
 #[derive(Args)]
 struct ScanArgs {
     /// File or directory to scan.
-    path: PathBuf,
+    #[arg(required_unless_present = "repo", conflicts_with = "repo")]
+    path: Option<PathBuf>,
+    /// Clone and scan a GitHub repository, optionally pinned as OWNER/REPO@REVISION.
+    #[arg(long, value_name = "OWNER/REPO[@REVISION]", conflicts_with = "path")]
+    repo: Option<String>,
     /// Number of threads [default: all available cores, or RAYON_NUM_THREADS].
     #[arg(long, value_name = "N")]
     threads: Option<NonZeroUsize>,
@@ -598,9 +602,231 @@ fn analyze(
     Ok(analysis)
 }
 
+struct RemoteCheckout {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    label: String,
+}
+
+fn repository_spec(value: &str) -> Result<(&str, Option<&str>), String> {
+    let (repository, revision) = value
+        .rsplit_once('@')
+        .map_or((value, None), |(repository, revision)| {
+            (repository, Some(revision))
+        });
+    let Some((owner, name)) = repository.split_once('/') else {
+        return Err("repository must be OWNER/REPO or OWNER/REPO@REVISION".to_owned());
+    };
+    let safe_name = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    };
+    if !safe_name(owner) || !safe_name(name) || name.contains('/') {
+        return Err("repository must be a safe GitHub OWNER/REPO name".to_owned());
+    }
+    if revision.is_some_and(|revision| {
+        revision.is_empty()
+            || revision.starts_with('-')
+            || !revision
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_./".contains(character))
+    }) {
+        return Err("repository revision contains unsupported characters".to_owned());
+    }
+    Ok((repository, revision))
+}
+
+#[cfg(test)]
+mod repository_input_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn repository_input_accepts_head_and_pinned_scans() {
+        assert_eq!(
+            repository_spec("owner/project").unwrap(),
+            ("owner/project", None)
+        );
+        assert_eq!(
+            repository_spec("owner/project@ace6a5fbc409").unwrap(),
+            ("owner/project", Some("ace6a5fbc409"))
+        );
+        assert_eq!(
+            repository_spec("owner/project@release/v1").unwrap(),
+            ("owner/project", Some("release/v1"))
+        );
+    }
+
+    #[test]
+    fn repository_input_rejects_urls_options_and_incomplete_names() {
+        for invalid in [
+            "project",
+            "owner/",
+            "/project",
+            "https://github.com/owner/project",
+            "owner/project@",
+            "owner/project@--upload-pack=bad",
+            "owner/project@main:refs/heads/x",
+        ] {
+            assert!(repository_spec(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn scan_cli_accepts_exactly_one_repository_source() {
+        assert!(Cli::try_parse_from(["jsspector", "scan", "--repo", "owner/project"]).is_ok());
+        assert!(Cli::try_parse_from(["jsspector", "scan", "."]).is_ok());
+        assert!(
+            Cli::try_parse_from(["jsspector", "scan", ".", "--repo", "owner/project"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["jsspector", "scan"]).is_err());
+    }
+}
+
+fn checkout_repository(value: &str) -> Result<RemoteCheckout, String> {
+    let (repository, revision) = repository_spec(value)?;
+    let directory = tempfile::Builder::new()
+        .prefix("jsspector-repo-")
+        .tempdir()
+        .map_err(|error| format!("create temporary repository checkout: {error}"))?;
+    let path = directory.path().join("repository");
+    let url = format!("https://github.com/{repository}.git");
+    let mut clone = ProcessCommand::new("git");
+    clone.args(["clone", "--filter=blob:none"]);
+    if revision.is_some() {
+        clone.arg("--no-checkout");
+    } else {
+        clone.args(["--depth", "1"]);
+    }
+    let status = clone
+        .arg(&url)
+        .arg(&path)
+        .status()
+        .map_err(|error| format!("start git clone for {repository}: {error}"))?;
+    if !status.success() {
+        return Err(format!("git clone failed for {repository} with {status}"));
+    }
+    if let Some(revision) = revision {
+        let expression = format!("{revision}^{{commit}}");
+        let local = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["rev-parse", "--verify", "--quiet", &expression])
+            .output()
+            .map_err(|error| format!("resolve local git revision for {value}: {error}"))?;
+        let checkout = if local.status.success() {
+            String::from_utf8(local.stdout)
+                .map_err(|error| format!("git revision for {value} is not UTF-8: {error}"))?
+                .trim()
+                .to_owned()
+        } else {
+            let status = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(["fetch", "--depth", "1", "origin", revision])
+                .status()
+                .map_err(|error| format!("start git fetch for {value}: {error}"))?;
+            if !status.success() {
+                return Err(format!("git fetch failed for {value} with {status}"));
+            }
+            "FETCH_HEAD".to_owned()
+        };
+        let status = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["checkout", "--quiet", "--detach", &checkout])
+            .status()
+            .map_err(|error| format!("start git checkout for {value}: {error}"))?;
+        if !status.success() {
+            return Err(format!("git checkout failed for {value} with {status}"));
+        }
+    }
+    Ok(RemoteCheckout {
+        _directory: directory,
+        path,
+        label: value.to_owned(),
+    })
+}
+
+fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
+    let compiled_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "the compiled JSSpector source root is unavailable".to_owned())?;
+    let source_root = std::env::var_os("JSSPECTOR_SOURCE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| compiled_root.to_path_buf());
+    let workflow = source_root.join(".satori/self-heal.sh");
+    if !workflow.is_file() {
+        return Err(format!(
+            "automatic scanner repair needs a JSSpector source checkout; set \
+             JSSPECTOR_SOURCE_ROOT (looked for {})",
+            workflow.display()
+        ));
+    }
+    eprintln!("jsspector: validating and repairing scanner support for {repository}");
+    let status = ProcessCommand::new(&workflow)
+        .current_dir(&source_root)
+        .args(["--repo", repository])
+        .status()
+        .map_err(|error| format!("start automatic scanner repair: {error}"))?;
+    if !status.success() {
+        return Err(format!("automatic scanner repair failed with {status}"));
+    }
+    let status = ProcessCommand::new("cargo")
+        .current_dir(&source_root)
+        .args(["build", "--release", "--locked", "-p", "jsspector"])
+        .status()
+        .map_err(|error| format!("rebuild repaired JSSpector: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "rebuilding repaired JSSpector failed with {status}"
+        ));
+    }
+    let scanner = source_root.join("target/release/jsspector");
+    let status = ProcessCommand::new(scanner)
+        .args(std::env::args_os().skip(1))
+        .env("JSSPECTOR_SELF_HEAL_ACTIVE", "1")
+        .status()
+        .map_err(|error| format!("restart repaired JSSpector scan: {error}"))?;
+    Ok(ExitCode::from(
+        status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(EXIT_ENGINE),
+    ))
+}
+
 fn scan(args: &ScanArgs) -> ExitCode {
+    if let Some(repository) = args.repo.as_deref()
+        && std::env::var_os("JSSPECTOR_SELF_HEAL_ACTIVE").is_none()
+    {
+        return match self_heal_repository_scan(repository) {
+            Ok(code) => code,
+            Err(error) => fail(EXIT_ENGINE, error),
+        };
+    }
     let started = Instant::now();
-    let loaded = match setup(&args.path, &args.config) {
+    let remote = match args.repo.as_deref().map(checkout_repository).transpose() {
+        Ok(remote) => remote,
+        Err(error) => return fail(EXIT_USAGE, error),
+    };
+    let Some(path) = remote
+        .as_ref()
+        .map(|checkout| checkout.path.as_path())
+        .or(args.path.as_deref())
+    else {
+        return fail(EXIT_USAGE, "give a local path or --repo OWNER/REPO");
+    };
+    let root_label = remote.as_ref().map_or_else(
+        || path.to_string_lossy().into_owned(),
+        |checkout| checkout.label.clone(),
+    );
+    let loaded = match setup(path, &args.config) {
         Ok(loaded) => loaded,
         Err(code) => return code,
     };
@@ -637,7 +863,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
         Ok(include) => include,
         Err(code) => return code,
     };
-    let analysis = match analyze(&args.path, args.threads, include, &excludes) {
+    let analysis = match analyze(path, args.threads, include, &excludes) {
         Ok(analysis) => analysis,
         Err(code) => return code,
     };
@@ -668,7 +894,10 @@ fn scan(args: &ScanArgs) -> ExitCode {
 
     // `--verify`: run the app and confirm each finding. Only when asked; a failure to reach
     // Docker in strict mode is a usage error.
-    let verification = match args.verify {
+    let verification = match args
+        .verify
+        .or(args.repo.as_ref().map(|_| VerifyMode::Strict))
+    {
         None => Vec::new(),
         Some(mode) => {
             let missing = match mode {
@@ -700,7 +929,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
         Format::Json => {
             let verdicts = verdicts_by_fingerprint(&verification);
             let output = ScanOutput {
-                root: args.path.to_string_lossy().into_owned(),
+                root: root_label,
                 files_scanned: analysis.files_scanned,
                 findings: findings
                     .iter()

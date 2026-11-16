@@ -4138,8 +4138,15 @@ impl Walker<'_> {
                         "default".to_owned(),
                         name.clone().unwrap_or_else(|| "<default>".to_owned()),
                     );
-                    // A default-exported `(req, res)` handler (Next.js `pages/api`).
-                    if f.params.items.len() >= 2 {
+                    // A default-exported `(req, res)` handler (Next.js `pages/api`), or a
+                    // single-argument web handler (`export default function handler(request)`) of a
+                    // filesystem-routed function — a Vercel/Netlify edge function or a `pages/api`
+                    // edge route — where the file's location gives the path.
+                    if f.params.items.len() >= 2
+                        || (f.params.items.len() == 1
+                            && crate::routes::file_route_path(self.linking.file, "default-export")
+                                .is_some())
+                    {
                         self.facts.routes.push(RouteFact {
                             at: None,
                             receiver: None,
@@ -4219,7 +4226,15 @@ impl Walker<'_> {
                         // `export default async (req, res) => {}`, `export default handler`,
                         // `export default withAuth(handler)`: a pages/api route's handler.
                         let handler = match expr.get_inner_expression() {
-                            Expression::ArrowFunctionExpression(f) if f.params.items.len() >= 2 => {
+                            Expression::ArrowFunctionExpression(f)
+                                if f.params.items.len() >= 2
+                                    || (f.params.items.len() == 1
+                                        && crate::routes::file_route_path(
+                                            self.linking.file,
+                                            "default-export",
+                                        )
+                                        .is_some()) =>
+                            {
                                 Some("<default>".to_owned())
                             }
                             Expression::Identifier(id) => Some(id.name.as_str().to_owned()),

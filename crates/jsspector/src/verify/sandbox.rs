@@ -6133,6 +6133,18 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
     {
         return Some(worker_host_command(&file));
     }
+    // A Vercel/Netlify filesystem function (`api/proxy.js`) binds no listener of its own: the platform
+    // runtime invokes its default export per request. The manifest's own launch serves the front-end
+    // bundle (`vite`, a static build), never these functions, so when the finding's own file is such a
+    // module serve its default-export handler through the worker host shim, which already drives a
+    // function-valued default export (an edge function's `(request) => Response`, or a Node `(req,
+    // res)` handler). Checked before the manifest so the real entry point wins.
+    if let Some(rel) = entry.and_then(|path| path.to_str())
+        && let Some(file) = package_file(root, rel)
+        && is_vercel_function(root, &file)
+    {
+        return Some(worker_host_command(&file));
+    }
     // A package can expose several independent servers from one manifest: its ordinary `start`
     // entry may bind one port while the file that owns this finding constructs and listens on a
     // different Express/HTTP app. Running the manifest then makes port discovery select a healthy
@@ -6525,6 +6537,35 @@ fn declares_fetch_handler(body: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a file is a Vercel/Netlify filesystem function: a handler module under a deployment-root
+/// `api/` directory ([`jss_frontend::routes::vercel_api_route_path`]) whose default export is a request
+/// handler and which binds no listener of its own (`.listen(`). The platform runtime invokes the
+/// default export once per request — an edge function takes a single web `Request` and returns a
+/// `Response`; a Node function takes `(req, res)` — so the module publishes no server and is mounted on
+/// a throwaway server through the worker host shim rather than run directly, which would only evaluate
+/// and exit. The `api/`-directory convention is the platform's, and the handler shape is read from the
+/// module's own default export; no app-specific identifier is assumed.
+fn is_vercel_function(root: &std::path::Path, file: &str) -> bool {
+    if jss_frontend::routes::vercel_api_route_path(file).is_none() {
+        return false;
+    }
+    let path = root.join(file);
+    let is_source = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs" | "ts" | "mts" | "cts"));
+    if !is_source {
+        return false;
+    }
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    if src.contains(".listen(") {
+        return false;
+    }
+    exports_route_handler(&src)
 }
 
 /// Whether the package manifest's selected launch is the Azure Functions host (`func start` /
@@ -10782,6 +10823,48 @@ mod tests {
             "export default { fn: async (req, res) => { return await fetch(req.query.url); } };\n",
         );
         assert!(!is_module_worker(&root.join("handler.js")));
+    }
+
+    #[test]
+    fn a_vercel_filesystem_function_is_launched_through_the_worker_host_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A Vite front-end project whose only launch serves the client bundle; the backend route lives
+        // in a Vercel edge function under `api/` with a single-argument web handler and no listener.
+        write(
+            root,
+            "package.json",
+            r#"{"type":"module","scripts":{"dev":"vite","build":"vite build"}}"#,
+        );
+        write(
+            root,
+            "api/proxy.js",
+            "export const config = { runtime: 'edge' };\n\
+             export default async function handler(req) {\n\
+               const target = new URL(req.url).searchParams.get('url');\n\
+               return new Response(await (await fetch(target)).blob());\n\
+             }\n",
+        );
+        assert!(is_vercel_function(root, "api/proxy.js"));
+        assert_eq!(
+            start_command(root, Some(std::path::Path::new("api/proxy.js"))).as_deref(),
+            Some(r#"["node","/jss-worker-host.mjs","api/proxy.js"]"#),
+            "the edge function's default-export handler is served through the worker host shim",
+        );
+        // A self-contained server under `api/` that binds its own listener keeps the normal launch path.
+        write(
+            root,
+            "api/server.js",
+            "export default {}; require('http').createServer((q, r) => r.end()).listen(3000);",
+        );
+        assert!(!is_vercel_function(root, "api/server.js"));
+        // A module outside an `api/` deployment root is not a filesystem function.
+        write(
+            root,
+            "src/client.js",
+            "export default async function client(req) { return fetch(req); }\n",
+        );
+        assert!(!is_vercel_function(root, "src/client.js"));
     }
 
     #[test]

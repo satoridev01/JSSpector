@@ -987,36 +987,47 @@ pub fn openapi_path(path: &str) -> String {
     out
 }
 
-/// The URL path of a file route: a named `GET`/`POST`/... export of a Next.js `app/**/route.ts`
-/// (`kind` "file-route"), or the default export of a `pages/api/**` module ("default-export").
-fn file_route_path(file: &str, kind: &str) -> Option<String> {
-    let segments: Vec<&str> = file.split('/').collect();
-    let stem = |s: &str| s.split('.').next().unwrap_or("").to_owned();
-    let convert = |parts: &[&str]| -> String {
-        let mut out = Vec::new();
-        for part in parts {
-            if part.starts_with('(') && part.ends_with(')') {
-                continue; // route group
-            }
-            if part.starts_with('@') {
-                continue; // parallel route slot
-            }
-            let inner = part.trim_start_matches('[').trim_end_matches(']');
-            if part.starts_with("[[...") || part.starts_with("[...") {
-                out.push(format!(
-                    "{{{}}}",
-                    inner.trim_start_matches("[...").trim_start_matches("...")
-                ));
-            } else if part.starts_with('[') {
-                out.push(format!("{{{inner}}}"));
-            } else {
-                out.push((*part).to_owned());
-            }
+/// The segment conventions shared by every file-route form: a dynamic `[param]` becomes `{param}`, a
+/// catch-all `[...rest]`/`[[...rest]]` becomes `{rest}`, and route groups `(name)` / parallel slots
+/// `@slot` contribute nothing to the URL.
+fn convert_route_parts(parts: &[&str]) -> String {
+    let mut out = Vec::new();
+    for part in parts {
+        if part.starts_with('(') && part.ends_with(')') {
+            continue; // route group
         }
-        format!("/{}", out.join("/"))
-    };
+        if part.starts_with('@') {
+            continue; // parallel route slot
+        }
+        let inner = part.trim_start_matches('[').trim_end_matches(']');
+        if part.starts_with("[[...") || part.starts_with("[...") {
+            out.push(format!(
+                "{{{}}}",
+                inner.trim_start_matches("[...").trim_start_matches("...")
+            ));
+        } else if part.starts_with('[') {
+            out.push(format!("{{{inner}}}"));
+        } else {
+            out.push((*part).to_owned());
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// A file name without its final extension (`proxy.js` -> `proxy`, `[id].ts` -> `[id]`,
+/// `[...path].js` -> `[...path]`). Only the trailing extension is removed, so a catch-all segment's
+/// own dots are preserved.
+fn path_stem(s: &str) -> &str {
+    s.rsplit_once('.').map_or(s, |(stem, _)| stem)
+}
+
+/// The URL path of a file route: a named `GET`/`POST`/... export of a Next.js `app/**/route.ts`
+/// (`kind` "file-route"), the default export of a `pages/api/**` module ("default-export"), or a
+/// Vercel/Netlify filesystem function under a deployment-root `api/` directory (also "default-export").
+pub fn file_route_path(file: &str, kind: &str) -> Option<String> {
+    let segments: Vec<&str> = file.split('/').collect();
     if kind == "file-route" {
-        if !segments.last().is_some_and(|last| stem(last) == "route") {
+        if !segments.last().is_some_and(|last| path_stem(last) == "route") {
             return None;
         }
         // The app directory: `src/app`, else the first `app` that is not a package named `app`
@@ -1032,20 +1043,48 @@ fn file_route_path(file: &str, kind: &str) -> Option<String> {
                 })
             })?;
         let parts = segments.get(at + 1..segments.len() - 1)?;
-        return Some(convert(parts));
+        return Some(convert_route_parts(parts));
     }
     if let Some(at) = segments.windows(2).position(|w| w == ["pages", "api"]) {
         let mut parts: Vec<&str> = segments.get(at + 1..)?.to_vec();
         let last = parts.pop()?;
-        let name = stem(last);
-        let mut path = convert(&parts);
+        let name = path_stem(last);
+        let mut path = convert_route_parts(&parts);
         if name != "index" {
-            let converted = convert(&[name.as_str()]);
-            path = join(&path, &converted);
+            path = join(&path, &convert_route_parts(&[name]));
         }
         return Some(path);
     }
-    None
+    vercel_api_route_path(file)
+}
+
+/// The URL path of a Vercel/Netlify filesystem function: a handler module directly under a
+/// deployment-root `api/` directory — the project root, or a single package/app directory in a
+/// monorepo — named by its endpoint (`api/proxy.js` -> `/api/proxy`, `api/users/[id].ts` ->
+/// `/api/users/{id}`, `api/items/index.js` -> `/api/items`). The `api/` directory is itself the URL
+/// prefix. Distinct from Next.js `pages/api/**` and `app/**/route.ts` (handled by [`file_route_path`]):
+/// those live under a `pages`/`app` tree, so an `api/` directory beneath one is not a standalone
+/// function root. The convention is the platform's, not any one app's.
+pub fn vercel_api_route_path(file: &str) -> Option<String> {
+    let segments: Vec<&str> = file.split('/').collect();
+    let at = segments.iter().position(|s| *s == "api")?;
+    let before = &segments[..at];
+    let is_deployment_root = before.is_empty()
+        || matches!(before, ["packages", _] | ["apps", _] | ["services", _]);
+    if !is_deployment_root {
+        return None;
+    }
+    let mut parts: Vec<&str> = segments.get(at..)?.to_vec(); // keep the `api` prefix segment
+    let last = parts.pop()?;
+    let name = path_stem(last);
+    if name.is_empty() {
+        return None;
+    }
+    let mut path = convert_route_parts(&parts);
+    if name != "index" {
+        path = join(&path, &convert_route_parts(&[name]));
+    }
+    Some(path)
 }
 
 #[cfg(test)]
@@ -1100,6 +1139,40 @@ mod tests {
             file_route_path("app/(dashboard)/app/route.ts", "file-route").as_deref(),
             Some("/app")
         );
+    }
+
+    #[test]
+    fn vercel_filesystem_functions() {
+        // A deployment-root `api/` directory: the `api/` prefix is kept, `[param]` and `index` convert.
+        assert_eq!(
+            file_route_path("api/proxy.js", "default-export").as_deref(),
+            Some("/api/proxy")
+        );
+        assert_eq!(
+            vercel_api_route_path("api/users/[id].ts").as_deref(),
+            Some("/api/users/{id}")
+        );
+        assert_eq!(
+            vercel_api_route_path("api/items/index.js").as_deref(),
+            Some("/api/items")
+        );
+        assert_eq!(
+            vercel_api_route_path("api/files/[...path].js").as_deref(),
+            Some("/api/files/{path}")
+        );
+        // A monorepo package/app root counts as a deployment root.
+        assert_eq!(
+            vercel_api_route_path("apps/web/api/proxy.ts").as_deref(),
+            Some("/api/proxy")
+        );
+        // A Next.js tree is not a standalone function root: its `api/` is handled by the forms above.
+        assert_eq!(vercel_api_route_path("app/api/x/route.ts"), None);
+        assert_eq!(vercel_api_route_path("pages/api/x.ts"), None);
+        assert_eq!(vercel_api_route_path("src/api/client.ts"), None);
+        // Nothing under `api/` is not a function.
+        assert_eq!(vercel_api_route_path("src/lib/util.ts"), None);
+        // A named export form is not a Vercel default-export function path.
+        assert_eq!(file_route_path("api/proxy.js", "file-route"), None);
     }
 
     #[test]

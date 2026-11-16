@@ -275,6 +275,53 @@ fn a_module_worker_default_export_is_an_http_entry_point() {
 }
 
 #[test]
+fn a_vercel_filesystem_function_default_export_is_an_http_entry_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A Vercel edge function: a single-argument web handler default-exported from an `api/` directory.
+    // The file's location gives the route path (`/api/proxy`), and a request-URL value that chooses the
+    // outbound host of `fetch` is an unauthenticated SSRF reachable from that route.
+    write(
+        root,
+        "api/proxy.js",
+        "export const config = { runtime: 'edge' };\n\
+         export default async function handler(req) {\n\
+           const url = new URL(req.url);\n\
+           const targetUrl = url.searchParams.get('url');\n\
+           const response = await fetch(targetUrl);\n\
+           return new Response(await response.blob());\n\
+         }\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    assert!(
+        routes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|route| { route["method"] == "ANY" && route["path"] == "/api/proxy" }),
+        "{routes}"
+    );
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["class"] == "ssrf")
+        .expect("the edge function's fetch sink should be found");
+    assert_eq!(finding["entry"], "ANY /api/proxy");
+
+    // A default-exported component under a non-`api/` tree is not a filesystem function route.
+    let other = tempfile::tempdir().unwrap();
+    write(
+        other.path(),
+        "src/pages/About.jsx",
+        "export default function About(props) { return null; }\n",
+    );
+    let routes = run(&["routes", "--json", other.path().to_str().unwrap()]);
+    assert_eq!(routes.as_array().unwrap().len(), 0, "{routes}");
+}
+
+#[test]
 fn provider_resource_routes_use_the_deployed_metadata_prefix() {
     let dir = tempfile::tempdir().unwrap();
     write(

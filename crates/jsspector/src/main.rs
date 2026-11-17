@@ -886,6 +886,12 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
     command
         .args(restart_args)
         .env("JSSPECTOR_SELF_HEAL_ACTIVE", "1");
+    // The trusted self-heal controller proves repaired cases with the isolated local verifier.
+    // Keep the final report on that same runtime (notably for browser-driven findings), unless
+    // the caller deliberately selected another runtime.
+    if std::env::var_os("JSS_VERIFY_RUNTIME").is_none() {
+        command.env("JSS_VERIFY_RUNTIME", "local");
+    }
     let status = command
         .status()
         .map_err(|error| format!("restart repaired JSSpector scan: {error}"))?;

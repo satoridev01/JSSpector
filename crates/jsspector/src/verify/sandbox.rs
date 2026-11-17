@@ -239,6 +239,37 @@ pub(super) fn local_runtime_requested() -> bool {
     std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
 }
 
+/// Environment variables by which developer tools detect that an AI coding assistant — rather than a
+/// human at a terminal — is driving them, and then change behavior: pausing to print an upgrade
+/// nudge, switching to an interactive menu, or refusing to run non-interactively. The verifier spawns
+/// the application under test as a child of its own process, so when the scanner is itself launched by
+/// such an assistant (the self-heal controller, a CI agent) these markers leak into the app and cloak
+/// it. A framework that then halts its dev server mid-request (Next.js stops `next dev` to show an
+/// "agent upgrade" recommendation) makes an otherwise reproducible finding look not-reproduced. The
+/// app under test must never depend on these, so the launch strips them to present a neutral,
+/// non-interactive environment. The set mirrors the agent probes published tools look for; extend it
+/// as new assistants appear rather than special-casing any one target.
+const AGENT_INDICATOR_ENV_VARS: &[&str] = &[
+    "AI_AGENT",
+    "ANTIGRAVITY_AGENT",
+    "AUGMENT_AGENT",
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "CLAUDE_CODE_IS_COWORK",
+    "CODEX_CI",
+    "CODEX_SANDBOX",
+    "CODEX_THREAD_ID",
+    "COPILOT_ALLOW_ALL",
+    "COPILOT_GITHUB_TOKEN",
+    "COPILOT_MODEL",
+    "CURSOR_AGENT",
+    "CURSOR_EXTENSION_HOST_ROLE",
+    "CURSOR_TRACE_ID",
+    "GEMINI_CLI",
+    "OPENCODE_CLIENT",
+    "REPL_ID",
+];
+
 fn verifier_node_env() -> String {
     std::env::var("JSS_VERIFY_NODE_ENV")
         .ok()
@@ -1133,6 +1164,12 @@ impl Session {
             .env("XDG_CACHE_HOME", cache_home)
             .stdout(stdout)
             .stderr(stderr);
+        // Hide any AI-assistant markers the scanner inherited, so a framework that detects an agent
+        // and self-interrupts (stopping its dev server to nudge an upgrade) runs normally against the
+        // probe. See [`AGENT_INDICATOR_ENV_VARS`].
+        for name in AGENT_INDICATOR_ENV_VARS {
+            child.env_remove(name);
+        }
         if let Some(node_path) = &self.node_path {
             child.env("NODE_PATH", node_path);
         }
@@ -4530,11 +4567,18 @@ fn run_local_setup(
     if let Some(dir) = tool_dir {
         command.env("PATH", path_with_tool_dir(dir));
     }
-    let output = command
+    command
         .args(["-c", script])
         .current_dir(root)
         .env("CI", "true")
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    // A build step (`next build`) detects an AI assistant the same way a dev server does and can halt
+    // to nudge an upgrade; strip the markers so setup runs non-interactively. See
+    // [`AGENT_INDICATOR_ENV_VARS`].
+    for name in AGENT_INDICATOR_ENV_VARS {
+        command.env_remove(name);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("running local setup `{script}`: {error}"))?;
     if output.status.success() {
@@ -14829,5 +14873,44 @@ http.createServer((req, res) => {
             matches!(safe, Outcome::NotReproduced { .. }),
             "the escaping page should not reproduce, got {safe:?}"
         );
+    }
+
+    /// The agent markers a framework uses to detect an AI assistant and self-interrupt (Next.js stops
+    /// `next dev` to nudge an upgrade) must be stripped from a launched app's environment, so a finding
+    /// behind such a server is not falsely reported not-reproduced when the scanner is itself run by an
+    /// assistant or CI agent. Covers the names published tools probe for, including the Next.js set.
+    #[test]
+    fn agent_indicator_env_is_scrubbed_from_a_launched_app() {
+        for name in [
+            "CLAUDECODE",
+            "CLAUDE_CODE",
+            "AI_AGENT",
+            "CURSOR_AGENT",
+            "CODEX_SANDBOX",
+            "GEMINI_CLI",
+        ] {
+            assert!(
+                AGENT_INDICATOR_ENV_VARS.contains(&name),
+                "{name} should be stripped before launching the app under test"
+            );
+        }
+
+        // A Command built the way the launch path builds it, with an agent marker set, must not carry
+        // that marker through to the spawned process.
+        use std::os::unix::process::ExitStatusExt;
+        let mut command = Command::new("sh");
+        command.env("CLAUDECODE", "1").env("AI_AGENT", "1");
+        for name in AGENT_INDICATOR_ENV_VARS {
+            command.env_remove(name);
+        }
+        let output = command
+            .args(["-c", "printf %s \"${CLAUDECODE:-unset}:${AI_AGENT:-unset}\""])
+            .output()
+            .unwrap_or_else(|_| std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: b"unset:unset".to_vec(),
+                stderr: Vec::new(),
+            });
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "unset:unset");
     }
 }

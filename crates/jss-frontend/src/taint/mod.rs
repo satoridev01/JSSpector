@@ -12047,7 +12047,8 @@ impl Walker<'_> {
                     // `./apis/v${v}/router.js`: one mount per matching file, each under its own
                     // concrete version prefix. Resolves the versioned-API loop a single string
                     // prefix cannot express.
-                    if self.record_versioned_mount(first, last, object.as_deref(), auth, call.span) {
+                    if self.record_versioned_mount(first, last, object.as_deref(), auth, call.span)
+                    {
                         return;
                     }
                     let (target, target_file, target_export) = match last {

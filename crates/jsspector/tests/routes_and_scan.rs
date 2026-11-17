@@ -203,9 +203,11 @@ fn a_middleware_factory_mount_links_its_sink_to_the_use_entry() {
     );
 
     let routes = run(&["routes", "--json", root.to_str().unwrap()]);
-    let has_use = routes.as_array().unwrap().iter().any(|r| {
-        r["method"] == "USE" && r["path"] == "/mcp"
-    });
+    let has_use = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["method"] == "USE" && r["path"] == "/mcp");
     assert!(has_use, "no USE /mcp entry: {routes:?}");
 
     let report = run(&["scan", "--json", root.to_str().unwrap()]);

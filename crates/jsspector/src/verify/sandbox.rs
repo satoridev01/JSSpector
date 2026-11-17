@@ -385,7 +385,7 @@ enum Runtime {
         /// Root of the disposable checkout being verified. This can be wider than `app_root`
         /// when the runnable package lives in a workspace subdirectory but resolves startup
         /// fixtures (for example TLS material) relative to the checkout root.
-        checkout_root: std::path::PathBuf,
+        checkout_root: Box<std::path::PathBuf>,
         app_root: std::path::PathBuf,
         log: std::path::PathBuf,
         command: Vec<String>,
@@ -394,10 +394,14 @@ enum Runtime {
         service_dirs: Vec<std::path::PathBuf>,
         marker_log: std::path::PathBuf,
         created_files: Vec<std::path::PathBuf>,
+        /// Private home presented to the application. Frameworks and CLIs commonly persist state
+        /// under `os.homedir()`; verification must never write that state into the operator's real
+        /// account.
+        home_dir: Box<std::path::PathBuf>,
         /// A verifier-provisioned runtime directory (the package's declared Bun release, see
         /// [`provision_local_bun`]) put first on the application's `PATH`. `None` when the app
         /// needs nothing beyond the host tools.
-        tool_dir: Option<std::path::PathBuf>,
+        tool_dir: Box<Option<std::path::PathBuf>>,
         /// Serializes the fixed `/tmp/jss-*` helper namespace across scanner processes. The OS
         /// releases this lock even when a scan is interrupted, allowing the next run to recover
         /// fixtures recorded in the ownership manifest without touching unrelated files.
@@ -676,6 +680,7 @@ impl Session {
         }
         let log = std::env::temp_dir().join(format!("jsspector-verify-{id}.log"));
         let marker_log = std::env::temp_dir().join(format!("jsspector-marker-{id}.log"));
+        let home_dir = std::env::temp_dir().join(format!("jsspector-home-{id}"));
         let mut service_dirs = Vec::new();
         if needs_db {
             service_dirs.push(std::env::temp_dir().join(format!("jsspector-mongo-{id}")));
@@ -683,6 +688,7 @@ impl Session {
         if needs_redis {
             service_dirs.push(std::env::temp_dir().join(format!("jsspector-redis-{id}")));
         }
+        service_dirs.push(home_dir.clone());
         // Every local launch receives a private free port through `PORT`. Applications that hard-code
         // their listener are still discovered by the readiness probe, while platform-host shims and
         // ordinary `process.env.PORT` servers cannot collide with an orphan from an interrupted scan.
@@ -717,7 +723,7 @@ impl Session {
         }
         let mut session = Self {
             runtime: Runtime::Local {
-                checkout_root: root.to_path_buf(),
+                checkout_root: Box::new(root.to_path_buf()),
                 app_root,
                 log,
                 command: local_command,
@@ -726,7 +732,8 @@ impl Session {
                 service_dirs,
                 marker_log,
                 created_files,
-                tool_dir,
+                home_dir: Box::new(home_dir),
+                tool_dir: Box::new(tool_dir),
                 _fixture_lock: fixture_lock,
             },
             tag: String::new(),
@@ -1035,6 +1042,7 @@ impl Session {
             command,
             process,
             tool_dir,
+            home_dir,
             ..
         } = &self.runtime
         else {
@@ -1054,8 +1062,30 @@ impl Session {
             let dir = localize_helper_paths(dir);
             std::fs::create_dir_all(&dir).map_err(|error| format!("creating {dir}: {error}"))?;
         }
+        let config_home = home_dir.join(".config");
+        let data_home = home_dir.join(".local/share");
+        let cache_home = home_dir.join(".cache");
+        for directory in [
+            home_dir.as_path(),
+            config_home.as_path(),
+            data_home.as_path(),
+            cache_home.as_path(),
+        ] {
+            std::fs::create_dir_all(directory).map_err(|error| {
+                format!(
+                    "creating private verifier home {}: {error}",
+                    directory.display()
+                )
+            })?;
+        }
         if self.run_as.is_some() {
-            Self::make_local_run_as_accessible(checkout_root, app_root, env, scratch_dirs)?;
+            Self::make_local_run_as_accessible(
+                checkout_root.as_path(),
+                app_root,
+                env,
+                scratch_dirs,
+                home_dir.as_path(),
+            )?;
         }
         let stdout = std::fs::File::create(log)
             .map_err(|error| format!("creating local verifier log: {error}"))?;
@@ -1097,12 +1127,16 @@ impl Session {
             .env("PORT", self.port.to_string())
             .env("HOST", "127.0.0.1")
             .env("NODE_ENV", verifier_node_env())
+            .env("HOME", home_dir.as_path())
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("XDG_DATA_HOME", data_home)
+            .env("XDG_CACHE_HOME", cache_home)
             .stdout(stdout)
             .stderr(stderr);
         if let Some(node_path) = &self.node_path {
             child.env("NODE_PATH", node_path);
         }
-        if let Some(dir) = tool_dir {
+        if let Some(dir) = tool_dir.as_deref() {
             child.env("PATH", path_with_tool_dir(dir));
         }
         let mut node_options = Vec::new();
@@ -1147,6 +1181,7 @@ impl Session {
         app_root: &std::path::Path,
         env: &[RequiredEnv],
         scratch_dirs: &[String],
+        home_dir: &std::path::Path,
     ) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1173,6 +1208,7 @@ impl Session {
             .filter(|var| var.directory)
             .map(|var| localize_helper_paths(&var.value))
             .chain(scratch_dirs.iter().map(|dir| localize_helper_paths(dir)))
+            .chain(std::iter::once(home_dir.display().to_string()))
         {
             let metadata = std::fs::metadata(&directory)
                 .map_err(|error| format!("reading {directory} permissions: {error}"))?;
@@ -1190,6 +1226,7 @@ impl Session {
         _app_root: &std::path::Path,
         _env: &[RequiredEnv],
         _scratch_dirs: &[String],
+        _home_dir: &std::path::Path,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -3226,12 +3263,25 @@ impl Session {
     }
 
     fn obtain_default_session(&self, boot: &super::plan::AuthBootstrap) -> Option<SessionCred> {
+        let mut passwords = template_login_passwords(&self.root);
+        for password in payload::default_login_passwords() {
+            if !passwords.iter().any(|candidate| candidate == password) {
+                passwords.push((*password).to_owned());
+            }
+        }
         for path in &boot.login_paths {
-            for password in payload::default_login_passwords() {
+            for password in &passwords {
                 let attempt = payload::default_login_post(path, password);
-                let Some((body, _status, cookies)) = self.fetch_meta(&attempt) else {
+                let Some((body, status, cookies)) = self.fetch_meta(&attempt) else {
                     continue;
                 };
+                if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                    eprintln!(
+                        "[verify] default-login path={path} status={status:?} cookies={} body[{}]",
+                        cookies.len(),
+                        body.chars().take(300).collect::<String>()
+                    );
+                }
                 if let Some(pair) = payload::session_cookie_pair(&cookies) {
                     return Some(SessionCred::Cookie { pair });
                 }
@@ -3908,7 +3958,7 @@ impl Session {
                 for path in created_files {
                     let _ = std::fs::remove_file(path);
                 }
-                for dir in service_dirs {
+                for dir in service_dirs.iter() {
                     let _ = std::fs::remove_dir_all(dir);
                 }
             }
@@ -4008,7 +4058,11 @@ fn prepare_local_app(
     if let Ok(manifest) = std::fs::read_to_string(&manifest_path)
         && let Some(script) = build_script(&manifest, install_root)
     {
-        run_local_setup(install_root, &build_command(package_manager, script), tool_dir)?;
+        run_local_setup(
+            install_root,
+            &build_command(package_manager, script),
+            tool_dir,
+        )?;
     }
     Ok(())
 }
@@ -4278,6 +4332,96 @@ fn declared_bun_spec(app_root: &std::path::Path) -> Option<String> {
     (bun_lock || bun_scripts).then(|| "latest".to_owned())
 }
 
+/// Published first-run login passwords from source-controlled environment templates. A verifier
+/// must satisfy an application's real authentication precondition, but must never read an
+/// operator's `.env` or invent/forge a credential. Only conventional login-password variables in
+/// `.env.example`/`.env.sample`/`.env.template` are considered; datastore credentials and obvious
+/// placeholders are ignored. Template values precede the small generic default list so rate-limited
+/// login routes are not locked before their documented first-run credential is tried.
+fn template_login_passwords(root: &std::path::Path) -> Vec<String> {
+    const TEMPLATES: [&str; 3] = [".env.example", ".env.sample", ".env.template"];
+    const LOGIN_PREFIXES: [&str; 6] = ["INITIAL", "DEFAULT", "ADMIN", "DASHBOARD", "LOGIN", "ROOT"];
+    let mut passwords = Vec::new();
+    let mut pending = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut budget = 256usize;
+    while let Some((directory, depth)) = pending.pop_front() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if depth < 3
+                    && !name.starts_with('.')
+                    && !matches!(name.as_ref(), "node_modules" | "target" | "vendor")
+                {
+                    pending.push_back((path, depth + 1));
+                }
+                continue;
+            }
+            if !TEMPLATES.contains(&name.as_ref()) {
+                continue;
+            }
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            if metadata.len() > 64 * 1024 {
+                continue;
+            }
+            let Ok(template) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for line in template.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let line = line.strip_prefix("export ").unwrap_or(line);
+                let Some((name, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let name = name.trim().to_ascii_uppercase();
+                let login_password = name == "PASSWORD"
+                    || name.strip_suffix("_PASSWORD").is_some_and(|prefix| {
+                        LOGIN_PREFIXES
+                            .iter()
+                            .any(|candidate| prefix == *candidate || prefix.ends_with(candidate))
+                    });
+                if !login_password
+                    || ["DATABASE", "MONGO", "REDIS", "MYSQL", "POSTGRES", "SQL"]
+                        .iter()
+                        .any(|service| name.contains(service))
+                {
+                    continue;
+                }
+                let value = value.trim().trim_matches(['\'', '"']);
+                if value.is_empty()
+                    || value.len() > 128
+                    || value
+                        .chars()
+                        .next()
+                        .is_some_and(|first| matches!(first, '$' | '<' | '{'))
+                    || value.eq_ignore_ascii_case("replace-me")
+                {
+                    continue;
+                }
+                if !passwords.iter().any(|existing| existing == value) {
+                    passwords.push(value.to_owned());
+                }
+            }
+        }
+    }
+    passwords
+}
+
 /// Whether any command in a package script runs the Bun executable (`bun x.js`, `bunx next`,
 /// `cross-env A=1 bun run y`), rather than merely mentioning the word.
 fn script_invokes_bun(script: &str) -> bool {
@@ -4296,7 +4440,13 @@ fn script_invokes_bun(script: &str) -> bool {
 fn local_bun_tool_dir(spec: &str) -> std::path::PathBuf {
     let key: String = spec
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     std::env::temp_dir()
         .join("jsspector-tools")
@@ -4675,6 +4825,11 @@ fn build_image(
     })
     .flatten();
     let native_build = needs_native_toolchain(install_root);
+    let bun_spec = declared_bun_spec(app_root).or_else(|| {
+        (install_root != app_root)
+            .then(|| declared_bun_spec(install_root))
+            .flatten()
+    });
     let dockerfile = dockerfile(
         &image,
         install_workdir,
@@ -4685,6 +4840,7 @@ fn build_image(
         pm,
         has_build,
         native_build,
+        bun_spec.as_deref(),
         build_env,
     );
     build_from_dockerfile(&dockerfile, tag, context)
@@ -5634,6 +5790,7 @@ fn dockerfile(
     pm: PackageManager,
     has_build: Option<&str>,
     native_build: bool,
+    bun_spec: Option<&str>,
     build_env: &[(String, String)],
 ) -> String {
     let token = &canary.token;
@@ -5671,6 +5828,15 @@ fn dockerfile(
     } else {
         String::new()
     };
+    // Bun is distributed as a platform-specific npm package. Install the release requested by the
+    // project before dependency installation and build, so Docker and the local verifier execute
+    // the same package scripts instead of letting `npm start` fail at the first `bun` command.
+    let bun_install = bun_spec.map_or_else(String::new, |spec| {
+        format!(
+            "RUN npm install --global {}\n",
+            shell_quote(&format!("bun@{spec}"))
+        )
+    });
     let build = match has_build {
         Some(script) => format!("RUN {}\n", build_command(pm, script)),
         None => String::new(),
@@ -5700,6 +5866,7 @@ fn dockerfile(
          COPY . /app\n\
          WORKDIR {install_workdir}\n\
          {native_toolchain}\
+         {bun_install}\
          {workspace_fixup}\
          RUN {install}\n\
          WORKDIR {workdir}\n\
@@ -10319,15 +10486,14 @@ impl BrowserSession {
     /// the payload in the fragment and reports verified on the first marker hit. The reproduction is
     /// the attacker-crafted page URL the victim runs the bookmarklet on (the fragment), not the
     /// driver.
-    fn exercise_bookmarklet(
-        &self,
-        probe: &super::plan::BrowserProbe,
-        source: &str,
-    ) -> Outcome {
+    fn exercise_bookmarklet(&self, probe: &super::plan::BrowserProbe, source: &str) -> Outcome {
         let attempts =
             super::browser::bookmarklet_attempts(&probe.file, source, &self.canary, self.nonce);
         let mut tried = 0usize;
-        for attempt in attempts.iter().take(MAX_HARNESS_PAGES * MAX_HARNESS_ATTEMPTS_PER_PAGE) {
+        for attempt in attempts
+            .iter()
+            .take(MAX_HARNESS_PAGES * MAX_HARNESS_ATTEMPTS_PER_PAGE)
+        {
             tried += 1;
             if self.drive(&attempt.url, &attempt.token, None) {
                 return bookmarklet_verified(&probe.file, &attempt.url, &attempt.token);
@@ -11470,8 +11636,16 @@ mod tests {
         // Off an Electron runtime, `require('electron')` resolves to the packaged binary's path — a
         // bare string — so `const { app } = require('electron')` is `undefined`. Reproduce that exact
         // shape with a local stand-in package.
-        write(root, "node_modules/electron/package.json", r#"{"name":"electron","main":"index.js"}"#);
-        write(root, "node_modules/electron/index.js", "module.exports = '/usr/bin/electron';");
+        write(
+            root,
+            "node_modules/electron/package.json",
+            r#"{"name":"electron","main":"index.js"}"#,
+        );
+        write(
+            root,
+            "node_modules/electron/index.js",
+            "module.exports = '/usr/bin/electron';",
+        );
         write(root, "electron-shim.js", ELECTRON_SHIM_JS);
         // The canary lives outside the application directory; the app reaches it only by `../` climbing
         // out of `__dirname`, exactly the historical path-traversal read.
@@ -11514,7 +11688,10 @@ mod tests {
         let shimmed = Command::new("node")
             .arg("app/main.js")
             .current_dir(root)
-            .env("NODE_OPTIONS", format!("--require={}", root.join("electron-shim.js").display()))
+            .env(
+                "NODE_OPTIONS",
+                format!("--require={}", root.join("electron-shim.js").display()),
+            )
             .output()
             .unwrap();
         assert!(
@@ -11546,7 +11723,11 @@ mod tests {
             "jss-worker-host.mjs",
             &String::from_utf8(local_helper_source(WORKER_HOST_JS)).unwrap(),
         );
-        write(root, "jss-driver.js", &String::from_utf8(local_helper_source(DRIVER_JS)).unwrap());
+        write(
+            root,
+            "jss-driver.js",
+            &String::from_utf8(local_helper_source(DRIVER_JS)).unwrap(),
+        );
         write(
             root,
             "api/proxy.js",
@@ -12346,7 +12527,8 @@ mod tests {
 
     #[test]
     fn driver_metadata_line_yields_status_and_set_cookie() {
-        let stderr = "some log\n__JSS_META__{\"status\":401,\"setCookie\":[\"auth_token=abc; HttpOnly\"]}\n";
+        let stderr =
+            "some log\n__JSS_META__{\"status\":401,\"setCookie\":[\"auth_token=abc; HttpOnly\"]}\n";
         let (status, cookies) = parse_driver_meta(stderr);
         assert_eq!(status, Some(401));
         assert_eq!(cookies, vec!["auth_token=abc; HttpOnly".to_owned()]);
@@ -12370,7 +12552,11 @@ mod tests {
         );
         assert_eq!(declared_bun_spec(dir.path()).as_deref(), Some("1.4.4"));
         // Otherwise the engines range is honored as an npm range.
-        write(dir.path(), "package.json", r#"{"engines":{"bun":">=1.2.0"}}"#);
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"engines":{"bun":">=1.2.0"}}"#,
+        );
         assert_eq!(declared_bun_spec(dir.path()).as_deref(), Some(">=1.2.0"));
         // A Bun launcher with no pin uses the current release.
         write(
@@ -12403,6 +12589,49 @@ mod tests {
             write(dir.path(), "package.json", hostile);
             assert_eq!(declared_bun_spec(dir.path()), None, "{hostile}");
         }
+    }
+
+    #[test]
+    fn docker_image_installs_the_declared_bun_before_package_scripts() {
+        let canary = Canary::new("tok".to_owned());
+        let file = dockerfile(
+            "node:22-slim",
+            "/app",
+            "/app",
+            &canary,
+            r#"["npm","start"]"#,
+            3000,
+            PackageManager::Npm,
+            None,
+            false,
+            Some(">=1.2 <2"),
+            &[],
+        );
+        let bun = file
+            .find("npm install --global 'bun@>=1.2 <2'")
+            .expect("Bun install");
+        let dependencies = file.find("npm ci").expect("dependency install");
+        assert!(bun < dependencies, "{file}");
+    }
+
+    #[test]
+    fn documented_first_run_passwords_precede_defaults_without_reading_dotenv_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".env.example",
+            "INITIAL_PASSWORD=change-me\nDATABASE_PASSWORD=db-secret\n",
+        );
+        write(dir.path(), ".env", "INITIAL_PASSWORD=real-secret\n");
+        write(
+            dir.path(),
+            "packages/app/.env.sample",
+            "DASHBOARD_PASSWORD='dashboard-first-run'\nREDIS_PASSWORD=cache\n",
+        );
+        assert_eq!(
+            template_login_passwords(dir.path()),
+            ["change-me", "dashboard-first-run"]
+        );
     }
 
     #[test]
@@ -12452,7 +12681,10 @@ mod tests {
             note_unavailable_services("exited".to_owned(), &unavailable),
             "exited (unavailable: Redis)"
         );
-        assert_eq!(note_unavailable_services("exited".to_owned(), &[]), "exited");
+        assert_eq!(
+            note_unavailable_services("exited".to_owned(), &[]),
+            "exited"
+        );
     }
 
     fn write(root: &std::path::Path, rel: &str, text: &str) {
@@ -12796,6 +13028,7 @@ mod tests {
             PackageManager::Yarn,
             Some("build"),
             false,
+            None,
             &[],
         );
         assert!(file.contains("RUN corepack enable"), "{file}");
@@ -12818,6 +13051,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            None,
             &[],
         );
         assert!(!no_build.contains("build"), "{no_build}");
@@ -13235,6 +13469,7 @@ mod tests {
             PackageManager::Npm,
             Some("build"),
             false,
+            None,
             &[],
         );
         assert!(file.contains(NPM_WORKSPACE_FIXUP), "{file}");
@@ -13250,6 +13485,7 @@ mod tests {
             PackageManager::Yarn,
             Some("build"),
             false,
+            None,
             &[],
         );
         assert!(!yarn.contains(NPM_WORKSPACE_FIXUP), "{yarn}");
@@ -13301,6 +13537,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            None,
             &[],
         );
         assert!(file.contains("/jss-node-red-host.mjs"), "{file}");
@@ -13848,6 +14085,7 @@ mod tests {
             PackageManager::Pnpm,
             None,
             false,
+            None,
             &[],
         );
         let install = file.find("pnpm install").unwrap();
@@ -13887,6 +14125,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            None,
             &[],
         );
         assert!(file.contains(r#"printf '"%s"' 'cafed00d'"#), "{file}");
@@ -13938,6 +14177,7 @@ mod tests {
             PackageManager::Npm,
             None,
             true,
+            None,
             &[],
         );
         let toolchain = with.find(NATIVE_TOOLCHAIN_INSTALL).expect("toolchain step");
@@ -13955,6 +14195,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            None,
             &[],
         );
         assert!(!without.contains(NATIVE_TOOLCHAIN_INSTALL), "{without}");
@@ -14168,6 +14409,7 @@ mod tests {
             PackageManager::Npm,
             None,
             false,
+            None,
             &[],
         );
         let copy = file.find("COPY . /app\n").unwrap();

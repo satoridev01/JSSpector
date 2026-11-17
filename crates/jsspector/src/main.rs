@@ -698,6 +698,29 @@ mod repository_input_tests {
         );
         assert!(Cli::try_parse_from(["jsspector", "scan"]).is_err());
     }
+
+    #[test]
+    fn recovered_repository_scan_selects_only_its_accepted_fingerprints() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".satori")).unwrap();
+        std::fs::write(
+            root.path().join(".satori/exploitability-targets.json"),
+            r#"{"targets":[
+                {"repository":"owner/one","fingerprints":["bbb","aaa","aaa"]},
+                {"repository":"owner/two","fingerprints":["ccc"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered_fingerprints(root.path(), "owner/one@deadbeef").unwrap(),
+            ["aaa", "bbb"]
+        );
+        assert!(
+            recovered_fingerprints(root.path(), "owner/missing")
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 fn checkout_repository(value: &str) -> Result<RemoteCheckout, String> {
@@ -801,9 +824,26 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
         ));
     }
     let scanner = source_root.join("target/release/jsspector");
-    let status = ProcessCommand::new(scanner)
-        .args(std::env::args_os().skip(1))
-        .env("JSSPECTOR_SELF_HEAL_ACTIVE", "1")
+    let original_args: Vec<_> = std::env::args_os().skip(1).collect();
+    let already_filtered = original_args.iter().any(|argument| {
+        argument == "--verify-fingerprint"
+            || argument
+                .to_str()
+                .is_some_and(|argument| argument.starts_with("--verify-fingerprint="))
+    });
+    let fingerprints = if already_filtered {
+        Vec::new()
+    } else {
+        recovered_fingerprints(&source_root, repository)?
+    };
+    let mut command = ProcessCommand::new(scanner);
+    command
+        .args(original_args)
+        .env("JSSPECTOR_SELF_HEAL_ACTIVE", "1");
+    for fingerprint in fingerprints {
+        command.args(["--verify-fingerprint", &fingerprint]);
+    }
+    let status = command
         .status()
         .map_err(|error| format!("restart repaired JSSpector scan: {error}"))?;
     Ok(ExitCode::from(
@@ -812,6 +852,39 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
             .and_then(|code| u8::try_from(code).ok())
             .unwrap_or(EXIT_ENGINE),
     ))
+}
+
+/// Fingerprints the trusted self-heal controller has accepted for this repository. The final scan
+/// rechecks only those identities: unrelated findings in a large repository must not turn one
+/// recovered case into an all-or-nothing verification run.
+fn recovered_fingerprints(source_root: &Path, repository: &str) -> Result<Vec<String>, String> {
+    let (repository, _) = repository_spec(repository)?;
+    let path = source_root.join(".satori/exploitability-targets.json");
+    let bytes = std::fs::read(&path).map_err(|error| {
+        format!(
+            "read recovered exploitability targets {}: {error}",
+            path.display()
+        )
+    })?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "parse recovered exploitability targets {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut fingerprints = document
+        .get("targets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|target| target["repository"].as_str() == Some(repository))
+        .flat_map(|target| target["fingerprints"].as_array().into_iter().flatten())
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    fingerprints.sort();
+    fingerprints.dedup();
+    Ok(fingerprints)
 }
 
 fn self_heal_repository_batch(

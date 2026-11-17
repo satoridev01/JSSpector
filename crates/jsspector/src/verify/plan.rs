@@ -382,10 +382,17 @@ fn middleware_auth_gate_covers(root: &std::path::Path, route_path: &str) -> bool
 /// `Unauthorized`) and reads an authentication state (a session/login/token check). Both are required
 /// so a module that merely mentions one word in passing does not read as an auth gate.
 fn source_enforces_auth(src: &str) -> bool {
-    let denies = src.contains("401") || src.contains("Unauthorized") || src.contains("unauthorized");
-    let checks = ["isAuthenticated", "requireLogin", "auth_token", "getToken", "verify"]
-        .iter()
-        .any(|needle| src.contains(needle))
+    let denies =
+        src.contains("401") || src.contains("Unauthorized") || src.contains("unauthorized");
+    let checks = [
+        "isAuthenticated",
+        "requireLogin",
+        "auth_token",
+        "getToken",
+        "verify",
+    ]
+    .iter()
+    .any(|needle| src.contains(needle))
         || (src.contains("cookies") && (src.contains("token") || src.contains("session")));
     denies && checks
 }
@@ -443,8 +450,12 @@ fn matcher_entry_covers(entry: &str, route_path: &str) -> bool {
             let group = rest.split(')').next().unwrap_or("");
             for excluded in group.split('|') {
                 let excluded = excluded.trim().trim_start_matches('/');
-                let excluded = excluded.split(['\\', '(', '.', '*', '?']).next().unwrap_or("");
-                if !excluded.is_empty() && route_path.trim_start_matches('/').starts_with(excluded) {
+                let excluded = excluded
+                    .split(['\\', '(', '.', '*', '?'])
+                    .next()
+                    .unwrap_or("");
+                if !excluded.is_empty() && route_path.trim_start_matches('/').starts_with(excluded)
+                {
                     return false;
                 }
             }
@@ -469,8 +480,14 @@ fn matcher_entry_covers(entry: &str, route_path: &str) -> bool {
 /// `authenticate`, `session`). The file path under `app/` becomes the URL path, route-group segments
 /// (`(auth)`) dropped and dynamic segments (`[id]`) skipped. Convention-based; no app-specific names.
 pub fn next_app_router_login_paths(root: &std::path::Path) -> Vec<String> {
-    const LOGIN_SEGMENTS: [&str; 6] =
-        ["login", "signin", "sign-in", "authenticate", "session", "sessions"];
+    const LOGIN_SEGMENTS: [&str; 6] = [
+        "login",
+        "signin",
+        "sign-in",
+        "authenticate",
+        "session",
+        "sessions",
+    ];
     let mut paths = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -513,7 +530,7 @@ fn app_router_route_url(root: &std::path::Path, route_file: &std::path::Path) ->
         .collect();
     let app_idx = components.iter().rposition(|c| c == "app")?;
     let mut segments = Vec::new();
-    for seg in &components[app_idx + 1..] {
+    for seg in components.get(app_idx + 1..).unwrap_or_default() {
         if seg.ends_with(".js")
             || seg.ends_with(".ts")
             || seg.ends_with(".tsx")
@@ -6843,7 +6860,11 @@ fn host_substring(lit: &str) -> Option<String> {
             break;
         }
     }
-    let host = rest.split(['/', '?', '#', '@']).next().unwrap_or(rest).trim();
+    let host = rest
+        .split(['/', '?', '#', '@'])
+        .next()
+        .unwrap_or(rest)
+        .trim();
     if host.len() < 4 || !host.contains('.') {
         return None;
     }
@@ -8581,11 +8602,20 @@ mod tests {
     fn matcher_entry_covers_catch_all_and_prefix_forms() {
         // A negative-lookahead catch-all covers an API route but not the excluded static assets.
         let catch_all = "/((?!_next/static|_next/image|favicon\\.ico).*)";
-        assert!(super::matcher_entry_covers(catch_all, "/api/oauth/x/api-key"));
-        assert!(!super::matcher_entry_covers(catch_all, "/_next/static/app.js"));
+        assert!(super::matcher_entry_covers(
+            catch_all,
+            "/api/oauth/x/api-key"
+        ));
+        assert!(!super::matcher_entry_covers(
+            catch_all,
+            "/_next/static/app.js"
+        ));
         // A path-prefix matcher covers its subtree only.
         assert!(super::matcher_entry_covers("/api/:path*", "/api/oauth/x"));
-        assert!(!super::matcher_entry_covers("/dashboard/:path*", "/api/oauth/x"));
+        assert!(!super::matcher_entry_covers(
+            "/dashboard/:path*",
+            "/api/oauth/x"
+        ));
         // A bare catch-all covers everything.
         assert!(super::matcher_entry_covers("/:path*", "/api/anything"));
     }
@@ -8599,7 +8629,9 @@ mod tests {
             "if (settings.requireLogin) return new Response('Unauthorized', {status: 401})"
         ));
         // A denial without any auth check, or a check without a denial, is not an auth gate.
-        assert!(!super::source_enforces_auth("return json({error:'Bad input'},{status:400})"));
+        assert!(!super::source_enforces_auth(
+            "return json({error:'Bad input'},{status:400})"
+        ));
         assert!(!super::source_enforces_auth("const user = getToken(req)"));
     }
 
@@ -8613,10 +8645,19 @@ mod tests {
             std::fs::write(p, body).unwrap();
         };
         // A conventional Next.js App Router login route, under a route group that drops from the URL.
-        write("src/app/(auth)/api/auth/login/route.js", "export async function POST(){}");
+        write(
+            "src/app/(auth)/api/auth/login/route.js",
+            "export async function POST(){}",
+        );
         // A non-login route is ignored; a dynamic segment yields no concrete URL.
-        write("src/app/api/models/route.js", "export async function GET(){}");
-        write("src/app/api/session/[id]/route.js", "export async function GET(){}");
+        write(
+            "src/app/api/models/route.js",
+            "export async function GET(){}",
+        );
+        write(
+            "src/app/api/session/[id]/route.js",
+            "export async function GET(){}",
+        );
         let logins = super::next_app_router_login_paths(root);
         assert_eq!(logins, vec!["/api/auth/login".to_owned()]);
     }
@@ -8630,7 +8671,10 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, body).unwrap();
         };
-        write("src/app/api/auth/login/route.js", "export async function POST(){}");
+        write(
+            "src/app/api/auth/login/route.js",
+            "export async function POST(){}",
+        );
         // No middleware yet: a route behind no gate needs no bootstrap.
         assert!(super::framework_auth_login_paths(root, "/api/oauth/x/api-key").is_none());
         // A Next.js middleware that denies the route unless authenticated: the login route is offered.
@@ -9293,7 +9337,11 @@ module.exports = { activityValidators };\n";
           }
           const response = await fetch(decodedUrl, { method: 'GET' });
         "#;
-        let names = vec!["decodedUrl".to_owned(), "imageUrl".to_owned(), "url".to_owned()];
+        let names = vec![
+            "decodedUrl".to_owned(),
+            "imageUrl".to_owned(),
+            "url".to_owned(),
+        ];
         assert_eq!(
             ssrf_allowlist_host_tokens(source, &names),
             vec!["googleusercontent.com".to_owned(), "google.com".to_owned()]
@@ -9336,7 +9384,10 @@ module.exports = { activityValidators };\n";
             vec!["api.example.com".to_owned()]
         );
         assert_eq!(
-            ssrf_allowlist_host_tokens("if (url.indexOf('cdn.example.net') === -1) return bad();", &names),
+            ssrf_allowlist_host_tokens(
+                "if (url.indexOf('cdn.example.net') === -1) return bad();",
+                &names
+            ),
             vec!["cdn.example.net".to_owned()]
         );
     }

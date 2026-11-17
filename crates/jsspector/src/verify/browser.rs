@@ -148,13 +148,11 @@ pub fn bookmarklet_attempts(
 fn js_string_breakout_canaries(canary: &Canary, token: &str) -> Vec<String> {
     let host = canary.marker_host();
     let scheme = canary.marker_scheme();
-    let url =
-        format!("'{scheme}:'+String.fromCharCode(47,47)+'{host}'+String.fromCharCode(47)+'{token}'");
+    let url = format!(
+        "'{scheme}:'+String.fromCharCode(47,47)+'{host}'+String.fromCharCode(47)+'{token}'"
+    );
     let code = format!("(new(Image)).setAttribute('src',{url})");
-    vec![
-        format!("');{code};void('"),
-        format!("\");{code};void(\""),
-    ]
+    vec![format!("');{code};void('"), format!("\");{code};void(\"")]
 }
 
 /// URL path markers a script matches against: an identifier immediately before an escaped slash in
@@ -182,7 +180,11 @@ fn url_path_markers(source: &str) -> Vec<String> {
             let end = i - 1;
             let start = source
                 .get(..end)
-                .and_then(|head| head.bytes().rposition(|b| !is_ident_byte(b)).map(|at| at + 1))
+                .and_then(|head| {
+                    head.bytes()
+                        .rposition(|b| !is_ident_byte(b))
+                        .map(|at| at + 1)
+                })
                 .unwrap_or(0);
             if let Some(word) = source.get(start..end) {
                 push(word);
@@ -372,7 +374,10 @@ mod tests {
             // URL serialization keeps none of these, so the canary must avoid them entirely.
             assert!(!payload.contains('/'), "{payload}");
             assert!(!payload.contains('?'), "{payload}");
-            assert!(!payload.contains('<') && !payload.contains('>'), "{payload}");
+            assert!(
+                !payload.contains('<') && !payload.contains('>'),
+                "{payload}"
+            );
             assert!(!payload.contains(' '), "{payload}");
             // It beacons the marker for this token through an image the fetch shim cannot swallow.
             assert!(payload.contains("Image"), "{payload}");
@@ -401,7 +406,11 @@ mod tests {
         let attempts = bookmarklet_attempts("bm.js", source, &canary, 2);
         assert!(!attempts.is_empty());
         // Every attempt drives the synthesized bookmarklet host for this script, via the fragment.
-        assert!(attempts.iter().all(|a| a.url.starts_with("/__jss/bm?s=bm.js#")));
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.url.starts_with("/__jss/bm?s=bm.js#"))
+        );
         assert!(attempts.iter().all(|a| a.token == "t-2"));
         // The mined `profile/` marker precedes the payload so the script's URL guard matches.
         assert!(

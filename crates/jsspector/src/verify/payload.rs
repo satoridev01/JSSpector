@@ -2731,10 +2731,7 @@ mod tests {
             Some("auth_token=eyJhbGci.eyJkYXRh.c2ln")
         );
         // Only a cleared/empty cookie present: nothing to carry.
-        assert_eq!(
-            session_cookie_pair(&["sid=; Max-Age=0".to_owned()]),
-            None
-        );
+        assert_eq!(session_cookie_pair(&["sid=; Max-Age=0".to_owned()]), None);
 
         // The captured cookie rides back verbatim on the gated request, with no forged bearer header.
         let attempt = Attempt {
@@ -2757,7 +2754,13 @@ mod tests {
         assert_eq!(default_login_passwords().first().copied(), Some("123456"));
         let login = default_login_post("/api/auth/login", "123456");
         assert_eq!(login.verb, "POST");
-        assert!(login.body.as_deref().unwrap().contains("\"password\":\"123456\""));
+        assert!(
+            login
+                .body
+                .as_deref()
+                .unwrap()
+                .contains("\"password\":\"123456\"")
+        );
     }
 
     fn probe(class: VulnClass, path: &str, entry: Entry) -> Probe {
@@ -3112,7 +3115,11 @@ mod tests {
         // `google.com`. Each bypass variant must still land at the marker (carry the marker host and the
         // probe token) while embedding the allow token, and the out-of-band signal is unchanged.
         let canary = Canary::new("tok".to_owned());
-        let mut p = probe(VulnClass::Ssrf, "/api/proxy-image", Entry::Query("url".to_owned()));
+        let mut p = probe(
+            VulnClass::Ssrf,
+            "/api/proxy-image",
+            Entry::Query("url".to_owned()),
+        );
         p.allow_tokens = vec!["google.com".to_owned()];
         let a = attempts(&p, &canary, 0);
         // The userinfo variant keeps the marker as host and begins `http://google.com@`, so a substring
@@ -3587,16 +3594,14 @@ mod tests {
         let absolute = format!("http://{MARKER_HOST}/mcp/{token}");
         assert!(
             a.iter()
-                .any(|x| x.target == absolute
-                    && x.signal == Signal::ServiceReached(token.clone())),
+                .any(|x| x.target == absolute && x.signal == Signal::ServiceReached(token.clone())),
             "no mounted absolute-form host override in {targets:?}"
         );
         // Protocol-relative host override, also under the mount: `//jss-marker/mcp/<token>`.
         let protocol_relative = format!("//{MARKER_HOST}/mcp/{token}");
         assert!(
-            a.iter()
-                .any(|x| x.target == protocol_relative
-                    && x.signal == Signal::ServiceReached(token.clone())),
+            a.iter().any(|x| x.target == protocol_relative
+                && x.signal == Signal::ServiceReached(token.clone())),
             "no mounted protocol-relative host override in {targets:?}"
         );
         // A host-override target whose path dropped the mount prefix would never route to the

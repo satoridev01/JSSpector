@@ -328,7 +328,55 @@ pub struct Session {
     tls: bool,
     local_marker_port: Option<u16>,
     local_baseline_ports: Vec<u16>,
+    /// Backing services the app declares a client for but the local runtime cannot provide (Redis
+    /// without `redis-server` on PATH). The app is still launched without that service's connection
+    /// settings — many apps treat a cache/queue as optional and fall back to in-process state when it
+    /// is unconfigured — so a finding can be proved on the code path that does not need it. Because
+    /// the environment is reduced, a negative result is never reported as `not-reproduced`: see
+    /// [`qualify_reduced_environment`].
+    unavailable_services: Vec<String>,
     torn_down: bool,
+}
+
+/// What the local runtime does with a declared Redis client: start a private `redis-server` when
+/// one is installed, otherwise launch without Redis and record the gap. A declared client is not
+/// proof the app needs Redis to serve a request (it is often optional and env-gated), so refusing
+/// to launch would skip findings whose path never touches it.
+fn local_redis_plan(declared: bool, server_available: bool) -> (bool, Option<String>) {
+    match (declared, server_available) {
+        (true, true) => (true, None),
+        (true, false) => (
+            false,
+            Some("Redis (`redis-server` is not on PATH, so the app ran without Redis)".to_owned()),
+        ),
+        (false, _) => (false, None),
+    }
+}
+
+/// Attach the services the sandbox could not provide to a launch failure, so a crash caused by
+/// the missing service is not mistaken for an unrelated startup problem.
+fn note_unavailable_services(error: String, unavailable: &[String]) -> String {
+    if unavailable.is_empty() {
+        error
+    } else {
+        format!("{error} (unavailable: {})", unavailable.join(", "))
+    }
+}
+
+/// A run in a reduced environment (a declared backing service was unavailable) proves a finding
+/// when it reproduces, because the proof is the app's own behavior. A negative result is
+/// inconclusive, though: the vulnerable path may need the missing service. So it is reported as
+/// skipped, with the reason, never as `not-reproduced`.
+fn qualify_reduced_environment(outcome: Outcome, unavailable: &[String]) -> Outcome {
+    match outcome {
+        Outcome::NotReproduced { tried } if !unavailable.is_empty() => Outcome::Skipped {
+            reason: format!(
+                "not reproduced after {tried} request(s) in a reduced environment; unavailable: {}",
+                unavailable.join(", ")
+            ),
+        },
+        other => other,
+    }
 }
 
 enum Runtime {
@@ -346,6 +394,10 @@ enum Runtime {
         service_dirs: Vec<std::path::PathBuf>,
         marker_log: std::path::PathBuf,
         created_files: Vec<std::path::PathBuf>,
+        /// A verifier-provisioned runtime directory (the package's declared Bun release, see
+        /// [`provision_local_bun`]) put first on the application's `PATH`. `None` when the app
+        /// needs nothing beyond the host tools.
+        tool_dir: Option<std::path::PathBuf>,
         /// Serializes the fixed `/tmp/jss-*` helper namespace across scanner processes. The OS
         /// releases this lock even when a scan is interrupted, allowing the next run to recover
         /// fixtures recorded in the ownership manifest without touching unrelated files.
@@ -509,6 +561,7 @@ impl Session {
             tls: false,
             local_marker_port: None,
             local_baseline_ports: Vec::new(),
+            unavailable_services: Vec::new(),
             torn_down: false,
         };
         if let Err(err) = session.boot() {
@@ -553,10 +606,12 @@ impl Session {
             .flatten();
         let manages_ephemeral_db = app_needs_db && ephemeral_db_command.is_some();
         let needs_db = app_needs_db && !manages_ephemeral_db && has_local_mongo;
-        let needs_redis = redis_service(&app_root);
-        if needs_redis && !command_available("redis-server") {
-            return Err("the local verifier needs `redis-server` on PATH for this app".to_owned());
-        }
+        let declares_redis = redis_service(&app_root);
+        let (needs_redis, missing_redis) = local_redis_plan(
+            declares_redis,
+            declares_redis && command_available("redis-server"),
+        );
+        let unavailable_services: Vec<String> = missing_redis.into_iter().collect();
         let entry_rel = entry_file.and_then(|file| file.strip_prefix(app_path).ok());
         // Install and build before choosing the launch command. A package whose start script names
         // generated output (`node dist/index.js`) must be evaluated after its `compile`/`build`
@@ -574,7 +629,14 @@ impl Session {
                     .to_string()
             });
         let install_root = root.join(&install_rel);
-        prepare_local_app(root, &install_root)?;
+        // A package written for Bun runs its own startup and scripts with Bun; provide that runtime
+        // before installing, so its build and launch scripts execute as the project intends.
+        let tool_dir = match provision_local_bun(&app_root)? {
+            Some(dir) => Some(dir),
+            None if install_root != app_root => provision_local_bun(&install_root)?,
+            None => None,
+        };
+        prepare_local_app(root, &install_root, tool_dir.as_deref())?;
         let start_command = if let Some(command) = ephemeral_db_command {
             command
         } else if app_needs_db
@@ -664,6 +726,7 @@ impl Session {
                 service_dirs,
                 marker_log,
                 created_files,
+                tool_dir,
                 _fixture_lock: fixture_lock,
             },
             tag: String::new(),
@@ -692,11 +755,14 @@ impl Session {
             tls: false,
             local_marker_port,
             local_baseline_ports: Vec::new(),
+            unavailable_services,
             torn_down: false,
         };
         session.start_local_services()?;
         session.local_baseline_ports = local_listening_ports();
-        session.boot_local()?;
+        session
+            .boot_local()
+            .map_err(|error| note_unavailable_services(error, &session.unavailable_services))?;
         if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
             eprintln!(
                 "[verify] local launched app={} command={} port={} logs[{}]",
@@ -968,6 +1034,7 @@ impl Session {
             log,
             command,
             process,
+            tool_dir,
             ..
         } = &self.runtime
         else {
@@ -1034,6 +1101,9 @@ impl Session {
             .stderr(stderr);
         if let Some(node_path) = &self.node_path {
             child.env("NODE_PATH", node_path);
+        }
+        if let Some(dir) = tool_dir {
+            child.env("PATH", path_with_tool_dir(dir));
         }
         let mut node_options = Vec::new();
         if self.node_sqlite {
@@ -1663,6 +1733,12 @@ impl Session {
 
     /// Sends every derived request for a probe and reports the first that reproduces, or that
     /// none did.
+    /// Report an outcome observed in this session, accounting for any backing service the sandbox
+    /// could not provide (see [`qualify_reduced_environment`]).
+    pub fn qualify(&self, outcome: Outcome) -> Outcome {
+        qualify_reduced_environment(outcome, &self.unavailable_services)
+    }
+
     pub fn exercise(&mut self, probe: &Probe) -> Outcome {
         self.nonce += 1;
         if probe.class == jss_core::VulnClass::NosqlInjection {
@@ -1785,10 +1861,19 @@ impl Session {
         // so each JSON-body attempt gets a form-urlencoded twin. A session the app never issued cannot
         // be forged, so this reaches only a sink a real logged-in request would.
         if let Some(boot) = &probe.auth {
-            if let Some(token) = self.obtain_session(boot) {
+            // A framework-middleware gate costs a login round-trip, so only pursue it when the app
+            // actually challenges this route; an in-handler gate is always pursued (an anonymous
+            // request simply never reaches its sink).
+            let gated = !boot.default_credentials || self.auth_challenge(&attempts);
+            if gated && let Some(cred) = self.obtain_session(boot) {
                 let mut decorated = Vec::with_capacity(attempts.len() * 2);
                 for attempt in &attempts {
-                    let with = payload::with_session(attempt, &boot.cookie, &token);
+                    let with = match &cred {
+                        SessionCred::Bearer { cookie, token } => {
+                            payload::with_session(attempt, cookie, token)
+                        }
+                        SessionCred::Cookie { pair } => payload::with_cookie(attempt, pair),
+                    };
                     if let Some(form) = payload::urlencoded_twin(&with) {
                         decorated.push(form);
                     }
@@ -1797,8 +1882,8 @@ impl Session {
                 attempts = decorated;
             } else if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
                 eprintln!(
-                    "[verify] auth-bootstrap could not obtain a session (login={:?} register={:?})",
-                    boot.login_paths, boot.register_paths
+                    "[verify] auth-bootstrap could not obtain a session (login={:?} register={:?} default-creds={})",
+                    boot.login_paths, boot.register_paths, boot.default_credentials
                 );
             }
         }
@@ -3108,7 +3193,20 @@ impl Session {
     /// bypasses the authentication — it satisfies the precondition the way a user would. `None` when
     /// no login returns a token, leaving the gated request to be sent unauthenticated (and so, for a
     /// genuinely authenticated sink, honestly not reproduce).
-    fn obtain_session(&self, boot: &super::plan::AuthBootstrap) -> Option<String> {
+    fn obtain_session(&self, boot: &super::plan::AuthBootstrap) -> Option<SessionCred> {
+        // A framework-middleware gate: mint a session against the app's own login route using the
+        // deployment's first-run default credential, sent as a genuine loopback request (no synthetic
+        // forwarding header) so a login that issues its session only to a local first-run client does
+        // so honestly. Capture the session from the login's `Set-Cookie`, or a bearer token in its body.
+        if boot.default_credentials {
+            let restore = self.omit_forwarding.get();
+            self.omit_forwarding.set(true);
+            let result = self.obtain_default_session(boot);
+            self.omit_forwarding.set(restore);
+            return result;
+        }
+        // An in-handler session gate: register a throwaway account, log in with those generated
+        // credentials, and carry the returned bearer token back under the handler's cookie.
         let email = format!("jss-{}@jsspector.test", self.canary.token);
         let password = format!("Jss!{}aA1", self.canary.token);
         for path in &boot.register_paths {
@@ -3118,10 +3216,71 @@ impl Session {
             if let Some(body) = self.fetch(&payload::credential_post(path, &email, &password))
                 && let Some(token) = payload::extract_bearer_token(&body)
             {
-                return Some(token);
+                return Some(SessionCred::Bearer {
+                    cookie: boot.cookie.clone(),
+                    token,
+                });
             }
         }
         None
+    }
+
+    fn obtain_default_session(&self, boot: &super::plan::AuthBootstrap) -> Option<SessionCred> {
+        for path in &boot.login_paths {
+            for password in payload::default_login_passwords() {
+                let attempt = payload::default_login_post(path, password);
+                let Some((body, _status, cookies)) = self.fetch_meta(&attempt) else {
+                    continue;
+                };
+                if let Some(pair) = payload::session_cookie_pair(&cookies) {
+                    return Some(SessionCred::Cookie { pair });
+                }
+                if let Some(token) = payload::extract_bearer_token(&body) {
+                    return Some(SessionCred::Bearer {
+                        cookie: if boot.cookie.is_empty() {
+                            "token".to_owned()
+                        } else {
+                            boot.cookie.clone()
+                        },
+                        token,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the app answers these probes with an authentication challenge (HTTP 401/403, or an
+    /// auth-shaped body). Used to attempt a login bootstrap only when the route is actually gated, so
+    /// an app that does not challenge receives no spurious login traffic.
+    fn auth_challenge(&self, attempts: &[Attempt]) -> bool {
+        let Some(attempt) = attempts.first() else {
+            return false;
+        };
+        let Some((body, status, _)) = self.fetch_meta(attempt) else {
+            return false;
+        };
+        if matches!(status, Some(401) | Some(403)) {
+            return true;
+        }
+        let lower = body.to_ascii_lowercase();
+        lower.contains("unauthorized")
+            || lower.contains("authentication required")
+            || lower.contains("login required")
+            || lower.contains("requirelogin")
+    }
+
+    /// Runs one request through the driver and returns its body, status and `Set-Cookie` headers,
+    /// read from the driver's tagged metadata line.
+    fn fetch_meta(&self, attempt: &Attempt) -> Option<(String, Option<u16>, Vec<String>)> {
+        let spec = request_spec(attempt, self.port, !self.omit_forwarding.get(), self.tls);
+        let output = self
+            .exec(&self.app, &["node", "/jss-driver.js", &spec])
+            .ok()?;
+        let body = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let (status, cookies) = parse_driver_meta(&stderr);
+        Some((body, status, cookies))
     }
 
     fn fetch(&self, attempt: &Attempt) -> Option<String> {
@@ -3795,6 +3954,7 @@ fn local_process_group_running(_group: u32) -> bool {
 fn prepare_local_app(
     _root: &std::path::Path,
     install_root: &std::path::Path,
+    tool_dir: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let package_manager = package_manager(install_root);
     let manifest_path = install_root.join("package.json");
@@ -3806,7 +3966,7 @@ fn prepare_local_app(
     } else {
         None
     };
-    let install_result = run_local_setup(install_root, install_command(package_manager));
+    let install_result = run_local_setup(install_root, install_command(package_manager), tool_dir);
     if let Some(original) = original_manifest {
         std::fs::write(&manifest_path, original)
             .map_err(|error| format!("restoring {}: {error}", manifest_path.display()))?;
@@ -3832,7 +3992,7 @@ fn prepare_local_app(
             // can pin an otherwise ordinary transitive dependency to a prohibited remote tarball, so
             // keep it out of this registry-only fallback and restore it byte-for-byte afterwards.
             let original_locks = temporarily_remove_npm_lockfiles(install_root)?;
-            let repair_result = run_local_setup(install_root, &repair);
+            let repair_result = run_local_setup(install_root, &repair, tool_dir);
             let manifest_restore = if let Some(original) = original_manifest {
                 std::fs::write(&manifest_path, original)
                     .map_err(|error| format!("restoring {}: {error}", manifest_path.display()))
@@ -3848,7 +4008,7 @@ fn prepare_local_app(
     if let Ok(manifest) = std::fs::read_to_string(&manifest_path)
         && let Some(script) = build_script(&manifest, install_root)
     {
-        run_local_setup(install_root, &build_command(package_manager, script))?;
+        run_local_setup(install_root, &build_command(package_manager, script), tool_dir)?;
     }
     Ok(())
 }
@@ -4074,8 +4234,153 @@ fn prepare_standalone_npm_manifest(
     Ok(Some(original))
 }
 
-fn run_local_setup(root: &std::path::Path, script: &str) -> Result<(), String> {
-    let output = Command::new("sh")
+/// The Bun release a package declares as its runtime, as an npm version spec: the exact version
+/// pinned by `packageManager` (`bun@1.4.4+sha…` -> `1.4.4`), else the `engines.bun` range, else
+/// `latest` when the package's lockfile or scripts are Bun's (`bun.lock`, `"start": "bun server.js"`).
+/// `None` for a package that never asks for Bun. Only a conservative character set is accepted, so a
+/// manifest value can never become an npm flag or a non-registry specifier.
+fn declared_bun_spec(app_root: &std::path::Path) -> Option<String> {
+    let manifest = std::fs::read_to_string(app_root.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    let valid = |spec: &str| {
+        let spec = spec.trim();
+        !spec.is_empty()
+            && !spec.starts_with('-')
+            && spec
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " .^~<>=|*-".contains(c))
+    };
+    if let Some(version) = json
+        .get("packageManager")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.strip_prefix("bun@"))
+        .map(|value| value.split('+').next().unwrap_or(value).trim())
+    {
+        return valid(version).then(|| version.to_owned());
+    }
+    if let Some(range) = json
+        .get("engines")
+        .and_then(|engines| engines.get("bun"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return valid(range).then(|| range.trim().to_owned());
+    }
+    let bun_lock = app_root.join("bun.lock").is_file() || app_root.join("bun.lockb").is_file();
+    let bun_scripts = json
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            ["start", "serve", "server", "app", "dev", "build"]
+                .iter()
+                .filter_map(|name| scripts.get(*name).and_then(serde_json::Value::as_str))
+                .any(script_invokes_bun)
+        });
+    (bun_lock || bun_scripts).then(|| "latest".to_owned())
+}
+
+/// Whether any command in a package script runs the Bun executable (`bun x.js`, `bunx next`,
+/// `cross-env A=1 bun run y`), rather than merely mentioning the word.
+fn script_invokes_bun(script: &str) -> bool {
+    script
+        .split(['&', '|', ';'])
+        .filter_map(|command| {
+            command
+                .split_whitespace()
+                .find(|word| !word.contains('=') && *word != "cross-env" && *word != "env")
+        })
+        .any(|program| program == "bun" || program == "bunx")
+}
+
+/// The verifier-owned directory a Bun release for `spec` is installed into. Outside every checkout,
+/// keyed by the spec so different pins never share a binary.
+fn local_bun_tool_dir(spec: &str) -> std::path::PathBuf {
+    let key: String = spec
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' })
+        .collect();
+    std::env::temp_dir()
+        .join("jsspector-tools")
+        .join(format!("bun-{key}"))
+}
+
+/// Make the Bun runtime a package declares available to the local verifier. A package written for
+/// Bun (`bun:sqlite`, `Bun.*`, `bun server.js` launchers) cannot run its real startup under Node,
+/// and no Node substitute would be faithful, so provide the declared release itself: installed from
+/// the npm registry (`bun` ships its platform binaries there) into a verifier-owned tool directory,
+/// never into the checkout. Returns the directory to prepend to `PATH`, or `None` when the package
+/// does not declare Bun or a `bun` is already on `PATH`.
+fn provision_local_bun(app_root: &std::path::Path) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(spec) = declared_bun_spec(app_root) else {
+        return Ok(None);
+    };
+    if command_available("bun") {
+        return Ok(None);
+    }
+    let dir = local_bun_tool_dir(&spec);
+    let bin = dir.join("node_modules").join(".bin");
+    let ready = |bin: &std::path::Path| {
+        Command::new(bin.join("bun"))
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if ready(&bin) {
+        return Ok(Some(bin));
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("creating Bun tool directory {}: {error}", dir.display()))?;
+    let lock = File::create(dir.join(".lock"))
+        .map_err(|error| format!("creating Bun tool lock: {error}"))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("locking Bun tool directory: {error}"))?;
+    if ready(&bin) {
+        return Ok(Some(bin));
+    }
+    let output = Command::new("npm")
+        .args([
+            "install",
+            "--no-save",
+            "--no-package-lock",
+            "--no-audit",
+            "--no-fund",
+            "--prefix",
+        ])
+        .arg(&dir)
+        .arg(format!("bun@{spec}"))
+        .current_dir(&dir)
+        .output()
+        .map_err(|error| format!("installing the declared Bun runtime: {error}"))?;
+    if !output.status.success() || !ready(&bin) {
+        return Err(format!(
+            "the app declares the Bun runtime (bun@{spec}), which could not be provisioned:\n{}",
+            tail(&String::from_utf8_lossy(&output.stderr), 20)
+        ));
+    }
+    Ok(Some(bin))
+}
+
+/// `PATH` with a verifier tool directory first, so package scripts (`bun …`) find the provisioned
+/// runtime while everything else resolves as before.
+fn path_with_tool_dir(tool_dir: &std::path::Path) -> std::ffi::OsString {
+    let mut parts = vec![tool_dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        parts.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(parts).unwrap_or_else(|_| tool_dir.as_os_str().to_owned())
+}
+
+fn run_local_setup(
+    root: &std::path::Path,
+    script: &str,
+    tool_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let mut command = Command::new("sh");
+    if let Some(dir) = tool_dir {
+        command.env("PATH", path_with_tool_dir(dir));
+    }
+    let output = command
         .args(["-c", script])
         .current_dir(root)
         .env("CI", "true")
@@ -7747,6 +8052,42 @@ fn container_dir(app: &std::path::Path) -> Option<String> {
 }
 
 /// The request the driver sends, as a compact JSON spec on one argv slot.
+/// A genuine session minted through the app's own authentication, carried back on the gated request.
+enum SessionCred {
+    /// A bearer token (a JWT the login returned in its body), carried under a cookie and the bearer
+    /// header.
+    Bearer { cookie: String, token: String },
+    /// A `name=value` cookie the login's `Set-Cookie` issued, carried back verbatim.
+    Cookie { pair: String },
+}
+
+/// The HTTP status and `Set-Cookie` headers from the driver's tagged metadata line on stderr.
+fn parse_driver_meta(stderr: &str) -> (Option<u16>, Vec<String>) {
+    for line in stderr.lines() {
+        let Some(rest) = line.trim().strip_prefix("__JSS_META__") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(rest) else {
+            continue;
+        };
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|code| *code > 0)
+            .map(|code| code as u16);
+        let cookies = match value.get("setCookie") {
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect(),
+            Some(serde_json::Value::String(single)) => vec![single.clone()],
+            _ => Vec::new(),
+        };
+        return (status, cookies);
+    }
+    (None, Vec::new())
+}
+
 fn request_spec(attempt: &Attempt, port: u16, forward: bool, tls: bool) -> String {
     let mut pairs: Vec<(String, String)> = attempt.headers.clone();
     // Give each driven request a distinct client address. A per-IP rate limiter buckets requests by
@@ -9528,6 +9869,10 @@ function attempt(){
   let sent = false;
   const done = (data)=>{if(sent){return;} sent=true; try{process.stdout.write(data,()=>process.exit(0));}catch(e){process.exit(0);}};
   const req = mod.request(options,(res)=>{
+    // Emit the response status and any Set-Cookie on stderr, tagged, so the verifier can detect an
+    // authentication challenge and capture a session the app's own login issued. stdout stays the
+    // response body, unchanged, so body-based comparisons are unaffected.
+    try{process.stderr.write('__JSS_META__'+JSON.stringify({status:res.statusCode||0,setCookie:res.headers['set-cookie']||null})+'\n');}catch(e){}
     let data='';
     // Cap how much is kept (a large body is only compared, never parsed), but still emit what was
     // collected: dropping it entirely would make a large success response read as empty and hide,
@@ -11983,6 +12328,131 @@ mod tests {
                 .iter()
                 .any(|(name, value)| { name == "REDIS_URL" && value == "redis://127.0.0.1:6379" })
         );
+    }
+
+    #[test]
+    fn local_runtime_launches_without_an_uninstalled_redis_and_records_the_gap() {
+        // A declared client with a local server starts the sidecar and needs no caveat.
+        assert_eq!(local_redis_plan(true, true), (true, None));
+        // No declared client: nothing to start, nothing missing.
+        assert_eq!(local_redis_plan(false, false), (false, None));
+        assert_eq!(local_redis_plan(false, true), (false, None));
+        // A declared client without `redis-server` no longer refuses to launch: the app runs without
+        // Redis connection settings, and the gap is recorded.
+        let (start, missing) = local_redis_plan(true, false);
+        assert!(!start);
+        assert!(missing.is_some_and(|note| note.contains("redis-server")));
+    }
+
+    #[test]
+    fn driver_metadata_line_yields_status_and_set_cookie() {
+        let stderr = "some log\n__JSS_META__{\"status\":401,\"setCookie\":[\"auth_token=abc; HttpOnly\"]}\n";
+        let (status, cookies) = parse_driver_meta(stderr);
+        assert_eq!(status, Some(401));
+        assert_eq!(cookies, vec!["auth_token=abc; HttpOnly".to_owned()]);
+        // A single-string Set-Cookie and a zero/absent status are handled.
+        let (status, cookies) =
+            parse_driver_meta("__JSS_META__{\"status\":0,\"setCookie\":\"x=y\"}");
+        assert_eq!(status, None);
+        assert_eq!(cookies, vec!["x=y".to_owned()]);
+        // No metadata line: nothing parsed.
+        assert_eq!(parse_driver_meta("connection refused"), (None, Vec::new()));
+    }
+
+    #[test]
+    fn declared_bun_runtime_is_read_from_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // `packageManager` pins the exact release; its integrity suffix is not part of the version.
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"packageManager":"bun@1.4.4+sha512.abc","engines":{"bun":">=1.2"}}"#,
+        );
+        assert_eq!(declared_bun_spec(dir.path()).as_deref(), Some("1.4.4"));
+        // Otherwise the engines range is honored as an npm range.
+        write(dir.path(), "package.json", r#"{"engines":{"bun":">=1.2.0"}}"#);
+        assert_eq!(declared_bun_spec(dir.path()).as_deref(), Some(">=1.2.0"));
+        // A Bun launcher with no pin uses the current release.
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"scripts":{"start":"cross-env NODE_ENV=production bun server.js"}}"#,
+        );
+        assert_eq!(declared_bun_spec(dir.path()).as_deref(), Some("latest"));
+        // A Node package, or one that only mentions the word, asks for nothing.
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"packageManager":"pnpm@9.0.0","scripts":{"start":"node bun-server.js","build":"echo bun"}}"#,
+        );
+        assert_eq!(declared_bun_spec(dir.path()), None);
+        // A Bun lockfile alone also declares the runtime.
+        write(dir.path(), "bun.lock", "{}");
+        assert_eq!(declared_bun_spec(dir.path()).as_deref(), Some("latest"));
+    }
+
+    #[test]
+    fn declared_bun_spec_never_becomes_a_flag_or_non_registry_specifier() {
+        let dir = tempfile::tempdir().unwrap();
+        for hostile in [
+            r#"{"packageManager":"bun@--registry=http://evil"}"#,
+            r#"{"packageManager":"bun@https://evil/bun.tgz"}"#,
+            r#"{"engines":{"bun":"github:evil/bun"}}"#,
+            r#"{"engines":{"bun":"1.0; rm -rf /"}}"#,
+        ] {
+            write(dir.path(), "package.json", hostile);
+            assert_eq!(declared_bun_spec(dir.path()), None, "{hostile}");
+        }
+    }
+
+    #[test]
+    fn provisioned_runtime_dir_is_first_on_path_and_outside_the_checkout() {
+        let dir = local_bun_tool_dir(">=1.2 <2");
+        assert!(dir.starts_with(std::env::temp_dir().join("jsspector-tools")));
+        assert!(
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("bun-") && !name.contains(['>', '<', ' ']))
+        );
+        let tool = std::path::Path::new("/opt/jss-tool/bin");
+        let path = path_with_tool_dir(tool);
+        assert_eq!(std::env::split_paths(&path).next().as_deref(), Some(tool));
+        assert!(script_invokes_bun("bun --bun next dev --port 1"));
+        assert!(script_invokes_bun("npm run lint && bunx next build"));
+        assert!(!script_invokes_bun("node scripts/bun-helper.js"));
+    }
+
+    #[test]
+    fn reduced_environment_never_reports_a_negative_as_not_reproduced() {
+        let unavailable = vec!["Redis".to_owned()];
+        // A negative result without the declared service is inconclusive.
+        match qualify_reduced_environment(Outcome::NotReproduced { tried: 3 }, &unavailable) {
+            Outcome::Skipped { reason } => {
+                assert!(reason.contains("reduced environment") && reason.contains("Redis"));
+            }
+            other => panic!("expected skipped, got {}", other.label()),
+        }
+        // A complete environment keeps the negative verdict.
+        assert!(matches!(
+            qualify_reduced_environment(Outcome::NotReproduced { tried: 3 }, &[]),
+            Outcome::NotReproduced { tried: 3 }
+        ));
+        // Skips pass through unchanged, and a reproduction is never altered or invented.
+        assert!(matches!(
+            qualify_reduced_environment(
+                Outcome::Skipped {
+                    reason: "x".to_owned()
+                },
+                &unavailable
+            ),
+            Outcome::Skipped { reason } if reason == "x"
+        ));
+        // Launch failures name the missing service; a full environment leaves them untouched.
+        assert_eq!(
+            note_unavailable_services("exited".to_owned(), &unavailable),
+            "exited (unavailable: Redis)"
+        );
+        assert_eq!(note_unavailable_services("exited".to_owned(), &[]), "exited");
     }
 
     fn write(root: &std::path::Path, rel: &str, text: &str) {

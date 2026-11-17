@@ -256,6 +256,281 @@ pub struct AuthBootstrap {
     /// Candidate login endpoints that exchange the generated credentials for a session token, tried
     /// in order until one returns a token.
     pub login_paths: Vec<String>,
+    /// Whether the gate is a framework request-middleware (a Next.js `middleware`/matcher, a global
+    /// request proxy) that denies the route unless authenticated, rather than an in-handler credential
+    /// read. In that case the session is minted through the app's own login route using the
+    /// deployment's first-run credential — the public default an operator is expected to change —
+    /// and captured from the login's `Set-Cookie` (or a bearer token in the body). This reproduces a
+    /// realistic default-deployment exploit; a session the app itself never issues cannot be forged,
+    /// so it only reaches a sink an open/default-credentialed deployment already exposes.
+    pub default_credentials: bool,
+}
+
+/// Login endpoints to mint a first-run session against when a finding's route is gated by a
+/// framework request-middleware (a Next.js `middleware` with a `matcher`, a global request proxy)
+/// rather than an in-handler check. Returns `Some(login_paths)` — most-conventional first — when
+/// (a) the repository has such a middleware whose matcher covers the route and whose own source or a
+/// module it imports enforces authentication (a 401/`Unauthorized` gated on a session/login state),
+/// and (b) at least one login endpoint is discoverable. `None` otherwise. Everything is mined by
+/// generic framework convention and authentication vocabulary; nothing names a specific app.
+pub fn framework_auth_login_paths(root: &std::path::Path, route_path: &str) -> Option<Vec<String>> {
+    if !middleware_auth_gate_covers(root, route_path) {
+        return None;
+    }
+    let mut paths = next_app_router_login_paths(root);
+    // Also mine the middleware and route-registration sources for login endpoints, reusing the
+    // generic auth vocabulary. Covers routers that list routes in a central module.
+    for file in middleware_source_files(root) {
+        if let Ok(src) = std::fs::read_to_string(&file) {
+            let (login, _) = auth_endpoints(&src);
+            for p in login {
+                if !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Candidate Next.js / global request-middleware source files: a module that exports a default
+/// function *and* an `export const config` naming a `matcher`. Excludes build output and
+/// dependencies. The file name is not required to be `middleware` — some projects export their
+/// middleware from a differently named module re-exported through the framework's entry.
+fn middleware_source_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                if name != "node_modules" && name != ".git" && name != ".next" && name != "dist" {
+                    stack.push(path);
+                }
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs" | "ts" | "tsx"))
+                && let Ok(src) = std::fs::read_to_string(&path)
+                && declares_middleware_matcher(&src)
+            {
+                found.push(path);
+            }
+        }
+        if found.len() >= 8 {
+            break;
+        }
+    }
+    found
+}
+
+/// Whether a source declares a framework request-middleware: a default export plus a `config` with a
+/// `matcher`. This is the Next.js middleware contract, and a reliable, framework-generic marker that
+/// the module gates requests.
+fn declares_middleware_matcher(src: &str) -> bool {
+    let has_default = src.contains("export default") || src.contains("export { default");
+    let has_matcher = src.contains("matcher")
+        && (src.contains("export const config") || src.contains("export let config"));
+    has_default && has_matcher
+}
+
+/// Whether a repository middleware's matcher covers `route_path` and the middleware enforces
+/// authentication. Conservative: requires an actual auth gate (a 401/`Unauthorized`, or a
+/// session/login/`requireLogin` check) in the middleware file or a sibling module, so an unrelated
+/// rewriting middleware does not trigger a login bootstrap.
+fn middleware_auth_gate_covers(root: &std::path::Path, route_path: &str) -> bool {
+    for file in middleware_source_files(root) {
+        let Ok(src) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        if !matcher_covers_route(&src, route_path) {
+            continue;
+        }
+        if source_enforces_auth(&src) {
+            return true;
+        }
+        // The gate may live in a guard module the middleware imports (a common split: the middleware
+        // delegates to `dashboardGuard`/`authMiddleware`). Check sibling modules in the same folder.
+        if let Some(parent) = file.parent()
+            && let Ok(entries) = std::fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path == file || !path.is_file() {
+                    continue;
+                }
+                if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs" | "ts" | "tsx"))
+                    && let Ok(guard) = std::fs::read_to_string(&path)
+                    && source_enforces_auth(&guard)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether a source enforces authentication: it produces an unauthorized response (`401`, the word
+/// `Unauthorized`) and reads an authentication state (a session/login/token check). Both are required
+/// so a module that merely mentions one word in passing does not read as an auth gate.
+fn source_enforces_auth(src: &str) -> bool {
+    let denies = src.contains("401") || src.contains("Unauthorized") || src.contains("unauthorized");
+    let checks = ["isAuthenticated", "requireLogin", "auth_token", "getToken", "verify"]
+        .iter()
+        .any(|needle| src.contains(needle))
+        || (src.contains("cookies") && (src.contains("token") || src.contains("session")));
+    denies && checks
+}
+
+/// Whether any `matcher` entry in a middleware source covers `route_path`. Handles the two common
+/// matcher forms: a catch-all negative-lookahead (`/((?!_next|favicon).*)`) that matches every path
+/// except the excluded static assets, and a path-prefix form (`/api/:path*`, `/dashboard/:path*`).
+fn matcher_covers_route(src: &str, route_path: &str) -> bool {
+    for literal in matcher_literals(src) {
+        if matcher_entry_covers(&literal, route_path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The string literals inside a `matcher: [ ... ]` (or `matcher: "..."`) declaration.
+fn matcher_literals(src: &str) -> Vec<String> {
+    let Some(pos) = src.find("matcher") else {
+        return Vec::new();
+    };
+    let after = &src[pos..];
+    // Bound the scan to the matcher's own array/string, not the rest of the file.
+    let end = after
+        .find(']')
+        .or_else(|| after.find('}'))
+        .map(|e| e + 1)
+        .unwrap_or_else(|| after.len().min(400));
+    let region = &after[..end.min(after.len())];
+    let mut out = Vec::new();
+    for quote in ['"', '\'', '`'] {
+        let mut from = 0;
+        while let Some(start) = region[from..].find(quote) {
+            let s = from + start + 1;
+            if let Some(len) = region[s..].find(quote) {
+                out.push(region[s..s + len].to_owned());
+                from = s + len + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Whether a single matcher entry covers a concrete route path.
+fn matcher_entry_covers(entry: &str, route_path: &str) -> bool {
+    if !entry.starts_with('/') {
+        return false;
+    }
+    // A negative-lookahead catch-all (`/((?!a|b).*)`) matches everything except the listed prefixes.
+    if entry.contains("(?!") {
+        if let Some(start) = entry.find("(?!") {
+            let rest = &entry[start + 3..];
+            let group = rest.split(')').next().unwrap_or("");
+            for excluded in group.split('|') {
+                let excluded = excluded.trim().trim_start_matches('/');
+                let excluded = excluded.split(['\\', '(', '.', '*', '?']).next().unwrap_or("");
+                if !excluded.is_empty() && route_path.trim_start_matches('/').starts_with(excluded) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    // A path-prefix form: the static prefix before any pattern token must prefix the route.
+    let prefix: String = entry
+        .chars()
+        .take_while(|c| !matches!(c, ':' | '*' | '(' | '[' | '?'))
+        .collect();
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        // Bare `/` or `/:path*` catch-all.
+        return true;
+    }
+    route_path == prefix || route_path.starts_with(&format!("{prefix}/"))
+}
+
+/// Login endpoint URL paths discovered from a Next.js App Router layout: a `route.{js,ts,...}` file
+/// whose directory chain's last concrete segment is generic login vocabulary (`login`, `signin`,
+/// `authenticate`, `session`). The file path under `app/` becomes the URL path, route-group segments
+/// (`(auth)`) dropped and dynamic segments (`[id]`) skipped. Convention-based; no app-specific names.
+pub fn next_app_router_login_paths(root: &std::path::Path) -> Vec<String> {
+    const LOGIN_SEGMENTS: [&str; 6] =
+        ["login", "signin", "sign-in", "authenticate", "session", "sessions"];
+    let mut paths = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                if name != "node_modules" && name != ".git" && name != ".next" {
+                    stack.push(path);
+                }
+            } else if path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem == "route")
+                && let Some(url) = app_router_route_url(root, &path)
+                && url
+                    .rsplit('/')
+                    .find(|seg| !seg.is_empty())
+                    .is_some_and(|last| LOGIN_SEGMENTS.contains(&last))
+                && !paths.contains(&url)
+            {
+                paths.push(url);
+            }
+        }
+    }
+    paths
+}
+
+/// The URL path a Next.js App Router `route` file serves: the segments after an `app/` (or
+/// `src/app/`) directory, with route-group segments `(group)` dropped. `None` for a file not under
+/// an `app` directory, or one whose path still contains a dynamic `[param]` segment (no concrete URL).
+fn app_router_route_url(root: &std::path::Path, route_file: &std::path::Path) -> Option<String> {
+    let rel = route_file.strip_prefix(root).ok()?;
+    let components: Vec<String> = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(str::to_owned))
+        .collect();
+    let app_idx = components.iter().rposition(|c| c == "app")?;
+    let mut segments = Vec::new();
+    for seg in &components[app_idx + 1..] {
+        if seg.ends_with(".js")
+            || seg.ends_with(".ts")
+            || seg.ends_with(".tsx")
+            || seg.ends_with(".mjs")
+            || seg.ends_with(".cjs")
+        {
+            break; // the `route.*` file itself
+        }
+        if seg.starts_with('(') && seg.ends_with(')') {
+            continue; // route group: not part of the URL
+        }
+        if seg.starts_with('[') {
+            return None; // dynamic segment: no single concrete URL
+        }
+        segments.push(seg.clone());
+    }
+    Some(format!("/{}", segments.join("/")))
 }
 
 /// The shape of a body parsed with `Request.formData()`. `fields` contains every named `.get(...)`
@@ -3817,6 +4092,12 @@ fn sibling_value(source: &str, part: &str, name: &str) -> String {
     if let Some(literal) = constrained_literal(source, part, name) {
         return literal;
     }
+    // A prefix guard (`key.startsWith("sk-")`) on the sibling — or on a local derived from it — must
+    // be satisfied for the branch holding the sink to run. Lead the generated filler with the required
+    // prefix so the guard passes; the rest is an ordinary placeholder.
+    if let Some(prefix) = prefix_literal(source, part, name) {
+        return format!("{prefix}jsspector");
+    }
     if let Some(value) = joi_field_filler(source, name) {
         return value;
     }
@@ -3937,6 +4218,68 @@ fn constrained_literal(source: &str, part: &str, name: &str) -> Option<String> {
     None
 }
 
+/// The string literal a `.startsWith(...)` guard on the sibling (or a local derived from it) requires
+/// its value to begin with. `None` when the sibling is under no such prefix guard. Handles the common
+/// rename-and-normalize shape (`const key = apiKey.trim(); if (!key.startsWith("sk-")) ...`): the
+/// guarded receiver may be the sibling itself, an alias bound from `req.<part>.<name>`, or a local
+/// assigned from the destructured sibling identifier.
+fn prefix_literal(source: &str, part: &str, name: &str) -> Option<String> {
+    let mut ids = aliases(source, part, name);
+    ids.extend(derived_locals(source, name));
+    ids.push(name.to_owned());
+    let marker = ".startsWith(";
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(marker) {
+        let at = from + rel;
+        from = at + marker.len();
+        // The receiver is the expression immediately before `.startsWith`, back to the previous
+        // boundary (`!key` -> `key`, `apiKey.trim()` -> mentions `apiKey`).
+        let start = source[..at]
+            .rfind(|c: char| "(!&|;{},=? \t\n".contains(c))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let receiver = &source[start..at];
+        let Some(arg) = balanced_arg(&source[from..]) else {
+            continue;
+        };
+        let Some(literal) = string_literal_value(arg.trim()) else {
+            continue;
+        };
+        if !literal.is_empty() && ids.iter().any(|id| mentions(receiver, id)) {
+            return Some(literal);
+        }
+    }
+    None
+}
+
+/// Plain locals assigned from an expression that mentions the destructured sibling `name`
+/// (`const key = apiKey.trim()` -> `key` for `name = apiKey`). Lets a guard on the renamed local be
+/// traced back to the request sibling the verifier controls.
+fn derived_locals(source: &str, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for keyword in ["const ", "let ", "var "] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(keyword) {
+            let at = from + rel + keyword.len();
+            from = at;
+            let rest = &source[at..];
+            let ident: String = rest.chars().take_while(|c| is_ident(*c as u8)).collect();
+            if ident.is_empty() || ident == name {
+                continue;
+            }
+            let tail = rest[ident.len()..].trim_start();
+            let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
+                continue;
+            };
+            let end = rhs.find(';').unwrap_or(rhs.len()).min(300);
+            if mentions(&rhs[..end], name) {
+                out.push(ident);
+            }
+        }
+    }
+    out
+}
+
 /// Local variables bound directly from `<receiver>.<part>.<name>`
 /// (`const responseType = request.query.response_type ?? ...` -> `responseType`).
 fn aliases(source: &str, part: &str, name: &str) -> Vec<String> {
@@ -4055,9 +4398,12 @@ fn equality_literal(source: &str, id: &str) -> Option<String> {
         if !before_ok || !after_ok {
             continue;
         }
-        // `id === 'lit'`
+        // `id === 'lit'`. A `typeof id === 'string'` is a type guard, not a value constraint: the
+        // literal names a JS type, not a value the parameter must equal, so skip it.
         let tail = source[after_idx..].trim_start();
-        if let Some(rest) = tail.strip_prefix("===").or_else(|| tail.strip_prefix("=="))
+        let after_typeof = source[..at].trim_end().ends_with("typeof");
+        if !after_typeof
+            && let Some(rest) = tail.strip_prefix("===").or_else(|| tail.strip_prefix("=="))
             && let Some(lit) = leading_string(rest.trim_start())
         {
             return Some(lit);
@@ -8208,6 +8554,99 @@ mod tests {
         assert_eq!(register, vec!["/api/Users".to_owned()]);
         assert!(!login.iter().any(|p| p.contains(":id")));
         assert!(!register.iter().any(|p| p.contains(":id")));
+    }
+
+    #[test]
+    fn sibling_value_satisfies_a_startswith_prefix_guard() {
+        // The sink runs only when a required sibling begins with a fixed prefix, checked on a renamed,
+        // trimmed local. The generated filler must lead with that prefix so the guarded branch runs.
+        let handler = "export async function POST(request) {\n\
+             const { apiKey, baseUrl } = await request.json();\n\
+             const key = typeof apiKey === \"string\" ? apiKey.trim() : \"\";\n\
+             if (key && !key.startsWith(\"sk-\")) return bad();\n\
+             if (key) { fetch(`${baseUrl}/models`); }\n\
+           }";
+        let siblings = super::required_siblings(handler, "body", "baseUrl");
+        let api_key = siblings
+            .iter()
+            .find(|(name, _)| name == "apiKey")
+            .map(|(_, value)| value.as_str());
+        assert!(
+            api_key.is_some_and(|value| value.starts_with("sk-")),
+            "apiKey filler should satisfy startsWith(\"sk-\"), got {api_key:?}"
+        );
+    }
+
+    #[test]
+    fn matcher_entry_covers_catch_all_and_prefix_forms() {
+        // A negative-lookahead catch-all covers an API route but not the excluded static assets.
+        let catch_all = "/((?!_next/static|_next/image|favicon\\.ico).*)";
+        assert!(super::matcher_entry_covers(catch_all, "/api/oauth/x/api-key"));
+        assert!(!super::matcher_entry_covers(catch_all, "/_next/static/app.js"));
+        // A path-prefix matcher covers its subtree only.
+        assert!(super::matcher_entry_covers("/api/:path*", "/api/oauth/x"));
+        assert!(!super::matcher_entry_covers("/dashboard/:path*", "/api/oauth/x"));
+        // A bare catch-all covers everything.
+        assert!(super::matcher_entry_covers("/:path*", "/api/anything"));
+    }
+
+    #[test]
+    fn source_enforces_auth_requires_both_a_denial_and_a_check() {
+        assert!(super::source_enforces_auth(
+            "if (!isAuthenticated(req)) return json({error:'Unauthorized'},{status:401})"
+        ));
+        assert!(super::source_enforces_auth(
+            "if (settings.requireLogin) return new Response('Unauthorized', {status: 401})"
+        ));
+        // A denial without any auth check, or a check without a denial, is not an auth gate.
+        assert!(!super::source_enforces_auth("return json({error:'Bad input'},{status:400})"));
+        assert!(!super::source_enforces_auth("const user = getToken(req)"));
+    }
+
+    #[test]
+    fn app_router_login_path_derives_url_and_skips_dynamic_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        // A conventional Next.js App Router login route, under a route group that drops from the URL.
+        write("src/app/(auth)/api/auth/login/route.js", "export async function POST(){}");
+        // A non-login route is ignored; a dynamic segment yields no concrete URL.
+        write("src/app/api/models/route.js", "export async function GET(){}");
+        write("src/app/api/session/[id]/route.js", "export async function GET(){}");
+        let logins = super::next_app_router_login_paths(root);
+        assert_eq!(logins, vec!["/api/auth/login".to_owned()]);
+    }
+
+    #[test]
+    fn framework_auth_login_paths_needs_a_covering_auth_middleware() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        };
+        write("src/app/api/auth/login/route.js", "export async function POST(){}");
+        // No middleware yet: a route behind no gate needs no bootstrap.
+        assert!(super::framework_auth_login_paths(root, "/api/oauth/x/api-key").is_none());
+        // A Next.js middleware that denies the route unless authenticated: the login route is offered.
+        write(
+            "src/proxy.js",
+            "export default async function proxy(request){\n\
+               if (!(await isAuthenticated(request))) return json({error:'Unauthorized'},{status:401});\n\
+             }\n\
+             export const config = { matcher: ['/((?!_next/static|favicon\\\\.ico).*)'] };",
+        );
+        assert_eq!(
+            super::framework_auth_login_paths(root, "/api/oauth/x/api-key"),
+            Some(vec!["/api/auth/login".to_owned()])
+        );
+        // A path the matcher excludes is not treated as gated.
+        assert!(super::framework_auth_login_paths(root, "/_next/static/app.js").is_none());
     }
 
     #[test]

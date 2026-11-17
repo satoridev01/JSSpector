@@ -2462,6 +2462,71 @@ pub fn with_session(attempt: &Attempt, cookie: &str, token: &str) -> Attempt {
     }
 }
 
+/// `attempt` carrying a session cookie minted through the app's own login (`Cookie: name=value`).
+/// Unlike [`with_session`] this attaches no bearer header: the credential is the exact cookie the
+/// login's `Set-Cookie` returned, which the framework middleware reads back to authorize the request.
+pub fn with_cookie(attempt: &Attempt, cookie_pair: &str) -> Attempt {
+    let mut headers = attempt.headers.clone();
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+    headers.push(("Cookie".to_owned(), cookie_pair.to_owned()));
+    Attempt {
+        headers,
+        ..attempt.clone()
+    }
+}
+
+/// The session `name=value` to carry from a login response's `Set-Cookie` headers, or `None` when
+/// none looks like a live session. Prefers a cookie whose name is session vocabulary (`auth`,
+/// `token`, `session`, `sid`, `jwt`); skips a cookie being cleared (`Max-Age=0` or a 1970 expiry) or
+/// with an empty value, which would carry no session.
+pub fn session_cookie_pair(set_cookies: &[String]) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    for header in set_cookies {
+        let pair = header.split(';').next().unwrap_or("").trim();
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        let lower = header.to_ascii_lowercase();
+        let cleared = lower.contains("max-age=0")
+            || lower.contains("expires=thu, 01 jan 1970")
+            || lower.contains("expires=thu, 01-jan-1970");
+        if cleared {
+            continue;
+        }
+        let name_lc = name.to_ascii_lowercase();
+        let session_like = ["auth", "token", "session", "sid", "jwt", "connect.sid"]
+            .iter()
+            .any(|needle| name_lc.contains(needle));
+        if session_like {
+            return Some(format!("{name}={value}"));
+        }
+        if fallback.is_none() {
+            fallback = Some(format!("{name}={value}"));
+        }
+    }
+    fallback
+}
+
+/// First-run default credentials to try against a login route for a framework-gated sink, in order.
+/// These are published vendor/first-boot defaults an operator is expected to change — the generic
+/// equivalent of the payload wordlists elsewhere in this module, not an app-specific secret. The
+/// empty password covers apps whose unset-password first boot accepts any/empty input.
+pub fn default_login_passwords() -> &'static [&'static str] {
+    &["123456", "admin", "password", "changeme", "admin123", ""]
+}
+
+/// A login POST carrying a default first-run credential as the common field shapes a login handler
+/// reads (`password`, and `email`/`username` for handlers that require an identifier too). Reuses
+/// [`credential_post`]'s superset body so one request satisfies either shape.
+pub fn default_login_post(path: &str, password: &str) -> Attempt {
+    credential_post(path, "admin@local", password)
+}
+
 /// A form-urlencoded twin of a JSON-body `attempt`, or `None` when the attempt carries no flat JSON
 /// object body. Some Express apps mount `express.urlencoded` before a route but the JSON body parser
 /// only after it (so the route reads `req.body` from a form submission, never from JSON); sending the
@@ -2650,6 +2715,49 @@ mod tests {
         );
         // The form twin keeps the attached session, so it too reaches the authenticated sink.
         assert!(form.headers.iter().any(|(k, _)| k == "Cookie"));
+    }
+
+    #[test]
+    fn framework_login_session_is_captured_from_set_cookie_and_carried_back() {
+        // A login's `Set-Cookie` issuing a session is the credential carried back; a cleared cookie or
+        // an unrelated preference cookie is not mistaken for the session.
+        let cookies = vec![
+            "theme=dark; Path=/".to_owned(),
+            "old=; Path=/; Max-Age=0".to_owned(),
+            "auth_token=eyJhbGci.eyJkYXRh.c2ln; Path=/; HttpOnly; SameSite=Lax".to_owned(),
+        ];
+        assert_eq!(
+            session_cookie_pair(&cookies).as_deref(),
+            Some("auth_token=eyJhbGci.eyJkYXRh.c2ln")
+        );
+        // Only a cleared/empty cookie present: nothing to carry.
+        assert_eq!(
+            session_cookie_pair(&["sid=; Max-Age=0".to_owned()]),
+            None
+        );
+
+        // The captured cookie rides back verbatim on the gated request, with no forged bearer header.
+        let attempt = Attempt {
+            verb: "POST",
+            target: "/api/oauth/x/api-key".to_owned(),
+            body: Some(r#"{"baseUrl":"http://jss-marker/tok"}"#.to_owned()),
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            signal: Signal::ServiceReached("tok".to_owned()),
+        };
+        let with = with_cookie(&attempt, "auth_token=eyJhbGci.eyJkYXRh.c2ln");
+        assert!(
+            with.headers
+                .iter()
+                .any(|(k, v)| k == "Cookie" && v == "auth_token=eyJhbGci.eyJkYXRh.c2ln")
+        );
+        assert!(!with.headers.iter().any(|(k, _)| k == "Authorization"));
+
+        // The default-credential login body carries a password field the login handler reads, and the
+        // public first-run default leads the list.
+        assert_eq!(default_login_passwords().first().copied(), Some("123456"));
+        let login = default_login_post("/api/auth/login", "123456");
+        assert_eq!(login.verb, "POST");
+        assert!(login.body.as_deref().unwrap().contains("\"password\":\"123456\""));
     }
 
     fn probe(class: VulnClass, path: &str, entry: Entry) -> Probe {

@@ -599,8 +599,32 @@ pub fn run(
                     cookie,
                     register_paths: register,
                     login_paths: login,
+                    default_credentials: false,
                 });
             }
+        }
+    }
+
+    // A sink whose route-level authentication is a framework request-middleware (a Next.js
+    // `middleware`/matcher, a global request proxy) is reported by the engine as having no in-handler
+    // auth check, yet an anonymous probe is turned away with 401 before the sink. Such a sink is still
+    // exploitable on a realistic deployment: the app's own login route issues a session for the
+    // first-run default credential (the public default an operator is expected to change), after which
+    // the sink is reachable. Mint that session through the app's own login route and carry it back on
+    // the gated request. A session the app itself never issues cannot be forged, so this reaches only
+    // a sink an open/default-credentialed deployment already exposes. Generic: the middleware and
+    // login routes are found by framework convention and auth vocabulary, never by app-specific names.
+    for planned in plans.iter_mut() {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.auth.is_none()
+            && let Some(login_paths) = plan::framework_auth_login_paths(root, &probe.path)
+        {
+            probe.auth = Some(plan::AuthBootstrap {
+                cookie: String::new(),
+                register_paths: Vec::new(),
+                login_paths,
+                default_credentials: true,
+            });
         }
     }
 
@@ -668,7 +692,10 @@ pub fn run(
                 Ok(plan::Plan::Http(probe)) => {
                     let index = acquire_http_session(&mut http, root, finding);
                     match http.get_mut(index).map(|(_, session)| session) {
-                        Some(Ok(session)) => session.exercise(probe),
+                        Some(Ok(session)) => {
+                            let outcome = session.exercise(probe);
+                            session.qualify(outcome)
+                        }
                         Some(Err(err)) => Outcome::Skipped {
                             reason: format!("the app could not be launched: {err}"),
                         },
@@ -680,7 +707,10 @@ pub fn run(
                 Ok(plan::Plan::ReflectedXss(probe)) => {
                     let index = acquire_http_session(&mut http, root, finding);
                     match http.get_mut(index).map(|(_, session)| session) {
-                        Some(Ok(session)) => session.exercise_reflected_xss(probe),
+                        Some(Ok(session)) => {
+                            let outcome = session.exercise_reflected_xss(probe);
+                            session.qualify(outcome)
+                        }
                         Some(Err(err)) => Outcome::Skipped {
                             reason: format!("the app could not be launched: {err}"),
                         },

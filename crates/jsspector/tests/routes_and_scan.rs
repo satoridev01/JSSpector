@@ -280,6 +280,48 @@ fn versioned_dynamic_mounts_link_anonymous_default_routers_and_class_instances()
 }
 
 #[test]
+fn an_inline_handler_on_a_prefixed_router_links_to_its_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A router's own prefix (`new Hono().basePath('/api')`, `new Router({ prefix })`) belongs in
+    // the route's path, but the inline handler must still resolve to the function the walk named,
+    // so a finding inside it gets the route as its entry point (and verification can drive it).
+    write(
+        root,
+        "app/api/[[...route]]/route.js",
+        "import { Hono } from 'hono';\n\
+         import { handle } from 'hono/vercel';\n\
+         const app = new Hono().basePath('/api');\n\
+         app.get('/auth/callback', async (c) => {\n\
+           const reason = c.req.query('error_description');\n\
+           return c.html(`<p>${reason}</p>`);\n\
+         });\n\
+         export const GET = handle(app);\n",
+    );
+    write(
+        root,
+        "koa/files.js",
+        "const fs = require('fs');\n\
+         const Router = require('@koa/router');\n\
+         const router = new Router({ prefix: '/v1' });\n\
+         router.get('/files', (ctx) => { ctx.body = fs.readFileSync(ctx.query.name); });\n\
+         module.exports = router;\n",
+    );
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = report["findings"].as_array().unwrap();
+    let xss = findings
+        .iter()
+        .find(|finding| finding["class"] == "xss")
+        .expect("the reflected query value should reach c.html");
+    assert_eq!(xss["entry"], "GET /api/auth/callback", "{xss}");
+    let traversal = findings
+        .iter()
+        .find(|finding| finding["class"] == "path-traversal")
+        .expect("the query value should reach readFileSync");
+    assert_eq!(traversal["entry"], "GET /v1/files", "{traversal}");
+}
+
+#[test]
 fn a_module_worker_default_export_is_an_http_entry_point() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

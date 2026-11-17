@@ -12013,10 +12013,10 @@ impl Walker<'_> {
             }
             return;
         }
-        let Some(path) = first.and_then(|e| self.resolve_text(e, env)) else {
+        let Some(own_path) = first.and_then(|e| self.resolve_text(e, env)) else {
             return;
         };
-        let path = join_path(&self.own_prefix(object.as_deref()), &path);
+        let path = join_path(&self.own_prefix(object.as_deref()), &own_path);
         let object = &object;
         let method = &method;
         // Only registrations on a router or app: not `$http.get('/x', config)` in a client.
@@ -12031,7 +12031,10 @@ impl Walker<'_> {
                 other => self.route_handler_name(other),
             })
             .unwrap_or_else(|| {
-                self.inline_route_name(method, &path, object.as_deref(), call.span.start)
+                // Named from the path as written, before the router's own prefix
+                // (`new Hono().basePath('/api')`, `new Router({ prefix })`): the walk names the
+                // same inline handler that way, and the route must resolve to that function.
+                self.inline_route_name(method, &own_path, object.as_deref(), call.span.start)
             });
         let is_function = last.is_some_and(|e| {
             matches!(

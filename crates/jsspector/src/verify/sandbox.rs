@@ -7773,6 +7773,22 @@ fn request_spec(attempt: &Attempt, port: u16, forward: bool, tls: bool) -> Strin
             ),
         ));
     }
+    // Present the request as arriving over TLS at a terminating reverse proxy. A great many Node
+    // deployments sit behind a load balancer that offloads HTTPS and sets `X-Forwarded-Proto: https`;
+    // the app (trusting its loopback proxy) redirects any request it reads as plain HTTP straight to
+    // `https://…` with an empty body, so a verifier request without this header never reaches a
+    // handler — every probe bounces off the redirect before the sink. The verifier reaches the app
+    // from loopback, which is exactly where that trusted proxy sits, so claiming the proxy's standard
+    // scheme header is faithful, not a bypass: the request still carries the real payload and proves
+    // the same flow. Gated on `forward` and suppressed on the loopback-origin retry alongside
+    // `X-Forwarded-For`, and left alone when a payload sets the header itself.
+    if forward
+        && !pairs
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-proto"))
+    {
+        pairs.push(("X-Forwarded-Proto".to_owned(), "https".to_owned()));
+    }
     let headers = pairs
         .iter()
         .map(|(k, v)| format!("\"{}\":\"{}\"", esc(k), esc(v)))
@@ -11724,12 +11740,15 @@ mod tests {
         assert_eq!(value["body"], "{\"url\":\"http://jss-marker/t\"}");
         assert_eq!(value["tls"], false);
         assert!(request_spec(&attempt, 3000, true, true).contains("\"tls\":true"));
-        // The forwarding header de-buckets a rate limiter by default, but is suppressed on the
-        // loopback-origin retry so a genuine loopback request carries no forged proxy hop.
+        // The forwarding headers de-bucket a rate limiter and present the TLS-terminating proxy's
+        // scheme by default, but both are suppressed on the loopback-origin retry so a genuine
+        // loopback request carries no forged proxy hop.
         assert!(value["headers"].get("X-Forwarded-For").is_some());
+        assert_eq!(value["headers"]["X-Forwarded-Proto"], "https");
         let loopback = request_spec(&attempt, 3000, false, false);
         let loopback_value: serde_json::Value = serde_json::from_str(&loopback).unwrap();
         assert!(loopback_value["headers"].get("X-Forwarded-For").is_none());
+        assert!(loopback_value["headers"].get("X-Forwarded-Proto").is_none());
     }
 
     #[test]

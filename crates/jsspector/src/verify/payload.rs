@@ -1916,18 +1916,16 @@ fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Atte
             headers.extend(sibling_headers(probe, name));
         }
         Entry::Url => {
+            // A catch-all handler runs only for requests whose path begins with the route's literal
+            // prefix: the mount path of a sub-router (`app.use('/css', router)` with `router.get('/*')`)
+            // and any fixed leading segments before the wildcard. The handler reads the request path
+            // (`req.path`, `req.url`, `req.originalUrl`) and the climbing payload replaces the wildcard
+            // tail, so the payload must ride *beneath* that prefix or the request never reaches the
+            // handler. A root-level route (`app.get('/*')`) has an empty prefix, so the payload is the
+            // whole path with a single leading slash, as before.
             let rest = value.trim_start_matches('/');
-            if probe.method == Method::Use {
-                // A middleware mounted at a path prefix (`app.use('/clients', ...)`) only runs for
-                // requests whose path begins with that prefix, and reads the full `req.originalUrl`
-                // (prefix included). Place the payload *under* the mount so the request reaches the
-                // handler and the traversal rides on the original URL.
-                let prefix = probe.path.trim_end_matches('/');
-                target = format!("{prefix}/{rest}");
-            } else {
-                // The payload is the path. Keep a single leading slash.
-                target = format!("/{rest}");
-            }
+            let prefix = route_literal_prefix(&probe.path);
+            target = format!("{prefix}/{rest}");
         }
     }
     // Any unfilled `{param}` slot gets its guard-pinned value, or a placeholder, so the route matches.
@@ -2246,6 +2244,19 @@ pub(crate) fn fill_remaining(path: &str, fillers: &[(String, String)]) -> String
 
 /// Minimal percent-encoding for a query key or value: everything but the unreserved set, and the
 /// payload's own `/` and `.` kept readable where they are already safe in a query.
+/// The literal, slot-free leading portion of a route path: everything before the first `{param}`
+/// slot, with any trailing slash removed. `/css/{wildcard}` -> `/css`; `/{wildcard}` -> ``;
+/// `/clients` -> `/clients`. This is the path prefix a request must carry to reach a catch-all
+/// handler whose tainted input is the request URL/path, so a climbing payload placed beneath it
+/// still routes to the handler.
+fn route_literal_prefix(path: &str) -> &str {
+    let literal = match path.find('{') {
+        Some(at) => &path[..at],
+        None => path,
+    };
+    literal.trim_end_matches('/')
+}
+
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
@@ -3349,6 +3360,41 @@ mod tests {
         );
         assert!(a.iter().all(|x| x.target.starts_with('/')));
         assert!(a.iter().all(|x| !x.target.contains("{wildcard}")));
+    }
+
+    #[test]
+    fn a_mounted_catch_all_url_traversal_rides_beneath_the_mount_prefix() {
+        // A sub-router mounted under a prefix (`app.use('/css', router)` with `router.get('/*')`)
+        // reads the request path and interpolates it into a file path. The router runs only for
+        // requests whose path begins with `/css`, so every climbing payload must ride beneath that
+        // prefix, not at the root, or the request never reaches the handler.
+        let canary = Canary::new("tok".to_owned());
+        let a = attempts(
+            &probe(VulnClass::PathTraversal, "/css/{wildcard}", Entry::Url),
+            &canary,
+            0,
+        );
+        assert!(
+            a.iter().all(|x| x.target.starts_with("/css/")),
+            "every payload rides under the mount: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
+        assert!(a.iter().all(|x| !x.target.contains("{wildcard}")));
+        // The `/etc/passwd` OS-file read climbs out of the mount: `/css/<../ ...>etc/passwd`.
+        assert!(
+            a.iter()
+                .any(|x| x.target.starts_with("/css/") && x.target.ends_with("/etc/passwd")),
+            "a climbing read reaches an absolute OS path: {:?}",
+            a.iter().map(|x| &x.target).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn route_literal_prefix_is_the_slot_free_lead() {
+        assert_eq!(route_literal_prefix("/css/{wildcard}"), "/css");
+        assert_eq!(route_literal_prefix("/{wildcard}"), "");
+        assert_eq!(route_literal_prefix("/clients"), "/clients");
+        assert_eq!(route_literal_prefix("/a/b/{id}/c"), "/a/b");
     }
 
     /// An SSRF through the request target itself (`new URL(req.url, base)`): the marker URL as a

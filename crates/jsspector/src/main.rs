@@ -721,6 +721,51 @@ mod repository_input_tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn recovered_repository_scan_enables_strict_verification() {
+        let arguments = recovered_scan_arguments(
+            ["scan", "--repo", "owner/one"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect(),
+            &["aaa".to_owned(), "bbb".to_owned()],
+        );
+        let cli = Cli::try_parse_from(
+            std::iter::once(std::ffi::OsString::from("jsspector")).chain(arguments),
+        )
+        .unwrap();
+        let Command::Scan(scan) = cli.command else {
+            panic!("expected scan command");
+        };
+        assert!(matches!(scan.verify, Some(VerifyMode::Strict)));
+        assert_eq!(scan.verify_fingerprint, ["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn recovered_repository_scan_preserves_explicit_verification_mode() {
+        let arguments = recovered_scan_arguments(
+            ["scan", "--repo", "owner/one", "--verify=best-effort"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect(),
+            &["aaa".to_owned()],
+        );
+        assert_eq!(
+            arguments
+                .iter()
+                .filter_map(|argument| argument.to_str())
+                .filter(|argument| argument.starts_with("--verify"))
+                .collect::<Vec<_>>(),
+            ["--verify=best-effort", "--verify-fingerprint"]
+        );
+        assert!(
+            Cli::try_parse_from(
+                std::iter::once(std::ffi::OsString::from("jsspector")).chain(arguments)
+            )
+            .is_ok()
+        );
+    }
 }
 
 fn checkout_repository(value: &str) -> Result<RemoteCheckout, String> {
@@ -836,13 +881,11 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
     } else {
         recovered_fingerprints(&source_root, repository)?
     };
+    let restart_args = recovered_scan_arguments(original_args, &fingerprints);
     let mut command = ProcessCommand::new(scanner);
     command
-        .args(original_args)
+        .args(restart_args)
         .env("JSSPECTOR_SELF_HEAL_ACTIVE", "1");
-    for fingerprint in fingerprints {
-        command.args(["--verify-fingerprint", &fingerprint]);
-    }
     let status = command
         .status()
         .map_err(|error| format!("restart repaired JSSpector scan: {error}"))?;
@@ -852,6 +895,31 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
             .and_then(|code| u8::try_from(code).ok())
             .unwrap_or(EXIT_ENGINE),
     ))
+}
+
+/// Build the post-repair invocation. Fingerprint filters require an explicit verification mode
+/// at CLI parsing time, even though repository scans normally select strict verification later.
+fn recovered_scan_arguments(
+    mut arguments: Vec<std::ffi::OsString>,
+    fingerprints: &[String],
+) -> Vec<std::ffi::OsString> {
+    if fingerprints.is_empty() {
+        return arguments;
+    }
+    let has_verify = arguments.iter().any(|argument| {
+        argument == "--verify"
+            || argument
+                .to_str()
+                .is_some_and(|argument| argument.starts_with("--verify="))
+    });
+    if !has_verify {
+        arguments.push("--verify=strict".into());
+    }
+    for fingerprint in fingerprints {
+        arguments.push("--verify-fingerprint".into());
+        arguments.push(fingerprint.into());
+    }
+    arguments
 }
 
 /// Fingerprints the trusted self-heal controller has accepted for this repository. The final scan

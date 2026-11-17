@@ -14904,7 +14904,10 @@ http.createServer((req, res) => {
             command.env_remove(name);
         }
         let output = command
-            .args(["-c", "printf %s \"${CLAUDECODE:-unset}:${AI_AGENT:-unset}\""])
+            .args([
+                "-c",
+                "printf %s \"${CLAUDECODE:-unset}:${AI_AGENT:-unset}\"",
+            ])
             .output()
             .unwrap_or_else(|_| std::process::Output {
                 status: std::process::ExitStatus::from_raw(0),

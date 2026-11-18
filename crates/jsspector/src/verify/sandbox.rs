@@ -374,10 +374,16 @@ pub struct Session {
     /// [`request_spec`]); it also falls back across protocols, so this is an ordering hint, not a
     /// security relaxation of the app.
     tls: bool,
-    /// The app's own build step and the directory it runs in, when the image ran one: a source
-    /// change copied into the container only takes effect after it runs again (see
-    /// [`Self::relaunch_with_files`]).
+    /// The app's own build step and the directory it runs in (inside the container for Docker, on
+    /// disk for the local runtime), when preparing the app ran one: a source change only takes
+    /// effect after it runs again (see [`Self::relaunch_with_files`]).
     rebuild: Option<(String, String)>,
+    /// How the local runtime last launched the app successfully, so it can be relaunched the same
+    /// way with a changed file. `None` for Docker, which restarts its container instead.
+    local_launch: Option<LocalLaunch>,
+    /// Files the local runtime overwrote on disk to try a change, with their original content:
+    /// restored by [`Self::restore_files`], and by teardown as a backstop.
+    overwritten: Vec<(String, String)>,
     local_marker_port: Option<u16>,
     local_baseline_ports: Vec<u16>,
     /// Backing services the app declares a client for but the local runtime cannot provide (Redis
@@ -429,6 +435,16 @@ fn qualify_reduced_environment(outcome: Outcome, unavailable: &[String]) -> Outc
         },
         other => other,
     }
+}
+
+/// The settings a successful local launch ended up with (see `boot_local`'s retries).
+#[derive(Clone)]
+struct LocalLaunch {
+    env: Vec<RequiredEnv>,
+    stub_missing_modules: bool,
+    mongodb_callback_promises: bool,
+    next_development: bool,
+    scratch_dirs: Vec<String>,
 }
 
 enum Runtime {
@@ -689,6 +705,8 @@ impl Session {
             start_command: start_command.clone(),
             tls: false,
             rebuild,
+            local_launch: None,
+            overwritten: Vec::new(),
             local_marker_port: None,
             local_baseline_ports: Vec::new(),
             unavailable_services: Vec::new(),
@@ -767,6 +785,17 @@ impl Session {
             None => None,
         };
         prepare_local_app(root, &install_root, tool_dir.as_deref())?;
+        // The same build step `prepare_local_app` ran, kept so a changed source file can be built
+        // again before the app is relaunched with it.
+        let local_rebuild = std::fs::read_to_string(install_root.join("package.json"))
+            .ok()
+            .and_then(|manifest| build_script(&manifest, &install_root))
+            .map(|script| {
+                (
+                    install_root.display().to_string(),
+                    build_command(package_manager(&install_root), script),
+                )
+            });
         let start_command = if let Some(command) = ephemeral_db_command {
             command
         } else if app_needs_db
@@ -891,7 +920,9 @@ impl Session {
             guarded_modules,
             start_command: start_command.clone(),
             tls: false,
-            rebuild: None,
+            rebuild: local_rebuild,
+            local_launch: None,
+            overwritten: Vec::new(),
             local_marker_port,
             local_baseline_ports: Vec::new(),
             unavailable_services,
@@ -1026,6 +1057,13 @@ impl Session {
                     self.port = port;
                     restore_local_read_canaries(&self.canary)?;
                     self.seed_db();
+                    self.local_launch = Some(LocalLaunch {
+                        env: env.clone(),
+                        stub_missing_modules,
+                        mongodb_callback_promises,
+                        next_development: next_development_retry,
+                        scratch_dirs: scratch_dirs.clone(),
+                    });
                     return Ok(());
                 }
                 Err(error) => error,
@@ -2158,10 +2196,11 @@ impl Session {
         qualify_reduced_environment(outcome, &self.unavailable_services)
     }
 
-    /// Whether the app runs in its own Docker container, where a candidate fix can be copied in and
-    /// the app relaunched with it.
-    pub fn is_docker(&self) -> bool {
-        matches!(self.runtime, Runtime::Docker)
+    /// Whether the app can be relaunched with a changed file: always in Docker (its container is
+    /// restarted), and in the local runtime once a launch has succeeded (the process is relaunched
+    /// with the same settings).
+    pub fn can_relaunch(&self) -> bool {
+        matches!(self.runtime, Runtime::Docker) || self.local_launch.is_some()
     }
 
     /// The HTTP status the route gives the probe's own request carrying a plain, harmless value
@@ -2171,14 +2210,21 @@ impl Session {
             .and_then(|(_, status, _)| status)
     }
 
-    /// Replaces each `(path, content)` (relative to the repository root) inside the running app
-    /// container, runs the app's build step again when it has one, restarts the app and waits until
-    /// it listens: the very app the finding reproduced against, now with a candidate change. Its
-    /// datastore sidecars keep running untouched. Docker only.
+    /// Replaces each `(path, content)` (relative to the repository root), runs the app's build step
+    /// again when it has one, relaunches the app and waits until it listens: the very app the
+    /// finding reproduced against, now with a candidate change. Datastore sidecars keep running.
+    ///
+    /// Docker copies the files into the running container and restarts it; the checkout on disk is
+    /// never touched. The local runtime runs the app from the checkout itself, so it writes the
+    /// files there, remembering each original for [`Self::restore_files`] (and teardown).
     pub fn relaunch_with_files(&mut self, files: &[(String, String)]) -> Result<(), String> {
-        if !self.is_docker() {
-            return Err("relaunching with a changed file needs the Docker runtime".to_owned());
+        match &self.runtime {
+            Runtime::Docker => self.relaunch_docker(files),
+            Runtime::Local { .. } => self.relaunch_local(files),
         }
+    }
+
+    fn relaunch_docker(&mut self, files: &[(String, String)]) -> Result<(), String> {
         for (rel, content) in files {
             let target = container_dir(std::path::Path::new(rel))
                 .ok_or_else(|| format!("unsupported path `{rel}`"))?;
@@ -2219,6 +2265,70 @@ impl Session {
             .map_err(|e| format!("could not restart the app: {e}"))?;
         self.port = self.wait_until_listening()?;
         Ok(())
+    }
+
+    fn relaunch_local(&mut self, files: &[(String, String)]) -> Result<(), String> {
+        let launch = self
+            .local_launch
+            .clone()
+            .ok_or_else(|| "the app has not launched successfully yet".to_owned())?;
+        for (rel, content) in files {
+            let path = self.local_path(rel)?;
+            if self.overwritten.iter().all(|(seen, _)| seen != rel) {
+                let original = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("could not read {rel}: {e}"))?;
+                self.overwritten.push((rel.clone(), original));
+            }
+            std::fs::write(&path, content).map_err(|e| format!("could not write {rel}: {e}"))?;
+        }
+        if let (Some((dir, command)), Runtime::Local { tool_dir, .. }) =
+            (&self.rebuild, &self.runtime)
+        {
+            run_local_setup(std::path::Path::new(dir), command, tool_dir.as_deref())
+                .map_err(|e| format!("the app's build step failed: {e}"))?;
+        }
+        self.run_local_app(
+            &launch.env,
+            launch.stub_missing_modules,
+            launch.mongodb_callback_promises,
+            launch.next_development,
+            &launch.scratch_dirs,
+        )?;
+        self.port = self.wait_until_listening()?;
+        restore_local_read_canaries(&self.canary)?;
+        Ok(())
+    }
+
+    /// The on-disk path of `rel` in the local checkout, refusing anything that would leave it.
+    fn local_path(&self, rel: &str) -> Result<std::path::PathBuf, String> {
+        let relative = std::path::Path::new(rel);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(format!("unsupported path `{rel}`"));
+        }
+        Ok(self.root.join(relative))
+    }
+
+    /// Writes back every file the local runtime overwrote to try a change. Nothing to do for
+    /// Docker, whose changes live only in the disposable container.
+    pub fn restore_files(&mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for (rel, original) in std::mem::take(&mut self.overwritten) {
+            let written = self
+                .local_path(&rel)
+                .and_then(|path| std::fs::write(path, &original).map_err(|e| e.to_string()));
+            if let Err(error) = written {
+                failures.push(format!("{rel}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("could not restore {}", failures.join(", ")))
+        }
     }
 
     /// This session's private network name, unique per launch (see [`run_id`]). Test-only: proves
@@ -4549,6 +4659,10 @@ impl Session {
             return;
         }
         self.torn_down = true;
+        // A fix attempt the caller did not get to undo must not leave the checkout changed.
+        if let Err(error) = self.restore_files() {
+            eprintln!("jsspector: {error}");
+        }
         match &self.runtime {
             Runtime::Docker => {
                 remove_container(&self.app);
@@ -16232,7 +16346,7 @@ http.createServer((req, res) => {
         );
 
         // A change that only breaks startup must not pass as a fix.
-        let mut applied = None;
+        let mut state = fix::ProofState::default();
         let broken = Candidate {
             strategy: "test:broken".to_owned(),
             file: "server.js".to_owned(),
@@ -16245,7 +16359,7 @@ http.createServer((req, res) => {
             dir.path(),
             &broken,
             200,
-            &mut applied,
+            &mut state,
         );
         // A change that drops the route stops the exploit too, but the benign request's status gives
         // it away.
@@ -16261,7 +16375,7 @@ http.createServer((req, res) => {
             dir.path(),
             &gone,
             200,
-            &mut applied,
+            &mut state,
         );
         session.teardown();
         let crashed = crashed.expect_err("a crashing change is not a fix");

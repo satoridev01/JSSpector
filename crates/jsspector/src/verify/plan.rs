@@ -8712,7 +8712,16 @@ fn source_entry(expr: &str, path: &str) -> Option<Entry> {
     }
     let mut parts = chain.split('.');
     let first = parts.next()?;
-    let rest: Vec<&str> = parts.filter(|p| !p.is_empty()).collect();
+    // A dot-accessed field name is an identifier: cut whatever trails it in the source text it was
+    // read from (`req.query.name)` inside `path.resolve(base, req.query.name)`, a `,` or `;`), so the
+    // request carries the payload under the field the handler actually reads.
+    let rest: Vec<&str> = parts
+        .map(|p| {
+            let end = p.bytes().position(|b| !is_ident(b)).unwrap_or(p.len());
+            &p[..end]
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
     match first {
         "query" => rest.first().map(|name| Entry::Query((*name).to_owned())),
         "body" | "payload" => Some(Entry::Body(rest.first().map(|n| (*n).to_owned()))),
@@ -10669,6 +10678,24 @@ module.exports = { activityValidators };\n";
                 "const parts = 'a&b&c'.split('&'); console.log(parts.length);"
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_field_read_inside_a_call_keeps_only_its_name() {
+        // `path.resolve(base, req.query.name)`: the accessor as read from the source text carries the
+        // call's closing paren, which is not part of the field the handler reads.
+        assert_eq!(
+            source_entry("req.query.name)", "/read"),
+            Some(Entry::Query("name".to_owned()))
+        );
+        assert_eq!(
+            source_entry("req.body.user,", "/login"),
+            Some(Entry::Body(Some("user".to_owned())))
+        );
+        assert_eq!(
+            source_entry("req.params.id);", "/items/{id}"),
+            Some(Entry::PathParam("id".to_owned()))
         );
     }
 

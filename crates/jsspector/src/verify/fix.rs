@@ -102,7 +102,8 @@ pub struct Candidate {
     pub content: String,
 }
 
-/// Looks for a proven fix for `finding`, whose `probe` just reproduced in `session`.
+/// Looks for a proven fix for `finding`, whose `probe` just reproduced in `session`. Whatever the
+/// outcome, every file a candidate changed on disk (local runtime) is restored before returning.
 pub fn prove(
     session: &mut Session,
     probe: &Probe,
@@ -111,11 +112,24 @@ pub fn prove(
     outcome: &Outcome,
     options: &FixOptions,
 ) -> FixOutcome {
-    if !session.is_docker() {
+    let result = search(session, probe, finding, root, outcome, options);
+    if let Err(error) = session.restore_files() {
+        eprintln!("jsspector: {error}");
+    }
+    result
+}
+
+fn search(
+    session: &mut Session,
+    probe: &Probe,
+    finding: &Finding,
+    root: &Path,
+    outcome: &Outcome,
+    options: &FixOptions,
+) -> FixOutcome {
+    if !session.can_relaunch() {
         return FixOutcome::Unsupported {
-            reason: "proving a fix needs the Docker runtime, where the app can be relaunched \
-                     with the change"
-                .to_owned(),
+            reason: "the app cannot be relaunched with a change in this runtime".to_owned(),
         };
     }
     let Some(benign) = session.benign_status(probe) else {
@@ -133,7 +147,7 @@ pub fn prove(
     let mut trial = Trial {
         rejected: Vec::new(),
         seen: Vec::new(),
-        applied: None,
+        state: ProofState::default(),
         attempts: 0,
     };
 
@@ -145,7 +159,7 @@ pub fn prove(
             continue;
         }
         if let Some(proven) = trial.run(session, probe, finding, root, candidate, benign) {
-            return proven_outcome(root, proven, benign, trial.attempts, trial.rejected);
+            return trial.proven(root, proven, benign);
         }
     }
 
@@ -154,21 +168,31 @@ pub fn prove(
             if Instant::now() >= deadline {
                 break;
             }
-            let candidate =
-                match llm_candidate(finding, root, poc, &trial.rejected, options, deadline) {
-                    Ok(candidate) => candidate,
-                    Err(reason) => {
-                        trial.attempts += 1;
-                        trial.reject("llm", reason);
-                        continue;
-                    }
-                };
+            let file = sink_file(finding).to_owned();
+            let candidate = match trial.state.original(root, &file).and_then(|original| {
+                llm_candidate(
+                    finding,
+                    &file,
+                    &original,
+                    poc,
+                    &trial.rejected,
+                    options,
+                    deadline,
+                )
+            }) {
+                Ok(candidate) => candidate,
+                Err(reason) => {
+                    trial.attempts += 1;
+                    trial.reject("llm", reason);
+                    continue;
+                }
+            };
             if trial.seen.contains(&candidate.content) {
                 trial.reject("llm", "repeated an earlier rejected change".to_owned());
                 continue;
             }
             if let Some(proven) = trial.run(session, probe, finding, root, candidate, benign) {
-                return proven_outcome(root, proven, benign, trial.attempts, trial.rejected);
+                return trial.proven(root, proven, benign);
             }
         }
     }
@@ -207,9 +231,30 @@ struct Trial {
     rejected: Vec<FixAttempt>,
     /// Contents already tried, so a repeat is not relaunched again.
     seen: Vec<String>,
-    /// The file the last relaunch changed.
-    applied: Option<String>,
+    state: ProofState,
     attempts: usize,
+}
+
+/// What the proof needs to remember across candidates: each changed file's original content, read
+/// before any candidate touched it (the local runtime writes candidates into the checkout itself),
+/// and the file the last relaunch changed.
+#[derive(Debug, Default)]
+pub(crate) struct ProofState {
+    originals: Vec<(String, String)>,
+    applied: Option<String>,
+}
+
+impl ProofState {
+    /// `file`'s content before any candidate changed it.
+    fn original(&mut self, root: &Path, file: &str) -> Result<String, String> {
+        if let Some((_, content)) = self.originals.iter().find(|(name, _)| name == file) {
+            return Ok(content.clone());
+        }
+        let content = std::fs::read_to_string(root.join(file))
+            .map_err(|e| format!("could not read {file}: {e}"))?;
+        self.originals.push((file.to_owned(), content.clone()));
+        Ok(content)
+    }
 }
 
 impl Trial {
@@ -239,7 +284,7 @@ impl Trial {
             root,
             &candidate,
             benign,
-            &mut self.applied,
+            &mut self.state,
         ) {
             Ok(()) => Some(candidate),
             Err(reason) => {
@@ -250,28 +295,27 @@ impl Trial {
     }
 }
 
-fn proven_outcome(
-    root: &Path,
-    candidate: Candidate,
-    benign: u16,
-    attempts: usize,
-    rejected: Vec<FixAttempt>,
-) -> FixOutcome {
-    let original = std::fs::read_to_string(root.join(&candidate.file)).unwrap_or_default();
-    FixOutcome::Proven {
-        diff: unified_diff(&candidate.file, &original, &candidate.content),
-        original_fingerprint: jss_core::finding::fingerprint(&original),
-        strategy: candidate.strategy,
-        file: candidate.file,
-        benign_status: benign,
-        attempts,
-        rejected,
+impl Trial {
+    fn proven(mut self, root: &Path, candidate: Candidate, benign: u16) -> FixOutcome {
+        let original = self
+            .state
+            .original(root, &candidate.file)
+            .unwrap_or_default();
+        FixOutcome::Proven {
+            diff: unified_diff(&candidate.file, &original, &candidate.content),
+            original_fingerprint: jss_core::finding::fingerprint(&original),
+            strategy: candidate.strategy,
+            file: candidate.file,
+            benign_status: benign,
+            attempts: self.attempts,
+            rejected: self.rejected,
+        }
     }
 }
 
-/// Applies `candidate` in `session` and checks the three controls. `applied` names the file an
-/// earlier rejected candidate changed, restored to its original content in the same relaunch when
-/// this candidate changes a different file.
+/// Applies `candidate` in `session` and checks the three controls. A file an earlier rejected
+/// candidate changed is restored to its original content in the same relaunch when this candidate
+/// changes a different one.
 pub(crate) fn check(
     session: &mut Session,
     probe: &Probe,
@@ -279,10 +323,9 @@ pub(crate) fn check(
     root: &Path,
     candidate: &Candidate,
     benign: u16,
-    applied: &mut Option<String>,
+    state: &mut ProofState,
 ) -> Result<(), String> {
-    let original = std::fs::read_to_string(root.join(&candidate.file))
-        .map_err(|e| format!("could not read {}: {e}", candidate.file))?;
+    let original = state.original(root, &candidate.file)?;
     if candidate.content == original {
         return Err("the change is empty".to_owned());
     }
@@ -293,15 +336,15 @@ pub(crate) fn check(
         ));
     }
     let mut files = vec![(candidate.file.clone(), candidate.content.clone())];
-    if let Some(previous) = applied
-        .as_ref()
-        .filter(|previous| **previous != candidate.file)
+    if let Some(previous) = state
+        .applied
+        .clone()
+        .filter(|previous| *previous != candidate.file)
     {
-        let restored = std::fs::read_to_string(root.join(previous))
-            .map_err(|e| format!("could not restore {previous}: {e}"))?;
-        files.push((previous.clone(), restored));
+        let restored = state.original(root, &previous)?;
+        files.push((previous, restored));
     }
-    *applied = Some(candidate.file.clone());
+    state.applied = Some(candidate.file.clone());
     session
         .relaunch_with_files(&files)
         .map_err(|e| format!("the app does not start with the change: {e}"))?;
@@ -819,15 +862,13 @@ fn claude_available() -> bool {
 
 fn llm_candidate(
     finding: &Finding,
-    root: &Path,
+    file: &str,
+    original: &str,
     poc: Option<&Reproduction>,
     rejected: &[FixAttempt],
     options: &FixOptions,
     deadline: Instant,
 ) -> Result<Candidate, String> {
-    let file = sink_file(finding).to_owned();
-    let original = std::fs::read_to_string(root.join(&file))
-        .map_err(|e| format!("could not read {file}: {e}"))?;
     if original.len() > LLM_MAX_FILE {
         return Err(format!("{file} is too large for the LLM fallback"));
     }
@@ -835,7 +876,7 @@ fn llm_candidate(
     if remaining < Duration::from_secs(30) {
         return Err("the time budget ran out".to_owned());
     }
-    let prompt = llm_prompt(finding, &file, &original, poc, rejected);
+    let prompt = llm_prompt(finding, file, original, poc, rejected);
     let mut command = Command::new("claude");
     command.args([
         "-p",
@@ -863,7 +904,7 @@ fn llm_candidate(
     } else {
         content
     };
-    let changed = changed_lines(&original, &content);
+    let changed = changed_lines(original, &content);
     if changed > LLM_MAX_CHANGED_LINES {
         return Err(format!(
             "the LLM change touches {changed} lines, not a minimal fix"
@@ -871,7 +912,7 @@ fn llm_candidate(
     }
     Ok(Candidate {
         strategy: "llm".to_owned(),
-        file,
+        file: file.to_owned(),
         content,
     })
 }

@@ -57,7 +57,7 @@ enum Command {
     /// Every finding is a candidate for triage, with its path from source to sink. Settings come
     /// from `.jsspector.yml` in the scanned directory (command-line options win). Output is
     /// deterministic: the same tree gives the same report for any number of threads.
-    Scan(ScanArgs),
+    Scan(Box<ScanArgs>),
     /// List every entry point: HTTP routes with full paths (mount prefixes followed across files),
     /// socket events, IPC channels, GraphQL fields, tRPC procedures and queue processors.
     Routes(RoutesArgs),
@@ -185,6 +185,23 @@ struct ScanArgs {
     /// includes every static finding. Intended for targeted reproduction and repair checks.
     #[arg(long, value_name = "FINGERPRINT", requires = "verify")]
     verify_fingerprint: Vec<String>,
+    /// Do not look for a proven fix for verified findings. By default, each verified finding gets
+    /// a `fix`: a minimal change shown to stop the exploit in the same sandbox while a benign
+    /// request to the route keeps its behavior.
+    #[arg(long, requires = "verify")]
+    no_fix: bool,
+    /// Do not fall back to an LLM (the `claude` CLI) when no deterministic fix is proven.
+    #[arg(long, requires = "verify")]
+    no_fix_llm: bool,
+    /// LLM fix candidates per verified finding [default: 3].
+    #[arg(long, value_name = "N", requires = "verify")]
+    fix_attempts: Option<usize>,
+    /// Time budget in seconds to prove a fix for one finding [default: 600].
+    #[arg(long, value_name = "SECONDS", requires = "verify")]
+    fix_timeout: Option<u64>,
+    /// Model for the LLM fix fallback [default: the `claude` CLI's own].
+    #[arg(long, value_name = "MODEL", requires = "verify")]
+    fix_model: Option<String>,
     #[command(flatten)]
     config: ConfigArgs,
 }
@@ -256,6 +273,10 @@ struct ReportedFinding<'a> {
     /// The request and evidence, present only when dynamic exploitation was verified.
     #[serde(skip_serializing_if = "Option::is_none")]
     poc: Option<&'a verify::Reproduction>,
+    /// A change proven to stop the verified exploit (or why there is none), present only when the
+    /// finding verified and fixes were not turned off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<&'a verify::FixOutcome>,
 }
 
 impl<'a> ReportedFinding<'a> {
@@ -280,6 +301,7 @@ impl<'a> ReportedFinding<'a> {
             remediation: rules::remediation(finding.class),
             exploitation,
             poc,
+            fix: verdict.and_then(|verdict| verdict.fix.as_ref()),
         }
     }
 }
@@ -342,6 +364,7 @@ mod exploitation_output_tests {
             entry: Some("GET /items".to_owned()),
             class: "sql-injection".to_owned(),
             outcome,
+            fix: None,
         }
     }
 
@@ -1153,7 +1176,17 @@ fn scan(args: &ScanArgs) -> ExitCode {
                     .cloned()
                     .collect()
             };
-            match verify::run(&analysis.root, &selected, missing) {
+            let defaults = verify::FixOptions::default();
+            let fix_options = verify::FixOptions {
+                enabled: !args.no_fix,
+                llm: !args.no_fix_llm,
+                model: args.fix_model.clone(),
+                attempts: args.fix_attempts.unwrap_or(defaults.attempts),
+                timeout: args
+                    .fix_timeout
+                    .map_or(defaults.timeout, std::time::Duration::from_secs),
+            };
+            match verify::run(&analysis.root, &selected, missing, &fix_options) {
                 Ok(verdicts) => verdicts,
                 Err(err) => return fail(EXIT_USAGE, err),
             }

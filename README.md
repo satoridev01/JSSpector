@@ -87,16 +87,43 @@ Routes are followed through router mounts across files (`app.use('/api', require
 - **Guards:** validation that exits (`if (!/^\w+$/.test(x)) return`), allowlists (also in regex captures and matches), containment (`p === base || p.startsWith(base + sep)`, never against a base the request chose), comparisons with constants, `typeof`/`check()` type checks (NoSQL), `--` before positional arguments and leading-dash checks, fields the code overwrote, schema validation results, URL checks (`sanitizeUrl`), validators and escapers listed in packs.
 - **Auth:** each finding carries `auth` (`none-detected`, `user`, `admin`) from route middleware, `router.use`, guard decorators and in-handler checks; admin-only paths are one level lower.
 - **Precision:** NoSQL query sinks apply where the project has a MongoDB driver (or is a Meteor app); browser-side sources never reach server sinks; a service worker's `request` is the page's; appending a created DOM node is no HTML injection; `location.href` starts with the page's own origin.
-- **Output:** grouped by sink file with every step from source to sink; JSON and SARIF carry line-independent fingerprints for baselines. JSON findings start with a readable `title` and carry `resource` (sink file:line), `description` and `remediation`. With `--verify`, each selected JSON finding also carries its exact `exploitation` outcome and a structured `poc` when exploitation was verified, so issue trackers such as Satori can ingest the evidence directly.
+- **Output:** grouped by sink file with every step from source to sink; JSON and SARIF carry line-independent fingerprints for baselines. JSON findings start with a readable `title` and carry `resource` (sink file:line), `description` and `remediation`. With `--verify`, each selected JSON finding also carries its exact `exploitation` outcome and a structured `poc` when exploitation was verified, so issue trackers such as Satori can ingest the evidence directly; a verified finding also carries a `fix` (see below).
+
+### Proven fixes
+
+With `--verify`, every verified finding also gets a `fix`: a minimal code change proven, in the
+same sandbox that reproduced the exploit, to stop it. A change counts as `proven` only when the
+app still starts with it, the same probe no longer reproduces, and a benign request to the route
+still gets the HTTP status it got before the change — so a change that merely breaks the route
+never passes. The scanned checkout is never modified; the report carries the change as a unified
+diff, with the original file's fingerprint so the diff can be re-applied and re-proved later.
+
+Candidates come first from deterministic strategies (NoSQL injection: coerce every request value in
+the query filter to a string, then Mongoose `sanitizeFilter`; path traversal: reduce the request
+segment to its base name), then from an LLM through the `claude` CLI, which is told why each earlier
+candidate failed. The outcome is `proven` (with the diff and its strategy), `unproven` (every
+candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be
+tried here, such as a browser-driven finding).
+
+```sh
+jsspector scan . --verify                  # verify, then prove a fix for each verified finding
+jsspector scan . --verify --no-fix-llm     # deterministic strategies only
+jsspector scan . --verify --no-fix         # verification only
+```
+
+`--fix-attempts` (default 3) bounds the LLM candidates, `--fix-timeout` (default 600 seconds) the
+total time per finding, and `--fix-model` picks the LLM model.
 
 ### Scanning a GitHub repository
 
-`scan --repo` accepts either the repository HEAD or a pinned revision. Remote scans dynamically
-verify findings by default and automatically repair missing scanner capabilities:
+`scan --repo` accepts either the repository HEAD or a pinned revision, and clones and scans it
+directly. `--self-heal` first validates and repairs the scanner against the historical benchmark
+(it needs a clean, published JSSpector checkout):
 
 ```sh
-jsspector scan --repo owner/repository
-jsspector scan --repo owner/repository@revision
+jsspector scan --repo owner/repository --verify
+jsspector scan --repo owner/repository@revision --verify
+jsspector scan --repo owner/repository --self-heal
 ```
 
 To complete a pinned corpus with two independent workers:

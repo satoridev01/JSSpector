@@ -374,6 +374,10 @@ pub struct Session {
     /// [`request_spec`]); it also falls back across protocols, so this is an ordering hint, not a
     /// security relaxation of the app.
     tls: bool,
+    /// The app's own build step and the directory it runs in, when the image ran one: a source
+    /// change copied into the container only takes effect after it runs again (see
+    /// [`Self::relaunch_with_files`]).
+    rebuild: Option<(String, String)>,
     local_marker_port: Option<u16>,
     local_baseline_ports: Vec<u16>,
     /// Backing services the app declares a client for but the local runtime cannot provide (Redis
@@ -586,6 +590,22 @@ impl Session {
             .chain(service_env.iter())
             .cloned()
             .collect();
+        // The same build step `build_image` bakes into the image, kept so a source change copied
+        // into the running container can be built again before the app restarts.
+        let rebuild = (!start_command.contains("/jss-azure-func-host")
+            && !start_command.contains("/jss-worker-host"))
+        .then(|| {
+            std::fs::read_to_string(app_root.join("package.json"))
+                .ok()
+                .and_then(|manifest| build_script(&manifest, &app_root))
+        })
+        .flatten()
+        .map(|script| {
+            (
+                workdir.clone(),
+                build_command(package_manager(&install_root), script),
+            )
+        });
         build_image(
             root,
             &app_root,
@@ -668,6 +688,7 @@ impl Session {
             guarded_modules,
             start_command: start_command.clone(),
             tls: false,
+            rebuild,
             local_marker_port: None,
             local_baseline_ports: Vec::new(),
             unavailable_services: Vec::new(),
@@ -870,6 +891,7 @@ impl Session {
             guarded_modules,
             start_command: start_command.clone(),
             tls: false,
+            rebuild: None,
             local_marker_port,
             local_baseline_ports: Vec::new(),
             unavailable_services,
@@ -2134,6 +2156,69 @@ impl Session {
     /// could not provide (see [`qualify_reduced_environment`]).
     pub fn qualify(&self, outcome: Outcome) -> Outcome {
         qualify_reduced_environment(outcome, &self.unavailable_services)
+    }
+
+    /// Whether the app runs in its own Docker container, where a candidate fix can be copied in and
+    /// the app relaunched with it.
+    pub fn is_docker(&self) -> bool {
+        matches!(self.runtime, Runtime::Docker)
+    }
+
+    /// The HTTP status the route gives the probe's own request carrying a plain, harmless value
+    /// instead of the payload: the legitimate behavior a fix must leave unchanged.
+    pub fn benign_status(&self, probe: &Probe) -> Option<u16> {
+        self.fetch_meta(&payload::benign(probe))
+            .and_then(|(_, status, _)| status)
+    }
+
+    /// Replaces each `(path, content)` (relative to the repository root) inside the running app
+    /// container, runs the app's build step again when it has one, restarts the app and waits until
+    /// it listens: the very app the finding reproduced against, now with a candidate change. Its
+    /// datastore sidecars keep running untouched. Docker only.
+    pub fn relaunch_with_files(&mut self, files: &[(String, String)]) -> Result<(), String> {
+        if !self.is_docker() {
+            return Err("relaunching with a changed file needs the Docker runtime".to_owned());
+        }
+        for (rel, content) in files {
+            let target = container_dir(std::path::Path::new(rel))
+                .ok_or_else(|| format!("unsupported path `{rel}`"))?;
+            let staged = tempfile::NamedTempFile::new()
+                .map_err(|e| format!("could not stage {rel}: {e}"))?;
+            std::fs::write(staged.path(), content)
+                .map_err(|e| format!("could not stage {rel}: {e}"))?;
+            // Readable by the app whatever uid it runs as: the copy keeps the staged file's mode.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o644))
+                    .map_err(|e| format!("could not stage {rel}: {e}"))?;
+            }
+            let source = staged
+                .path()
+                .to_str()
+                .ok_or_else(|| format!("could not stage {rel}: non-UTF-8 temp path"))?;
+            docker(&["cp", source, &format!("{}:{target}", self.app)])
+                .map_err(|e| format!("could not copy {rel} into the app: {e}"))?;
+        }
+        if let Some((workdir, command)) = &self.rebuild {
+            let output = self.exec(
+                &self.app,
+                &[
+                    "sh",
+                    "-c",
+                    &format!("cd {} && {command}", shell_quote(workdir)),
+                ],
+            )?;
+            if !output.status.success() {
+                let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
+                log.push_str(&String::from_utf8_lossy(&output.stderr));
+                return Err(format!("the app's build step failed:\n{}", tail(&log, 20)));
+            }
+        }
+        docker(&["restart", "-t", "2", &self.app])
+            .map_err(|e| format!("could not restart the app: {e}"))?;
+        self.port = self.wait_until_listening()?;
+        Ok(())
     }
 
     /// This session's private network name, unique per launch (see [`run_id`]). Test-only: proves
@@ -15995,6 +16080,197 @@ socket.on('error', (e) => { console.error('database unreachable: ' + e.message);
                 session.teardown();
             }
         }
+    }
+
+    const FIX_FIXTURE: &str = r#"const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const url = require('url');
+const FILES = path.join(__dirname, 'files');
+fs.mkdirSync(FILES, { recursive: true });
+fs.writeFileSync(path.join(FILES, 'jsspector'), 'public');
+http.createServer((req, res) => {
+  const u = url.parse(req.url, true);
+  if (u.pathname === '/read') {
+    const name = (u.query.name || '').toString();
+    const filepath = path.join(FILES, name);
+    try { res.end(fs.readFileSync(filepath)); } catch (e) { res.statusCode = 404; res.end('missing'); }
+    return;
+  }
+  res.statusCode = 404;
+  res.end('x');
+}).listen(process.env.PORT || 3000, '0.0.0.0');
+"#;
+
+    #[test]
+    fn a_fix_is_proven_only_when_it_closes_the_exploit_and_keeps_the_route() {
+        use super::super::fix::{self, Candidate, FixOptions, FixOutcome};
+        use super::super::plan::{Entry, Method, Probe};
+        use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, TraceStep, VulnClass};
+
+        if !available() {
+            eprintln!("fix proof end-to-end: skipped (no Docker daemon reachable)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"fix-fixture","version":"1.0.0","scripts":{"start":"node server.js"}}"#,
+        );
+        write(dir.path(), "server.js", FIX_FIXTURE);
+        let step = |line: u32, col: u32, note: &str| TraceStep {
+            file: None,
+            line,
+            col,
+            note: note.to_owned(),
+        };
+        let finding = Finding {
+            file: "server.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "fs.readFileSync".to_owned(),
+                arg: "filepath".to_owned(),
+                line: 13,
+                col: 22,
+            },
+            class: VulnClass::PathTraversal,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "<anonymous>".to_owned(),
+            entry: Some("GET /read".to_owned()),
+            entry_at: None,
+            source: SourceLoc {
+                kind: "http",
+                expr: "u.query".to_owned(),
+                line: 11,
+                col: 19,
+            },
+            stored_by: None,
+            trace: vec![
+                step(11, 11, "assigned to `name`"),
+                step(12, 22, "through path.join()"),
+                step(12, 11, "assigned to `filepath`"),
+            ],
+            key: "k".to_owned(),
+            fingerprint: "f".to_owned(),
+        };
+        let probe = Probe {
+            method: Method::Get,
+            path: "/read".to_owned(),
+            entry: Entry::Query("name".to_owned()),
+            class: VulnClass::PathTraversal,
+            siblings: Vec::new(),
+            gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            doc_envelope: None,
+            lists_dir: false,
+            removes: false,
+            removes_dir: false,
+            creates: false,
+            archive_upload: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            body_object: false,
+            body_query_override: None,
+            sql: None,
+            sql_value: None,
+            array_element: false,
+            appended_fields: Vec::new(),
+            proto_pollution: None,
+            alt_paths: Vec::new(),
+            auth: None,
+            multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
+            allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
+        };
+
+        let mut session = Session::start(dir.path()).expect("the fixture sandbox should start");
+        let outcome = session.exercise(&probe);
+        assert!(
+            matches!(outcome, Outcome::Verified { .. }),
+            "the unconfined read should verify first, got {outcome:?}"
+        );
+        let options = FixOptions {
+            llm: false,
+            ..FixOptions::default()
+        };
+        let proven = fix::prove(
+            &mut session,
+            &probe,
+            &finding,
+            dir.path(),
+            &outcome,
+            &options,
+        );
+        let FixOutcome::Proven {
+            strategy,
+            diff,
+            benign_status,
+            ..
+        } = &proven
+        else {
+            session.teardown();
+            panic!("the base-name fix should be proven, got {proven:?}");
+        };
+        assert_eq!(strategy, "deterministic:path-basename-join");
+        assert_eq!(*benign_status, 200);
+        assert!(
+            diff.contains("+    const filepath = path.join(FILES, path.basename(name));"),
+            "{diff}"
+        );
+
+        // A change that only breaks startup must not pass as a fix.
+        let mut applied = None;
+        let broken = Candidate {
+            strategy: "test:broken".to_owned(),
+            file: "server.js".to_owned(),
+            content: format!("throw new Error('broken');\n{FIX_FIXTURE}"),
+        };
+        let crashed = fix::check(
+            &mut session,
+            &probe,
+            &finding,
+            dir.path(),
+            &broken,
+            200,
+            &mut applied,
+        );
+        // A change that drops the route stops the exploit too, but the benign request's status gives
+        // it away.
+        let gone = Candidate {
+            strategy: "test:route-gone".to_owned(),
+            file: "server.js".to_owned(),
+            content: FIX_FIXTURE.replace("'/read'", "'/gone'"),
+        };
+        let dropped = fix::check(
+            &mut session,
+            &probe,
+            &finding,
+            dir.path(),
+            &gone,
+            200,
+            &mut applied,
+        );
+        session.teardown();
+        let crashed = crashed.expect_err("a crashing change is not a fix");
+        assert!(crashed.contains("does not start"), "{crashed}");
+        let dropped = dropped.expect_err("a change that drops the route is not a fix");
+        assert!(
+            dropped.contains("HTTP 404 instead of HTTP 200"),
+            "{dropped}"
+        );
     }
 
     #[test]

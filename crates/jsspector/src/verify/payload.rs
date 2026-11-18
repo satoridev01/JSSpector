@@ -1883,6 +1883,17 @@ fn mount_marker_url(value: &str, probe: &Probe) -> String {
     }
 }
 
+/// The probe's own request with a plain, harmless value in place of the payload: the legitimate
+/// behavior of the route, which a fix must leave unchanged.
+pub fn benign(probe: &Probe) -> Attempt {
+    place(
+        probe,
+        probe.method.verb(&probe.entry),
+        ENVELOPE_PLACEHOLDER,
+        Signal::InResponse,
+    )
+}
+
 fn place(probe: &Probe, verb: &'static str, value: &str, signal: Signal) -> Attempt {
     let mut target = probe.path.clone();
     let mut body = None;

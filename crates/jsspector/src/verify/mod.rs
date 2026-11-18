@@ -9,6 +9,7 @@
 //! "clean".
 
 mod browser;
+mod fix;
 mod payload;
 mod plan;
 mod reflected;
@@ -17,6 +18,8 @@ mod services;
 
 use jss_core::{Finding, VulnClass};
 use serde::Serialize;
+
+pub use fix::{FixOptions, FixOutcome};
 
 /// A negative-control request and the response it produced. Differential verifiers attach these to
 /// the reproduction so a downstream reviewer can audit the claimed contrast instead of seeing only
@@ -79,6 +82,8 @@ pub struct Verdict {
     pub entry: Option<String>,
     pub class: String,
     pub outcome: Outcome,
+    /// The proven fix (or why there is none), when the finding verified and fixes are enabled.
+    pub fix: Option<FixOutcome>,
 }
 
 /// How a run should behave when the selected execution runtime is not reachable.
@@ -95,6 +100,7 @@ pub fn run(
     root: &std::path::Path,
     findings: &[Finding],
     missing: Missing,
+    fix_options: &FixOptions,
 ) -> Result<Vec<Verdict>, String> {
     // A custom or convention-based router may leave a handler without an inventory entry. For an
     // HTTP finding, try a conservative route derived from a recognized controller/routes tree.
@@ -766,6 +772,7 @@ pub fn run(
         .iter()
         .zip(&plans)
         .map(|(finding, plan)| {
+            let mut fix = None;
             let outcome = match plan {
                 Err(skip) => Outcome::Skipped {
                     reason: skip.0.clone(),
@@ -775,7 +782,18 @@ pub fn run(
                     match http.get_mut(index).map(|(_, session)| session) {
                         Some(Ok(session)) => {
                             let outcome = session.exercise(probe);
-                            session.qualify(outcome)
+                            let outcome = session.qualify(outcome);
+                            if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                                fix = Some(fix::prove(
+                                    session,
+                                    probe,
+                                    finding,
+                                    root,
+                                    &outcome,
+                                    fix_options,
+                                ));
+                            }
+                            outcome
                         }
                         Some(Err(err)) => Outcome::Skipped {
                             reason: format!("the app could not be launched: {err}"),
@@ -810,7 +828,18 @@ pub fn run(
                     },
                 },
             };
-            verdict(finding, outcome)
+            // A browser-driven reproduction runs the page, not the server process a candidate
+            // change can be relaunched in.
+            if fix.is_none() && fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                fix = Some(FixOutcome::Unsupported {
+                    reason: "proving a fix for a browser-driven finding is not supported yet"
+                        .to_owned(),
+                });
+            }
+            Verdict {
+                fix,
+                ..verdict(finding, outcome)
+            }
         })
         .collect();
 
@@ -1131,6 +1160,7 @@ fn verdict(finding: &Finding, outcome: Outcome) -> Verdict {
         entry: finding.entry.clone(),
         class: finding.class.name().to_owned(),
         outcome,
+        fix: None,
     }
 }
 
@@ -1144,10 +1174,12 @@ pub fn write_text(
     if verdicts.is_empty() {
         return Ok(());
     }
-    let (bold, green, yellow, dim, reset) = if color {
-        ("\x1b[1m", "\x1b[32m", "\x1b[33m", "\x1b[2m", "\x1b[0m")
+    let (bold, green, red, yellow, dim, reset) = if color {
+        (
+            "\x1b[1m", "\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[2m", "\x1b[0m",
+        )
     } else {
-        ("", "", "", "", "")
+        ("", "", "", "", "", "")
     };
     let (mut verified, mut not_reproduced, mut skipped) = (0, 0, 0);
     writeln!(out, "\n  {bold}Verification{reset}")?;
@@ -1161,6 +1193,44 @@ pub fn write_text(
                     "  {green}✔ verified{reset} {entry} {dim}{}{reset}  ({how})",
                     v.fingerprint
                 )?;
+                match &v.fix {
+                    Some(FixOutcome::Proven {
+                        strategy,
+                        file,
+                        diff,
+                        attempts,
+                        ..
+                    }) => {
+                        writeln!(
+                            out,
+                            "    {green}✔ fix proven{reset} {file} {dim}({strategy}, {attempts} attempt(s)){reset}"
+                        )?;
+                        for line in diff.lines() {
+                            let tint = if line.starts_with("+++") || line.starts_with("---") {
+                                dim
+                            } else if line.starts_with('+') {
+                                green
+                            } else if line.starts_with('-') {
+                                red
+                            } else if line.starts_with("@@") {
+                                dim
+                            } else {
+                                ""
+                            };
+                            writeln!(out, "      {tint}{line}{reset}")?;
+                        }
+                    }
+                    Some(FixOutcome::Unproven {
+                        reason, attempts, ..
+                    }) => writeln!(
+                        out,
+                        "    {yellow}• fix unproven{reset} {dim}after {attempts} attempt(s): {reason}{reset}"
+                    )?,
+                    Some(FixOutcome::Unsupported { reason }) => {
+                        writeln!(out, "    {dim}• no fix: {reason}{reset}")?;
+                    }
+                    None => {}
+                }
             }
             Outcome::NotReproduced { tried } => {
                 not_reproduced += 1;

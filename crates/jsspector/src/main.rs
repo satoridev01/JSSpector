@@ -139,6 +139,9 @@ struct ScanArgs {
     /// Repository workers used with --repos.
     #[arg(long, value_name = "N", requires = "repos")]
     parallel: Option<NonZeroUsize>,
+    /// Scan --repo directly, without first validating and repairing the scanner against it.
+    #[arg(long, requires = "repo")]
+    skip_self_heal: bool,
     /// Number of threads [default: all available cores, or RAYON_NUM_THREADS].
     #[arg(long, value_name = "N")]
     threads: Option<NonZeroUsize>,
@@ -701,6 +704,25 @@ mod repository_input_tests {
     }
 
     #[test]
+    fn skip_self_heal_defaults_off_and_is_set_with_repo() {
+        assert!(
+            Cli::try_parse_from(["jsspector", "scan", "--repo", "owner/project"]).is_ok_and(
+                |cli| !matches!(cli.command, Command::Scan(ref scan) if scan.skip_self_heal)
+            )
+        );
+        assert!(
+            Cli::try_parse_from([
+                "jsspector",
+                "scan",
+                "--repo",
+                "owner/project",
+                "--skip-self-heal"
+            ])
+            .is_ok_and(|cli| matches!(cli.command, Command::Scan(ref scan) if scan.skip_self_heal))
+        );
+    }
+
+    #[test]
     fn recovered_repository_scan_selects_only_its_accepted_fingerprints() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join(".satori")).unwrap();
@@ -1019,6 +1041,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
         };
     }
     if let Some(repository) = args.repo.as_deref()
+        && !args.skip_self_heal
         && std::env::var_os("JSSPECTOR_SELF_HEAL_ACTIVE").is_none()
     {
         return match self_heal_repository_scan(repository) {

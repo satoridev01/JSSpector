@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use jss_core::{Finding, VulnClass};
+use jss_core::{Finding, Severity, VulnClass};
 
 use crate::rules;
 
@@ -13,7 +13,9 @@ use crate::rules;
 pub struct Style {
     pub bold: &'static str,
     pub dim: &'static str,
+    pub maroon: &'static str,
     pub red: &'static str,
+    pub orange: &'static str,
     pub yellow: &'static str,
     pub reset: &'static str,
 }
@@ -24,7 +26,10 @@ impl Style {
             Style {
                 bold: "\x1b[1m",
                 dim: "\x1b[2m",
+                // 256-color maroon/orange; the base 16 colors have no distinct shade for either.
+                maroon: "\x1b[38;5;88m",
                 red: "\x1b[31m",
+                orange: "\x1b[38;5;208m",
                 yellow: "\x1b[33m",
                 reset: "\x1b[0m",
             }
@@ -32,10 +37,23 @@ impl Style {
             Style {
                 bold: "",
                 dim: "",
+                maroon: "",
                 red: "",
+                orange: "",
                 yellow: "",
                 reset: "",
             }
+        }
+    }
+
+    /// The severity's own color: critical in maroon, high in red, medium in orange, low in
+    /// yellow.
+    fn severity_color(&self, severity: Severity) -> &'static str {
+        match severity {
+            Severity::Critical => self.maroon,
+            Severity::High => self.red,
+            Severity::Medium => self.orange,
+            Severity::Low => self.yellow,
         }
     }
 }
@@ -195,11 +213,7 @@ pub fn write(
         writeln!(out, "\n  {}{file}{}", st.bold, st.reset)?;
         for f in findings {
             let severity = rules::severity_name(f.severity).to_uppercase();
-            let color = if severity == "CRITICAL" {
-                st.red
-            } else {
-                st.yellow
-            };
+            let color = st.severity_color(f.severity);
             writeln!(
                 out,
                 "  {color}{}❯❯❱ {}{} {}[{severity}]{} {}{}{}",
@@ -315,5 +329,19 @@ mod tests {
             "// jsspector-ignore because the id is checked",
             sql
         ));
+    }
+
+    #[test]
+    fn each_severity_gets_its_own_color() {
+        let st = Style::new(true);
+        assert_eq!(st.severity_color(Severity::Critical), st.maroon);
+        assert_eq!(st.severity_color(Severity::High), st.red);
+        assert_eq!(st.severity_color(Severity::Medium), st.orange);
+        assert_eq!(st.severity_color(Severity::Low), st.yellow);
+        // Four distinct codes, not some severity silently sharing another's color.
+        let mut colors = vec![st.maroon, st.red, st.orange, st.yellow];
+        colors.sort_unstable();
+        colors.dedup();
+        assert_eq!(colors.len(), 4);
     }
 }

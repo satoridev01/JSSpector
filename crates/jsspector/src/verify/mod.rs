@@ -21,6 +21,12 @@ use serde::Serialize;
 
 pub use fix::{FixOptions, FixOutcome};
 
+/// Runs verified apps in this already-disposable environment (a CI or Satori job) instead of a
+/// Docker container: `scan --local`.
+pub fn use_local_runtime() {
+    sandbox::request_local_runtime();
+}
+
 /// A negative-control request and the response it produced. Differential verifiers attach these to
 /// the reproduction so a downstream reviewer can audit the claimed contrast instead of seeing only
 /// the successful leg.
@@ -891,6 +897,10 @@ fn acquire_http_session(
         if let Ok(session) = &mut slot.1 {
             session.teardown();
         }
+        // Drop the old session before starting its replacement: a local session holds the
+        // process-wide fixture lock until it is dropped, and the new one waits for that lock, so
+        // starting it while the old one is still in the slot would wait forever.
+        slot.1 = Err("relaunching".to_owned());
         let gating = gating_env_sources(root, finding);
         *slot = (
             key,

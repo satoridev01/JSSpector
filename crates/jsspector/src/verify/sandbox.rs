@@ -29,6 +29,17 @@ const DB_IMAGE: &str = "mongo:6";
 const DB_ALIASES: [&str; 4] = ["mongo", "mongodb", "db", "database"];
 const DB_NAME: &str = "jssverifydb";
 const REDIS_IMAGE: &str = "redis:7-alpine";
+/// The MongoDB server the local runtime provisions on demand when an app needs a database and none
+/// is installed. 7.0 is the oldest series published for Debian 12 (the image Satori runs) and speaks
+/// the same wire protocol as the Docker runtime's `mongo:6` sidecar.
+const LOCAL_MONGO_VERSION: &str = "7.0.28";
+/// Downloads the `mongod` build for the host's OS, distribution and architecture.
+const LOCAL_MONGO_DOWNLOADER: &str = "mongodb-memory-server-core@11.3.0";
+/// The MongoDB shell provisioned alongside it, as MongoDB's own standalone build.
+const LOCAL_MONGOSH_VERSION: &str = "2.13.0";
+/// The Redis server the local runtime builds from source on demand: the series of the Docker
+/// runtime's `redis:7-alpine` sidecar.
+const LOCAL_REDIS_VERSION: &str = "7.2.11";
 
 /// Enable full (level 2) profiling on every application database, so the server records the namespace
 /// of every command it receives. Used to discover which collection a read-only sink actually queries.
@@ -238,8 +249,20 @@ fn wait_local_service(child: &mut Child, port: u16, name: &str) -> Result<(), St
     ))
 }
 
+/// Set by `scan --local`: run apps in this already-disposable environment instead of Docker.
+static LOCAL_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Selects the local runtime for this process (`scan --local`).
+pub(super) fn request_local_runtime() {
+    LOCAL_RUNTIME.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether apps run in this environment rather than in Docker: `scan --local`, or
+/// `JSS_VERIFY_RUNTIME=local` (kept for existing scripts and for the self-heal controller's
+/// re-invocation).
 pub(super) fn local_runtime_requested() -> bool {
-    std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
+    LOCAL_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
 }
 
 /// Environment variables by which developer tools detect that an AI coding assistant — rather than a
@@ -393,19 +416,27 @@ pub struct Session {
     /// the environment is reduced, a negative result is never reported as `not-reproduced`: see
     /// [`qualify_reduced_environment`].
     unavailable_services: Vec<String>,
+    /// `PATH` with the directories of backing-service binaries the local runtime provisioned
+    /// (`mongod`, `mongosh`, `redis-server`) first, for the services it starts and the commands it
+    /// runs against them. `None` when nothing was provisioned.
+    service_path: Option<std::ffi::OsString>,
     torn_down: bool,
 }
 
 /// What the local runtime does with a declared Redis client: start a private `redis-server` when
-/// one is installed, otherwise launch without Redis and record the gap. A declared client is not
-/// proof the app needs Redis to serve a request (it is often optional and env-gated), so refusing
-/// to launch would skip findings whose path never touches it.
+/// one is installed or could be provisioned, otherwise launch without Redis and record the gap. A
+/// declared client is not proof the app needs Redis to serve a request (it is often optional and
+/// env-gated), so refusing to launch would skip findings whose path never touches it.
 fn local_redis_plan(declared: bool, server_available: bool) -> (bool, Option<String>) {
     match (declared, server_available) {
         (true, true) => (true, None),
         (true, false) => (
             false,
-            Some("Redis (`redis-server` is not on PATH, so the app ran without Redis)".to_owned()),
+            Some(
+                "Redis (`redis-server` is not installed and could not be provisioned, so the app \
+                 ran without Redis)"
+                    .to_owned(),
+            ),
         ),
         (false, _) => (false, None),
     }
@@ -710,6 +741,7 @@ impl Session {
             local_marker_port: None,
             local_baseline_ports: Vec::new(),
             unavailable_services: Vec::new(),
+            service_path: None,
             torn_down: false,
         };
         if let Err(err) = session.boot() {
@@ -748,18 +780,52 @@ impl Session {
             .with_marker_host(marker_host);
         let app_root = root.join(app_path);
         let app_needs_db = db_service(&app_root);
-        let has_local_mongo = command_available("mongod") && command_available("mongosh");
-        let ephemeral_db_command = (!has_local_mongo)
+        let mongo_installed = command_available("mongod") && command_available("mongosh");
+        let ephemeral_db_command = (!mongo_installed)
             .then(|| local_ephemeral_mongo_next_launch(&app_root))
             .flatten();
         let manages_ephemeral_db = app_needs_db && ephemeral_db_command.is_some();
+        // A backing service the app needs but the host lacks is provisioned now, for this app only:
+        // a repository without a database client never pays for one. A service that cannot be
+        // provisioned leaves the app launchable without it, and is recorded so a negative result
+        // is not reported as `not-reproduced` (see [`qualify_reduced_environment`]).
+        let mut unavailable_services: Vec<String> = Vec::new();
+        let mut service_tools: Vec<std::path::PathBuf> = Vec::new();
+        let has_local_mongo = mongo_installed
+            || (app_needs_db
+                && !manages_ephemeral_db
+                && match provision_local_mongo() {
+                    Ok(bin) => {
+                        service_tools.push(bin);
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("jsspector: MongoDB could not be provisioned: {error}");
+                        unavailable_services.push(
+                            "MongoDB (`mongod` is not installed and could not be provisioned, so \
+                             the app ran without a database)"
+                                .to_owned(),
+                        );
+                        false
+                    }
+                });
         let needs_db = app_needs_db && !manages_ephemeral_db && has_local_mongo;
         let declares_redis = redis_service(&app_root);
-        let (needs_redis, missing_redis) = local_redis_plan(
-            declares_redis,
-            declares_redis && command_available("redis-server"),
-        );
-        let unavailable_services: Vec<String> = missing_redis.into_iter().collect();
+        let redis_available = declares_redis
+            && (command_available("redis-server")
+                || match provision_local_redis() {
+                    Ok(bin) => {
+                        service_tools.push(bin);
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("jsspector: Redis could not be provisioned: {error}");
+                        false
+                    }
+                });
+        let (needs_redis, missing_redis) = local_redis_plan(declares_redis, redis_available);
+        unavailable_services.extend(missing_redis);
+        let service_path = (!service_tools.is_empty()).then(|| path_with_tool_dirs(&service_tools));
         let entry_rel = entry_file.and_then(|file| file.strip_prefix(app_path).ok());
         // Install and build before choosing the launch command. A package whose start script names
         // generated output (`node dist/index.js`) must be evaluated after its `compile`/`build`
@@ -926,6 +992,7 @@ impl Session {
             local_marker_port,
             local_baseline_ports: Vec::new(),
             unavailable_services,
+            service_path,
             torn_down: false,
         };
         session.start_local_services()?;
@@ -983,7 +1050,11 @@ impl Session {
             let stderr = log
                 .try_clone()
                 .map_err(|error| format!("opening local MongoDB log: {error}"))?;
-            let mut child = Command::new("mongod")
+            let mut command = Command::new("mongod");
+            if let Some(path) = &self.service_path {
+                command.env("PATH", path);
+            }
+            let mut child = command
                 .args([
                     "--bind_ip",
                     "127.0.0.1",
@@ -1012,7 +1083,11 @@ impl Session {
             let stderr = log
                 .try_clone()
                 .map_err(|error| format!("opening local Redis log: {error}"))?;
-            let mut child = Command::new("redis-server")
+            let mut command = Command::new("redis-server");
+            if let Some(path) = &self.service_path {
+                command.env("PATH", path);
+            }
+            let mut child = command
                 .args([
                     "--bind",
                     "127.0.0.1",
@@ -4187,7 +4262,11 @@ impl Session {
                 let (program, args) = cmd
                     .split_first()
                     .ok_or_else(|| "empty local sidecar command".to_owned())?;
-                Command::new(program)
+                let mut command = Command::new(program);
+                if let Some(path) = &self.service_path {
+                    command.env("PATH", path);
+                }
+                command
                     .args(args)
                     .current_dir(app_root)
                     .output()
@@ -5287,11 +5366,249 @@ fn provision_local_bun(app_root: &std::path::Path) -> Result<Option<std::path::P
 /// `PATH` with a verifier tool directory first, so package scripts (`bun …`) find the provisioned
 /// runtime while everything else resolves as before.
 fn path_with_tool_dir(tool_dir: &std::path::Path) -> std::ffi::OsString {
-    let mut parts = vec![tool_dir.to_path_buf()];
+    path_with_tool_dirs(&[tool_dir.to_path_buf()])
+}
+
+/// `PATH` with verifier tool directories first, in order, then the inherited `PATH`.
+fn path_with_tool_dirs(tool_dirs: &[std::path::PathBuf]) -> std::ffi::OsString {
+    let mut parts = tool_dirs.to_vec();
     if let Some(existing) = std::env::var_os("PATH") {
         parts.extend(std::env::split_paths(&existing));
     }
-    std::env::join_paths(parts).unwrap_or_else(|_| tool_dir.as_os_str().to_owned())
+    std::env::join_paths(&parts).unwrap_or_else(|_| {
+        tool_dirs
+            .first()
+            .map(|dir| dir.as_os_str().to_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the program at `path` runs (`--version` exits successfully).
+fn tool_runs(path: &std::path::Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Provide a cached tool directory: return its `bin/` when `ready` accepts it, otherwise run
+/// `install` once under an exclusive lock (concurrent verifiers wait for the first one) and check
+/// again. The directory lives under the system temp dir, so it is shared by every run on the host.
+fn provision_tool_dir(
+    name: &str,
+    ready: impl Fn(&std::path::Path) -> bool,
+    install: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join("jsspector-tools").join(name);
+    let bin = dir.join("bin");
+    if ready(&bin) {
+        return Ok(bin);
+    }
+    std::fs::create_dir_all(&bin)
+        .map_err(|error| format!("creating tool directory {}: {error}", dir.display()))?;
+    let lock = File::create(dir.join(".lock"))
+        .map_err(|error| format!("creating tool lock {}: {error}", dir.display()))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("locking tool directory {}: {error}", dir.display()))?;
+    if ready(&bin) {
+        return Ok(bin);
+    }
+    eprintln!(
+        "jsspector: provisioning {name} for the local runtime (first use; cached in {})",
+        dir.display()
+    );
+    install(&dir)?;
+    if ready(&bin) {
+        Ok(bin)
+    } else {
+        Err(format!(
+            "{name} was installed in {} but does not run",
+            dir.display()
+        ))
+    }
+}
+
+/// Run a provisioning step, turning a failure into its command's last lines of output.
+fn run_provision_step(command: &mut Command, what: &str) -> Result<Output, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("{what}: {error}"))?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    Err(format!("{what} failed:\n{}", tail(&detail, 15)))
+}
+
+/// Point `bin/<name>` at a provisioned binary, replacing a link a failed attempt left behind.
+fn link_tool(bin: &std::path::Path, name: &str, target: &std::path::Path) -> Result<(), String> {
+    let link = bin.join(name);
+    if link.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link)
+            .map_err(|error| format!("replacing {}: {error}", link.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, &link)
+            .map_err(|error| format!("linking {}: {error}", link.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        Err("provisioning backing services needs a Unix host".to_owned())
+    }
+}
+
+/// MongoDB's standalone `mongosh` build for this host: its platform name and archive extension.
+fn mongosh_platform(os: &str, arch: &str) -> Option<(&'static str, &'static str)> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some(("linux-x64", "tgz")),
+        ("linux", "aarch64") => Some(("linux-arm64", "tgz")),
+        ("macos", "aarch64") => Some(("darwin-arm64", "zip")),
+        ("macos", "x86_64") => Some(("darwin-x64", "zip")),
+        _ => None,
+    }
+}
+
+/// Provide `mongod` and `mongosh` for an app that needs MongoDB on a host that has neither: the
+/// server build for this OS, distribution and architecture (fetched by `mongodb-memory-server`) and
+/// MongoDB's standalone shell, both pinned, linked into one cached `bin/`.
+fn provision_local_mongo() -> Result<std::path::PathBuf, String> {
+    let name = format!("mongodb-{LOCAL_MONGO_VERSION}-mongosh-{LOCAL_MONGOSH_VERSION}");
+    let ready =
+        |bin: &std::path::Path| tool_runs(&bin.join("mongod")) && tool_runs(&bin.join("mongosh"));
+    provision_tool_dir(&name, ready, |dir| {
+        let (platform, extension) = mongosh_platform(std::env::consts::OS, std::env::consts::ARCH)
+            .ok_or_else(|| {
+                format!(
+                    "no MongoDB shell build for {}/{}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+            })?;
+        let bin = dir.join("bin");
+        let downloader = dir.join("downloader");
+        std::fs::create_dir_all(&downloader)
+            .map_err(|error| format!("creating {}: {error}", downloader.display()))?;
+        run_provision_step(
+            Command::new("npm")
+                .args([
+                    "install",
+                    "--no-save",
+                    "--no-package-lock",
+                    "--no-audit",
+                    "--no-fund",
+                    "--ignore-scripts",
+                    "--prefix",
+                ])
+                .arg(&downloader)
+                .arg(LOCAL_MONGO_DOWNLOADER)
+                .current_dir(&downloader),
+            "installing the MongoDB downloader",
+        )?;
+        let fetched = run_provision_step(
+            Command::new("node")
+                .args([
+                    "-e",
+                    "require('mongodb-memory-server-core').MongoBinary.getPath()\
+                     .then((path) => console.log('JSSPECTOR_MONGOD=' + path))",
+                ])
+                .current_dir(&downloader)
+                .env("MONGOMS_DOWNLOAD_DIR", dir.join("server"))
+                .env("MONGOMS_VERSION", LOCAL_MONGO_VERSION)
+                .env_remove("MONGOMS_SYSTEM_BINARY")
+                .env_remove("MONGOMS_ARCHIVE_NAME")
+                .env_remove("MONGOMS_DOWNLOAD_URL"),
+            &format!("downloading MongoDB {LOCAL_MONGO_VERSION}"),
+        )?;
+        // The downloader reports progress on stdout too; the path is on the marked line.
+        let stdout = String::from_utf8_lossy(&fetched.stdout);
+        let server = stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("JSSPECTOR_MONGOD="))
+            .ok_or_else(|| {
+                format!(
+                    "the MongoDB downloader reported no binary:\n{}",
+                    tail(&stdout, 5)
+                )
+            })?;
+        link_tool(&bin, "mongod", std::path::Path::new(server))?;
+        let archive = dir.join(format!("mongosh.{extension}"));
+        run_provision_step(
+            Command::new("curl")
+                .args(["-fsSL", "--retry", "3", "-o"])
+                .arg(&archive)
+                .arg(format!(
+                    "https://downloads.mongodb.com/compass/mongosh-{LOCAL_MONGOSH_VERSION}-{platform}.{extension}"
+                )),
+            &format!("downloading mongosh {LOCAL_MONGOSH_VERSION}"),
+        )?;
+        run_provision_step(
+            Command::new("tar")
+                .arg("-xf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(dir),
+            "unpacking mongosh",
+        )?;
+        link_tool(
+            &bin,
+            "mongosh",
+            &dir.join(format!("mongosh-{LOCAL_MONGOSH_VERSION}-{platform}"))
+                .join("bin")
+                .join("mongosh"),
+        )
+    })
+}
+
+/// Provide `redis-server` for an app that declares a Redis client on a host without one: the pinned
+/// release built from its official source archive (it needs only `make` and a C compiler).
+fn provision_local_redis() -> Result<std::path::PathBuf, String> {
+    let name = format!("redis-{LOCAL_REDIS_VERSION}");
+    let ready = |bin: &std::path::Path| tool_runs(&bin.join("redis-server"));
+    provision_tool_dir(&name, ready, |dir| {
+        let archive = dir.join("redis.tar.gz");
+        run_provision_step(
+            Command::new("curl")
+                .args(["-fsSL", "--retry", "3", "-o"])
+                .arg(&archive)
+                .arg(format!(
+                    "https://download.redis.io/releases/redis-{LOCAL_REDIS_VERSION}.tar.gz"
+                )),
+            &format!("downloading Redis {LOCAL_REDIS_VERSION}"),
+        )?;
+        run_provision_step(
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(dir),
+            "unpacking Redis",
+        )?;
+        let source = dir.join(format!("redis-{LOCAL_REDIS_VERSION}"));
+        let jobs = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
+        run_provision_step(
+            Command::new("make")
+                .arg("-C")
+                .arg(&source)
+                .arg(format!("-j{jobs}"))
+                .args(["MALLOC=libc", "BUILD_TLS=no"]),
+            &format!("building Redis {LOCAL_REDIS_VERSION}"),
+        )?;
+        link_tool(
+            &dir.join("bin"),
+            "redis-server",
+            &source.join("src").join("redis-server"),
+        )
+    })
 }
 
 fn run_local_setup(
@@ -13535,6 +13852,44 @@ mod tests {
         let (start, missing) = local_redis_plan(true, false);
         assert!(!start);
         assert!(missing.is_some_and(|note| note.contains("redis-server")));
+    }
+
+    #[test]
+    fn provisioned_service_binaries_come_first_on_path() {
+        let first = std::path::PathBuf::from("/opt/jss-a/bin");
+        let second = std::path::PathBuf::from("/opt/jss-b/bin");
+        let path = path_with_tool_dirs(&[first.clone(), second.clone()]);
+        let parts: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(parts.first(), Some(&first));
+        assert_eq!(parts.get(1), Some(&second));
+        // The inherited PATH follows, so everything else resolves as before.
+        if let Some(inherited) = std::env::var_os("PATH") {
+            assert_eq!(
+                parts.get(2..).map(<[_]>::to_vec),
+                Some(std::env::split_paths(&inherited).collect::<Vec<_>>())
+            );
+        }
+    }
+
+    #[test]
+    fn mongosh_is_fetched_as_the_standalone_build_for_the_host() {
+        assert_eq!(
+            mongosh_platform("linux", "x86_64"),
+            Some(("linux-x64", "tgz"))
+        );
+        assert_eq!(
+            mongosh_platform("linux", "aarch64"),
+            Some(("linux-arm64", "tgz"))
+        );
+        assert_eq!(
+            mongosh_platform("macos", "aarch64"),
+            Some(("darwin-arm64", "zip"))
+        );
+        assert_eq!(
+            mongosh_platform("macos", "x86_64"),
+            Some(("darwin-x64", "zip"))
+        );
+        assert_eq!(mongosh_platform("windows", "x86_64"), None);
     }
 
     #[test]

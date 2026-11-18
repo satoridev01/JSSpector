@@ -181,11 +181,15 @@ struct ScanArgs {
     #[arg(long, value_name = "FILE")]
     write_baseline: Option<PathBuf>,
     /// Confirm each reported finding by running the app in a throwaway Docker container and
-    /// sending the request it implies. By default this uses Docker; in an already-disposable
-    /// execution sandbox, `JSS_VERIFY_RUNTIME=local` prepares and runs the app in that sandbox.
-    /// `--verify=strict` fails instead of skipping when the selected runtime is unavailable.
+    /// sending the request it implies (or in this environment with `--local`). `--verify=strict`
+    /// fails instead of skipping when the selected runtime is unavailable.
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "best-effort")]
     verify: Option<VerifyMode>,
+    /// Run each verified app in this environment instead of a Docker container: for an
+    /// already-disposable sandbox such as a CI or Satori job, where Docker is not available. The
+    /// services an app needs (MongoDB, Redis) are provisioned on demand.
+    #[arg(long, requires = "verify")]
+    local: bool,
     /// Dynamically verify only this exact finding fingerprint. Repeatable; the report still
     /// includes every static finding. Intended for targeted reproduction and repair checks.
     #[arg(long, value_name = "FINGERPRINT", requires = "verify")]
@@ -752,6 +756,20 @@ mod repository_input_tests {
     }
 
     #[test]
+    fn local_runtime_is_a_verify_option() {
+        assert!(
+            Cli::try_parse_from(["jsspector", "scan", ".", "--verify"])
+                .is_ok_and(|cli| matches!(cli.command, Command::Scan(ref scan) if !scan.local))
+        );
+        assert!(
+            Cli::try_parse_from(["jsspector", "scan", ".", "--verify", "--local"])
+                .is_ok_and(|cli| matches!(cli.command, Command::Scan(ref scan) if scan.local))
+        );
+        // Without `--verify` there is no app to run, so `--local` is a usage error.
+        assert!(Cli::try_parse_from(["jsspector", "scan", ".", "--local"]).is_err());
+    }
+
+    #[test]
     fn recovered_repository_scan_selects_only_its_accepted_fingerprints() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join(".satori")).unwrap();
@@ -1181,6 +1199,9 @@ fn scan(args: &ScanArgs) -> ExitCode {
                     .cloned()
                     .collect()
             };
+            if args.local {
+                verify::use_local_runtime();
+            }
             let defaults = verify::FixOptions::default();
             let fix_options = verify::FixOptions {
                 enabled: !args.no_fix,

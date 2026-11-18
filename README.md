@@ -116,6 +116,16 @@ jsspector scan . --verify --no-fix         # verification only
 `--fix-attempts` (default 3) bounds the LLM candidates, `--fix-timeout` (default 600 seconds) the
 total time per finding, and `--fix-model` picks the LLM model.
 
+### Verifying without Docker
+
+`--verify` runs each app in a disposable Docker container. In an environment that is already disposable and has no Docker, such as a CI or Satori job, `--local` runs the app there instead, with the same exploit and fix proofs:
+
+```sh
+jsspector scan . --verify --local --format json
+```
+
+The backing services an app needs are provisioned on demand, only for an app that needs them and only when the host lacks them: MongoDB 7.0 (with `mongosh`) for an app with a MongoDB driver, Redis 7.2 (built from source; needs `make` and a C compiler) for an app with a Redis client. They are cached under the system temp directory, so later runs start them at once. A service that cannot be provisioned leaves the app running without it, and a finding that then does not reproduce is reported as skipped rather than not reproduced.
+
 ### Scanning a GitHub repository
 
 `scan --repo` accepts either the repository HEAD or a pinned revision, and clones and scans it

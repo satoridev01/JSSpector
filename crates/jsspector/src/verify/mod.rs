@@ -12,6 +12,7 @@ mod browser;
 mod fix;
 mod payload;
 mod plan;
+mod recipes;
 mod reflected;
 mod sandbox;
 mod services;
@@ -1209,11 +1210,17 @@ pub fn write_text(
                         file,
                         diff,
                         attempts,
+                        recipes,
                         ..
                     }) => {
+                        let guided = if recipes.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {} recipe(s)", recipes.len())
+                        };
                         writeln!(
                             out,
-                            "    {green}✔ fix proven{reset} {file} {dim}({strategy}, {attempts} attempt(s)){reset}"
+                            "    {green}✔ fix proven{reset} {file} {dim}({strategy}, {attempts} attempt(s){guided}){reset}"
                         )?;
                         for line in diff.lines() {
                             let tint = if line.starts_with("+++") || line.starts_with("---") {

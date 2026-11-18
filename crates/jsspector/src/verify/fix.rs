@@ -1,8 +1,12 @@
 //! A proven fix for a verified finding: a minimal code change that stops the exploit from
 //! reproducing while the route keeps its legitimate behavior.
 //!
-//! Candidates come first from deterministic per-class strategies, then (when the `claude` CLI is
-//! available and not disabled) from an LLM that is told why every earlier candidate failed.
+//! A candidate comes from one of two places. When the recipe store holds an example proven before
+//! for this very finding on this very file content, its exact change is replayed first, with no
+//! LLM. Otherwise an LLM (the `claude` CLI) proposes the change, shown the fix recipes already
+//! proven for the finding's class and told why every earlier candidate failed. JSSpector applies no
+//! fix pattern by itself.
+//!
 //! Whatever its origin, a candidate becomes a `proven` fix only after the sandbox that reproduced
 //! the finding relaunches the app with the change and three controls hold:
 //!
@@ -11,19 +15,20 @@
 //! 3. a benign request to the same route still gets the HTTP status it got before the change.
 //!
 //! The third control is what keeps a change that merely breaks the route from passing as a fix.
-//! The scanned checkout is never modified: the change lives only in the disposable container, and
-//! the report carries it as a unified diff (plus the original file's fingerprint, so the diff can
-//! be re-applied and re-proved later without an LLM).
+//! The scanned checkout is never modified: the change lives only in the disposable sandbox, and
+//! the report carries it as a unified diff. A proven LLM fix is recorded in the store (see
+//! [`super::recipes`]) as a recipe for later prompts and an example for later replays.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use jss_core::{Finding, VulnClass};
+use jss_core::Finding;
 use serde::Serialize;
 
 use super::plan::Probe;
+use super::recipes::{Book, Learned, Recipe};
 use super::sandbox::Session;
 use super::{Outcome, Reproduction};
 
@@ -32,14 +37,17 @@ use super::{Outcome, Reproduction};
 pub struct FixOptions {
     /// Produce a fix at all (`--no-fix` turns this off).
     pub enabled: bool,
-    /// Fall back to an LLM when no deterministic strategy is proven (`--no-fix-llm` turns it off).
+    /// Ask an LLM for candidates (`--no-fix-llm` turns it off: only recorded examples replay).
     pub llm: bool,
-    /// The model for the LLM fallback; the `claude` CLI's own default when unset.
+    /// The LLM model; the `claude` CLI's own default when unset.
     pub model: Option<String>,
     /// LLM candidates per finding.
     pub attempts: usize,
-    /// Total time budget per finding, deterministic and LLM candidates together.
+    /// Total time budget per finding.
     pub timeout: Duration,
+    /// The recipe store, read for replays and prompts and written with what each search learned;
+    /// none by default, so nothing is read or recorded unless a caller names one.
+    pub recipes: Option<PathBuf>,
 }
 
 impl Default for FixOptions {
@@ -50,6 +58,7 @@ impl Default for FixOptions {
             model: None,
             attempts: 3,
             timeout: Duration::from_secs(600),
+            recipes: None,
         }
     }
 }
@@ -67,7 +76,8 @@ pub struct FixAttempt {
 pub enum FixOutcome {
     /// A change that passed all three controls.
     Proven {
-        /// Where the change came from: `deterministic:<name>` or `llm`.
+        /// Where the change came from: `replay` (an example recorded for this finding and file
+        /// content) or `llm`.
         strategy: String,
         /// The changed file, relative to the scanned root.
         file: String,
@@ -80,6 +90,9 @@ pub enum FixOutcome {
         benign_status: u16,
         /// Candidates tried, this one included.
         attempts: usize,
+        /// The recipes shown to the LLM.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        recipes: Vec<String>,
         /// The candidates rejected before this one.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         rejected: Vec<FixAttempt>,
@@ -88,6 +101,9 @@ pub enum FixOutcome {
     Unproven {
         reason: String,
         attempts: usize,
+        /// The recipes shown to the LLM.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        recipes: Vec<String>,
         rejected: Vec<FixAttempt>,
     },
     /// No candidate could be produced or proven here at all.
@@ -103,7 +119,8 @@ pub struct Candidate {
 }
 
 /// Looks for a proven fix for `finding`, whose `probe` just reproduced in `session`. Whatever the
-/// outcome, every file a candidate changed on disk (local runtime) is restored before returning.
+/// outcome, every file a candidate changed on disk (local runtime) is restored before returning,
+/// and what the search learned is recorded in the recipe store when there is one.
 pub fn prove(
     session: &mut Session,
     probe: &Probe,
@@ -112,117 +129,204 @@ pub fn prove(
     outcome: &Outcome,
     options: &FixOptions,
 ) -> FixOutcome {
-    let result = search(session, probe, finding, root, outcome, options);
-    if let Err(error) = session.restore_files() {
-        eprintln!("jsspector: {error}");
-    }
-    result
-}
-
-fn search(
-    session: &mut Session,
-    probe: &Probe,
-    finding: &Finding,
-    root: &Path,
-    outcome: &Outcome,
-    options: &FixOptions,
-) -> FixOutcome {
-    if !session.can_relaunch() {
-        return FixOutcome::Unsupported {
-            reason: "the app cannot be relaunched with a change in this runtime".to_owned(),
-        };
-    }
-    let Some(benign) = session.benign_status(probe) else {
-        return FixOutcome::Unsupported {
-            reason: "the route gave no response to a benign request, so a change cannot be \
-                     shown to keep its legitimate behavior"
-                .to_owned(),
-        };
-    };
-    let deadline = Instant::now() + options.timeout;
+    let book = options.recipes.as_deref().map(Book::new);
     let poc = match outcome {
         Outcome::Verified { poc, .. } => Some(poc),
         _ => None,
     };
-    let mut trial = Trial {
-        rejected: Vec::new(),
-        seen: Vec::new(),
-        state: ProofState::default(),
-        attempts: 0,
+    let mut search = Search {
+        trial: Trial {
+            rejected: Vec::new(),
+            seen: Vec::new(),
+            state: ProofState::default(),
+            attempts: 0,
+        },
+        offered: Vec::new(),
+        llm_attempts: 0,
+        proven_by_llm: None,
     };
-
-    for candidate in deterministic_candidates(finding, root) {
-        if Instant::now() >= deadline {
-            break;
-        }
-        if trial.seen.contains(&candidate.content) {
-            continue;
-        }
-        if let Some(proven) = trial.run(session, probe, finding, root, candidate, benign) {
-            return trial.proven(root, proven, benign);
+    let result = search.run(session, probe, finding, root, poc, options, book.as_ref());
+    if let Err(error) = session.restore_files() {
+        eprintln!("jsspector: {error}");
+    }
+    if let Some(book) = &book {
+        let file = sink_file(finding);
+        let benign_status = match &result {
+            FixOutcome::Proven { benign_status, .. } => *benign_status,
+            _ => 0,
+        };
+        if let Ok(original) = search.trial.state.original(root, file) {
+            let learned = Learned {
+                finding,
+                file,
+                original: &original,
+                proven: search.proven_by_llm.as_deref(),
+                poc: poc.map(|poc| poc.command.as_str()),
+                benign_status,
+                offered: &search.offered,
+                first_try: search.proven_by_llm.is_some() && search.llm_attempts == 1,
+            };
+            if let Err(error) = book.record(&learned) {
+                eprintln!(
+                    "jsspector: recording the fix in {}: {error}",
+                    book_dir(options)
+                );
+            }
         }
     }
+    result
+}
 
-    if options.llm && claude_available() {
-        for _ in 0..options.attempts {
-            if Instant::now() >= deadline {
-                break;
+fn book_dir(options: &FixOptions) -> String {
+    options
+        .recipes
+        .as_deref()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default()
+}
+
+/// One finding's fix search.
+struct Search {
+    trial: Trial,
+    /// The ids of the recipes shown to the LLM.
+    offered: Vec<String>,
+    /// LLM candidates requested.
+    llm_attempts: usize,
+    /// The content an LLM candidate was proven with.
+    proven_by_llm: Option<String>,
+}
+
+impl Search {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        session: &mut Session,
+        probe: &Probe,
+        finding: &Finding,
+        root: &Path,
+        poc: Option<&Reproduction>,
+        options: &FixOptions,
+        book: Option<&Book>,
+    ) -> FixOutcome {
+        if !session.can_relaunch() {
+            return FixOutcome::Unsupported {
+                reason: "the app cannot be relaunched with a change in this runtime".to_owned(),
+            };
+        }
+        let Some(benign) = session.benign_status(probe) else {
+            return FixOutcome::Unsupported {
+                reason: "the route gave no response to a benign request, so a change cannot be \
+                         shown to keep its legitimate behavior"
+                    .to_owned(),
+            };
+        };
+        let deadline = Instant::now() + options.timeout;
+        let file = sink_file(finding).to_owned();
+        let original = match self.trial.state.original(root, &file) {
+            Ok(original) => original,
+            Err(reason) => return FixOutcome::Unsupported { reason },
+        };
+
+        // The exact change proven before for this finding on this content, proved again.
+        if let Some(content) = book.and_then(|book| book.replay(finding, &file, &original)) {
+            let candidate = Candidate {
+                strategy: "replay".to_owned(),
+                file: file.clone(),
+                content,
+            };
+            if let Some(proven) = self
+                .trial
+                .run(session, probe, finding, root, candidate, benign)
+            {
+                return self.proven(root, proven, benign);
             }
-            let file = sink_file(finding).to_owned();
-            let candidate = match trial.state.original(root, &file).and_then(|original| {
-                llm_candidate(
+        }
+
+        let llm = options.llm && claude_available();
+        if llm {
+            let recipes = book.map(|book| book.lookup(finding)).unwrap_or_default();
+            self.offered = recipes.iter().map(|recipe| recipe.id.clone()).collect();
+            for _ in 0..options.attempts {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                self.llm_attempts += 1;
+                let candidate = match llm_candidate(
                     finding,
                     &file,
                     &original,
                     poc,
-                    &trial.rejected,
+                    &recipes,
+                    &self.trial.rejected,
                     options,
                     deadline,
-                )
-            }) {
-                Ok(candidate) => candidate,
-                Err(reason) => {
-                    trial.attempts += 1;
-                    trial.reject("llm", reason);
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(reason) => {
+                        self.trial.attempts += 1;
+                        self.trial.reject("llm", reason);
+                        continue;
+                    }
+                };
+                if self.trial.seen.contains(&candidate.content) {
+                    self.trial
+                        .reject("llm", "repeated an earlier rejected change".to_owned());
                     continue;
                 }
-            };
-            if trial.seen.contains(&candidate.content) {
-                trial.reject("llm", "repeated an earlier rejected change".to_owned());
-                continue;
-            }
-            if let Some(proven) = trial.run(session, probe, finding, root, candidate, benign) {
-                return trial.proven(root, proven, benign);
+                if let Some(proven) = self
+                    .trial
+                    .run(session, probe, finding, root, candidate, benign)
+                {
+                    self.proven_by_llm = Some(proven.content.clone());
+                    return self.proven(root, proven, benign);
+                }
             }
         }
-    }
-    let Trial {
-        rejected, attempts, ..
-    } = trial;
 
-    if rejected.is_empty() {
-        let llm_note = if !options.llm {
-            "the LLM fallback is disabled"
-        } else if !claude_available() {
-            "the LLM fallback needs the `claude` CLI on PATH"
-        } else {
-            "the time budget ran out before the LLM fallback ran"
-        };
-        return FixOutcome::Unsupported {
-            reason: format!(
-                "no deterministic fix strategy for {}, and {llm_note}",
-                finding.class.name()
-            ),
-        };
+        if self.trial.rejected.is_empty() {
+            let why = if !options.llm {
+                "the LLM is disabled (--no-fix-llm)"
+            } else if !llm {
+                "proposing one needs the `claude` CLI on PATH"
+            } else {
+                "the time budget ran out before the LLM ran"
+            };
+            return FixOutcome::Unsupported {
+                reason: format!(
+                    "no fix was recorded for this finding on this file content, and {why}"
+                ),
+            };
+        }
+        let reason = self
+            .trial
+            .rejected
+            .last()
+            .map(|last| format!("{}: {}", last.strategy, last.reason))
+            .unwrap_or_default();
+        FixOutcome::Unproven {
+            reason,
+            attempts: self.trial.attempts,
+            recipes: self.offered.clone(),
+            rejected: std::mem::take(&mut self.trial.rejected),
+        }
     }
-    let reason = rejected
-        .last()
-        .map(|last| format!("{}: {}", last.strategy, last.reason))
-        .unwrap_or_default();
-    FixOutcome::Unproven {
-        reason,
-        attempts,
-        rejected,
+
+    fn proven(&mut self, root: &Path, candidate: Candidate, benign: u16) -> FixOutcome {
+        let original = self
+            .trial
+            .state
+            .original(root, &candidate.file)
+            .unwrap_or_default();
+        FixOutcome::Proven {
+            diff: unified_diff(&candidate.file, &original, &candidate.content),
+            original_fingerprint: jss_core::finding::fingerprint(&original),
+            strategy: candidate.strategy,
+            file: candidate.file,
+            benign_status: benign,
+            attempts: self.trial.attempts,
+            recipes: self.offered.clone(),
+            rejected: std::mem::take(&mut self.trial.rejected),
+        }
     }
 }
 
@@ -291,24 +395,6 @@ impl Trial {
                 self.reject(&candidate.strategy, reason);
                 None
             }
-        }
-    }
-}
-
-impl Trial {
-    fn proven(mut self, root: &Path, candidate: Candidate, benign: u16) -> FixOutcome {
-        let original = self
-            .state
-            .original(root, &candidate.file)
-            .unwrap_or_default();
-        FixOutcome::Proven {
-            diff: unified_diff(&candidate.file, &original, &candidate.content),
-            original_fingerprint: jss_core::finding::fingerprint(&original),
-            strategy: candidate.strategy,
-            file: candidate.file,
-            benign_status: benign,
-            attempts: self.attempts,
-            rejected: self.rejected,
         }
     }
 }
@@ -388,458 +474,6 @@ fn keeps_sink(finding: &Finding, original: &str, changed: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Deterministic strategies.
-
-/// The deterministic candidates for `finding`, most targeted first.
-pub fn deterministic_candidates(finding: &Finding, root: &Path) -> Vec<Candidate> {
-    match finding.class {
-        VulnClass::NosqlInjection => nosql_candidates(finding, root),
-        VulnClass::PathTraversal => traversal_candidates(finding, root),
-        _ => Vec::new(),
-    }
-}
-
-/// NoSQL injection: the sink's query filter receives a request value that can be an object
-/// (`{"$ne": …}`) instead of a scalar. Coerce every filter value that comes from the request to a
-/// string, then every plain reference in the filter, then (for Mongoose) sanitize the whole filter.
-///
-/// The first strategy covers every value of the same request, not only the one the trace follows:
-/// the proof re-runs the finding's own probe, which targets a single field, so a fix limited to that
-/// field would pass while a sibling field (`password` next to `username`) stayed injectable.
-fn nosql_candidates(finding: &Finding, root: &Path) -> Vec<Candidate> {
-    let file = sink_file(finding).to_owned();
-    let Ok(source) = std::fs::read_to_string(root.join(&file)) else {
-        return Vec::new();
-    };
-    let Some(start) = offset_of(&source, finding.sink.line, finding.sink.col) else {
-        return Vec::new();
-    };
-    let arg = finding.sink.arg.trim();
-    let Some(at) = source
-        .get(start..)
-        .and_then(|rest| rest.find(arg))
-        .map(|rel| start + rel)
-    else {
-        return Vec::new();
-    };
-    let mut names = tainted_names(finding);
-    if finding.file == file {
-        for name in destructured_at_source(&source, finding) {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    let replace = |replacement: &str| {
-        let mut changed = source.clone();
-        changed.replace_range(at..at + arg.len(), replacement);
-        changed
-    };
-    let mut out = Vec::new();
-    if arg.starts_with('{') && arg.ends_with('}') {
-        if let Some(coerced) = coerce_object(arg, |value| is_tainted(value, &names)) {
-            out.push(Candidate {
-                strategy: "deterministic:nosql-string-coercion".to_owned(),
-                file: file.clone(),
-                content: replace(&coerced),
-            });
-        }
-        if let Some(coerced) = coerce_object(arg, is_plain_reference) {
-            let content = replace(&coerced);
-            if out
-                .iter()
-                .all(|earlier: &Candidate| earlier.content != content)
-            {
-                out.push(Candidate {
-                    strategy: "deterministic:nosql-string-coercion-all".to_owned(),
-                    file: file.clone(),
-                    content,
-                });
-            }
-        }
-    }
-    if let Some(mongoose) = mongoose_binding(&source, root, &file) {
-        out.push(Candidate {
-            strategy: "deterministic:mongoose-sanitize-filter".to_owned(),
-            file,
-            content: replace(&format!("{mongoose}.sanitizeFilter({arg})")),
-        });
-    }
-    out
-}
-
-/// Path traversal: a request value becomes (part of) a file path. Reduce the tainted segment to its
-/// base name where the path is joined, then where the request value enters.
-fn traversal_candidates(finding: &Finding, root: &Path) -> Vec<Candidate> {
-    let file = finding.file.clone();
-    let Ok(source) = std::fs::read_to_string(root.join(&file)) else {
-        return Vec::new();
-    };
-    let Some(path) = path_binding(&source) else {
-        return Vec::new();
-    };
-    let names = tainted_names(finding);
-    let mut out = Vec::new();
-    // The join/resolve step the trace passes through, in this file.
-    for step in &finding.trace {
-        if step.file.as_deref().is_some_and(|other| other != file)
-            || !(step.note.contains("path.join") || step.note.contains("path.resolve"))
-        {
-            continue;
-        }
-        let Some(at) = offset_of(&source, step.line, step.col) else {
-            continue;
-        };
-        let Some(open) = source
-            .get(at..)
-            .and_then(|rest| rest.find('('))
-            .map(|r| at + r)
-        else {
-            continue;
-        };
-        let Some(close) = matching_paren(&source, open) else {
-            continue;
-        };
-        let inner = &source[open + 1..close];
-        let mut changed_inner = String::new();
-        let mut changed = false;
-        let mut last = 0;
-        for (from, to) in top_level_ranges(inner, ',') {
-            let part = &inner[from..to];
-            let trimmed = part.trim();
-            changed_inner.push_str(&inner[last..from]);
-            if is_tainted(trimmed, &names) {
-                let lead = part.len() - part.trim_start().len();
-                changed_inner.push_str(&part[..lead]);
-                changed_inner.push_str(&format!("{path}.basename({trimmed})"));
-                changed_inner.push_str(&part[lead + trimmed.len()..]);
-                changed = true;
-            } else {
-                changed_inner.push_str(part);
-            }
-            last = to;
-        }
-        changed_inner.push_str(&inner[last..]);
-        if changed {
-            let mut content = source.clone();
-            content.replace_range(open + 1..close, &changed_inner);
-            out.push(Candidate {
-                strategy: "deterministic:path-basename-join".to_owned(),
-                file: file.clone(),
-                content,
-            });
-        }
-    }
-    // The request value itself, where it enters (`req.params.filename`, not the bare `req.params`).
-    if let Some(at) = offset_of(&source, finding.source.line, finding.source.col) {
-        let chain = member_chain(&source[at..]);
-        if chain.split('.').count() >= 3 && is_plain_reference(chain) {
-            let mut content = source.clone();
-            content.replace_range(at..at + chain.len(), &format!("{path}.basename({chain})"));
-            out.push(Candidate {
-                strategy: "deterministic:path-basename-source".to_owned(),
-                file,
-                content,
-            });
-        }
-    }
-    out
-}
-
-/// The variables the trace says the tainted value was assigned to (`assigned to \`username\``).
-fn tainted_names(finding: &Finding) -> Vec<String> {
-    let mut names = Vec::new();
-    for step in &finding.trace {
-        let Some(rest) = step.note.split("assigned to `").nth(1) else {
-            continue;
-        };
-        if let Some(name) = rest.split('`').next()
-            && !name.is_empty()
-            && !names.iter().any(|n| n == name)
-        {
-            names.push(name.to_owned());
-        }
-    }
-    names
-}
-
-/// The names a destructuring declaration binds from the finding's source expression on its own
-/// line (`const { username, password: pass, role = 'user' } = req.body` gives `username`, `pass`,
-/// `role`): every one of them holds request data, not only the one the trace follows.
-fn destructured_at_source(source: &str, finding: &Finding) -> Vec<String> {
-    let Some(line) = source
-        .lines()
-        .nth(finding.source.line.saturating_sub(1) as usize)
-    else {
-        return Vec::new();
-    };
-    let Some(before) = line
-        .char_indices()
-        .nth(finding.source.col.saturating_sub(1) as usize)
-        .map(|(i, _)| &line[..i])
-    else {
-        return Vec::new();
-    };
-    let pattern = before.trim_end().trim_end_matches('=').trim_end();
-    let Some(open) = pattern.rfind('{') else {
-        return Vec::new();
-    };
-    let Some(inner) = pattern
-        .get(open + 1..)
-        .and_then(|rest| rest.strip_suffix('}'))
-    else {
-        return Vec::new();
-    };
-    top_level_ranges(inner, ',')
-        .into_iter()
-        .filter_map(|(from, to)| {
-            let part = inner[from..to].trim();
-            let part = part.split('=').next().unwrap_or_default().trim();
-            let name = part.rsplit(':').next().unwrap_or_default().trim();
-            (is_plain_reference(name) && !name.contains('.')).then(|| name.to_owned())
-        })
-        .collect()
-}
-
-/// Whether `value` is a plain reference to tainted data: a traced variable, or a request member.
-fn is_tainted(value: &str, names: &[String]) -> bool {
-    if !is_plain_reference(value) {
-        return false;
-    }
-    let root = value.split(['.', '[', '?']).next().unwrap_or_default();
-    names.iter().any(|name| name == root)
-        || [
-            "req.",
-            "request.",
-            "ctx.request.",
-            "ctx.query",
-            "ctx.params",
-            "event.",
-        ]
-        .iter()
-        .any(|prefix| value.starts_with(prefix))
-}
-
-/// An identifier or a dotted member chain (`a`, `a.b`, `a?.b.c`): not a literal, call or object.
-fn is_plain_reference(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && value
-            .split('.')
-            .map(|segment| segment.trim_end_matches('?'))
-            .all(|segment| {
-                let mut chars = segment.chars();
-                chars
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-            })
-}
-
-/// The member chain at the start of `text` (`req.params.filename` out of `req.params.filename)`).
-fn member_chain(text: &str) -> &str {
-    let end = text
-        .char_indices()
-        .find(|(_, c)| {
-            !(c.is_ascii_alphanumeric() || *c == '_' || *c == '$' || *c == '.' || *c == '?')
-        })
-        .map_or(text.len(), |(i, _)| i);
-    text[..end].trim_end_matches(['.', '?'])
-}
-
-/// `{ a, b: c, ...d }` with the values `wanted` accepts wrapped in `String(…)`; `None` when nothing
-/// changes.
-fn coerce_object(object: &str, wanted: impl Fn(&str) -> bool) -> Option<String> {
-    let inner = object.get(1..object.len().checked_sub(1)?)?;
-    let mut out = String::from("{");
-    let mut changed = false;
-    let mut last = 0;
-    for (from, to) in top_level_ranges(inner, ',') {
-        out.push_str(&inner[last..from]);
-        let part = &inner[from..to];
-        let trimmed = part.trim();
-        let lead = part.len() - part.trim_start().len();
-        let replacement = if trimmed.starts_with("...") || trimmed.is_empty() {
-            None
-        } else if let Some(colon) = top_level_ranges(trimmed, ':')
-            .first()
-            .map(|(_, end)| *end)
-            .filter(|end| *end < trimmed.len())
-        {
-            let (key, value) = (trimmed[..colon].trim_end(), trimmed[colon + 1..].trim());
-            wanted(value).then(|| format!("{key}: String({value})"))
-        } else if is_plain_reference(trimmed) && !trimmed.contains('.') && wanted(trimmed) {
-            Some(format!("{trimmed}: String({trimmed})"))
-        } else {
-            None
-        };
-        match replacement {
-            Some(text) => {
-                out.push_str(&part[..lead]);
-                out.push_str(&text);
-                out.push_str(&part[lead + trimmed.len()..]);
-                changed = true;
-            }
-            None => out.push_str(part),
-        }
-        last = to;
-    }
-    out.push_str(&inner[last..]);
-    out.push('}');
-    changed.then_some(out)
-}
-
-/// The byte ranges of `text` split on `separator` outside brackets, braces, parens and strings.
-fn top_level_ranges(text: &str, separator: char) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut start = 0;
-    for (i, c) in text.char_indices() {
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' | '`' => quote = Some(c),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            _ if c == separator && depth == 0 => {
-                out.push((start, i));
-                start = i + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    out.push((start, text.len()));
-    out
-}
-
-/// The index of the `)` matching the `(` at `open`.
-fn matching_paren(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for (i, c) in text.get(open..)?.char_indices() {
-        if let Some(q) = quote {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' | '`' => quote = Some(c),
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The byte offset of 1-based `line` and `col` (counted in characters).
-fn offset_of(source: &str, line: u32, col: u32) -> Option<usize> {
-    let mut start = 0usize;
-    for (index, text) in source.split_inclusive('\n').enumerate() {
-        if index + 1 == line as usize {
-            let column = col.checked_sub(1)? as usize;
-            return text
-                .char_indices()
-                .nth(column)
-                .map(|(i, _)| start + i)
-                .or_else(|| (text.chars().count() == column).then_some(start + text.len()));
-        }
-        start += text.len();
-    }
-    None
-}
-
-/// Whether the file is CommonJS (uses `require`, no top-level `import`).
-fn is_commonjs(source: &str) -> bool {
-    source.contains("require(")
-        && !source
-            .lines()
-            .any(|line| line.trim_start().starts_with("import "))
-}
-
-/// The expression that names Node's `path` module in this file.
-fn path_binding(source: &str) -> Option<String> {
-    module_binding(source, &["path", "node:path"])
-        .or_else(|| is_commonjs(source).then(|| "require('path')".to_owned()))
-}
-
-/// The expression that names Mongoose in this file, when the project depends on it.
-fn mongoose_binding(source: &str, root: &Path, file: &str) -> Option<String> {
-    if let Some(binding) = module_binding(source, &["mongoose"]) {
-        return Some(binding);
-    }
-    (is_commonjs(source) && depends_on(root, file, "mongoose"))
-        .then(|| "require('mongoose')".to_owned())
-}
-
-/// The local name a module is bound to: `const X = require('m')` or `import X from 'm'` /
-/// `import * as X from 'm'`.
-fn module_binding(source: &str, modules: &[&str]) -> Option<String> {
-    for line in source.lines() {
-        let line = line.trim();
-        let names_module = modules
-            .iter()
-            .any(|m| line.contains(&format!("'{m}'")) || line.contains(&format!("\"{m}\"")));
-        if !names_module {
-            continue;
-        }
-        if let Some(rest) = ["const ", "let ", "var "]
-            .iter()
-            .find_map(|kw| line.strip_prefix(kw))
-            && rest.contains("require(")
-        {
-            let name = rest.split('=').next().unwrap_or_default().trim();
-            if is_plain_reference(name) && !name.contains('.') {
-                return Some(name.to_owned());
-            }
-        }
-        if let Some(rest) = line.strip_prefix("import ") {
-            let spec = rest.split(" from ").next().unwrap_or_default().trim();
-            let name = spec.strip_prefix("* as ").unwrap_or(spec).trim();
-            if is_plain_reference(name) && !name.contains('.') {
-                return Some(name.to_owned());
-            }
-        }
-    }
-    None
-}
-
-/// Whether the nearest `package.json` above `file` declares `package`.
-fn depends_on(root: &Path, file: &str, package: &str) -> bool {
-    let mut dir = root.join(file);
-    while dir.pop() {
-        if let Ok(manifest) = std::fs::read_to_string(dir.join("package.json")) {
-            return manifest.contains(&format!("\"{package}\""));
-        }
-        if dir == root {
-            break;
-        }
-    }
-    false
-}
-
-// ---------------------------------------------------------------------------------------------
 // LLM fallback.
 
 const LLM_SYSTEM: &str = "You fix one security vulnerability in one source file. The file and \
@@ -860,11 +494,13 @@ fn claude_available() -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("claude").is_file()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn llm_candidate(
     finding: &Finding,
     file: &str,
     original: &str,
     poc: Option<&Reproduction>,
+    recipes: &[Recipe],
     rejected: &[FixAttempt],
     options: &FixOptions,
     deadline: Instant,
@@ -876,7 +512,7 @@ fn llm_candidate(
     if remaining < Duration::from_secs(30) {
         return Err("the time budget ran out".to_owned());
     }
-    let prompt = llm_prompt(finding, file, original, poc, rejected);
+    let prompt = llm_prompt(finding, file, original, poc, recipes, rejected);
     let mut command = Command::new("claude");
     command.args([
         "-p",
@@ -922,6 +558,7 @@ fn llm_prompt(
     file: &str,
     original: &str,
     poc: Option<&Reproduction>,
+    recipes: &[Recipe],
     rejected: &[FixAttempt],
 ) -> String {
     let line_text = |line: u32| {
@@ -952,6 +589,31 @@ fn llm_prompt(
             poc.command, poc.evidence
         ));
     }
+    if !recipes.is_empty() {
+        prompt.push_str(
+            "\nFixes already proven for this kind of vulnerability elsewhere (adapt the idea to \
+             this file; do not copy names that are not in it):\n",
+        );
+        for (index, recipe) in recipes.iter().enumerate() {
+            let at = if recipe.sink.is_empty() {
+                String::new()
+            } else {
+                format!(" at `{}`", recipe.sink)
+            };
+            prompt.push_str(&format!("{}.{at}", index + 1));
+            if recipe.proven > 0 {
+                prompt.push_str(&format!(" (proven {} time(s))", recipe.proven));
+            }
+            if let Some(note) = &recipe.note {
+                prompt.push_str(&format!(" {note}"));
+            }
+            prompt.push_str(&format!(
+                "\n   before:\n{}\n   after:\n{}\n",
+                indent(&recipe.before),
+                indent(&recipe.after)
+            ));
+        }
+    }
     if !rejected.is_empty() {
         prompt.push_str("\nRejected earlier changes (do not repeat them):\n");
         for attempt in rejected {
@@ -964,6 +626,14 @@ fn llm_prompt(
          Current content of {file}:\n<<<JSSPECTOR_FILE\n{original}\nJSSPECTOR_FILE>>>\n"
     ));
     prompt
+}
+
+/// `text` indented for the prompt.
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("     {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The file between the reply's markers.
@@ -1025,7 +695,7 @@ fn run_with_timeout(
 // Unified diff.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Op {
+pub(super) enum Op {
     Same,
     Removed,
     Added,
@@ -1041,7 +711,7 @@ fn changed_lines(old: &str, new: &str) -> usize {
 
 /// Line operations turning `old` into `new`: the common prefix and suffix kept as is, the middle by
 /// longest common subsequence (or replaced wholesale when it is too large to align cheaply).
-fn line_ops<'a>(old: &'a str, new: &'a str) -> Vec<(Op, &'a str)> {
+pub(super) fn line_ops<'a>(old: &'a str, new: &'a str) -> Vec<(Op, &'a str)> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
     let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
@@ -1177,7 +847,7 @@ pub fn unified_diff(file: &str, old: &str, new: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jss_core::{Auth, Severity, SinkLoc, SourceLoc, TraceStep};
+    use jss_core::{Auth, Severity, SinkLoc, SourceLoc, TraceStep, VulnClass};
 
     fn finding(
         class: VulnClass,
@@ -1221,121 +891,6 @@ mod tests {
             key: "k".to_owned(),
             fingerprint: "f".to_owned(),
         }
-    }
-
-    const AUTH: &str = r#"const { User } = require("../db");
-router.post('/login', async (req, res) => {
-    const { username, password } = req.body;
-    const user = await User.findOne({ username, password });
-    res.json(user);
-});
-"#;
-
-    #[test]
-    fn nosql_coerces_every_value_of_the_request_not_only_the_traced_one() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("routes")).unwrap();
-        std::fs::write(dir.path().join("routes/auth.js"), AUTH).unwrap();
-        std::fs::write(
-            dir.path().join("package.json"),
-            r#"{"dependencies":{"mongoose":"^7.4.1"}}"#,
-        )
-        .unwrap();
-        let f = finding(
-            VulnClass::NosqlInjection,
-            "routes/auth.js",
-            ("User.findOne", "{ username, password }", 4, 24),
-            ("req.body", 3, 36),
-            &[(3, 13, "assigned to `username`")],
-        );
-        let candidates = nosql_candidates(&f, dir.path());
-        let lines: Vec<&str> = candidates
-            .iter()
-            .map(|c| c.content.lines().nth(3).unwrap().trim())
-            .collect();
-        // The trace follows only `username`, but `password` comes from the same request body and
-        // reaches the same query: coercing just the traced field would leave it injectable.
-        assert_eq!(
-            lines,
-            [
-                "const user = await User.findOne({ username: String(username), password: String(password) });",
-                "const user = await User.findOne(require('mongoose').sanitizeFilter({ username, password }));",
-            ]
-        );
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|c| c.strategy.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "deterministic:nosql-string-coercion",
-                "deterministic:mongoose-sanitize-filter",
-            ]
-        );
-    }
-
-    #[test]
-    fn a_destructuring_source_binds_every_request_field() {
-        let f = finding(
-            VulnClass::NosqlInjection,
-            "a.js",
-            ("User.findOne", "{ u }", 2, 1),
-            ("req.body", 1, 46),
-            &[],
-        );
-        let source = "const { u, password: pass, role = 'user' } = req.body;\n";
-        assert_eq!(destructured_at_source(source, &f), ["u", "pass", "role"]);
-    }
-
-    #[test]
-    fn traversal_reduces_the_tainted_join_argument_to_its_base_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let server = r#"const path = require('path');
-app.get('/file/:filename', (req, res) => {
-  const filepath = path.join(__dirname, './files/', req.params.filename);
-  fs.readFile(filepath, 'utf8', () => {});
-});
-"#;
-        std::fs::write(dir.path().join("server.js"), server).unwrap();
-        let f = finding(
-            VulnClass::PathTraversal,
-            "server.js",
-            ("fs.readFile", "filepath", 4, 3),
-            ("req.params", 3, 53),
-            &[
-                (3, 20, "through path.join()"),
-                (3, 9, "assigned to `filepath`"),
-            ],
-        );
-        let candidates = traversal_candidates(&f, dir.path());
-        assert_eq!(
-            candidates[0].content.lines().nth(2).unwrap().trim(),
-            "const filepath = path.join(__dirname, './files/', path.basename(req.params.filename));"
-        );
-        assert_eq!(candidates[0].strategy, "deterministic:path-basename-join");
-        // The source-side variant lands on the same change here.
-        assert_eq!(candidates[1].content, candidates[0].content);
-    }
-
-    #[test]
-    fn coercion_skips_literals_spreads_and_calls() {
-        assert_eq!(
-            coerce_object(
-                "{ a, b: 1, ...c, d: f(x), e: req.body.e }",
-                is_plain_reference
-            )
-            .as_deref(),
-            Some("{ a: String(a), b: 1, ...c, d: f(x), e: String(req.body.e) }")
-        );
-        assert_eq!(coerce_object("{ b: 'x' }", is_plain_reference), None);
-    }
-
-    #[test]
-    fn offsets_follow_one_based_character_columns() {
-        let text = "ab\n  cd\n";
-        assert_eq!(offset_of(text, 1, 1), Some(0));
-        assert_eq!(offset_of(text, 2, 3), Some(5));
-        assert_eq!(offset_of(text, 3, 1), None);
     }
 
     #[test]

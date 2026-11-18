@@ -100,16 +100,16 @@ still gets the HTTP status it got before the change — so a change that merely 
 never passes. The scanned checkout is never modified; the report carries the change as a unified
 diff, with the original file's fingerprint so the diff can be re-applied and re-proved later.
 
-Candidates come first from deterministic strategies (NoSQL injection: coerce every request value in
-the query filter to a string, then Mongoose `sanitizeFilter`; path traversal: reduce the request
-segment to its base name), then from an LLM through the `claude` CLI, which is told why each earlier
-candidate failed. The outcome is `proven` (with the diff and its strategy), `unproven` (every
-candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be
-tried here, such as a browser-driven finding).
+JSSpector applies no fix pattern by itself. Candidates come from an LLM through the `claude` CLI, which is told why each earlier candidate failed and shown the fix recipes already proven for the finding's class. The outcome is `proven` (with the diff and its strategy), `unproven` (every candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be tried here, such as a browser-driven finding, or no LLM and no recorded fix).
+
+Every proven fix is kept in a recipe store (`--fix-recipes DIR`, by default `jsspector/fix-recipes` in the user's cache directory):
+
+- as a **recipe**: its class, the sink's callee, what the change introduced and a short before/after. Recipes of the same class, the same sink first, are shown to the LLM so later fixes of that pattern tend to pass on the first candidate. Each recipe counts the times it was shown and the times the first candidate was then proven. A few recipes ship with JSSpector as a starting point.
+- as an **example**: the finding's and the file's fingerprints, the exact change, the request that reproduced the exploit and the status a benign request kept. When the same finding shows up again on the same file content, the change is replayed and proved again, with no LLM. This is how a rescan of the same commit reproduces both the exploit and its fix deterministically.
 
 ```sh
 jsspector scan . --verify                  # verify, then prove a fix for each verified finding
-jsspector scan . --verify --no-fix-llm     # deterministic strategies only
+jsspector scan . --verify --no-fix-llm     # replay recorded fixes only, no LLM
 jsspector scan . --verify --no-fix         # verification only
 ```
 

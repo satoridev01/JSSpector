@@ -16575,6 +16575,7 @@ http.createServer((req, res) => {
     fn a_fix_is_proven_only_when_it_closes_the_exploit_and_keeps_the_route() {
         use super::super::fix::{self, Candidate, FixOptions, FixOutcome};
         use super::super::plan::{Entry, Method, Probe};
+        use super::super::recipes::{Book, Learned};
         use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, TraceStep, VulnClass};
 
         if !available() {
@@ -16671,8 +16672,28 @@ http.createServer((req, res) => {
             matches!(outcome, Outcome::Verified { .. }),
             "the unconfined read should verify first, got {outcome:?}"
         );
+        // A fix proven earlier for this finding on this file content, recorded in the store: it is
+        // replayed and proved again, with no LLM.
+        let store = tempfile::tempdir().unwrap();
+        let confined = FIX_FIXTURE.replace(
+            "path.join(FILES, name)",
+            "path.join(FILES, path.basename(name))",
+        );
+        Book::new(store.path())
+            .record(&Learned {
+                finding: &finding,
+                file: "server.js",
+                original: FIX_FIXTURE,
+                proven: Some(&confined),
+                poc: None,
+                benign_status: 200,
+                offered: &[],
+                first_try: false,
+            })
+            .unwrap();
         let options = FixOptions {
             llm: false,
+            recipes: Some(store.path().to_path_buf()),
             ..FixOptions::default()
         };
         let proven = fix::prove(
@@ -16691,9 +16712,9 @@ http.createServer((req, res) => {
         } = &proven
         else {
             session.teardown();
-            panic!("the base-name fix should be proven, got {proven:?}");
+            panic!("the recorded base-name fix should be proven, got {proven:?}");
         };
-        assert_eq!(strategy, "deterministic:path-basename-join");
+        assert_eq!(strategy, "replay");
         assert_eq!(*benign_status, 200);
         assert!(
             diff.contains("+    const filepath = path.join(FILES, path.basename(name));"),

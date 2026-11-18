@@ -1,0 +1,29 @@
+[
+  {
+    "id": "seed-nosql-string-coercion",
+    "class": "nosql-injection",
+    "sink": "",
+    "introduces": ["String"],
+    "note": "Coerce every request value used in the query filter to a string, every field and not only the one the exploit used, so an object such as {\"$ne\": null} cannot become an operator.",
+    "before": "const { username, password } = req.body;\nconst user = await User.findOne({ username, password });",
+    "after": "const { username, password } = req.body;\nconst user = await User.findOne({ username: String(username), password: String(password) });"
+  },
+  {
+    "id": "seed-nosql-mongoose-sanitize-filter",
+    "class": "nosql-injection",
+    "sink": "",
+    "introduces": ["sanitizeFilter"],
+    "note": "With Mongoose, wrap the whole filter in mongoose.sanitizeFilter, which neutralizes operator keys coming from the request.",
+    "before": "const docs = await Item.find(req.query);",
+    "after": "const docs = await Item.find(mongoose.sanitizeFilter(req.query));"
+  },
+  {
+    "id": "seed-path-basename",
+    "class": "path-traversal",
+    "sink": "",
+    "introduces": ["basename"],
+    "note": "Reduce the request-controlled segment to its base name before joining it to the base directory, so ../ sequences cannot leave it.",
+    "before": "const filepath = path.join(FILES, req.params.filename);",
+    "after": "const filepath = path.join(FILES, path.basename(req.params.filename));"
+  }
+]

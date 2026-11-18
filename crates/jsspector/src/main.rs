@@ -199,9 +199,15 @@ struct ScanArgs {
     /// request to the route keeps its behavior.
     #[arg(long, requires = "verify")]
     no_fix: bool,
-    /// Do not fall back to an LLM (the `claude` CLI) when no deterministic fix is proven.
+    /// Do not ask an LLM (the `claude` CLI) for fix candidates: only replay fixes recorded for the
+    /// same finding on the same file content.
     #[arg(long, requires = "verify")]
     no_fix_llm: bool,
+    /// The fix recipe store: proven fixes kept as recipes shown to the LLM and as examples replayed
+    /// on the same finding and file content [default: jsspector/fix-recipes in the user's cache
+    /// directory].
+    #[arg(long, value_name = "DIR", requires = "verify")]
+    fix_recipes: Option<PathBuf>,
     /// LLM fix candidates per verified finding [default: 3].
     #[arg(long, value_name = "N", requires = "verify")]
     fix_attempts: Option<usize>,
@@ -1211,6 +1217,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 timeout: args
                     .fix_timeout
                     .map_or(defaults.timeout, std::time::Duration::from_secs),
+                recipes: args.fix_recipes.clone().or_else(default_fix_recipes),
             };
             match verify::run(&analysis.root, &selected, missing, &fix_options) {
                 Ok(verdicts) => verdicts,
@@ -1598,6 +1605,15 @@ fn parse(args: &ParseArgs) -> ExitCode {
 }
 
 /// Prints `jsspector: <message>` to stderr and returns `code`.
+/// `jsspector/fix-recipes` in the user's cache directory (`$XDG_CACHE_HOME`, else `~/.cache`).
+fn default_fix_recipes() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .map(|cache| cache.join("jsspector").join("fix-recipes"))
+}
+
 fn fail(code: u8, message: impl Display) -> ExitCode {
     let _ = writeln!(io::stderr(), "jsspector: {message}");
     ExitCode::from(code)

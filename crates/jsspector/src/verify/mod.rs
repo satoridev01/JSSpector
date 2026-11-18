@@ -835,9 +835,15 @@ fn push_unique(into: &mut Vec<String>, items: Vec<String>) {
     }
 }
 
-/// The index into `http` of the app session that serves `finding`'s route, launching it on first use
-/// and reusing it afterwards. Shared by the HTTP and reflected-XSS dispatch, which both run the live
-/// application; the latter additionally drives a browser against its response.
+/// The index into `http` of the app session that serves `finding`'s route, freshly launched for
+/// this finding alone. A second finding on the same app (same `session_key`) gets a brand new
+/// session, not the live one its predecessor already drove: one finding's write, its planted
+/// NoSQL differential record, or any other exploitation side effect must never leak into the
+/// next finding's own verdict. The teardown-and-relaunch cost is paid once per finding, matching
+/// the isolation the local runtime already keeps when switching between different apps (see
+/// below); here it additionally covers two findings that share the very same app. Shared by the
+/// HTTP and reflected-XSS dispatch, which both run the live application; the latter additionally
+/// drives a browser against its response.
 fn acquire_http_session(
     http: &mut Vec<(std::path::PathBuf, Result<sandbox::Session, String>)>,
     root: &std::path::Path,
@@ -850,7 +856,17 @@ fn acquire_http_session(
     let declared = std::path::Path::new(declared);
     let app = sandbox::app_dir(root, declared);
     let key = sandbox::session_key(root, &app, declared);
-    if let Some(index) = http.iter().position(|(existing, _)| *existing == key) {
+    if let Some(index) = http.iter().position(|(existing, _)| *existing == key)
+        && let Some(slot) = http.get_mut(index)
+    {
+        if let Ok(session) = &mut slot.1 {
+            session.teardown();
+        }
+        let gating = gating_env_sources(root, finding);
+        *slot = (
+            key,
+            sandbox::Session::start_in(root, &app, Some(declared), &gating),
+        );
         return index;
     }
     // Local verification plants process-global fixtures such as the `/tmp/jss-canary-read` fixtures

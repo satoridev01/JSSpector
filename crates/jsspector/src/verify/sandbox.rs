@@ -286,8 +286,10 @@ fn verifier_node_env() -> String {
         .unwrap_or_else(|| "development".to_owned())
 }
 
-/// A built image, a private network, a marker service and a running app — one per `scan --verify`
-/// run, reused across findings. [`Self::teardown`] removes all of it; [`Drop`] is a backstop.
+/// A built image, a private network, a marker service and a running app — launched fresh for one
+/// finding's own attempts, never shared with another finding's (see `acquire_http_session`, which
+/// tears down and relaunches rather than reusing a live session across findings, even on the same
+/// app). [`Self::teardown`] removes all of it; [`Drop`] is a backstop.
 pub struct Session {
     runtime: Runtime,
     tag: String,
@@ -1516,31 +1518,43 @@ impl Session {
         // instead of throwing on an unavailable module. Adding it for an app that does not use the
         // module changes nothing. The missing-module stub is added only on the launch attempt that
         // needs it.
+        // An app that hard-codes its backing service on `localhost`/`127.0.0.1` (a connection string
+        // written inline, not read from the injected env) cannot reach the sidecar, which lives on the
+        // private network under a service alias. The launch shim then runs a loopback->sidecar TCP
+        // forwarder inside the app container so that hard-coded loopback connection reaches the very
+        // same MongoDB/Redis/SQL instance the env-configured apps use. Empty (and inert) when no
+        // backing service is running.
+        let loopback_forward = self.loopback_forward_spec();
         let mut node_options: Vec<String> = Vec::new();
         if self.node_sqlite {
             node_options.push("--experimental-sqlite".to_owned());
         }
-        if stub_missing_modules || mongodb_callback_promises {
+        let load_launch_shim =
+            stub_missing_modules || mongodb_callback_promises || !loopback_forward.is_empty();
+        if load_launch_shim {
             node_options.push("--require=/jss-launch-shim.js".to_owned());
         }
         if self.electron_main {
             node_options.push("--require=/jss-electron-shim.js".to_owned());
         }
-        if stub_missing_modules {
-            // Modules the entry file `require`s inside a `try`/`catch` are ones it tolerates the
-            // absence of: let the shim re-throw their `MODULE_NOT_FOUND` so the app's own fallback
-            // runs, instead of handing back an inert stub whose truthy value crashes that fallback.
-            if !self.guarded_modules.is_empty() {
-                args.push("-e".to_owned());
-                args.push(format!(
-                    "JSS_GUARDED_MODULES={}",
-                    self.guarded_modules.join(",")
-                ));
-            }
+        // Modules the entry file `require`s inside a `try`/`catch` are ones it tolerates the absence
+        // of: whenever the shim is active, let it re-throw their `MODULE_NOT_FOUND` so the app's own
+        // fallback runs, instead of handing back an inert stub whose truthy value crashes that
+        // fallback.
+        if load_launch_shim && !self.guarded_modules.is_empty() {
+            args.push("-e".to_owned());
+            args.push(format!(
+                "JSS_GUARDED_MODULES={}",
+                self.guarded_modules.join(",")
+            ));
         }
         if mongodb_callback_promises {
             args.push("-e".to_owned());
             args.push("JSS_MONGODB_CALLBACK_PROMISES=1".to_owned());
+        }
+        if !loopback_forward.is_empty() {
+            args.push("-e".to_owned());
+            args.push(format!("JSS_LOOPBACK_FORWARD={loopback_forward}"));
         }
         if !node_options.is_empty() {
             args.push("-e".to_owned());
@@ -1619,6 +1633,32 @@ impl Session {
         }
         script.push_str(&format!("exec {exec}"));
         Some(script)
+    }
+
+    /// The `localport:sidecarhost:sidecarport` forwarding routes the launch shim installs on the app
+    /// container's loopback, one per running backing service, so an application that hard-codes its
+    /// database/cache on `localhost`/`127.0.0.1` still reaches the real sidecar (which only answers
+    /// on the private network, under a service alias). The host of each route is the sidecar's own
+    /// canonical network alias — the same name the injected connection env points at — so no traffic
+    /// leaves the disposable sandbox and nothing about the query is fabricated: the app talks to the
+    /// actual MongoDB/Redis/SQL server. Empty when no backing service runs (the shim then forwards
+    /// nothing); an app that already connects by the alias is unaffected, since the forwarder only
+    /// occupies the otherwise-unused loopback service ports.
+    fn loopback_forward_spec(&self) -> String {
+        let mut routes: Vec<String> = Vec::new();
+        if self.db.is_some() {
+            routes.push(format!("27017:{}:27017", DB_ALIASES[0]));
+        }
+        if self.redis.is_some() {
+            routes.push(format!("6379:{}:6379", REDIS_ALIASES[0]));
+        }
+        for (_, sidecar) in &self.sql {
+            if let Some(alias) = sidecar.aliases.first() {
+                let port = sidecar.port();
+                routes.push(format!("{port}:{alias}:{port}"));
+            }
+        }
+        routes.join(",")
     }
 
     fn start_db(&self) -> Result<(), String> {
@@ -2094,6 +2134,14 @@ impl Session {
     /// could not provide (see [`qualify_reduced_environment`]).
     pub fn qualify(&self, outcome: Outcome) -> Outcome {
         qualify_reduced_environment(outcome, &self.unavailable_services)
+    }
+
+    /// This session's private network name, unique per launch (see [`run_id`]). Test-only: proves
+    /// a session was actually relaunched rather than reused, without depending on any other
+    /// observable side effect.
+    #[cfg(test)]
+    pub(crate) fn network_name(&self) -> &str {
+        &self.network
     }
 
     pub fn exercise(&mut self, probe: &Probe) -> Outcome {
@@ -9237,6 +9285,42 @@ const LAUNCH_SHIM_JS: &str = r#"
 const Module = require('module');
 const origLoad = Module._load;
 
+// A loopback->sidecar TCP forwarder for an app that hard-codes its backing service on
+// `localhost`/`127.0.0.1` (a connection string written inline, not read from the injected env). The
+// sidecar answers only on the private network under a service alias, so the hard-coded loopback
+// connection would never reach it. For each `localport:host:remoteport` route, listen on both
+// loopback families and pipe bytes verbatim to the real sidecar; the app then talks to the actual
+// database/cache. Protocol-agnostic raw piping fabricates nothing about the query. Each listener is
+// unref'd so it never keeps the process alive, and a bind that collides with a family the app itself
+// uses is ignored.
+if (process.env.JSS_LOOPBACK_FORWARD) {
+  try {
+    const net = require('net');
+    process.env.JSS_LOOPBACK_FORWARD.split(',')
+      .map(function (s) { return s.trim(); })
+      .filter(Boolean)
+      .forEach(function (spec) {
+        const parts = spec.split(':');
+        const lport = parseInt(parts[0], 10);
+        const host = parts[1];
+        const rport = parseInt(parts[2], 10);
+        if (!lport || !host || !rport) return;
+        ['127.0.0.1', '::1'].forEach(function (bind) {
+          const server = net.createServer(function (client) {
+            client.on('error', function () {});
+            const upstream = net.connect(rport, host);
+            upstream.on('error', function () { client.destroy(); });
+            client.pipe(upstream);
+            upstream.pipe(client);
+          });
+          server.on('error', function () {});
+          server.unref();
+          try { server.listen(lport, bind); } catch (e) {}
+        });
+      });
+  } catch (e) {}
+}
+
 if (process.env.JSS_MONGODB_CALLBACK_PROMISES === '1') {
   try {
     const mongodb = require('mongodb');
@@ -12241,6 +12325,81 @@ mod tests {
             );
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
         }
+    }
+
+    #[test]
+    fn launch_shim_forwards_a_loopback_service_port_to_the_sidecar() {
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        use std::io::{Read, Write};
+        // Stand-in sidecar: a plain TCP echo server. The shim is told to forward a loopback port to
+        // it, exactly as a hard-coded `mongodb://localhost:27017` is bridged to the `mongo` sidecar
+        // that answers only on the private network.
+        let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = upstream.accept() {
+                let mut buf = [0u8; 4];
+                if socket.read_exact(&mut buf).is_ok() {
+                    let _ = socket.write_all(b"pong");
+                }
+            }
+        });
+        let local_port = available_local_port().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Production stages the ESM hook at `/jss-esm-hook.mjs`; registering it keeps a long-running
+        // server's loop alive, which is fine there but would stop this short-lived probe from
+        // exiting. This exercise only targets the loopback forwarder, so skip that unrelated hook.
+        write(
+            dir.path(),
+            "disable-register.js",
+            "require('module').register = undefined;",
+        );
+        write(dir.path(), "launch-shim.js", LAUNCH_SHIM_JS);
+        // The "app": connects to the loopback service port the shim listens on, sends a probe and
+        // prints the echoed reply. It never knows the sidecar's real address.
+        write(
+            dir.path(),
+            "app.js",
+            &format!(
+                "const net = require('net');\n\
+                 let tries = 0;\n\
+                 (function go() {{\n\
+                   const s = net.connect({local_port}, '127.0.0.1');\n\
+                   s.on('connect', () => s.write('ping'));\n\
+                   s.on('data', (d) => {{ process.stdout.write(d.toString()); s.end(); }});\n\
+                   s.on('error', () => {{ if (tries++ < 50) setTimeout(go, 20); }});\n\
+                 }})();\n"
+            ),
+        );
+        let output = Command::new("node")
+            .arg("app.js")
+            .current_dir(dir.path())
+            .env(
+                "JSS_LOOPBACK_FORWARD",
+                format!("{local_port}:127.0.0.1:{upstream_port}"),
+            )
+            .env(
+                "NODE_OPTIONS",
+                format!(
+                    "--require={} --require={}",
+                    dir.path().join("disable-register.js").display(),
+                    dir.path().join("launch-shim.js").display()
+                ),
+            )
+            .output()
+            .unwrap();
+        // Wake the upstream thread whether or not the forward delivered a connection, so a future
+        // regression fails on the assertion below instead of blocking forever on `accept`.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", upstream_port));
+        server.join().ok();
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "pong");
     }
 
     #[test]
@@ -15749,6 +15908,92 @@ socket.on('error', (e) => { console.error('database unreachable: ' + e.message);
                 docker(&["inspect", &container]).is_err(),
                 "teardown must remove the database sidecar {container}"
             );
+        }
+    }
+
+    #[test]
+    fn acquire_http_session_relaunches_rather_than_reuses_a_session_two_findings_share() {
+        // Two findings on the very same app must never share a live session: one's exploitation
+        // attempts (a write, a planted record) could otherwise leak into the other's own verdict.
+        // The fix is in `acquire_http_session` itself; this proves the session is torn down and
+        // relaunched for the second finding, not handed back in place.
+        if !available() {
+            eprintln!("acquire_http_session relaunch: skipped (no Docker daemon reachable)");
+            return;
+        }
+        use jss_core::{Auth, Finding, SinkLoc, SourceLoc, VulnClass};
+
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"relaunch-fixture","version":"1.0.0","scripts":{"start":"node server.js"}}"#,
+        );
+        write(
+            dir.path(),
+            "server.js",
+            "require('http').createServer((req,res)=>res.end('ok'))\
+             .listen(process.env.PORT||3000,'0.0.0.0');\n",
+        );
+
+        let finding = |entry: &str| Finding {
+            file: "server.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "fs.readFile".to_owned(),
+                arg: "p".to_owned(),
+                line: 1,
+                col: 1,
+            },
+            class: VulnClass::PathTraversal,
+            severity: jss_core::Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "GET /x".to_owned(),
+            entry: Some(entry.to_owned()),
+            entry_at: None,
+            source: SourceLoc {
+                kind: "http",
+                expr: "req.query.name".to_owned(),
+                line: 1,
+                col: 1,
+            },
+            stored_by: None,
+            trace: Vec::new(),
+            key: entry.to_owned(),
+            fingerprint: entry.to_owned(),
+        };
+        let one = finding("GET /a");
+        let two = finding("GET /b");
+
+        let mut http: Vec<(std::path::PathBuf, Result<Session, String>)> = Vec::new();
+        let first_index = super::super::acquire_http_session(&mut http, dir.path(), &one);
+        let first_network = http[first_index]
+            .1
+            .as_ref()
+            .expect("the first finding's session should launch")
+            .network_name()
+            .to_owned();
+
+        let second_index = super::super::acquire_http_session(&mut http, dir.path(), &two);
+        assert_eq!(
+            first_index, second_index,
+            "the same app must still key to the same session slot"
+        );
+        let second_network = http[second_index]
+            .1
+            .as_ref()
+            .expect("the second finding's relaunch should succeed")
+            .network_name();
+        assert_ne!(
+            first_network, second_network,
+            "the second finding must get a freshly relaunched session, not the first one's"
+        );
+
+        for (_, session) in &mut http {
+            if let Ok(session) = session {
+                session.teardown();
+            }
         }
     }
 

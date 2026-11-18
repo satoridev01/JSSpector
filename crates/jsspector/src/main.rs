@@ -55,8 +55,9 @@ enum Command {
     /// Scan a file or directory for attacker-controlled data reaching dangerous sinks.
     ///
     /// Every finding is a candidate for triage, with its path from source to sink. Settings come
-    /// from `.jsspector.yml` in the scanned directory (command-line options win). Output is
-    /// deterministic: the same tree gives the same report for any number of threads.
+    /// from `--config FILE`, or with `--repo-config` from `.jsspector.yml` in the scanned directory
+    /// (command-line options win). Output is deterministic: the same tree gives the same report for
+    /// any number of threads.
     Scan(Box<ScanArgs>),
     /// List every entry point: HTTP routes with full paths (mount prefixes followed across files),
     /// socket events, IPC channels, GraphQL fields, tRPC procedures and queue processors.
@@ -99,11 +100,15 @@ struct RoutesArgs {
 /// Where settings come from.
 #[derive(Args)]
 struct ConfigArgs {
-    /// Read settings from FILE instead of `.jsspector.yml` in the scanned directory.
-    #[arg(long, value_name = "FILE")]
+    /// Read settings from FILE.
+    #[arg(long, value_name = "FILE", conflicts_with = "repo_config")]
     config: Option<PathBuf>,
-    /// Ignore `.jsspector.yml`.
-    #[arg(long, conflicts_with = "config")]
+    /// Read settings from `.jsspector.yml` in the scanned directory. Off by default: a scanned
+    /// repository's own settings could exclude or disable exactly what would report it.
+    #[arg(long)]
+    repo_config: bool,
+    /// Accepted for compatibility: the scanned directory's `.jsspector.yml` is ignored by default.
+    #[arg(long, hide = true, conflicts_with_all = ["config", "repo_config"])]
     no_config: bool,
 }
 
@@ -154,7 +159,7 @@ struct ScanArgs {
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
     /// Report only findings at or above this severity: critical, high, medium or low
-    /// [default: high].
+    /// [default: low].
     #[arg(long, value_name = "SEVERITY", value_parser = rules::parse_severity)]
     min_severity: Option<Severity>,
     /// Report format [default: text].
@@ -556,7 +561,7 @@ fn main() -> ExitCode {
 
 /// Reads the settings for scanning `path` and installs their packs (before any analysis).
 fn setup(path: &Path, args: &ConfigArgs) -> Result<config::Loaded, ExitCode> {
-    let loaded = config::Loaded::load(path, args.config.as_deref(), args.no_config)
+    let loaded = config::Loaded::load(path, args.config.as_deref(), !args.repo_config)
         .map_err(|err| fail(EXIT_USAGE, err))?;
     let packs = loaded.packs().map_err(|err| fail(EXIT_USAGE, err))?;
     if !packs.is_empty() {
@@ -1097,7 +1102,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
         let min_severity = args
             .min_severity
             .or(loaded.min_severity()?)
-            .unwrap_or(Severity::High);
+            .unwrap_or(Severity::Low);
         let fail_on = args.fail_on.or(loaded.fail_on()?);
         let disabled = loaded.disabled()?;
         let mut patterns = loaded.config.exclude.clone();

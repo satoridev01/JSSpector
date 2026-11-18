@@ -2447,7 +2447,7 @@ fn routers_in_fields_and_included_classes_are_inventoried() {
     }
     assert!(!routes.iter().any(|r| r == "GET /from-test"), "{routes:?}");
     write(root, ".jsspector.yml", "include: [tests]\n");
-    let routes = listed(&["routes", "--json", root.to_str().unwrap()]);
+    let routes = listed(&["routes", "--json", "--repo-config", root.to_str().unwrap()]);
     assert!(routes.iter().any(|r| r == "GET /from-test"), "{routes:?}");
 }
 

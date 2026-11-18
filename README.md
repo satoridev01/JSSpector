@@ -33,21 +33,23 @@ Each finding shows the sink, then every step from the source to it, across files
 
 | Option | Meaning |
 |---|---|
-| `--min-severity critical\|high\|medium\|low` | Lowest severity reported (default `high`) |
+| `--min-severity critical\|high\|medium\|low` | Lowest severity reported (default `low`: everything) |
 | `-f, --format text\|json\|sarif` | Readable list (default), the full JSON report, or SARIF 2.1.0 |
 | `-o, --output FILE` | Write the report to a file |
 | `--fail-on SEVERITY` | Exit with code 1 when a reported finding not in the baseline is at or above this |
 | `--baseline FILE` / `--write-baseline FILE` | Report only findings not in FILE / record the current findings in FILE |
 | `--exclude GLOB` | Skip paths (like `.gitignore`; repeatable) |
 | `--include tests,examples,docs,generated,vendor\|all` | Also scan these file classes (source files always are) |
-| `--config FILE` / `--no-config` | Settings file instead of `./.jsspector.yml` / ignore it |
+| `--config FILE` / `--repo-config` | Read settings from FILE / from `.jsspector.yml` in the scanned directory (neither by default) |
 | `--threads N` | Worker threads (default: all cores) |
 
 The output is byte-identical for any thread count. A file that cannot be parsed is reported as skipped, never a crash. Exit codes: 0 = no finding at `--fail-on` (or no `--fail-on`), 1 = findings at or above it, 2 = usage or configuration error, 3 = engine or I/O error.
 
 ### Configuration
 
-`.jsspector.yml` in the scanned directory (command-line options win):
+Settings are read only when asked for: from `--config FILE`, or with `--repo-config` from
+`.jsspector.yml` in the scanned directory. A scanned repository's own file is ignored by default, so
+it cannot exclude or disable what would report it. Command-line options win:
 
 ```yaml
 min_severity: high

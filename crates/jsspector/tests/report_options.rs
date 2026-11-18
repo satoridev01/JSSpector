@@ -331,7 +331,7 @@ fn the_config_file_sets_defaults_and_conventions() {
         "min_severity: high\nfail_on: critical\nexclude: [scripts/]\ndisable: [sql-injection]\n\
          packs: [sec/report.yaml]\nauth:\n  require: [gatekeeper]\n",
     );
-    let output = jsspector(&["scan", ".", "--format", "json"], root);
+    let output = jsspector(&["scan", ".", "--format", "json", "--repo-config"], root);
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -353,16 +353,25 @@ fn the_config_file_sets_defaults_and_conventions() {
     assert_eq!(gated["auth"], "user");
 
     // The routes honor the excludes and the auth conventions too.
-    let routes = json(&jsspector(&["routes", ".", "--json"], root));
+    let routes = json(&jsspector(
+        &["routes", ".", "--json", "--repo-config"],
+        root,
+    ));
     let routes = routes.as_array().unwrap();
     assert!(routes.iter().all(|r| r["path"] != "/x"));
     let gated = routes.iter().find(|r| r["path"] == "/gated").unwrap();
     assert_eq!(gated["auth"], "user");
 
-    // The command line wins; --no-config ignores the file.
-    let all = jsspector(&["scan", ".", "--format", "json", "--no-config"], root);
-    assert_eq!(all.status.code(), Some(0));
-    assert_eq!(json(&all)["findings"].as_array().unwrap().len(), 3);
+    // Without --repo-config the scanned directory's file is ignored (a scanned repository must not
+    // be able to switch off what would report it); --no-config is still accepted and does the same.
+    for args in [
+        &["scan", ".", "--format", "json"][..],
+        &["scan", ".", "--format", "json", "--no-config"],
+    ] {
+        let all = jsspector(args, root);
+        assert_eq!(all.status.code(), Some(0));
+        assert_eq!(json(&all)["findings"].as_array().unwrap().len(), 3);
+    }
 
     // Mistakes in the file are usage errors.
     write(
@@ -370,11 +379,26 @@ fn the_config_file_sets_defaults_and_conventions() {
         ".jsspector.yml",
         "min_severity: high\nexclude_paths: [x]\n",
     );
-    assert_eq!(jsspector(&["scan", "."], root).status.code(), Some(2));
+    assert_eq!(
+        jsspector(&["scan", ".", "--repo-config"], root)
+            .status
+            .code(),
+        Some(2)
+    );
     write(root, ".jsspector.yml", "disable: [lint]\n");
-    assert_eq!(jsspector(&["scan", "."], root).status.code(), Some(2));
+    assert_eq!(
+        jsspector(&["scan", ".", "--repo-config"], root)
+            .status
+            .code(),
+        Some(2)
+    );
     write(root, ".jsspector.yml", "packs: [sec/missing.yaml]\n");
-    assert_eq!(jsspector(&["scan", "."], root).status.code(), Some(2));
+    assert_eq!(
+        jsspector(&["scan", ".", "--repo-config"], root)
+            .status
+            .code(),
+        Some(2)
+    );
 }
 
 #[test]

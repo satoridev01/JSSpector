@@ -272,6 +272,13 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
             *value = doc_encode(doc, value);
         }
     }
+    // The handler requires a literal delimiter immediately around the tainted value itself before
+    // it reaches the sink (a hand-rolled wrap convention; see [`super::plan::TextWrap`]).
+    if let Some(wrap) = &probe.text_wrap {
+        for (value, _) in payloads.iter_mut() {
+            *value = format!("{}{}{}", wrap.prefix, value, wrap.suffix);
+        }
+    }
     // The handler base64-decodes its tainted input into a raw string the sink consumes directly
     // (`eval(Buffer.from(c, 'base64').toString())`), so the raw payload never reaches the sink as
     // itself. Base64-encode each payload in the alphabet the handler decodes, so the decode
@@ -2406,6 +2413,34 @@ pub fn credential_post(path: &str, email: &str, password: &str) -> Attempt {
     }
 }
 
+/// [`credential_post`] for a registration endpoint that also requires the account `fields` mined
+/// from the app (see [`super::plan::registration_fields`]): each password/confirmation field carries
+/// the password, an email field the email, and a name-like field the account name. Fields the
+/// generic body already sends are left as they are.
+pub fn registration_post(path: &str, email: &str, password: &str, fields: &[String]) -> Attempt {
+    use super::plan::{CredentialField, credential_field};
+    let mut attempt = credential_post(path, email, password);
+    let Some(body) = attempt.body.as_mut() else {
+        return attempt;
+    };
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return attempt;
+    };
+    for field in fields {
+        let value = match credential_field(field) {
+            Some(CredentialField::Password) => password,
+            Some(CredentialField::Email | CredentialField::Name) => email,
+            None => continue,
+        };
+        object
+            .entry(field.clone())
+            .or_insert_with(|| serde_json::Value::String(value.to_owned()));
+    }
+    *body = serde_json::Value::Object(object).to_string();
+    attempt
+}
+
 /// The JWT (or other compact `header.payload.signature` bearer token) a login response returns, so
 /// the bootstrap can carry it back to the gated request. Scans for the first three-part base64url
 /// token: a JWT always begins with a `eyJ` (`{"` base64url) header segment, which anchors the match
@@ -2668,6 +2703,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_registration_post_carries_the_mined_account_fields() {
+        let fields = vec![
+            "cpassword".to_owned(),
+            "name".to_owned(),
+            "password".to_owned(),
+            "role".to_owned(),
+        ];
+        let attempt = registration_post("/register", "a@b.test", "Pw1!", &fields);
+        let body: serde_json::Value =
+            serde_json::from_str(attempt.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cpassword"], "Pw1!");
+        assert_eq!(body["name"], "a@b.test");
+        assert_eq!(body["password"], "Pw1!");
+        assert_eq!(body["passwordRepeat"], "Pw1!");
+        assert!(body.get("role").is_none());
+        // The form twin carries the same fields.
+        let form = urlencoded_twin(&attempt).unwrap();
+        assert!(form.body.as_deref().unwrap().contains("cpassword=Pw1%21"));
+    }
+
+    #[test]
     fn auth_bootstrap_extracts_the_session_token_and_replays_it_authenticated() {
         // A login response returns a compact JWT under a nested `authentication.token` key; the
         // bootstrap pulls the three-part token out whatever key wraps it, and ignores a short dotted
@@ -2800,6 +2856,8 @@ mod tests {
             nosql_mutates: false,
             decode_base64: None,
             allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
         }
     }
 

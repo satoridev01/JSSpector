@@ -110,6 +110,19 @@ pub struct EntryLoc {
     pub line: u32,
 }
 
+/// How a stored value reached a finding whose source is `stored`: the request that saves it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct StoredBy {
+    /// The entry point that saves it (`POST /profile`), when the inventory finds one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// The request data it saves (`req.body.username`).
+    pub expr: String,
+    /// Where it is saved.
+    pub file: String,
+    pub line: u32,
+}
+
 /// One candidate: a tainted value reaching a sink.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Finding {
@@ -131,6 +144,9 @@ pub struct Finding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_at: Option<EntryLoc>,
     pub source: SourceLoc,
+    /// For a `stored` source: the request that saves the value read here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_by: Option<StoredBy>,
     pub trace: Vec<TraceStep>,
     /// Line-independent identity: `class|file|function|sink api|source expr|ordinal`.
     pub key: String,

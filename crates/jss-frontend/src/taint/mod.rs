@@ -77,6 +77,9 @@ pub struct Origin {
     pub primary_escaped: u8,
 }
 
+/// The source kind of a value a request stored and a later request reads back.
+const STORED: &str = "stored";
+
 /// The key under which a tracked object keeps what its fields of unknown name may hold
 /// (spreads of unknown shape, computed keys).
 const REST_FIELD: &str = "<rest>";
@@ -300,9 +303,28 @@ pub struct ExtSink {
 /// Repo-wide summaries: function name -> parameters that reach a sink.
 pub type Summaries = BTreeMap<String, Vec<Summary>>;
 
+/// A field a request stores from its own data (`user.update({ name: req.body.name })`), where, and
+/// the request expression it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredWrite {
+    pub file: String,
+    pub line: u32,
+    pub expr: String,
+    /// Whether the written value could be an object (`origin.object`) rather than a proven scalar
+    /// (`check(x, String)`, a validator) at the write site. A read-back of a field proven scalar
+    /// there is marked the same way: an operator-shaped sink argument (`{ $ne: null }`) needs an
+    /// object, so a value already proven a string there can never carry one.
+    pub object: bool,
+}
+
+/// Every stored field of the project by name (see [`StoredWrite`]).
+pub type StoredFields = BTreeMap<String, StoredWrite>;
+
 /// Result of scanning one program.
 #[derive(Debug, Default)]
 pub struct ScanResult {
+    /// The fields this file stores from request data.
+    pub stored: StoredFields,
     pub findings: Vec<RawFinding>,
     pub truncated: bool,
     /// This file's named functions whose parameters reach a sink.
@@ -332,7 +354,9 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
     let subclasses = BTreeMap::new();
     let names = BTreeMap::new();
     let properties = BTreeMap::new();
+    let stored = StoredFields::new();
     let linking = Linking {
+        stored: &stored,
         file: "",
         files: &files,
         workspace: &workspace,
@@ -353,6 +377,8 @@ pub fn scan_program_with(program: &Program<'_>, external: &Summaries) -> ScanRes
 /// relative imports.
 #[derive(Debug, Clone, Copy)]
 pub struct Linking<'a> {
+    /// The fields requests store, from every file of the last round.
+    pub stored: &'a StoredFields,
     pub file: &'a str,
     pub files: &'a BTreeSet<String>,
     /// The monorepo's own packages, for bare specifiers that name one.
@@ -454,6 +480,7 @@ fn scan_file_program_inner(
         injected: BTreeMap::new(),
         export_aliases: BTreeSet::new(),
         constants: BTreeMap::new(),
+        stored_writes: BTreeMap::new(),
         last_returned_fields: None,
         route_templates: BTreeMap::new(),
         require_wrappers: BTreeMap::new(),
@@ -474,6 +501,7 @@ fn scan_file_program_inner(
         declared_classes: BTreeSet::new(),
         caller_kinds: BTreeMap::new(),
         emit_field: None,
+        emit_with_param: None,
         field_slots: BTreeMap::new(),
         field_reads: BTreeMap::new(),
         call_fields: BTreeMap::new(),
@@ -535,6 +563,7 @@ fn scan_file_program_inner(
         facts: FileFacts::default(),
         templates: BTreeMap::new(),
         constants: BTreeMap::new(),
+        stored: StoredFields::new(),
     };
     walker.facts = FileFacts::default();
     let mut env = Env::new("<module>".to_owned());
@@ -561,6 +590,7 @@ fn scan_file_program_inner(
     result.facts = facts;
     result.templates = walker.route_templates;
     result.constants = walker.constants;
+    result.stored = walker.stored_writes;
     result
 }
 
@@ -716,6 +746,10 @@ pub struct Summary {
     /// For a [`PREDICATE`] that checks containment (`c.startsWith(p + path.sep)`): the parameter
     /// holding the base; the check confines only when the caller's base is not the attacker's.
     pub base_param: Option<usize>,
+    /// Sink summaries only: another parameter the sink also needs from the caller's attacker
+    /// (`target[k1][k2] = v` pollutes only when both keys are chosen): the caller's argument at this
+    /// index must carry attacker data too, or the call reaches nothing.
+    pub with_param: Option<usize>,
     /// The function a nested function is declared in (by the start of its parameter list;
     /// `None` at the top level and for functions no declaration names): a call by name takes
     /// the summaries of the closest declaration it can see, not of every function so named.
@@ -744,6 +778,8 @@ struct Env {
     vars: BTreeMap<String, Origin>,
     /// Names bound to request objects, with the source kind they produce.
     requests: BTreeMap<String, &'static str>,
+    /// Locals holding a record loaded from a store (`const user = await Model.findByPk(id)`).
+    records: BTreeSet<String>,
     /// Names bound to a connected client socket (`io.on('connection', (s) => ...)`).
     sockets: BTreeSet<String>,
     /// Names whose `.input` field is client data (tRPC procedure options).
@@ -1132,15 +1168,18 @@ impl Env {
             }
         }
         for (key, mut base, classes) in rebased {
+            // Only a value that carries data of its own is confined by the check; one that never
+            // held attacker data (a directory entry, a constant) stays untainted whatever base it is
+            // compared against: `file.startsWith(key)` filters `file`, it does not make `key` flow
+            // into it.
+            let Some(own) = self.vars.remove(&key) else {
+                continue;
+            };
             // The base's parameter stands for what the base confines only.
             base.escaped = guards::ALL & !classes;
             base.primary_escaped = base.escaped;
             self.clean.remove(&key);
-            let merged = match self.vars.remove(&key) {
-                Some(own) => union(Some(own), Some(base)),
-                None => Some(base),
-            };
-            if let Some(merged) = merged {
+            if let Some(merged) = union(Some(own), Some(base)) {
                 self.vars.insert(key, merged);
             }
         }
@@ -1150,6 +1189,7 @@ impl Env {
         Self {
             vars: BTreeMap::new(),
             requests: BTreeMap::new(),
+            records: BTreeSet::new(),
             sockets: BTreeSet::new(),
             inputs: BTreeMap::new(),
             fields: BTreeMap::new(),
@@ -1195,6 +1235,7 @@ impl Env {
         Self {
             vars: self.vars.clone(),
             requests: self.requests.clone(),
+            records: self.records.clone(),
             sockets: self.sockets.clone(),
             inputs: self.inputs.clone(),
             fields: self.fields.clone(),
@@ -1368,6 +1409,8 @@ struct Walker<'e> {
     export_aliases: BTreeSet<String>,
     /// Constants of this file: `Enum.Member`, `NAME`, `OBJ.key` -> text.
     constants: BTreeMap<String, String>,
+    /// Fields this file stores from request data (see [`StoredWrite`]).
+    stored_writes: StoredFields,
     /// The per-field taint of the object the last helper call returned (for `const x = f()`).
     last_returned_fields: Option<BTreeMap<String, Origin>>,
     /// Functions that register a route from their parameters: `add(path, handler)`.
@@ -1437,6 +1480,9 @@ struct Walker<'e> {
     /// whose summary needs one field of it (`new this(basic)` reaching `basic.serverConfig`):
     /// (that parameter's origin offset, the field), for the summary [`Self::emit`] derives.
     emit_field: Option<(u32, String)>,
+    /// While summarizing a sink that also needs another parameter from the caller (a nested
+    /// write's second key): that parameter's index, for the summary [`Self::emit`] derives.
+    emit_with_param: Option<usize>,
     /// The request kind this file's calls pass to a function as its first argument
     /// (`handleToolCall(request)` from an MCP handler): its conventionally named request
     /// parameter is that kind, not an HTTP request. `http` wins over any other.
@@ -2368,6 +2414,64 @@ fn string_receivers(expr: &Expression<'_>) -> Vec<(String, guards::Fact)> {
         current = member.object().get_inner_expression();
     }
     out
+}
+
+/// A constant written out: a string, number, boolean, `null`, or a template without
+/// substitutions.
+fn constant_literal(expr: &Expression<'_>) -> bool {
+    match expr.get_inner_expression() {
+        Expression::StringLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_) => true,
+        Expression::TemplateLiteral(t) => t.expressions.is_empty(),
+        Expression::UnaryExpression(u) => {
+            u.operator == UnaryOperator::UnaryNegation
+                && matches!(
+                    u.argument.get_inner_expression(),
+                    Expression::NumericLiteral(_)
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expr` gives the same value each time it is read in one expression: access paths,
+/// constants, and the value-returning methods the packs list as passing their receiver through
+/// (`u.split('.').slice(-1)[0].toLowerCase()`), none of which mutates or depends on anything else.
+fn deterministic_value(expr: &Expression<'_>) -> bool {
+    fn walk(expr: &Expression<'_>, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match expr.get_inner_expression() {
+            Expression::Identifier(_) | Expression::ThisExpression(_) => true,
+            e if constant_literal(e) => true,
+            Expression::StaticMemberExpression(m) => walk(&m.object, depth + 1),
+            Expression::ComputedMemberExpression(m) => {
+                walk(&m.object, depth + 1) && walk(&m.expression, depth + 1)
+            }
+            Expression::ChainExpression(chain) => chain
+                .expression
+                .as_member_expression()
+                .is_some_and(|m| walk(m.object(), depth + 1)),
+            Expression::CallExpression(call) => {
+                let Some(member) = call.callee.get_inner_expression().as_member_expression() else {
+                    return false;
+                };
+                member
+                    .static_property_name()
+                    .is_some_and(|name| name.as_str().is_some_and(|n| has(&m().pass_methods, n)))
+                    && walk(member.object(), depth + 1)
+                    && call
+                        .arguments
+                        .iter()
+                        .all(|a| a.as_expression().is_some_and(|e| walk(e, depth + 1)))
+            }
+            _ => false,
+        }
+    }
+    walk(expr, 0)
 }
 
 /// Whether evaluating `expr` calls something (`remember && rememberEmail(res, email)`), whose
@@ -4332,12 +4436,114 @@ impl Walker<'_> {
         }
     }
 
+    /// Whether the project's store methods (a pack's `stored` section) apply: it uses one of the
+    /// packages the pack names, or the scan saw no manifest.
+    fn stored_enabled(&self) -> bool {
+        let stored = &m().stored;
+        match self.linking.packages {
+            Some(packages) if !stored.requires.is_empty() => {
+                stored.requires.iter().any(|p| packages.contains(p))
+            }
+            _ => true,
+        }
+    }
+
+    /// Remembers whether `name` now holds a record loaded from a store (`await Model.findByPk(id)`),
+    /// whose fields a request may have stored.
+    fn note_record(&mut self, name: &str, init: &Expression<'_>, env: &mut Env) {
+        let mut expr = init.get_inner_expression();
+        while let Expression::AwaitExpression(a) = expr {
+            expr = a.argument.get_inner_expression();
+        }
+        let loads = self.stored_enabled()
+            && matches!(expr, Expression::CallExpression(call)
+                if matches!(self.callee(&call.callee), Callee::Method { ref method, .. }
+                    if has(&m().stored.read_methods, method)));
+        if loads {
+            env.records.insert(name.to_owned());
+        } else {
+            env.records.remove(name);
+        }
+    }
+
+    /// `user.update({ name: req.body.name })`, `Model.create({ data: { name } })`: the fields a
+    /// store method saves from request data. Only plain values (names and member accesses) are read,
+    /// so this adds no walk of its own.
+    fn note_stored_writes(&mut self, callee: &Callee, call: &CallExpression<'_>, env: &mut Env) {
+        let Callee::Method { method, .. } = callee else {
+            return;
+        };
+        if !has(&m().stored.write_methods, method) || !self.stored_enabled() {
+            return;
+        }
+        for argument in call.arguments.iter().filter_map(Argument::as_expression) {
+            if let Expression::ObjectExpression(object) = argument.get_inner_expression() {
+                self.stored_fields_of(object, env, 0);
+            }
+        }
+    }
+
+    fn stored_fields_of(
+        &mut self,
+        object: &oxc_ast::ast::ObjectExpression<'_>,
+        env: &mut Env,
+        depth: u8,
+    ) {
+        for property in &object.properties {
+            let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+            let Some(key) = prop_name(&property.key) else {
+                continue;
+            };
+            let value = property.value.get_inner_expression();
+            if let Expression::ObjectExpression(inner) = value {
+                if depth < 2 && has(&m().stored.wrappers, &key) {
+                    self.stored_fields_of(inner, env, depth + 1);
+                }
+                continue;
+            }
+            if !matches!(
+                value,
+                Expression::Identifier(_)
+                    | Expression::StaticMemberExpression(_)
+                    | Expression::ComputedMemberExpression(_)
+            ) {
+                continue;
+            }
+            let Some(origin) = self.expr(value, env) else {
+                continue;
+            };
+            if origin.kind == STORED || origin.param.is_some() || origin.upload {
+                continue;
+            }
+            let span = value.span();
+            let text = self
+                .source
+                .get(span.start as usize..span.end as usize)
+                .unwrap_or("")
+                .to_owned();
+            let line = self.line_at(span.start);
+            self.stored_writes
+                .entry(key)
+                .or_insert_with(|| StoredWrite {
+                    file: self.linking.file.to_owned(),
+                    line,
+                    expr: text,
+                    object: origin.object,
+                });
+        }
+    }
+
     fn var_decl(&mut self, declaration: &VariableDeclaration<'_>, env: &mut Env) {
         for declarator in &declaration.declarations {
             pattern_names(&declarator.id, &mut env.locals);
             let Some(init) = &declarator.init else {
                 continue;
             };
+            if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                self.note_record(id.name.as_str(), init, env);
+            }
             if let Some(spec) = require_spec(init) {
                 self.bind_require(&declarator.id, &spec, None);
                 continue;
@@ -6060,9 +6266,55 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: None,
                 base_param,
+                with_param: None,
                 scope: env.def_scope,
             });
         }
+    }
+
+    /// For `LIST.includes(e) ? e : other` (or `!LIST.includes(e) ? other : e`, `SET.has(e) ...`):
+    /// whether the consequent (`Some(true)`) or the alternate (`Some(false)`) repeats the checked
+    /// expression and so evaluates to one of the values the server listed. The expression must
+    /// read the same twice (only access paths and value-returning string/array methods), and a
+    /// list must be written out with constant elements.
+    fn allowlisted_echo(&self, c: &oxc_ast::ast::ConditionalExpression<'_>) -> Option<bool> {
+        let mut test = c.test.get_inner_expression();
+        let mut holds = true;
+        while let Expression::UnaryExpression(u) = test
+            && u.operator == UnaryOperator::LogicalNot
+        {
+            holds = !holds;
+            test = u.argument.get_inner_expression();
+        }
+        let Expression::CallExpression(call) = test else {
+            return None;
+        };
+        let member = call.callee.get_inner_expression().as_member_expression()?;
+        let name = member.static_property_name()?;
+        let name = name.as_str()?;
+        let model = m();
+        let listed = has(&model.set_members, name)
+            || (has(&model.list_members, name)
+                && matches!(
+                    member.object().get_inner_expression(),
+                    Expression::ArrayExpression(list)
+                        if list.elements.iter().all(|e| e.as_expression().is_some_and(constant_literal))
+                ));
+        if !listed || call.arguments.len() != 1 {
+            return None;
+        }
+        let checked = call.arguments.first()?.as_expression()?;
+        if !deterministic_value(checked) {
+            return None;
+        }
+        let branch = if holds { &c.consequent } else { &c.alternate };
+        let text = |e: &Expression<'_>| -> Option<String> {
+            let span = e.get_inner_expression().span();
+            self.source
+                .get(span.start as usize..span.end as usize)
+                .map(|t| t.chars().filter(|ch| !ch.is_whitespace()).collect())
+        };
+        (text(checked)? == text(branch)?).then_some(holds)
     }
 
     /// The facts a test establishes through calls to predicates by what they do (see
@@ -6185,6 +6437,7 @@ impl Walker<'_> {
                         rest: false,
                         instance_of: None,
                         base_param: None,
+                        with_param: None,
                         scope: env.def_scope,
                     });
             }
@@ -6223,6 +6476,7 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: None,
                 base_param: None,
+                with_param: None,
                 scope: env.def_scope,
             });
         }
@@ -6290,6 +6544,7 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: None,
                 base_param: None,
+                with_param: None,
                 scope: env.def_scope,
             });
         }
@@ -6369,6 +6624,7 @@ impl Walker<'_> {
                 rest: false,
                 instance_of: Some(class),
                 base_param: None,
+                with_param: None,
                 scope: env.def_scope,
             });
         }
@@ -6782,6 +7038,16 @@ impl Walker<'_> {
             }
             Expression::ConditionalExpression(c) => {
                 self.expr(&c.test, env);
+                // `['jpg', 'png'].includes(ext(u)) ? ext(u) : 'jpg'`: the branch that repeats the
+                // checked expression is one of the listed values, even when that expression has
+                // no access path for a fact to hold on.
+                let echoed = self.allowlisted_echo(c);
+                let mask = |a: Option<Origin>, b: Option<Origin>| {
+                    union(
+                        a.filter(|_| echoed != Some(true)),
+                        b.filter(|_| echoed != Some(false)),
+                    )
+                };
                 // `ALLOWED.includes(x) ? x : 'id'`, `isInsideDir(home, p) ? p : null`: what the
                 // test establishes holds in its branch.
                 let mut held = Vec::new();
@@ -6805,7 +7071,7 @@ impl Walker<'_> {
                     env.learn(failed);
                     let b = self.expr(&c.alternate, env);
                     env.join_with(&then_path);
-                    return union(a, b);
+                    return mask(a, b);
                 }
                 let a = if held.is_empty() {
                     self.expr(&c.consequent, env)
@@ -6821,7 +7087,7 @@ impl Walker<'_> {
                     probe.learn(failed);
                     self.expr(&c.alternate, &mut probe)
                 };
-                union(a, b)
+                mask(a, b)
             }
             Expression::AwaitExpression(a) => {
                 if let Expression::CallExpression(awaited) = a.argument.get_inner_expression() {
@@ -6853,6 +7119,7 @@ impl Walker<'_> {
                     && let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left
                 {
                     note_url_parts(id.name.as_str(), &assign.right, env);
+                    self.note_record(id.name.as_str(), &assign.right, env);
                 }
                 let name = match (&assign.left, assign.right.get_inner_expression()) {
                     // `module.exports = function runCommand() {}`: its own name, as exported.
@@ -8037,9 +8304,17 @@ impl Walker<'_> {
                         let mut probe = env.clone();
                         let outer_key = self.expr(&outer.expression, &mut probe);
                         let inner_key = self.expr(&inner.expression, &mut probe);
+                        // In a helper, a second key that is only a parameter pollutes only when the
+                        // caller's argument for it is the attacker's too (`store(key, 'fix', v)`
+                        // writes a constant second key).
+                        let with_param = outer_key
+                            .as_ref()
+                            .filter(|o| self.summarize && o.also.is_empty())
+                            .and_then(|o| o.param);
                         if let (Some(origin), Some(_)) = (inner_key, outer_key)
                             && origin.param.is_none() == !self.summarize
                         {
+                            self.emit_with_param = with_param;
                             self.emit(
                                 RawFinding {
                                     class: VulnClass::PrototypePollution,
@@ -8055,6 +8330,7 @@ impl Walker<'_> {
                                 },
                                 env,
                             );
+                            self.emit_with_param = None;
                         }
                     }
                     // `el.innerHTML = tainted`
@@ -8320,6 +8596,26 @@ impl Walker<'_> {
                 response: false,
                 primary_escaped: 0,
             });
+        }
+        // `user.name` of a record loaded from a store, where a request stored that field.
+        if let (Expression::Identifier(id), Some(field)) = (object, property.as_deref())
+            && !self.summarize
+            && env.records.contains(id.name.as_str())
+            && let Some(write) = self.linking.stored.get(field)
+        {
+            let at = member.span();
+            let mut origin = Origin::source(STORED, at);
+            // A value the write site already proved scalar (`check(x, String)`, a validator) can
+            // never carry an operator object here either; only a write whose value could still be
+            // an object keeps that possibility open on the read side.
+            origin.object = write.object;
+            return Some(origin.step(
+                at.start,
+                format!(
+                    "stored by {}:{} from `{}`, read back from the store",
+                    write.file, write.line, write.expr
+                ),
+            ));
         }
         // `this.url` in a class method: what another method stored there.
         if let (Expression::ThisExpression(_), Some(field), Some(class)) =
@@ -8660,6 +8956,7 @@ impl Walker<'_> {
             }
         }
         let callee = self.callee(&call.callee);
+        self.note_stored_writes(&callee, call, env);
         // Receiver taint (for pass-through methods), walking the callee once.
         let receiver = match call.callee.get_inner_expression().as_member_expression() {
             Some(member) => {
@@ -11591,6 +11888,7 @@ impl Walker<'_> {
         registration: Registration,
         call: &CallExpression<'_>,
         auth: Auth,
+        env: &Env,
     ) {
         let last = call.arguments.last().and_then(Argument::as_expression);
         let is_function = last.is_some_and(|e| {
@@ -11629,6 +11927,34 @@ impl Walker<'_> {
                     span: call.span,
                 });
                 continue;
+            }
+            // On the router our caller hands in (`module.exports = (router) => {
+            // router.route('/download').post(h) }`): also a template, as for `router.post(path, h)`,
+            // so a caller's mounted router gives it its prefix.
+            if let Some(index) = registration
+                .receiver
+                .as_deref()
+                .and_then(|r| env.params.iter().position(|p| p == r))
+                .filter(|_| env.function != "<anonymous>" && env.function != "<module>")
+            {
+                let template = RouteTemplate {
+                    receiver: Err(index),
+                    receiver_file: None,
+                    method: Ok(registration.method.clone()),
+                    path: vec![PathPart::Lit(path.clone())],
+                    auth,
+                    handler: Some(handler.clone()),
+                    handler_param: None,
+                    mount_module: None,
+                    at: Some((self.linking.file.to_owned(), self.line_at(call.span.start))),
+                };
+                let list = self
+                    .route_templates
+                    .entry(env.function.clone())
+                    .or_default();
+                if list.len() < MAX_TEMPLATES && !list.contains(&template) {
+                    list.push(template);
+                }
             }
             self.facts.routes.push(RouteFact {
                 at: None,
@@ -11712,8 +12038,12 @@ impl Walker<'_> {
         // makes this function a template too).
         if let Some((name, templates, defining_file)) = self.templates_for(callee) {
             // A helper calling itself (`add(p + '/x')` inside `add`) would derive its templates
-            // from its own, without end.
-            if name != env.function {
+            // from its own, without end. Only a function of this file can be the caller itself: two
+            // files' `module.exports = (router) => ...` share a name but are different functions.
+            let elsewhere = defining_file
+                .as_deref()
+                .is_some_and(|file| file != self.linking.file);
+            if elsewhere || name != env.function {
                 for template in templates {
                     self.instantiate(&name, &template, defining_file.as_deref(), call, auth, env);
                 }
@@ -11743,7 +12073,7 @@ impl Walker<'_> {
             && let Some(registration) =
                 self.registration(callee, &call.callee, &call.arguments, env)
         {
-            self.record_registration(registration, call, auth);
+            self.record_registration(registration, call, auth, env);
             return;
         }
         // `router.get(...)`, or `router[r.method](...)` with the method from a table row or a
@@ -11861,8 +12191,16 @@ impl Walker<'_> {
                     }
                     _ => false,
                 });
+        // `module.exports = (router) => { router.post('/download', h) }`: a literal path on a
+        // parameter named like a router. The route is recorded on that parameter as before (its
+        // prefix unknown here), and also as a template, so a caller that hands in its own mounted
+        // router (`files(router)` under `app.use('/api', router)`) instantiates it with the prefix.
+        // The inventory keeps the unprefixed copy only while no caller resolves the registration.
+        let router_param = receiver_param.is_some()
+            && !depends_on_params
+            && object.as_deref().is_some_and(|o| self.is_router(o));
         if role == Role::Route
-            && (depends_on_params || param_router)
+            && (depends_on_params || param_router || router_param)
             && router_receiver
             && handler_like(call)
             && env.function != "<anonymous>"
@@ -11938,7 +12276,9 @@ impl Walker<'_> {
             if !list.contains(&template) {
                 list.push(template);
             }
-            return;
+            if !router_param || param_router {
+                return;
+            }
         }
         if method_param.is_some() {
             return;
@@ -12058,6 +12398,17 @@ impl Walker<'_> {
                         Some(e) => self.mount_target(e),
                         None => (None, None, None),
                     };
+                    for router in last.map(|e| self.handed_routers(e)).unwrap_or_default() {
+                        self.facts.mounts.push(MountFact {
+                            receiver: object.clone(),
+                            prefix: path.clone(),
+                            target: Some(router),
+                            target_file: None,
+                            target_export: None,
+                            auth,
+                            span: call.span,
+                        });
+                    }
                     self.facts.mounts.push(MountFact {
                         receiver: object.clone(),
                         prefix: path,
@@ -12374,6 +12725,25 @@ impl Walker<'_> {
         recorded
     }
 
+    /// The routers of this file a mounted factory call is handed (`app.use('/api', routes(router))`):
+    /// a registrar fills the router it is given and returns it, so that router is mounted too.
+    fn handed_routers(&self, expr: &Expression<'_>) -> Vec<String> {
+        let Expression::CallExpression(call) = expr.get_inner_expression() else {
+            return Vec::new();
+        };
+        call.arguments
+            .iter()
+            .filter_map(
+                |argument| match argument.as_expression()?.get_inner_expression() {
+                    Expression::Identifier(id) if self.is_router(id.name.as_str()) => {
+                        Some(id.name.as_str().to_owned())
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
     fn mount_target(
         &self,
         expr: &Expression<'_>,
@@ -12648,14 +13018,21 @@ impl Walker<'_> {
                 }
             }
         }
+        let named = env.function != "<anonymous>" && env.function != "<module>";
         let open = path.iter().any(|p| matches!(p, PathPart::Param(_))) || method.is_err();
-        if open {
-            if env.function != "<anonymous>" && env.function != "<module>" {
+        // Registered on the router our own caller hands us (`module.exports = (router) => {
+        // files(router); }`): the route is on whatever router our callers pass, and only they know
+        // where it is mounted. Hand the template up to them too; the route is still recorded here
+        // without a receiver for a registrar no caller of ours reaches, and the inventory drops that
+        // copy once a caller resolves the registration onto a router.
+        let handed_on = named && receiver.is_err();
+        if open || handed_on {
+            if named {
                 let derived = RouteTemplate {
-                    receiver,
+                    receiver: receiver.clone(),
                     receiver_file: receiver_file.clone(),
-                    method,
-                    path,
+                    method: method.clone(),
+                    path: path.clone(),
                     auth: template.auth.max(auth),
                     handler: template
                         .handler
@@ -12686,7 +13063,9 @@ impl Walker<'_> {
                     list.push(derived);
                 }
             }
-            return;
+            if open {
+                return;
+            }
         }
         let text: String = path
             .iter()
@@ -13145,6 +13524,13 @@ impl Walker<'_> {
             let Some(origin) = origin else {
                 continue;
             };
+            // A sink that also needs another argument from the attacker (a nested write's second
+            // key): a caller passing a constant there reaches nothing.
+            if let Some(other) = summary.with_param
+                && argument_taint(taints, other, false).is_none()
+            {
+                continue;
+            }
             // Summarizing a function that hands its own parameter on whole (`new this(basic)`,
             // `create(options)`): what reaches the sink is that parameter's `field`, not all of
             // it (so a caller's other fields, `{ serverName, serverConfig }`, stay out).
@@ -13316,6 +13702,7 @@ impl Walker<'_> {
                         rest: self.rest_params.contains(&at),
                         instance_of: None,
                         base_param: None,
+                        with_param: self.emit_with_param.filter(|&other| other != param),
                         scope,
                     });
                 }
@@ -14376,6 +14763,44 @@ mod tests {
     }
 
     #[test]
+    fn filtering_untainted_values_by_a_parameter_does_not_taint_them() {
+        // `file.startsWith(key)` picks among directory entries the server listed; the caller's
+        // `key` decides which one, but never flows into the path.
+        let helpers = "const DIR = './fixes';\n\
+            function pick(key) { for (const file of fs.readdirSync(DIR)) { if (file.startsWith(key)) { return fs.readFileSync(DIR + '/' + file); } } }\n\
+            function first(key) { const file = fs.readdirSync(DIR)[0]; if (file.startsWith(key)) { return fs.readFileSync(DIR + '/' + file); } }\n\
+            function fixed(key) { const file = 'x.json'; if (file.startsWith(key)) { return fs.readFileSync(DIR + '/' + file); } }\n\
+            function both(key, name) { const f = path.join(DIR, name); if (f.startsWith(key)) { return fs.readFileSync(f); } }\n";
+        assert!(
+            one(&format!(
+                "{helpers}app.get('/a/:key', (req, res) => res.send(pick(req.params.key)));"
+            ))
+            .is_empty()
+        );
+        assert!(
+            one(&format!(
+                "{helpers}app.get('/b/:key', (req, res) => res.send(first(req.params.key)));"
+            ))
+            .is_empty()
+        );
+        assert!(
+            one(&format!(
+                "{helpers}app.get('/c/:key', (req, res) => res.send(fixed(req.params.key)));"
+            ))
+            .is_empty()
+        );
+        // A value that carries attacker data is still only as confined as the base it is checked
+        // against: under an attacker-chosen base, nothing.
+        assert_eq!(
+            one(&format!(
+                "{helpers}app.get('/d', (req, res) => res.send(both(req.query.base, req.query.n)));"
+            ))
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn a_segment_confined_under_one_base_is_confined_under_another() {
         // mStream getVPathInfo: the check is on `resolve(join(base, rel))`, but the function
         // returns `rel`, which the caller re-joins with a (DB-derived) base. `rel` cannot climb.
@@ -15294,6 +15719,68 @@ mod tests {
         assert_eq!(pp.len(), 1, "{pp:?}");
         assert_eq!(pp[0].0, VulnClass::PrototypePollution);
         assert!(one("app.post('/s', (req, res) => { cfg['x'][req.body.k] = 1; });").is_empty());
+    }
+
+    #[test]
+    fn a_ternary_that_repeats_an_allowlisted_expression_yields_a_listed_value() {
+        let write = |pick: &str| {
+            one(&format!(
+                "app.post('/a', (req, res) => {{ const u = req.body.url; const ext = {pick}; fs.createWriteStream(`up/1.${{ext}}`); res.end(); }});"
+            ))
+            .len()
+        };
+        let ext = "u.split('.').slice(-1)[0].toLowerCase()";
+        // The repeated expression is one of the listed values.
+        assert_eq!(
+            write(&format!("['jpg', 'png'].includes({ext}) ? {ext} : 'jpg'")),
+            0
+        );
+        assert_eq!(
+            write(&format!("!['jpg', 'png'].includes({ext}) ? 'jpg' : {ext}")),
+            0
+        );
+        assert_eq!(write("['jpg', 'png'].includes(u) ? u : 'jpg'"), 0);
+        // The value that failed the check, another expression, a substring test, a call that may
+        // answer differently the second time: not confined.
+        assert_eq!(
+            write(&format!("!['jpg', 'png'].includes({ext}) ? {ext} : 'jpg'")),
+            1
+        );
+        assert_eq!(
+            write(&format!("['jpg', 'png'].includes({ext}) ? u : 'jpg'")),
+            1
+        );
+        assert_eq!(write(&format!("u.includes({ext}) ? {ext} : 'jpg'")), 1);
+        assert_eq!(
+            write("['jpg', 'png'].includes(u.split('.').pop()) ? u.split('.').pop() : 'jpg'"),
+            1
+        );
+        assert_eq!(write("['jpg', u].includes(u.trim()) ? u.trim() : 'jpg'"), 1);
+    }
+
+    #[test]
+    fn a_nested_write_in_a_helper_needs_both_keys_from_the_caller() {
+        let helper = "const solves = {};\n\
+            function store(key, phase, value) { if (!solves[key]) { solves[key] = {}; } solves[key][phase] = value; }\n\
+            function storeFound(key, value) { store(key, 'find it', value); }\n";
+        // A constant second key, directly or one helper up: nothing to pollute with.
+        assert!(one(&format!("{helper}app.post('/a', (req, res) => {{ store(req.body.key, 'find it', true); res.end(); }});")).is_empty());
+        assert!(one(&format!("{helper}app.post('/b', (req, res) => {{ storeFound(req.body.key, true); res.end(); }});")).is_empty());
+        // Both keys from the request: `__proto__` then any property.
+        let both = one(&format!(
+            "{helper}app.post('/c', (req, res) => {{ store(req.body.key, req.body.phase, req.body.v); res.end(); }});"
+        ));
+        assert_eq!(both.len(), 1, "{both:?}");
+        assert_eq!(both[0].0, VulnClass::PrototypePollution);
+        // A second key the helper takes from the request itself needs nothing from the caller.
+        let own = "const cfg = {};\nfunction setOwn(req, key) { cfg[key][req.body.p] = 1; }\n";
+        assert_eq!(
+            one(&format!(
+                "{own}app.post('/d', (req, res) => {{ setOwn(req, req.body.k); res.end(); }});"
+            ))
+            .len(),
+            1
+        );
     }
 
     #[test]

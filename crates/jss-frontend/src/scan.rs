@@ -29,6 +29,7 @@ type Analysis = (
     Templates,
     BTreeMap<String, String>,
     BTreeSet<String>,
+    taint::StoredFields,
 );
 use jss_core::ir;
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,6 +63,8 @@ pub struct ScanReport {
     constants: BTreeMap<String, String>,
     /// Constructors that lift a pack's local cap, called in this file.
     constructed: BTreeSet<String>,
+    /// The fields this file stores from request data.
+    pub(crate) stored: taint::StoredFields,
 }
 
 /// What every file's scan needs to know about the scan root.
@@ -83,6 +86,8 @@ struct Context<'a> {
     external_names: BTreeMap<String, Vec<String>>,
     /// Properties every typed assignment gives the same class (see [`property_types`]).
     properties: BTreeMap<String, taint::ClassRef>,
+    /// The fields requests store, from every file of the last round.
+    stored: taint::StoredFields,
 }
 
 impl ParsePool {
@@ -111,7 +116,8 @@ impl ParsePool {
                    constants: BTreeMap<String, BTreeMap<String, String>>,
                    exports: BTreeMap<String, BTreeMap<String, String>>,
                    subclasses: BTreeMap<(String, String), Vec<(String, String)>>,
-                   properties: BTreeMap<String, taint::ClassRef>|
+                   properties: BTreeMap<String, taint::ClassRef>,
+                   stored: taint::StoredFields|
          -> Vec<ScanReport> {
             let context = Context {
                 all: &all,
@@ -125,6 +131,7 @@ impl ParsePool {
                 packages: &packages,
                 external_names: taint::index_names(external),
                 properties,
+                stored,
             };
             self.install(|| {
                 files
@@ -143,7 +150,7 @@ impl ParsePool {
         let mut external = Summaries::new();
         // What the last round ran on: summaries, templates, constants, exports and re-exports
         // (counted). A round on the same inputs would give the same reports.
-        let mut known = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut known = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         let mut reports = run(
             &external,
             BTreeMap::new(),
@@ -152,6 +159,7 @@ impl ParsePool {
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
+            taint::StoredFields::new(),
         );
         for _ in 1..CROSS_FILE_HOPS {
             let reexports = reexport_closure(&reports);
@@ -176,6 +184,7 @@ impl ParsePool {
                 .filter(|r| !r.module.exports.is_empty())
                 .map(|r| (r.rel_path.clone(), r.module.exports.clone()))
                 .collect();
+            let stored = stored_fields(&reports);
             let merged = merge(&reports);
             let now = (
                 count(&merged),
@@ -183,6 +192,7 @@ impl ParsePool {
                 constant_count,
                 exports.values().map(BTreeMap::len).sum(),
                 reexports.values().map(BTreeSet::len).sum(),
+                stored.len(),
             );
             if now == known {
                 break;
@@ -192,7 +202,7 @@ impl ParsePool {
             let subclasses = subclass_closure(&reports);
             let properties = property_types(&reports);
             reports = run(
-                &external, reexports, templates, constants, exports, subclasses, properties,
+                &external, reexports, templates, constants, exports, subclasses, properties, stored,
             );
         }
         apply_local_caps(&mut reports);
@@ -388,6 +398,18 @@ fn property_types(reports: &[ScanReport]) -> BTreeMap<String, taint::ClassRef> {
         .collect()
 }
 
+/// Every field some file stores from request data, by name; the first file (in path order) names
+/// the write when several do.
+pub(crate) fn stored_fields(reports: &[ScanReport]) -> taint::StoredFields {
+    let mut all = taint::StoredFields::new();
+    for report in reports {
+        for (field, write) in &report.stored {
+            all.entry(field.clone()).or_insert_with(|| write.clone());
+        }
+    }
+    all
+}
+
 /// Every class that extends or implements each class or interface, transitively (at most 64
 /// per base), from every module's class declarations.
 fn subclass_closure(reports: &[ScanReport]) -> BTreeMap<(String, String), Vec<(String, String)>> {
@@ -477,6 +499,7 @@ fn report(file: &SourceFile, status: ScanStatus) -> ScanReport {
         templates: BTreeMap::new(),
         constants: BTreeMap::new(),
         constructed: BTreeSet::new(),
+        stored: taint::StoredFields::new(),
     }
 }
 
@@ -512,19 +535,27 @@ fn scan_file(
         scan_text(allocator, file, text, external, context)
     });
     Some(match outcome {
-        Ok(Ok((findings, truncated, summaries, module, templates, constants, constructed))) => {
-            ScanReport {
-                rel_path: file.rel_path.clone(),
-                status: ScanStatus::Scanned,
-                truncated,
-                findings,
-                summaries,
-                module,
-                templates,
-                constants,
-                constructed,
-            }
-        }
+        Ok(Ok((
+            findings,
+            truncated,
+            summaries,
+            module,
+            templates,
+            constants,
+            constructed,
+            stored,
+        ))) => ScanReport {
+            rel_path: file.rel_path.clone(),
+            status: ScanStatus::Scanned,
+            truncated,
+            findings,
+            summaries,
+            module,
+            templates,
+            constants,
+            constructed,
+            stored,
+        },
         Ok(Err(reason)) => report(file, ScanStatus::Skipped(reason)),
         Err(ParseFailure::Panicked(panic)) => report(file, ScanStatus::Panicked(panic)),
         Err(ParseFailure::NoStack { bytes, error }) => report(
@@ -609,6 +640,7 @@ fn analyze(
     context: &Context<'_>,
 ) -> Analysis {
     let linking = Linking {
+        stored: &context.stored,
         file: &file.rel_path,
         files: context.all,
         workspace: context.workspace,
@@ -827,6 +859,7 @@ fn analyze(
         result.templates,
         result.constants,
         facts.constructed,
+        result.stored,
     )
 }
 
@@ -898,6 +931,7 @@ fn to_finding(raw: &RawFinding, file: &str, text: &str, index: &LineIndex) -> Fi
             line: source_at.line,
             col: source_at.column,
         },
+        stored_by: None,
         trace,
         key: String::new(),
         fingerprint: String::new(),
@@ -1049,6 +1083,7 @@ mod tests {
                 line: 4,
                 col: 15,
             },
+            stored_by: None,
             trace: vec![TraceStep {
                 file: Some("db.js".to_owned()),
                 line: 18,

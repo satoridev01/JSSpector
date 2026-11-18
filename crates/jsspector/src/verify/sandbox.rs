@@ -20,6 +20,9 @@ static REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 
 const BASE_IMAGE: &str = "node:22-slim";
 const DEFAULT_NODE_MAJOR: u32 = 22;
+/// The oldest Node a failed launch is retried on for a repository that pins an older runtime: the
+/// launch shim is preloaded through `NODE_OPTIONS`, which Node supports from 8.
+const MIN_FALLBACK_NODE_MAJOR: u32 = 8;
 
 const VERIFY_RUN_LABEL_KEY: &str = "ci.satori.jsspector.verify-run";
 const DB_IMAGE: &str = "mongo:6";
@@ -295,6 +298,18 @@ pub struct Session {
     db_env: Vec<(String, String)>,
     redis: Option<String>,
     redis_env: Vec<(String, String)>,
+    /// SQL databases the app needs before it listens (container name, plan); see
+    /// [`super::services`]. Docker runtime only.
+    sql: Vec<(String, super::services::SqlSidecar)>,
+    /// Extra network aliases for the MongoDB sidecar (the Compose service names the app uses).
+    mongo_aliases: Vec<String>,
+    /// The MongoDB image the repository pins (Compose or CI); [`DB_IMAGE`] otherwise.
+    mongo_image: Option<String>,
+    /// The shell the MongoDB image ships (`mongosh` from 5.0 on, `mongo` before), found once.
+    mongo_shell: std::cell::Cell<Option<&'static str>>,
+    /// The app's environment for those databases (from its Compose service and its own
+    /// `process.env` reads), applied after the generic database variables.
+    service_env: Vec<(String, String)>,
     canary: Canary,
     /// The container port the app listens on: the one we ask for via `PORT`, or, for an app that
     /// fixes its own, the one port it is found listening on (see [`listening_probe_excluding`]).
@@ -466,6 +481,42 @@ impl Session {
         if local_runtime_requested() {
             return Self::start_local(root, app_path, entry_file, gating_sources);
         }
+        let first = Self::start_on(root, app_path, entry_file, gating_sources, None);
+        let Err(err) = first else {
+            return first;
+        };
+        // An app written for an older Node (a native addon with no build for the current ABI, an API
+        // since removed) installs or boots only on the runtime its repository pins. The default
+        // runtime is tried first, so an app that already launches keeps launching exactly as before;
+        // only a failed launch is retried, once, on the repository's own Node.
+        let app_root = root.join(app_path);
+        let install_root = root.join(install_path(root, app_path));
+        let Some(image) = repo_node_fallback(root, &app_root, &install_root) else {
+            return Err(err);
+        };
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] launch failed on the default Node; retrying on the repository's {image}"
+            );
+        }
+        Self::start_on(root, app_path, entry_file, gating_sources, Some(&image)).map_err(|retry| {
+            if retry == err {
+                err
+            } else {
+                format!("{err}\n(on the repository's own {image} as well: {retry})")
+            }
+        })
+    }
+
+    /// One Docker launch of the app, on `node_image` when given (the repository's pinned runtime,
+    /// see [`repo_node_fallback`]) or else the image [`base_image`] chooses.
+    fn start_on(
+        root: &std::path::Path,
+        app_path: &std::path::Path,
+        entry_file: Option<&std::path::Path>,
+        gating_sources: &[String],
+        node_image: Option<&str>,
+    ) -> Result<Self, String> {
         let id = run_id();
         let canary = Canary::new(format!("{id}{}", short_rand()))
             .with_callback_host(configured_callback_host()?)
@@ -489,6 +540,17 @@ impl Session {
         } else {
             Vec::new()
         };
+        // The SQL databases the app needs (its Compose file, else its drivers) and how it finds them.
+        let services = super::services::plan(root, &app_root, db.is_some());
+        let sql: Vec<(String, super::services::SqlSidecar)> = services
+            .sql
+            .iter()
+            .enumerate()
+            .map(|(index, sidecar)| (format!("jss-verify-sql{index}-{id}"), sidecar.clone()))
+            .collect();
+        let mongo_aliases = services.mongo_aliases.clone();
+        let mongo_image = services.mongo_image.clone();
+        let service_env = services.app_env.clone();
         let entry_rel = entry_file.and_then(|file| file.strip_prefix(app_path).ok());
         let start_command = start_command(&app_root, entry_rel)
             .ok_or_else(|| "no launchable script or `main` file in package.json".to_owned())?;
@@ -516,8 +578,12 @@ impl Session {
         let install_workdir = container_dir(&install_rel)
             .ok_or_else(|| format!("unsupported install directory `{}`", install_rel.display()))?;
 
-        let build_env: Vec<(String, String)> =
-            db_env.iter().chain(redis_env.iter()).cloned().collect();
+        let build_env: Vec<(String, String)> = db_env
+            .iter()
+            .chain(redis_env.iter())
+            .chain(service_env.iter())
+            .cloned()
+            .collect();
         build_image(
             root,
             &app_root,
@@ -529,6 +595,7 @@ impl Session {
             &start_command,
             port,
             &build_env,
+            node_image,
         )?;
 
         // An internal network: DNS between its members, no route to the internet.
@@ -580,6 +647,11 @@ impl Session {
             db_env,
             redis,
             redis_env,
+            sql,
+            mongo_aliases,
+            mongo_image,
+            mongo_shell: std::cell::Cell::new(None),
+            service_env,
             canary,
             port,
             nonce: 0,
@@ -777,6 +849,11 @@ impl Session {
             redis_env: needs_redis
                 .then(local_redis_connection_env)
                 .unwrap_or_default(),
+            sql: Vec::new(),
+            mongo_aliases: Vec::new(),
+            mongo_image: None,
+            mongo_shell: std::cell::Cell::new(None),
+            service_env: Vec::new(),
             canary,
             port,
             nonce: 0,
@@ -1303,6 +1380,7 @@ impl Session {
         if self.redis.is_some() {
             self.start_redis()?;
         }
+        self.start_sql()?;
 
         // An app that refuses to start without an environment variable its deployment supplies
         // (`NOOBOT_WORKSPACE_ROOT is required`) is started again with it set to a neutral value
@@ -1491,6 +1569,10 @@ impl Session {
             args.push("-e".to_owned());
             args.push(format!("{name}={value}"));
         }
+        for (name, value) in &self.service_env {
+            args.push("-e".to_owned());
+            args.push(format!("{name}={value}"));
+        }
         args.push(self.tag.clone());
         // A TLS server reads its key/cert off the filesystem before it listens; when those files are
         // absent the app exits on startup. Stage the self-signed marker pair (already baked into the
@@ -1543,17 +1625,55 @@ impl Session {
         let Some(db) = self.db.as_deref() else {
             return Ok(());
         };
-        let mut args = vec!["run", "-d", "--name", db, "--network", &self.network];
-        for alias in DB_ALIASES {
+        let mut args = vec![
+            "run",
+            "-d",
+            "--name",
+            db,
+            "--network",
+            &self.network,
+            "--memory",
+            "512m",
+        ];
+        // A name a SQL database answers to is not also MongoDB's (`db` may be Postgres).
+        let taken: Vec<&str> = self
+            .sql
+            .iter()
+            .flat_map(|(_, s)| s.aliases.iter().map(String::as_str))
+            .collect();
+        for alias in DB_ALIASES
+            .iter()
+            .copied()
+            .chain(self.mongo_aliases.iter().map(String::as_str))
+            .filter(|alias| !taken.contains(alias))
+        {
             args.push("--network-alias");
             args.push(alias);
         }
-        args.push(DB_IMAGE);
-        docker(&args).map_err(|error| format!("could not start the database sidecar: {error}"))?;
+        let image = self
+            .mongo_image
+            .clone()
+            .unwrap_or_else(|| DB_IMAGE.to_owned());
+        args.push(&image);
+        // An older image a repository pins (`mongo:4.0.4`) may be published for amd64 only.
+        if let Err(error) = docker(&args) {
+            if !error.contains("no matching manifest") {
+                return Err(format!("could not start the database sidecar: {error}"));
+            }
+            remove_container(db);
+            args.splice(2..2, ["--platform", "linux/amd64"]);
+            docker(&args)
+                .map_err(|error| format!("could not start the database sidecar: {error}"))?;
+        }
         for _ in 0..40 {
             let ping = self.exec(
                 db,
-                &["mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"],
+                &[
+                    self.mongo_shell(),
+                    "--quiet",
+                    "--eval",
+                    "db.runCommand({ping:1}).ok",
+                ],
             );
             if ping
                 .ok()
@@ -1573,11 +1693,161 @@ impl Session {
         Err("the database sidecar did not become ready within 40s".to_owned())
     }
 
+    /// Starts each SQL database the app needs (see [`super::services`]) on the private network, under
+    /// the names the app connects to, with bounded memory and the repository's init scripts mounted
+    /// read-only, and waits until it accepts TCP connections — which the official images only do once
+    /// their initialization (users, database, init scripts) has finished.
+    fn start_sql(&self) -> Result<(), String> {
+        for (container, sidecar) in &self.sql {
+            let mut args: Vec<String> = [
+                "run",
+                "-d",
+                "--name",
+                container,
+                "--network",
+                &self.network,
+                "--memory",
+                "512m",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            for alias in &sidecar.aliases {
+                args.push("--network-alias".to_owned());
+                args.push(alias.clone());
+            }
+            for (name, value) in &sidecar.container_env {
+                args.push("-e".to_owned());
+                args.push(format!("{name}={value}"));
+            }
+            for (source, target) in &sidecar.mounts {
+                args.push("-v".to_owned());
+                args.push(format!("{}:{target}:ro", source.display()));
+            }
+            let run = |platform: Option<&str>| {
+                let mut full = args.clone();
+                if let Some(platform) = platform {
+                    full.splice(2..2, ["--platform".to_owned(), platform.to_owned()]);
+                }
+                full.push(sidecar.image.clone());
+                let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+                docker(&refs)
+            };
+            // An image published for amd64 only (`mysql:5.7`) runs emulated on an arm64 host.
+            if let Err(error) = run(None) {
+                if !error.contains("no matching manifest") {
+                    return Err(format!(
+                        "could not start the {} database sidecar: {error}",
+                        sidecar.image
+                    ));
+                }
+                remove_container(container);
+                run(Some("linux/amd64")).map_err(|error| {
+                    format!(
+                        "could not start the {} database sidecar: {error}",
+                        sidecar.image
+                    )
+                })?;
+            }
+            let port = sidecar.port().to_string();
+            let password = format!("-p{}", sidecar.password);
+            let user = format!("-u{}", sidecar.user);
+            let probe: Vec<&str> = match sidecar.kind {
+                super::services::SqlKind::Postgres => vec![
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &port,
+                    "-U",
+                    &sidecar.user,
+                ],
+                super::services::SqlKind::Mysql => {
+                    let mut probe = vec![
+                        "mysqladmin",
+                        "ping",
+                        "--silent",
+                        "--protocol=tcp",
+                        "-h",
+                        "127.0.0.1",
+                        "-P",
+                        &port,
+                        &user,
+                    ];
+                    if !sidecar.password.is_empty() {
+                        probe.push(&password);
+                    }
+                    probe
+                }
+            };
+            let mut ready = false;
+            for _ in 0..180 {
+                if self
+                    .exec(container, &probe)
+                    .is_ok_and(|output| output.status.success())
+                {
+                    ready = true;
+                    break;
+                }
+                if !self.container_running(container) {
+                    return Err(format!(
+                        "the {} database sidecar exited before it was ready:\n{}",
+                        sidecar.image,
+                        self.tail_logs(container)
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            if !ready {
+                return Err(format!(
+                    "the {} database sidecar did not become ready within 180s",
+                    sidecar.image
+                ));
+            }
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] sql sidecar {} ({}) ready as {:?}",
+                    container, sidecar.image, sidecar.aliases
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The MongoDB shell inside the database sidecar: `mongosh` (5.0 and later images) or the
+    /// legacy `mongo` (older images a repository may pin). Looked up once per session.
+    fn mongo_shell(&self) -> &'static str {
+        if let Some(shell) = self.mongo_shell.get() {
+            return shell;
+        }
+        let Some(db) = self.db.as_deref() else {
+            return "mongosh";
+        };
+        let has_mongosh = self
+            .exec(db, &["sh", "-c", "command -v mongosh"])
+            .is_ok_and(|output| output.status.success());
+        let shell = if has_mongosh { "mongosh" } else { "mongo" };
+        // Only remember the answer once the container is up to give one.
+        if self.container_running(db) {
+            self.mongo_shell.set(Some(shell));
+        }
+        shell
+    }
+
     fn start_redis(&self) -> Result<(), String> {
         let Some(redis) = self.redis.as_deref() else {
             return Ok(());
         };
-        let mut args = vec!["run", "-d", "--name", redis, "--network", &self.network];
+        let mut args = vec![
+            "run",
+            "-d",
+            "--name",
+            redis,
+            "--network",
+            &self.network,
+            "--memory",
+            "256m",
+        ];
         for alias in REDIS_ALIASES {
             args.push("--network-alias");
             args.push(alias);
@@ -1662,7 +1932,7 @@ impl Session {
                 d.getCollection(c).insertOne({jss_seed:1});}catch(e){}\
             });\
           });";
-        let output = self.exec(db, &["mongosh", "--quiet", "--eval", script]);
+        let output = self.exec(db, &[self.mongo_shell(), "--quiet", "--eval", script]);
         if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
             let (code, message) = match output {
                 Ok(output) => (
@@ -1679,7 +1949,7 @@ impl Session {
                 });\
               });";
             let listing = self
-                .exec(db, &["mongosh", "--quiet", "--eval", list])
+                .exec(db, &[self.mongo_shell(), "--quiet", "--eval", list])
                 .ok()
                 .map(|o| {
                     String::from_utf8_lossy(&o.stdout)
@@ -1704,7 +1974,12 @@ impl Session {
         };
         let _ = self.exec(
             db,
-            &["mongosh", "--quiet", "--eval", ENABLE_PROFILING_SCRIPT],
+            &[
+                self.mongo_shell(),
+                "--quiet",
+                "--eval",
+                ENABLE_PROFILING_SCRIPT,
+            ],
         );
     }
 
@@ -1718,7 +1993,15 @@ impl Session {
         let Some(db) = self.db.as_deref() else {
             return;
         };
-        let _ = self.exec(db, &["mongosh", "--quiet", "--eval", SEED_PROFILED_SCRIPT]);
+        let _ = self.exec(
+            db,
+            &[
+                self.mongo_shell(),
+                "--quiet",
+                "--eval",
+                SEED_PROFILED_SCRIPT,
+            ],
+        );
     }
 
     /// Plant a single record that a document-filtering NoSQL sink's own query selects, so the
@@ -1742,7 +2025,7 @@ impl Session {
         let _ = self.fetch(&first.match_none_eq);
         std::thread::sleep(std::time::Duration::from_secs(2));
         let script = nosql_lookup_seed_script(&first.absent);
-        let output = self.exec(db, &["mongosh", "--quiet", "--eval", &script]);
+        let output = self.exec(db, &[self.mongo_shell(), "--quiet", "--eval", &script]);
         if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
             let (code, message) = match output {
                 Ok(output) => (
@@ -1815,6 +2098,13 @@ impl Session {
 
     pub fn exercise(&mut self, probe: &Probe) -> Outcome {
         self.nonce += 1;
+        // A second-order finding: the payload must be saved by a write request before the read
+        // request named by `probe` loads it back into the sink. Checked first — the generic matrix
+        // below assumes the one request that carries the payload is also the one that reaches the
+        // sink, which does not hold here.
+        if let Some(write) = &probe.stored_write {
+            return self.exercise_stored(probe, write);
+        }
         if probe.class == jss_core::VulnClass::NosqlInjection {
             return self.exercise_nosql(probe);
         }
@@ -1939,8 +2229,25 @@ impl Session {
             // actually challenges this route; an in-handler gate is always pursued (an anonymous
             // request simply never reaches its sink).
             let gated = !boot.default_credentials || self.auth_challenge(&attempts);
-            if gated && let Some(cred) = self.obtain_session(boot) {
+            let cred = if gated {
+                self.obtain_session(boot)
+            } else {
+                None
+            };
+            // Behind route-level login middleware an anonymous request never reaches the sink, so
+            // without a session there is nothing honest to send: say so rather than reporting a
+            // not-reproduced that only reflects the login gate.
+            if boot.route_gate && cred.is_none() {
+                return Outcome::Skipped {
+                    reason: format!(
+                        "reaching it needs user authentication; no session could be minted through the app's login route ({})",
+                        boot.login_paths.join(", ")
+                    ),
+                };
+            }
+            if let Some(cred) = cred {
                 let mut decorated = Vec::with_capacity(attempts.len() * 2);
+                let mut first_with: Option<Attempt> = None;
                 for attempt in &attempts {
                     let with = match &cred {
                         SessionCred::Bearer { cookie, token } => {
@@ -1948,10 +2255,34 @@ impl Session {
                         }
                         SessionCred::Cookie { pair } => payload::with_cookie(attempt, pair),
                     };
+                    if first_with.is_none() {
+                        first_with = Some(with.clone());
+                    }
                     if let Some(form) = payload::urlencoded_twin(&with) {
                         decorated.push(form);
                     }
                     decorated.push(with);
+                }
+                // Control: the login gate turns the anonymous request away (401/403 or a redirect to
+                // the login page); when the request carrying the minted session is turned away the
+                // same way, the app did not accept that session for this route, and replaying the
+                // payloads would only measure the gate.
+                if boot.route_gate
+                    && let (Some(anonymous), Some(authed)) = (attempts.first(), first_with.as_ref())
+                    && let Some((_, Some(before), _)) = self.fetch_meta(anonymous)
+                    && let Some((_, Some(after), _)) = self.fetch_meta(authed)
+                    && is_gate_refusal(before)
+                    && (after == before || after == 403)
+                {
+                    // A 403 to a logged-in request is a role the self-registered account lacks.
+                    let reason = if after == 403 && before != 403 {
+                        "reaching it needs a role a self-registered account does not have; the session minted through the app's login route was refused on this route (HTTP 403)".to_owned()
+                    } else {
+                        format!(
+                            "reaching it needs user authentication; the session minted through the app's login route was refused on this route (HTTP {after})"
+                        )
+                    };
+                    return Outcome::Skipped { reason };
                 }
                 attempts = decorated;
             } else if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
@@ -1989,6 +2320,73 @@ impl Session {
                 how: format!("{} {}", poc.method, poc.target),
                 poc,
             };
+        }
+        Outcome::NotReproduced { tried }
+    }
+
+    /// Drives a second-order finding (see [`super::plan::Probe::stored_write`]): sends each payload
+    /// through the request that saves it, then fetches the request named by `probe` itself and checks
+    /// *that* response for the canary — the write's own response proves nothing, since the sink runs
+    /// only when the stored value is read back. Both requests carry the same minted session when the
+    /// finding is login-gated, since Juice-Shop-style profile fields require one to save and load.
+    fn exercise_stored(&mut self, probe: &Probe, write: &super::plan::StoredWrite) -> Outcome {
+        let write_probe = Probe {
+            method: write.method,
+            path: write.path.clone(),
+            entry: write.entry.clone(),
+            ..probe.clone()
+        };
+        let write_attempts = payload::attempts(&write_probe, &self.canary, self.nonce);
+        let read_target = payload::fill_remaining(&probe.path, &[]);
+        let read_verb = probe.method.verb(&probe.entry);
+        let cred = match &probe.auth {
+            Some(boot) => {
+                let cred = self.obtain_session(boot);
+                if boot.route_gate && cred.is_none() {
+                    return Outcome::Skipped {
+                        reason: format!(
+                            "reaching it needs user authentication; no session could be minted through the app's login route ({})",
+                            boot.login_paths.join(", ")
+                        ),
+                    };
+                }
+                cred
+            }
+            None => None,
+        };
+        let with_cred = |attempt: &Attempt| match &cred {
+            Some(SessionCred::Bearer { cookie, token }) => {
+                payload::with_session(attempt, cookie, token)
+            }
+            Some(SessionCred::Cookie { pair }) => payload::with_cookie(attempt, pair),
+            None => attempt.clone(),
+        };
+        let tried = write_attempts.len();
+        for write_attempt in &write_attempts {
+            let decorated_write = with_cred(write_attempt);
+            for plant in std::iter::once(decorated_write.clone())
+                .chain(payload::urlencoded_twin(&decorated_write))
+            {
+                // Plants the payload; its own response is not the oracle for a stored value.
+                let _ = self.fetch(&plant);
+            }
+            let read_attempt = with_cred(&Attempt {
+                verb: read_verb,
+                target: read_target.clone(),
+                body: None,
+                headers: Vec::new(),
+                signal: write_attempt.signal.clone(),
+            });
+            if let Some(mut poc) = self.send(&read_attempt) {
+                poc.evidence = format!(
+                    "{} (the payload was saved first by {} {})",
+                    poc.evidence, decorated_write.verb, decorated_write.target
+                );
+                return Outcome::Verified {
+                    how: format!("{} {}", poc.method, poc.target),
+                    poc,
+                };
+            }
         }
         Outcome::NotReproduced { tried }
     }
@@ -3136,7 +3534,7 @@ impl Session {
              out.sort();print(out.join('\\n'));"
         );
         let output = self
-            .exec(db, &["mongosh", "--quiet", "--eval", &script])
+            .exec(db, &[self.mongo_shell(), "--quiet", "--eval", &script])
             .ok()?;
         output
             .status
@@ -3251,7 +3649,7 @@ impl Session {
              print(out.join('\\n'));"
         );
         let output = self
-            .exec(db, &["mongosh", "--quiet", "--eval", &script])
+            .exec(db, &[self.mongo_shell(), "--quiet", "--eval", &script])
             .ok()?;
         if !output.status.success() {
             return None;
@@ -3283,6 +3681,9 @@ impl Session {
         // credentials, and carry the returned bearer token back under the handler's cookie.
         let email = format!("jss-{}@jsspector.test", self.canary.token);
         let password = format!("Jss!{}aA1", self.canary.token);
+        if boot.route_gate {
+            return self.obtain_registered_session(boot, &email, &password);
+        }
         for path in &boot.register_paths {
             let _ = self.fetch(&payload::credential_post(path, &email, &password));
         }
@@ -3294,6 +3695,60 @@ impl Session {
                     cookie: boot.cookie.clone(),
                     token,
                 });
+            }
+        }
+        None
+    }
+
+    /// A session for a route behind login middleware: registers the throwaway account on each
+    /// candidate registration endpoint and logs in on each login endpoint, each as JSON and as a form
+    /// submission (apps parse one or the other). The session is the bearer token the login returns in
+    /// its body, or the session cookie a successful (2xx/3xx) login sets. Registration failures are
+    /// ignored; the caller's control request still checks the gate accepts what came back.
+    fn obtain_registered_session(
+        &self,
+        boot: &super::plan::AuthBootstrap,
+        email: &str,
+        password: &str,
+    ) -> Option<SessionCred> {
+        let both = |path: &str| {
+            let json = payload::credential_post(path, email, password);
+            let form = payload::urlencoded_twin(&json);
+            std::iter::once(json).chain(form)
+        };
+        // The confirmation, display name and similar fields the app's signup requires.
+        let fields = super::plan::registration_fields(&self.root);
+        for path in &boot.register_paths {
+            let json = payload::registration_post(path, email, password, &fields);
+            let form = payload::urlencoded_twin(&json);
+            for attempt in std::iter::once(json).chain(form) {
+                let _ = self.fetch(&attempt);
+            }
+        }
+        for path in &boot.login_paths {
+            for attempt in both(path) {
+                let Some((body, status, cookies)) = self.fetch_meta(&attempt) else {
+                    continue;
+                };
+                if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                    eprintln!(
+                        "[verify] user-login path={path} status={status:?} cookies={} body[{}]",
+                        cookies.len(),
+                        body.chars().take(200).collect::<String>()
+                    );
+                }
+                if let Some(token) = payload::extract_bearer_token(&body) {
+                    return Some(SessionCred::Bearer {
+                        cookie: boot.cookie.clone(),
+                        token,
+                    });
+                }
+                if status.is_some_and(|code| (200..400).contains(&code))
+                    && !redirects_back_to_auth(&body)
+                    && let Some(pair) = payload::session_cookie_pair(&cookies)
+                {
+                    return Some(SessionCred::Cookie { pair });
+                }
             }
         }
         None
@@ -3971,6 +4426,9 @@ impl Session {
                 if let Some(redis) = &self.redis {
                     remove_container(redis);
                 }
+                for (container, _) in &self.sql {
+                    remove_container(container);
+                }
                 let _ = docker(&["network", "rm", &self.network]);
                 let _ = docker(&["rmi", "-f", &self.tag]);
             }
@@ -4367,6 +4825,37 @@ fn declared_bun_spec(app_root: &std::path::Path) -> Option<String> {
                 .any(script_invokes_bun)
         });
     (bun_lock || bun_scripts).then(|| "latest".to_owned())
+}
+
+/// Whether an HTTP status is how a login gate turns a request away: 401/403, or a redirect (to the
+/// login page) instead of the route's own answer.
+/// Whether a login response is the redirect a failed attempt gets: back to a login or registration
+/// page (`Found. Redirecting to /login`, the body Express and Koa send with a redirect). The cookie such
+/// a response sets is an anonymous session, so the next attempt (the form encoding, another endpoint)
+/// must still be tried.
+fn redirects_back_to_auth(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.split("redirecting to").nth(1).is_some_and(|target| {
+        // The target as written: a bare URL, or the first link of an HTML redirect body.
+        let target = target.trim_start();
+        let target = target
+            .strip_prefix("<a href=\"")
+            .or_else(|| target.strip_prefix("<a href='"))
+            .unwrap_or(target);
+        let target: String = target
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !matches!(c, '<' | '"' | '\''))
+            .collect();
+        [
+            "login", "signin", "sign-in", "log-in", "register", "signup", "sign-up", "auth",
+        ]
+        .iter()
+        .any(|word| target.contains(word))
+    })
+}
+
+fn is_gate_refusal(status: u16) -> bool {
+    matches!(status, 401 | 403 | 301 | 302 | 303 | 307 | 308)
 }
 
 /// Published first-run login passwords from source-controlled environment templates. A verifier
@@ -4847,6 +5336,7 @@ fn build_image(
     start_command: &str,
     port: u16,
     build_env: &[(String, String)],
+    node_image: Option<&str>,
 ) -> Result<(), String> {
     let context = root
         .to_str()
@@ -4855,7 +5345,7 @@ fn build_image(
     // of the launch directory), so the package manager and base image are chosen from there. The
     // build script, by contrast, belongs to the app actually launched: a standalone server run from
     // a manifest-less subdirectory needs its ancestor's dependencies, not its ancestor's build.
-    let image = base_image(install_root);
+    let image = node_image.map_or_else(|| base_image(install_root), str::to_owned);
     let pm = package_manager(install_root);
     // The Azure and worker host shims load the application's own source directly, so the app's build
     // step (a webpack/wrangler bundle produced for the deployment host) is dead weight — and running
@@ -4868,7 +5358,9 @@ fn build_image(
             .and_then(|manifest| build_script(&manifest, app_root))
     })
     .flatten();
-    let native_build = needs_native_toolchain(install_root);
+    // The full image of a pinned older Node already bundles the compiler toolchain, and the archived
+    // Debian release under it can no longer `apt-get` one.
+    let native_build = node_image.is_none() && needs_native_toolchain(install_root);
     let bun_spec = declared_bun_spec(app_root).or_else(|| {
         (install_root != app_root)
             .then(|| declared_bun_spec(install_root))
@@ -5563,7 +6055,15 @@ fn redis_connection_env_for(host: &str, port: u16) -> Vec<(String, String)> {
 /// The Node image the app needs: the major of the lowest Node version `engines.node` of the
 /// repo's `package.json` allows (`>=24.17` -> 24), never older than the default.
 fn base_image(root: &std::path::Path) -> String {
-    let major = std::fs::read_to_string(root.join("package.json"))
+    match declared_engine_major(root) {
+        Some(major) if major > DEFAULT_NODE_MAJOR && major < 100 => format!("node:{major}-slim"),
+        _ => BASE_IMAGE.to_owned(),
+    }
+}
+
+/// The lowest Node major `engines.node` of the `package.json` in `root` allows, if it declares one.
+fn declared_engine_major(root: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(root.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|json| {
@@ -5571,11 +6071,93 @@ fn base_image(root: &std::path::Path) -> String {
                 .and_then(|engines| engines.get("node"))
                 .and_then(|node| node.as_str())
                 .and_then(engine_major)
-        });
-    match major {
-        Some(major) if major > DEFAULT_NODE_MAJOR && major < 100 => format!("node:{major}-slim"),
-        _ => BASE_IMAGE.to_owned(),
+        })
+}
+
+/// The image to retry a failed launch on: the Node the repository itself pins (see
+/// [`pinned_node_major`]) when it is older than the one the default launch used and no older than
+/// [`MIN_FALLBACK_NODE_MAJOR`]. The full image, not `-slim`: an app pinned to an old runtime typically
+/// compiles a native addon at install, and the full image bundles the toolchain for it.
+fn repo_node_fallback(
+    root: &std::path::Path,
+    app_root: &std::path::Path,
+    install_root: &std::path::Path,
+) -> Option<String> {
+    let used = declared_engine_major(install_root)
+        .filter(|&major| major < 100)
+        .map_or(DEFAULT_NODE_MAJOR, |major| major.max(DEFAULT_NODE_MAJOR));
+    let pinned = pinned_node_major(root, &[app_root, install_root])?;
+    (MIN_FALLBACK_NODE_MAJOR..used)
+        .contains(&pinned)
+        .then(|| format!("node:{pinned}"))
+}
+
+/// The Node major a repository pins for its runtime: a version file (`.nvmrc`, `.node-version`) in a
+/// launch directory or any ancestor up to `root`, else the `FROM node:<tag>` of the launch
+/// directory's own `Dockerfile` (the last such stage, the one that runs the app). `engines.node` is
+/// deliberately not used: it states the oldest supported version, not the one the app runs on.
+fn pinned_node_major(root: &std::path::Path, dirs: &[&std::path::Path]) -> Option<u32> {
+    for dir in dirs {
+        let mut current = Some(*dir);
+        while let Some(at) = current.filter(|at| at.starts_with(root)) {
+            for name in [".nvmrc", ".node-version"] {
+                if let Some(major) = std::fs::read_to_string(at.join(name))
+                    .ok()
+                    .and_then(|text| node_version_major(text.split_whitespace().next()?))
+                {
+                    return Some(major);
+                }
+            }
+            current = at.parent();
+        }
     }
+    dirs.iter().find_map(|dir| {
+        let text = std::fs::read_to_string(dir.join("Dockerfile")).ok()?;
+        text.lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                if !words.next()?.eq_ignore_ascii_case("FROM") {
+                    return None;
+                }
+                let image = words.find(|word| !word.starts_with("--"))?;
+                let (name, tag) = image.split_once(':')?;
+                let name = name.rsplit('/').next()?;
+                (name == "node")
+                    .then(|| node_version_major(tag.split(['-', '@']).next()?))
+                    .flatten()
+            })
+            .next_back()
+    })
+}
+
+/// The major of a Node version as a version file or image tag spells it: `v8.17.0`, `14`,
+/// `lts/carbon`, or a release codename (`carbon` = 8). `None` for a floating name (`node`, `lts/*`,
+/// `latest`), which pins nothing.
+fn node_version_major(version: &str) -> Option<u32> {
+    let version = version.trim().to_ascii_lowercase();
+    let version = version.strip_prefix("lts/").unwrap_or(&version);
+    const CODENAMES: [(&str, u32); 11] = [
+        ("argon", 4),
+        ("boron", 6),
+        ("carbon", 8),
+        ("dubnium", 10),
+        ("erbium", 12),
+        ("fermium", 14),
+        ("gallium", 16),
+        ("hydrogen", 18),
+        ("iron", 20),
+        ("jod", 22),
+        ("krypton", 24),
+    ];
+    if let Some((_, major)) = CODENAMES.iter().find(|(name, _)| *name == version) {
+        return Some(*major);
+    }
+    let digits: String = version
+        .trim_start_matches('v')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok().filter(|&major| major > 0)
 }
 
 /// Which package manager installs the app's dependencies, chosen by the lockfile present. A yarn or
@@ -5626,6 +6208,30 @@ fn install_command(pm: PackageManager) -> &'static str {
         }
     }
 }
+
+/// The npm install of the Docker image: [`install_command`], plus one recovery step before the
+/// legacy fallbacks. A dependency the registry no longer serves (an unpublished package, a 404 on its
+/// tarball) fails the whole install, so not even the app's live dependencies install and it cannot
+/// start. When the plain install fails on such 404s, drop the dead packages the manifest declares
+/// directly and install the rest. A dropped package the app still `require`s resolves to the launch
+/// shim's inert stub, exactly like an undeclared one; that stub returns nothing usable, so it can only
+/// stop a flow, never pass the canary through. Docker only: the local runtime installs in the user's
+/// checkout, whose manifest it must not rewrite.
+const NPM_DOCKER_INSTALL: &str = concat!(
+    "npm ci --no-audit --no-fund || npm install --no-audit --no-fund >/tmp/jss-npm.log 2>&1 || { ",
+    "node -e 'try{const fs=require(\"fs\");",
+    "const log=fs.readFileSync(\"/tmp/jss-npm.log\",\"utf8\");",
+    "const re=/404 Not Found - GET https?:\\/\\/[^\\/\\s]+\\/((?:@[^\\/\\s]+(?:\\/|%2[fF]))?[^\\/\\s]+)/g;",
+    "const dead=new Set();let m;while((m=re.exec(log)))dead.add(decodeURIComponent(m[1]));",
+    "const j=JSON.parse(fs.readFileSync(\"package.json\",\"utf8\"));let n=0;",
+    "for(const s of [\"dependencies\",\"devDependencies\",\"optionalDependencies\"]){const o=j[s];",
+    "if(o&&typeof o===\"object\")for(const d of dead)if(Object.prototype.hasOwnProperty.call(o,d)){delete o[d];n++;}}",
+    "if(!n)process.exit(1);fs.writeFileSync(\"package.json\",JSON.stringify(j,null,2));",
+    "console.error(\"dropped dependencies the registry no longer serves: \"+Array.from(dead).join(\",\"));",
+    "}catch(e){process.exit(1);}' && npm install --no-audit --no-fund; } || ",
+    "npm install --no-audit --no-fund --legacy-peer-deps || ",
+    "npm install --omit=dev --ignore-scripts --legacy-peer-deps --no-audit --no-fund || true"
+);
 
 /// The build command for a package manager, run when the app declares a `build` script. A
 /// production server (`next start`, `vite preview`, a compiled `dist/`) serves the build output and
@@ -5849,7 +6455,11 @@ fn dockerfile(
     // of echoing it still has an observably successful file-found branch (see [`payload::PLANTED_IMAGE`]).
     let canary_image_path = canary.planted_image_file();
     let canary_image_b64 = base64(payload::PLANTED_IMAGE_PNG);
-    let install = install_command(pm);
+    let install = if pm == PackageManager::Npm {
+        NPM_DOCKER_INSTALL
+    } else {
+        install_command(pm)
+    };
     // npm cannot resolve the `workspace:` protocol a monorepo uses to pin its sibling packages, and
     // aborts the whole install the moment it parses one — so even unrelated registry dependencies
     // (the app's real runtime deps) never install, and the app cannot start. When installing a
@@ -6805,7 +7415,7 @@ fn listening_probe_excluding_candidates(
     format!(
         "const fs=require('fs'),net=require('net');const ports=new Set([{candidates}]);\
          const excluded=new Set([{excluded}]);\
-         for(const f of ['/proc/net/tcp','/proc/net/tcp6']){{let t='';try{{t=fs.readFileSync(f,'utf8')}}catch{{}}\
+         for(const f of ['/proc/net/tcp','/proc/net/tcp6']){{let t='';try{{t=fs.readFileSync(f,'utf8')}}catch(e){{}}\
          for(const l of t.split('\\n').slice(1)){{const c=l.trim().split(/\\s+/);\
          const [a,p]=(c[1]||'').split(':');\
          const port=parseInt(p,16);\
@@ -6817,7 +7427,7 @@ fn listening_probe_excluding_candidates(
          net.connect({{port,host:hosts[hi++]}}).on('connect',function(){{this.destroy();cb(true)}}).on('error',()=>go());}})();}}\
          function httpOk(port,cb){{let hi=0;(function go(){{if(hi>=hosts.length)return cb(false);\
          const s=net.connect({{port,host:hosts[hi++]}});let buf='';let done=false;\
-         const fin=(v)=>{{if(done)return;done=true;try{{s.destroy()}}catch{{}}if(v)return cb(true);go()}};\
+         const fin=(v)=>{{if(done)return;done=true;try{{s.destroy()}}catch(e){{}}if(v)return cb(true);go()}};\
          s.setTimeout(2000);\
          s.on('connect',()=>s.write('GET / HTTP/1.0\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n'));\
          s.on('data',(d)=>{{buf+=d;const m=/^HTTP\\/\\d\\.\\d (\\d{{3}})/.exec(buf.split('\\r\\n')[0]);\
@@ -13000,6 +13610,97 @@ mod tests {
     }
 
     #[test]
+    fn a_login_that_redirects_back_to_the_login_page_is_not_a_session() {
+        assert!(redirects_back_to_auth("Found. Redirecting to /login"));
+        assert!(redirects_back_to_auth(
+            "<p>Found. Redirecting to <a href=\"/register\">/register</a></p>"
+        ));
+        assert!(redirects_back_to_auth(
+            "Redirecting to /auth/signin?error=1"
+        ));
+        assert!(!redirects_back_to_auth("Found. Redirecting to /learn"));
+        assert!(!redirects_back_to_auth("Found. Redirecting to /dashboard"));
+        assert!(!redirects_back_to_auth("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn node_versions_are_read_from_version_files_tags_and_codenames() {
+        assert_eq!(node_version_major("v8.17.0"), Some(8));
+        assert_eq!(node_version_major("14"), Some(14));
+        assert_eq!(node_version_major("lts/carbon"), Some(8));
+        assert_eq!(node_version_major("Dubnium"), Some(10));
+        assert_eq!(node_version_major("lts/*"), None);
+        assert_eq!(node_version_major("node"), None);
+        assert_eq!(node_version_major("latest"), None);
+    }
+
+    #[test]
+    fn a_failed_launch_retries_on_the_node_the_repository_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The running stage's `FROM node:<codename>` pins the runtime; the build stage does not.
+        write(
+            root,
+            "app/Dockerfile",
+            "FROM node:20 AS build\nRUN npm ci\nFROM --platform=linux/amd64 node:carbon-slim\nCMD [\"npm\",\"start\"]\n",
+        );
+        write(root, "app/package.json", r#"{"engines":{"node":">=6"}}"#);
+        let app = root.join("app");
+        assert_eq!(
+            repo_node_fallback(root, &app, &app).as_deref(),
+            Some("node:8")
+        );
+
+        // A version file in an ancestor wins over the Dockerfile.
+        write(root, ".nvmrc", "v12.22.1\n");
+        assert_eq!(
+            repo_node_fallback(root, &app, &app).as_deref(),
+            Some("node:12")
+        );
+    }
+
+    #[test]
+    fn only_an_older_supported_pin_triggers_a_node_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // `engines.node` is a floor, not the runtime: it pins nothing.
+        write(root, "package.json", r#"{"engines":{"node":">=8"}}"#);
+        assert_eq!(repo_node_fallback(root, root, root), None);
+        // The default runtime or a newer one is what the first launch already used.
+        write(root, ".nvmrc", "22\n");
+        assert_eq!(repo_node_fallback(root, root, root), None);
+        // Older than the launch shim supports.
+        write(root, ".nvmrc", "6\n");
+        assert_eq!(repo_node_fallback(root, root, root), None);
+        // A floating alias pins nothing.
+        write(root, ".nvmrc", "lts/*\n");
+        assert_eq!(repo_node_fallback(root, root, root), None);
+    }
+
+    #[test]
+    fn the_docker_npm_install_drops_unpublished_dependencies_before_the_legacy_fallbacks() {
+        let plain = NPM_DOCKER_INSTALL
+            .find("npm install --no-audit --no-fund >/tmp/jss-npm.log")
+            .expect("the plain install keeps its log");
+        let drop = NPM_DOCKER_INSTALL
+            .find("404 Not Found - GET")
+            .expect("registry 404s are recognized");
+        let legacy = NPM_DOCKER_INSTALL
+            .find("--legacy-peer-deps")
+            .expect("the legacy install remains");
+        assert!(plain < drop && drop < legacy, "{NPM_DOCKER_INSTALL}");
+        assert!(NPM_DOCKER_INSTALL.starts_with("npm ci "));
+        assert!(NPM_DOCKER_INSTALL.ends_with("|| true"));
+        // The script is single-quoted for the shell, so it must not contain a single quote itself.
+        let script = NPM_DOCKER_INSTALL
+            .split_once("node -e '")
+            .and_then(|(_, rest)| rest.split_once("' && npm install"))
+            .map(|(script, _)| script)
+            .expect("the recovery script");
+        assert!(!script.contains('\''));
+    }
+
+    #[test]
     fn the_npm_install_prefers_a_peer_aware_install_before_the_legacy_fallback() {
         // A runtime dependency a package declares only as a peer (the classic `request-promise` ->
         // `request` split) is installed by a plain `npm install`, as modern npm does, but *not* by
@@ -14580,6 +15281,8 @@ http.createServer((req, res) => {
             nosql_mutates: false,
             decode_base64: None,
             allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
         };
         let confined = Probe {
             method: Method::Get,
@@ -14617,6 +15320,8 @@ http.createServer((req, res) => {
             nosql_mutates: false,
             decode_base64: None,
             allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
         };
         let command = Probe {
             method: Method::Get,
@@ -14654,6 +15359,8 @@ http.createServer((req, res) => {
             nosql_mutates: false,
             decode_base64: None,
             allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
         };
         let visible_command = Probe {
             path: "/run".to_owned(),
@@ -14695,6 +15402,8 @@ http.createServer((req, res) => {
             nosql_mutates: false,
             decode_base64: None,
             allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
         };
         let vulnerable = session.exercise(&traversal);
         let safe = session.exercise(&confined);
@@ -14744,6 +15453,303 @@ http.createServer((req, res) => {
             matches!(forged, Outcome::Verified { .. }),
             "the SSRF should verify, got {forged:?}"
         );
+    }
+
+    /// An app whose file read sits behind login middleware: accounts are created on `/api/users`,
+    /// `/api/login` returns a JWT-shaped bearer token, and `requireAuth` answers 401 without one.
+    /// `/api/signin` + `/cookie/read` are the session-cookie variant (redirect to the sign-in page when
+    /// anonymous). `/locked/read` refuses every token, as a gate the minted session cannot pass.
+    const LOGIN_FIXTURE: &str = r#"
+const http = require('http');
+const fs = require('fs');
+const url = require('url');
+const crypto = require('crypto');
+const users = new Map();
+const sessions = new Set();
+const b64 = (s) => Buffer.from(s).toString('base64url');
+function body(req, done) {
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    try { return done(JSON.parse(raw)); } catch (e) {}
+    done(Object.fromEntries(new URLSearchParams(raw)));
+  });
+}
+function requireAuth(req, res) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+  if (!sessions.has(token)) { res.statusCode = 401; res.end('Unauthorized'); return false; }
+  return true;
+}
+http.createServer((req, res) => {
+  const u = url.parse(req.url, true);
+  if (req.method === 'POST' && u.pathname === '/api/users') {
+    return body(req, (b) => { users.set(b.email, b.password); res.statusCode = 201; res.end('{}'); });
+  }
+  if (req.method === 'POST' && u.pathname === '/api/login') {
+    return body(req, (b) => {
+      if (!b.email || users.get(b.email) !== b.password) { res.statusCode = 401; return res.end('{"error":"bad"}'); }
+      const token = b64('{"alg":"HS256"}') + '.' + b64(JSON.stringify({ sub: b.email })) + '.' + crypto.randomBytes(8).toString('base64url');
+      sessions.add(token);
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ token }));
+    });
+  }
+  if (u.pathname === '/secure/read') {
+    if (!requireAuth(req, res)) return;
+    try { res.end(fs.readFileSync((u.query.name || '').toString())); } catch (e) { res.statusCode = 404; res.end('x'); }
+    return;
+  }
+  if (req.method === 'POST' && u.pathname === '/api/signin') {
+    return body(req, (b) => {
+      if (!b.email || users.get(b.email) !== b.password) { res.statusCode = 302; res.setHeader('Location', '/signin'); return res.end(); }
+      const sid = crypto.randomBytes(12).toString('hex');
+      sessions.add(sid);
+      res.setHeader('Set-Cookie', 'sid=' + sid + '; HttpOnly; Path=/');
+      res.statusCode = 302; res.setHeader('Location', '/'); res.end();
+    });
+  }
+  if (u.pathname === '/cookie/read') {
+    const sid = ((req.headers.cookie || '').match(/(?:^|; )sid=([^;]+)/) || [])[1];
+    if (!sessions.has(sid)) { res.statusCode = 302; res.setHeader('Location', '/signin'); return res.end(); }
+    try { res.end(fs.readFileSync((u.query.name || '').toString())); } catch (e) { res.statusCode = 404; res.end('x'); }
+    return;
+  }
+  if (u.pathname === '/admin/read') {
+    if (!requireAuth(req, res)) return;
+    res.statusCode = 403; return res.end('{"error":"admin access required"}');
+  }
+  if (u.pathname === '/locked/read') {
+    res.statusCode = 401; return res.end('Unauthorized');
+  }
+  res.statusCode = 404; res.end('x');
+}).listen(process.env.PORT || 3000, process.env.HOST || '0.0.0.0');
+"#;
+
+    /// A login-gated traversal verifies with a session the run registers and logs in for; a gate that
+    /// refuses the minted session, and an app with no working login route, are skipped with the
+    /// reason instead of being reported as not reproduced. Skipped (not failed) without Docker.
+    #[test]
+    fn end_to_end_verifies_a_login_gated_route_with_a_registered_session() {
+        use super::super::Outcome;
+        use super::super::plan::{AuthBootstrap, Entry, Method, Probe};
+        use jss_core::VulnClass;
+
+        if !available() {
+            eprintln!("verify login end-to-end: skipped (no Docker daemon reachable)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"verify-login-fixture","version":"1.0.0","scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("server.js"), LOGIN_FIXTURE).unwrap();
+
+        let boot = |login: &str| AuthBootstrap {
+            cookie: "token".to_owned(),
+            register_paths: vec!["/api/users".to_owned()],
+            login_paths: vec![login.to_owned()],
+            default_credentials: false,
+            route_gate: true,
+        };
+        let read = |path: &str, login: &str| Probe {
+            method: Method::Get,
+            path: path.to_owned(),
+            entry: Entry::Query("name".to_owned()),
+            class: VulnClass::PathTraversal,
+            siblings: Vec::new(),
+            gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            doc_envelope: None,
+            lists_dir: false,
+            removes: false,
+            removes_dir: false,
+            creates: false,
+            archive_upload: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            body_object: false,
+            body_query_override: None,
+            sql: None,
+            sql_value: None,
+            array_element: false,
+            appended_fields: Vec::new(),
+            proto_pollution: None,
+            alt_paths: Vec::new(),
+            auth: Some(boot(login)),
+            multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
+            allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
+        };
+
+        let mut session =
+            Session::start(dir.path()).expect("the login fixture sandbox should start");
+        let gated = session.exercise(&read("/secure/read", "/api/login"));
+        let refused = session.exercise(&read("/locked/read", "/api/login"));
+        let no_login = session.exercise(&read("/secure/read", "/api/nope/login"));
+        let cookie_gated = session.exercise(&read("/cookie/read", "/api/signin"));
+        let role_gated = session.exercise(&read("/admin/read", "/api/login"));
+        session.teardown();
+
+        match &role_gated {
+            Outcome::Skipped { reason } => assert!(reason.contains("needs a role"), "{reason}"),
+            other => {
+                panic!("a route refusing the logged-in account should be skipped, got {other:?}")
+            }
+        }
+
+        match &cookie_gated {
+            Outcome::Verified { poc, .. } => assert!(
+                poc.headers.iter().any(|h| h.starts_with("Cookie: sid=")),
+                "the reproduction must carry the session cookie the login set, got {:?}",
+                poc.headers
+            ),
+            other => panic!("the cookie-session traversal should verify, got {other:?}"),
+        }
+
+        match &gated {
+            Outcome::Verified { poc, .. } => assert!(
+                poc.headers
+                    .iter()
+                    .any(|h| h.starts_with("Authorization: Bearer eyJ")),
+                "the reproduction must carry the minted bearer session, got {:?}",
+                poc.headers
+            ),
+            other => panic!("the login-gated traversal should verify, got {other:?}"),
+        }
+        match &refused {
+            Outcome::Skipped { reason } => assert!(
+                reason.contains("was refused on this route (HTTP 401)"),
+                "{reason}"
+            ),
+            other => panic!("a gate refusing the minted session should be skipped, got {other:?}"),
+        }
+        match &no_login {
+            Outcome::Skipped { reason } => assert!(
+                reason.contains("no session could be minted") && reason.contains("/api/nope/login"),
+                "{reason}"
+            ),
+            other => {
+                panic!("without a working login route the probe should be skipped, got {other:?}")
+            }
+        }
+    }
+
+    /// An app that exits unless its Compose database is reachable: the sandbox starts that database
+    /// under the Compose service name, passes the app the Compose environment, and the traversal
+    /// behind it then verifies. Skipped (not failed) without Docker.
+    #[test]
+    fn end_to_end_starts_the_compose_database_the_app_needs() {
+        use super::super::Outcome;
+        use super::super::plan::{Entry, Method, Probe};
+        use jss_core::VulnClass;
+
+        if !available() {
+            eprintln!("verify database end-to-end: skipped (no Docker daemon reachable)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"verify-db-fixture","version":"1.0.0","scripts":{"start":"node server.js"},"dependencies":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  db:\n    image: postgres:16-alpine\n    environment:\n      POSTGRES_PASSWORD: pw\n  web:\n    build: .\n    environment:\n      DB_HOST: db\n    depends_on:\n      - db\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("server.js"),
+            r#"
+const http = require('http');
+const net = require('net');
+const fs = require('fs');
+const url = require('url');
+const host = process.env.DB_HOST;
+const port = Number(process.env.PGPORT || 5432);
+const socket = net.connect(port, host, () => {
+  socket.end();
+  http.createServer((req, res) => {
+    const u = url.parse(req.url, true);
+    if (u.pathname === '/read') {
+      try { return res.end(fs.readFileSync((u.query.name || '').toString())); } catch (e) { res.statusCode = 404; return res.end('x'); }
+    }
+    res.statusCode = 404; res.end('x');
+  }).listen(process.env.PORT || 3000, '0.0.0.0');
+});
+socket.on('error', (e) => { console.error('database unreachable: ' + e.message); process.exit(1); });
+"#,
+        )
+        .unwrap();
+
+        let mut session =
+            Session::start(dir.path()).expect("the app should start once its database runs");
+        let read = Probe {
+            method: Method::Get,
+            path: "/read".to_owned(),
+            entry: Entry::Query("name".to_owned()),
+            class: VulnClass::PathTraversal,
+            siblings: Vec::new(),
+            gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            doc_envelope: None,
+            lists_dir: false,
+            removes: false,
+            removes_dir: false,
+            creates: false,
+            archive_upload: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            body_object: false,
+            body_query_override: None,
+            sql: None,
+            sql_value: None,
+            array_element: false,
+            appended_fields: Vec::new(),
+            proto_pollution: None,
+            alt_paths: Vec::new(),
+            auth: None,
+            multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
+            allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
+        };
+        let outcome = session.exercise(&read);
+        let sidecars: Vec<String> = session.sql.iter().map(|(c, _)| c.clone()).collect();
+        session.teardown();
+        assert_eq!(sidecars.len(), 1, "the Compose database should be planned");
+        assert!(
+            matches!(outcome, Outcome::Verified { .. }),
+            "the traversal behind the database-gated startup should verify, got {outcome:?}"
+        );
+        for container in sidecars {
+            assert!(
+                docker(&["inspect", &container]).is_err(),
+                "teardown must remove the database sidecar {container}"
+            );
+        }
     }
 
     #[test]

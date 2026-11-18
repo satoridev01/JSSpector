@@ -363,6 +363,7 @@ mod exploitation_output_tests {
                 line: 1,
                 col: 1,
             },
+            stored_by: None,
             trace: Vec::new(),
             key: "sql|server.js|handler|db.query|req.query.id|0".to_owned(),
             fingerprint: "0123456789abcdef".to_owned(),

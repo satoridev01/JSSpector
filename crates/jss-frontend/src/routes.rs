@@ -133,6 +133,54 @@ pub fn attach_entries(root: &Path, reports: &mut [ScanReport]) {
     // lie in the handler's lines (and in this file), weakest authentication first.
     let mut scoped = scoped;
     scoped.sort_by_key(|r| r.auth);
+    // A `stored` source is read where an earlier request saved it: name that request.
+    let stored = crate::scan::stored_fields(reports);
+    for report in reports.iter_mut() {
+        for finding in &mut report.findings {
+            if finding.source.kind != "stored" {
+                continue;
+            }
+            let Some(write) = finding
+                .source
+                .expr
+                .rsplit('.')
+                .next()
+                .and_then(|field| stored.get(field))
+            else {
+                continue;
+            };
+            // The function the write is in: the last one that starts at or before it.
+            let writer = by_file.get(write.file.as_str()).and_then(|module| {
+                module
+                    .functions
+                    .iter()
+                    .filter(|function| function.line <= write.line)
+                    .max_by_key(|function| function.line)
+                    .map(|function| (write.file.clone(), function.name.clone()))
+            });
+            let entry = writer
+                .and_then(|id| reached.get(&id))
+                .and_then(|index| labels.get(*index))
+                .map(|(label, _, _)| label.clone())
+                .or_else(|| {
+                    scoped
+                        .iter()
+                        .find(|r| {
+                            r.file == write.file
+                                && r.lines.is_some_and(|(first, last)| {
+                                    (first..=last).contains(&write.line)
+                                })
+                        })
+                        .map(|r| format!("{} {}", r.method, r.path))
+                });
+            finding.stored_by = Some(jss_core::StoredBy {
+                entry,
+                expr: write.expr.clone(),
+                file: write.file.clone(),
+                line: write.line,
+            });
+        }
+    }
     for report in reports.iter_mut() {
         for finding in &mut report.findings {
             if finding.entry.is_some() || finding.sink.file.is_some() {
@@ -291,15 +339,70 @@ pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
             });
         }
     }
+    // Registrations a caller resolved onto one of its routers: a registrar's route instantiated
+    // where a router is handed in (`files(router)`), by the registrar's own call site, with the
+    // routers it landed on.
+    let mut resolved: BTreeMap<(&str, u32, &str), Vec<RouterId>> = BTreeMap::new();
+    // Call sites recorded directly where they are written (on the registrar's router parameter).
+    let mut direct: BTreeSet<(&str, u32, &str)> = BTreeSet::new();
     for (file, report) in &by_file {
         for entry in &report.module.entries {
-            let prefixes = match &entry.receiver {
+            match (&entry.at, &entry.receiver) {
+                (Some((site, line)), Some(receiver)) => {
+                    let owner = entry.receiver_file.as_deref().unwrap_or(file);
+                    let routers = resolved
+                        .entry((site.as_str(), *line, entry.method.as_str()))
+                        .or_default();
+                    let router = (owner.to_string(), receiver.clone());
+                    if !routers.contains(&router) {
+                        routers.push(router);
+                    }
+                }
+                (None, _) => {
+                    direct.insert((*file, entry.line, entry.method.as_str()));
+                }
+                _ => {}
+            }
+        }
+    }
+    for (file, report) in &by_file {
+        for entry in &report.module.entries {
+            // A registration written on the registrar's router parameter is reported once, from its
+            // own call site (where its handler resolves), under the prefixes of the routers its
+            // callers hand in. The copies instantiated at those callers, and a middle registrar's
+            // copy that knows no router, only repeat it.
+            if let Some((site, line)) = &entry.at {
+                let key = (site.as_str(), *line, entry.method.as_str());
+                if direct.contains(&key) && resolved.contains_key(&key) {
+                    continue;
+                }
+                if entry.receiver.is_none() && resolved.contains_key(&key) {
+                    continue;
+                }
+            }
+            let handed_in = entry
+                .at
+                .is_none()
+                .then(|| resolved.get(&(*file, entry.line, entry.method.as_str())))
+                .flatten();
+            let prefixes = match (handed_in, &entry.receiver) {
+                (Some(routers), _) => {
+                    let mut all: Vec<(String, Auth)> = Vec::new();
+                    for router in routers {
+                        for prefix in prefixes(&parents, router, &mut memo) {
+                            if !all.contains(&prefix) {
+                                all.push(prefix);
+                            }
+                        }
+                    }
+                    all
+                }
                 // A route added through another file's helper is on that file's router.
-                Some(receiver) => {
+                (None, Some(receiver)) => {
                     let owner = entry.receiver_file.as_deref().unwrap_or(file);
                     prefixes(&parents, &(owner.to_string(), receiver.clone()), &mut memo)
                 }
-                None => vec![(String::new(), Auth::NoneDetected)],
+                (None, None) => vec![(String::new(), Auth::NoneDetected)],
             };
             let path = match entry.kind.as_str() {
                 kind @ ("file-route" | "default-export") => match file_route_path(file, kind) {

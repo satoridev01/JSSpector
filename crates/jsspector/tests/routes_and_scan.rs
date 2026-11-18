@@ -618,6 +618,117 @@ fn workspace_packages_and_barrels_are_followed() {
 }
 
 #[test]
+fn a_field_one_request_stores_is_a_source_where_another_request_reads_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"dependencies":{"express":"4","sequelize":"6"}}"#,
+    );
+    write(
+        root,
+        "src/app.js",
+        "const express = require('express');\nconst { updateProfile } = require('./update');\n\
+         const { showProfile } = require('./show');\nconst { badge } = require('./badge');\n\
+         const app = express();\napp.post('/profile', updateProfile);\napp.get('/profile', showProfile);\n\
+         app.get('/badge', badge);\napp.listen(3000);\n",
+    );
+    // The write: the username arrives in one request and is saved on the record.
+    write(
+        root,
+        "src/update.js",
+        "const { User } = require('./models');\n\
+         exports.updateProfile = async (req, res) => {\n  const user = await User.findByPk(req.session.id);\n  \
+         await user.update({ username: req.body.username });\n  res.end();\n};\n",
+    );
+    // The read: a later request loads the record and evaluates the stored value.
+    write(
+        root,
+        "src/show.js",
+        "const { User } = require('./models');\n\
+         exports.showProfile = async (req, res) => {\n  const user = await User.findByPk(req.session.id);\n  \
+         res.send(String(eval(user.username)));\n};\n",
+    );
+    // A field no request stores, and a value that is not a loaded record, are not sources.
+    write(
+        root,
+        "src/badge.js",
+        "const { User } = require('./models');\n\
+         exports.badge = async (req, res) => {\n  const user = await User.findByPk(1);\n  \
+         const local = { username: 'x' };\n  res.send(String(eval(user.createdBy) + eval(local.username)));\n};\n",
+    );
+    write(
+        root,
+        "src/models.js",
+        "exports.User = { findByPk() {}, update() {} };\n",
+    );
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let finding = &findings[0];
+    assert_eq!(finding["class"], "code-injection");
+    assert_eq!(finding["file"], "src/show.js");
+    assert_eq!(finding["source"]["kind"], "stored");
+    assert!(
+        finding["title"].as_str().unwrap().contains("GET /profile"),
+        "{finding}"
+    );
+    // The request that saves the value is named, with the data it saves.
+    assert_eq!(finding["stored_by"]["entry"], "POST /profile", "{finding}");
+    assert_eq!(finding["stored_by"]["expr"], "req.body.username");
+    assert_eq!(finding["stored_by"]["file"], "src/update.js");
+    assert_eq!(finding["stored_by"]["line"], 4);
+}
+
+#[test]
+fn a_stored_value_proven_scalar_at_the_write_cannot_carry_a_nosql_operator_at_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"dependencies":{"express":"4","mongoose":"7"}}"#,
+    );
+    write(
+        root,
+        "src/app.js",
+        "const express = require('express');\nconst app = express();\n\
+         app.post('/save', require('./save'));\napp.get('/load', require('./load'));\n\
+         app.listen(3000);\n",
+    );
+    // The write proves `boardId` is a plain string before saving it: `check` (Meteor-style) narrows
+    // it, so it can never be an operator object (`{ \"$ne\": null }`) by the time it is stored.
+    write(
+        root,
+        "src/save.js",
+        "const { Board } = require('./models');\n\
+         module.exports = async (req, res) => {\n  const boardId = req.body.boardId;\n  \
+         check(boardId, String);\n  await Board.updateOne({ _id: 1 }, { boardId });\n  res.end();\n};\n",
+    );
+    // The read passes it straight into a query selector: an operator object would be a NoSQL
+    // injection, but the write side already ruled that out.
+    write(
+        root,
+        "src/load.js",
+        "const { Board } = require('./models');\n\
+         module.exports = async (req, res) => {\n  const run = await Board.findOne({ _id: 1 });\n  \
+         const other = await Board.findOne({ _id: run.boardId });\n  res.json(other);\n};\n",
+    );
+    write(
+        root,
+        "src/models.js",
+        "exports.Board = { findOne() {}, updateOne() {} };\n",
+    );
+    let report = run(&["scan", "--json", root.to_str().unwrap()]);
+    let findings = report["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().all(|f| f["class"] != "nosql-injection"),
+        "a value proven scalar at the write must not be flagged: {findings:?}"
+    );
+}
+
+#[test]
 fn route_helpers_across_files_build_paths_and_factories_mount_their_router() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -672,6 +783,74 @@ fn route_helpers_across_files_build_paths_and_factories_mount_their_router() {
             "{expected} missing from {list:?}"
         );
     }
+}
+
+#[test]
+fn routes_registered_on_a_router_handed_down_through_registrars_keep_the_mount_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // The app mounts the product of a registrar that hands its router parameter on to one
+    // registrar per feature file, each adding its routes to that same router.
+    write(
+        root,
+        "src/server.js",
+        "const express = require('express');\nconst routes = require('./routes');\n\
+         const app = express();\nconst router = express.Router();\n\
+         app.use('/api', routes(router));\napp.listen(3000);\n",
+    );
+    write(
+        root,
+        "src/routes/index.js",
+        "const files = require('./files');\nconst notes = require('./notes');\n\
+         module.exports = (router) => {\n  files(router);\n  notes(router);\n  return router;\n};\n",
+    );
+    write(
+        root,
+        "src/routes/files.js",
+        "const controller = require('../controllers/files');\n\
+         module.exports = (router) => {\n  router.route('/download').post(controller.fetch);\n};\n",
+    );
+    write(
+        root,
+        "src/routes/notes.js",
+        "module.exports = function (router) {\n  router.get('/v2/info', (req, res) => res.send('ok'));\n};\n",
+    );
+    write(
+        root,
+        "src/controllers/files.js",
+        "exports.fetch = (req, res) => res.sendFile(req.body.path);\n",
+    );
+    // A registrar called with a router of its own module, with no mount above it, keeps its path.
+    write(
+        root,
+        "src/admin.js",
+        "const express = require('express');\nconst notes = require('./routes/notes');\n\
+         const admin = express();\nnotes(admin);\nadmin.listen(4000);\n",
+    );
+    let routes = run(&["routes", "--json", root.to_str().unwrap()]);
+    let list: Vec<String> = routes
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {}",
+                r["method"].as_str().unwrap(),
+                r["path"].as_str().unwrap()
+            )
+        })
+        .collect();
+    for expected in ["POST /api/download", "GET /api/v2/info", "GET /v2/info"] {
+        assert!(
+            list.iter().any(|r| r == expected),
+            "{expected} missing from {list:?}"
+        );
+    }
+    // The registration reached through the mounted router is not also reported without its prefix.
+    assert!(
+        !list.iter().any(|r| r == "POST /download"),
+        "unprefixed duplicate in {list:?}"
+    );
 }
 
 #[test]

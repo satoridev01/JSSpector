@@ -13,6 +13,7 @@ mod payload;
 mod plan;
 mod reflected;
 mod sandbox;
+mod services;
 
 use jss_core::{Finding, VulnClass};
 use serde::Serialize;
@@ -556,6 +557,31 @@ pub fn run(
         }
     }
 
+    // A handler may require the tainted value itself to carry a literal delimiter before it reaches
+    // the sink (`username?.match(/#{(.*)}/) !== null`, then `username.substring(2,
+    // username.length - 1)`): a hand-rolled wrap convention distinct from the JSON-packing
+    // `envelope`/`doc_envelope` above. Mined from the finding's own file for every identifier its
+    // trace names (the sink's own argument and everything it was assigned from along the way), so
+    // it is found whichever alias the handler actually tests. Mutually exclusive with the JSON
+    // envelopes: only one wrapping convention applies to a given value.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.envelope.is_none()
+            && probe.doc_envelope.is_none()
+            && matches!(
+                probe.class,
+                jss_core::VulnClass::CodeInjection
+                    | jss_core::VulnClass::CommandInjection
+                    | jss_core::VulnClass::PathTraversal
+                    | jss_core::VulnClass::Ssrf
+            )
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let tainted = plan::tainted_identifiers(finding, &probe.entry);
+            probe.text_wrap = plan::text_wrap(&source, &tainted);
+        }
+    }
+
     // A sink the handler reaches only on a branch guarded by a session it looks up from a request
     // cookie it reads itself (`const u = sessions.get(req.cookies.token); if (u) { fetch(url) }`) is
     // not driveable by an anonymous request even though no route-level auth middleware flagged it:
@@ -600,6 +626,7 @@ pub fn run(
                     register_paths: register,
                     login_paths: login,
                     default_credentials: false,
+                    route_gate: false,
                 });
             }
         }
@@ -624,8 +651,62 @@ pub fn run(
                 register_paths: Vec::new(),
                 login_paths,
                 default_credentials: true,
+                route_gate: false,
             });
         }
+    }
+
+    // A sink behind route-level login middleware the engine recognized (auth `user`) is reachable by
+    // any account the app lets a visitor create. Mine the app's own registration and login routes —
+    // from the entry and handler modules first, then from every route source in the project when the
+    // auth routes live elsewhere — so the sandbox can register a throwaway account, log in, and replay
+    // the request with that session. No login route means no honest way in: skip with that reason.
+    let mut project_endpoints: Option<(Vec<String>, Vec<String>)> = None;
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        let Ok(plan::Plan::Http(probe)) = planned else {
+            continue;
+        };
+        let Some(boot) = probe.auth.as_mut() else {
+            continue;
+        };
+        if !boot.route_gate || !boot.login_paths.is_empty() {
+            continue;
+        }
+        let handler = std::fs::read_to_string(root.join(&finding.file)).ok();
+        let mut login = Vec::new();
+        let mut register = Vec::new();
+        let route_files = [
+            finding.entry_at.as_ref().map(|at| at.file.as_str()),
+            Some(finding.file.as_str()),
+        ];
+        for file in route_files.into_iter().flatten() {
+            let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+                continue;
+            };
+            let (l, r) = plan::auth_endpoints(&src);
+            push_unique(&mut login, l);
+            push_unique(&mut register, r);
+        }
+        if login.is_empty() || register.is_empty() {
+            let (l, r) = project_endpoints
+                .get_or_insert_with(|| plan::project_auth_endpoints(root))
+                .clone();
+            push_unique(&mut login, l);
+            push_unique(&mut register, r);
+        }
+        if login.is_empty() {
+            *planned = Err(plan::Skip(
+                "reaching it needs user authentication, and no login route was found to mint a session"
+                    .to_owned(),
+            ));
+            continue;
+        }
+        boot.cookie = handler
+            .as_deref()
+            .and_then(|src| plan::session_cookie_gate(src, finding.sink.line as usize))
+            .unwrap_or_else(|| "token".to_owned());
+        boot.login_paths = login;
+        boot.register_paths = register;
     }
 
     // A reflected XSS runs the app (like an HTTP finding) and additionally drives a headless browser
@@ -742,6 +823,16 @@ pub fn run(
         session.teardown();
     }
     Ok(verdicts)
+}
+
+/// Appends each of `items` to `into` unless already present, keeping first-seen order (the ranking
+/// the endpoint miner produced).
+fn push_unique(into: &mut Vec<String>, items: Vec<String>) {
+    for item in items {
+        if !into.contains(&item) {
+            into.push(item);
+        }
+    }
 }
 
 /// The index into `http` of the app session that serves `finding`'s route, launching it on first use

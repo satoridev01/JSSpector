@@ -20,6 +20,17 @@ pub enum Entry {
     Url,
 }
 
+/// The literal text a handler requires immediately before and after the tainted value itself
+/// before it reaches the sink (`username?.match(/#{(.*)}/) !== null`, then `username.substring(2,
+/// username.length - 1)`): a hand-rolled delimiter convention, distinct from [`Envelope`]/
+/// [`DocEnvelope`] (which pack the payload into a JSON object). The payload becomes `prefix` +
+/// `value` + `suffix`. Mined from the handler source only (see [`text_wrap`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextWrap {
+    pub prefix: String,
+    pub suffix: String,
+}
+
 /// A finding we know how to drive: a method, a route path (with `{param}` slots), where the
 /// payload enters, and the class that decides the payload and the check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +247,25 @@ pub struct Probe {
     /// mined; a non-negated `url.includes("169.254.169.254")` is a blocklist and is left out. Mined
     /// from the handler source only; empty when the handler gates the URL on no such substring.
     pub allow_tokens: Vec<String>,
+    /// The literal delimiter a handler requires immediately around the tainted value before it
+    /// reaches the sink (see [`TextWrap`]). `None` for the common case where the value reaches the
+    /// sink unwrapped. Mutually exclusive with [`Self::envelope`]/[`Self::doc_envelope`] (which pack
+    /// the payload into a JSON object instead of wrapping it as plain text).
+    pub text_wrap: Option<TextWrap>,
+    /// For a second-order finding (`finding.source.kind == "stored"`): the request that must run
+    /// first to save the payload, so a later request to [`Self::path`] loads it back into the sink.
+    /// `None` for the ordinary case where the payload rides the same request that reaches the sink.
+    pub stored_write: Option<StoredWrite>,
+}
+
+/// Where and how a second-order finding's payload is saved before the read that reaches the sink
+/// (see [`Probe::stored_write`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredWrite {
+    pub method: Method,
+    pub path: String,
+    /// Where in that request the payload goes (the request field the write handler reads it from).
+    pub entry: Entry,
 }
 
 /// How to obtain a genuine authenticated session for a sink gated behind an in-handler credential
@@ -264,6 +294,180 @@ pub struct AuthBootstrap {
     /// realistic default-deployment exploit; a session the app itself never issues cannot be forged,
     /// so it only reaches a sink an open/default-credentialed deployment already exposes.
     pub default_credentials: bool,
+    /// Whether the gate is route-level login middleware the engine recognized (the finding's auth is
+    /// `user`), rather than an in-handler session read. The session is a throwaway account the run
+    /// registers and logs in through the app's own routes, carried back as a bearer token (under
+    /// [`Self::cookie`] and the `Authorization` header) or as the session cookie the login set. When
+    /// no session can be minted the finding is skipped with that reason instead of being sent
+    /// anonymously. Login and registration endpoints start empty and are mined from the project's
+    /// route sources before the run; only role-free login is attempted (an admin gate stays skipped).
+    pub route_gate: bool,
+}
+
+impl AuthBootstrap {
+    /// A pending route-level bootstrap for a login-gated finding: the endpoints are mined later from
+    /// the project's route sources (see [`project_auth_endpoints`]).
+    pub fn route_gate() -> Self {
+        Self {
+            cookie: String::new(),
+            register_paths: Vec::new(),
+            login_paths: Vec::new(),
+            default_credentials: false,
+            route_gate: true,
+        }
+    }
+}
+
+/// Login and account-registration endpoints mined from every route source in the project, for a
+/// login-gated finding whose entry and handler files do not themselves register the auth routes
+/// (routes split across modules). Sources are concatenated and read once by [`auth_endpoints`], so
+/// the exact-verb login tier is ranked across the whole project. Skips dependencies, build output and
+/// VCS metadata, and stops after a bounded amount of source so a huge repository stays cheap.
+pub fn project_auth_endpoints(root: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let mut text = String::new();
+    for_each_project_source(root, |src| {
+        text.push_str(src);
+        text.push_str("\n;\n");
+    });
+    auth_endpoints(&text)
+}
+
+/// The account fields a registration handler requires beyond the generic credentials
+/// [`super::payload::credential_post`] sends: a confirmation (`cpassword`), a display `name`. Read from
+/// the request-body fields of every project source that reads a password from the body (the signup
+/// route, or a passport strategy in its own module). Only credential and identity fields are taken —
+/// password/confirmation, email, and name-like (`name`, `fullName`, `login`) — so the throwaway account
+/// never sets a role, a flag or any other attribute the app would not let a visitor choose.
+pub fn registration_fields(root: &std::path::Path) -> Vec<String> {
+    const MAX_FIELDS: usize = 12;
+    let mut fields: Vec<String> = Vec::new();
+    for_each_project_source(root, |src| {
+        let names = body_field_names(src);
+        if !names
+            .iter()
+            .any(|name| credential_field(name) == Some(CredentialField::Password))
+        {
+            return;
+        }
+        for name in names {
+            if credential_field(&name).is_some()
+                && !fields.contains(&name)
+                && fields.len() < MAX_FIELDS
+            {
+                fields.push(name);
+            }
+        }
+    });
+    fields
+}
+
+/// Which credential a registration field carries, by its name; `None` for any other attribute.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CredentialField {
+    Password,
+    Email,
+    Name,
+}
+
+pub fn credential_field(name: &str) -> Option<CredentialField> {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("pass") || lower.contains("pwd") {
+        Some(CredentialField::Password)
+    } else if lower.contains("mail") {
+        Some(CredentialField::Email)
+    } else if ["name", "user", "login", "nick"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Some(CredentialField::Name)
+    } else {
+        None
+    }
+}
+
+/// The request-body field names a source reads: `req.body.x`, `body['x']`, and the names
+/// destructured from it (`const { a, b: c } = req.body`).
+fn body_field_names(src: &str) -> Vec<String> {
+    let ident = |s: &str| -> String {
+        s.chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect()
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |name: String| {
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    for (at, _) in src.match_indices("body") {
+        let rest = &src[at + "body".len()..];
+        if let Some(after) = rest.strip_prefix('.') {
+            push(ident(after));
+        } else if let Some(after) = rest.strip_prefix("['").or_else(|| rest.strip_prefix("[\"")) {
+            push(ident(after));
+        }
+    }
+    // `{ a, b: c } = req.body`: the keys before `}` that precede `= <x>.body`.
+    for (at, _) in src.match_indices(".body") {
+        let before = src[..at].trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        let Some(before) = before.trim_end().strip_suffix('=') else {
+            continue;
+        };
+        let Some(close) = before.trim_end().strip_suffix('}') else {
+            continue;
+        };
+        let Some(open) = close.rfind('{') else {
+            continue;
+        };
+        for key in close[open + 1..].split(',') {
+            let key = key.split(':').next().unwrap_or_default().trim();
+            push(ident(key));
+        }
+    }
+    names
+}
+
+/// Calls `visit` with the text of every JavaScript/TypeScript source in the project, skipping
+/// dependencies, build output and VCS metadata, up to a bounded total.
+fn for_each_project_source(root: &std::path::Path, mut visit: impl FnMut(&str)) {
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    let mut seen = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !matches!(
+                    name.as_ref(),
+                    "node_modules" | ".git" | ".next" | "dist" | "build" | "coverage" | "vendor"
+                ) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let script = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| matches!(ext, "js" | "mjs" | "cjs" | "ts" | "mts" | "cts"));
+            if !script || name.ends_with(".min.js") || name.ends_with(".d.ts") {
+                continue;
+            }
+            if let Ok(src) = std::fs::read_to_string(&path) {
+                seen += src.len();
+                visit(&src);
+                if seen > MAX_BYTES {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Login endpoints to mint a first-run session against when a finding's route is gated by a
@@ -1180,7 +1384,12 @@ impl Probe {
                 nosql_mutates: false,
                 decode_base64: None,
                 allow_tokens: Vec::new(),
+                stored_write: None,
+                text_wrap: None,
             });
+        }
+        if finding.source.kind == "stored" {
+            return Self::stored_probe(finding);
         }
         if finding.source.kind != "http" {
             return skip(&format!(
@@ -1188,10 +1397,28 @@ impl Probe {
                 finding.source.kind
             ));
         }
-        if finding.auth != Auth::NoneDetected {
+        // A login-gated route is driven as a throwaway account the run registers through the app's
+        // own routes (see `AuthBootstrap::route_gate`). A role gate is not: a self-registered account
+        // is not an admin, and reaching it would mean forging privileges.
+        if finding.auth == Auth::Admin {
             return skip(&format!(
                 "reaching it needs {} authentication, which verify v1 does not perform",
                 finding.auth.name()
+            ));
+        }
+        let login_gated = finding.auth == Auth::User;
+        // The SQL and NoSQL differentials run their own request sequences, which do not carry a
+        // minted session yet; sent anonymously behind a login gate they would only report a
+        // misleading not-reproduced.
+        if login_gated
+            && matches!(
+                finding.class,
+                VulnClass::SqlInjection | VulnClass::NosqlInjection
+            )
+        {
+            return skip(&format!(
+                "reaching it needs user authentication, and the {} oracle does not carry a login session yet",
+                finding.class.name()
             ));
         }
         let Some(entry_point) = finding.entry.as_deref() else {
@@ -1242,6 +1469,12 @@ impl Probe {
         let removes_dir =
             finding.class == VulnClass::PathTraversal && sink_removes_dir(&finding.sink.api);
         let creates = finding.class == VulnClass::PathTraversal && sink_creates(&finding.sink.api);
+        // The delete and create oracles send their own requests without the minted session.
+        if login_gated && (removes || creates) {
+            return skip(
+                "reaching it needs user authentication, and the file delete/create oracles do not carry a login session yet",
+            );
+        }
         // A listing whose read path is `<tainted-dir>/<sibling>` reaches a real directory only when
         // the sibling route parameter carries a value the handler accepts; recover it from the route
         // and the handler's own guard so the probe can drive it.
@@ -1343,7 +1576,7 @@ impl Probe {
             appended_fields,
             proto_pollution: None,
             alt_paths: Vec::new(),
-            auth: None,
+            auth: login_gated.then(AuthBootstrap::route_gate),
             multipart: None,
             cmd_quote,
             cmd_dir_segment,
@@ -1352,6 +1585,8 @@ impl Probe {
             nosql_mutates,
             decode_base64,
             allow_tokens,
+            stored_write: None,
+            text_wrap: None,
         })
     }
 
@@ -1421,8 +1656,152 @@ impl Probe {
             nosql_mutates: false,
             decode_base64: None,
             allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
         })
     }
+
+    /// Plans a second-order finding (`finding.source.kind == "stored"`): the payload must be saved
+    /// through the request named by [`Finding::stored_by`] before the request named by
+    /// [`Finding::entry`] loads it back into the sink. Driven only for the classes the generic
+    /// single-request matrix already covers; SQL/NoSQL run their own oracles that do not yet carry
+    /// a second request, and a nested-write prototype-pollution sink has its own two-key planner.
+    fn stored_probe(finding: &Finding) -> Result<Self, Skip> {
+        let skip = |reason: &str| Err(Skip(reason.to_owned()));
+        if !matches!(
+            finding.class,
+            VulnClass::PathTraversal
+                | VulnClass::CommandInjection
+                | VulnClass::CodeInjection
+                | VulnClass::Ssrf
+        ) {
+            return skip(&format!(
+                "a second-order {} (one request stores the value, another reads it back) is not driven by verify v1 yet",
+                finding.class.name()
+            ));
+        }
+        if finding.auth == Auth::Admin {
+            return skip(&format!(
+                "reaching it needs {} authentication, which verify v1 does not perform",
+                finding.auth.name()
+            ));
+        }
+        let Some(stored_by) = &finding.stored_by else {
+            return skip("no entry point saves the value this sink reads back from the store");
+        };
+        let Some(write_entry) = stored_by.entry.as_deref() else {
+            return skip("no entry point saves the value this sink reads back from the store");
+        };
+        let Some(entry_point) = finding.entry.as_deref() else {
+            return skip("no entry point maps to this sink; nothing to send");
+        };
+        let (method, path) = parse_entry(entry_point)
+            .ok_or_else(|| Skip(format!("entry `{entry_point}` is not a routable HTTP path")))?;
+        let (write_method, write_path) = parse_entry(write_entry)
+            .ok_or_else(|| Skip(format!("entry `{write_entry}` is not a routable HTTP path")))?;
+        let Some(write_input) = entry_from_request_expr(&stored_by.expr) else {
+            return skip(&format!(
+                "cannot tell where `{}` enters the request that saves it",
+                stored_by.expr
+            ));
+        };
+        Ok(Self {
+            method,
+            path,
+            entry: Entry::Body(None),
+            class: finding.class,
+            siblings: Vec::new(),
+            gate_paths: Vec::new(),
+            url_query_params: Vec::new(),
+            read_suffix: None,
+            envelope: None,
+            doc_envelope: None,
+            lists_dir: false,
+            removes: false,
+            removes_dir: false,
+            creates: false,
+            archive_upload: false,
+            appended_param: None,
+            path_fillers: Vec::new(),
+            body_requires: Vec::new(),
+            body_object: false,
+            body_query_override: None,
+            sql: None,
+            sql_value: None,
+            array_element: false,
+            appended_fields: Vec::new(),
+            proto_pollution: None,
+            alt_paths: Vec::new(),
+            auth: (finding.auth == Auth::User).then(AuthBootstrap::route_gate),
+            multipart: None,
+            cmd_quote: None,
+            cmd_dir_segment: false,
+            nosql_lookup: false,
+            nosql_inserts_before_sink: false,
+            nosql_mutates: false,
+            decode_base64: None,
+            allow_tokens: Vec::new(),
+            stored_write: Some(StoredWrite {
+                method: write_method,
+                path: write_path,
+                entry: write_input,
+            }),
+            text_wrap: None,
+        })
+    }
+}
+
+/// Where in a request a plain request-access expression (`req.body.username`, `req.query.x`,
+/// `req.params.id`) places its value — the generic shapes [`StoredWrite::entry`] needs. `None` for
+/// any other shape (a header, the whole body, a computed access): the write side is skipped rather
+/// than guessed.
+fn entry_from_request_expr(expr: &str) -> Option<Entry> {
+    let field = |rest: &str| -> String {
+        rest.trim_end_matches(']')
+            .trim_matches(|c: char| c == '\'' || c == '"')
+            .to_owned()
+    };
+    if let Some(at) = expr.find(".body.") {
+        return Some(Entry::Body(Some(field(&expr[at + ".body.".len()..]))));
+    }
+    if let Some(at) = expr.find(".query.") {
+        return Some(Entry::Query(field(&expr[at + ".query.".len()..])));
+    }
+    if let Some(at) = expr.find(".params.") {
+        return Some(Entry::PathParam(field(&expr[at + ".params.".len()..])));
+    }
+    None
+}
+
+/// A literal-delimited wrap a handler requires around the tainted value itself before it reaches
+/// the sink (see [`TextWrap`]): a regex the handler tests or matches one of the tainted identifiers
+/// against (`username?.match(/#{(.*)}/) !== null`, `/^\[(.*)\]$/.test(id)`), whose pattern has a
+/// capturing group. The literal text around that group's first and last occurrence is the scaffold a
+/// value must carry for the handler's own guard to accept it and unwrap it into the sink. Tried for
+/// every identifier the finding's trace names (the sink's own argument and everything it was
+/// assigned from), so the convention is found whichever alias the handler tests. Mined from the
+/// handler source only.
+pub fn text_wrap(source: &str, tainted: &[String]) -> Option<TextWrap> {
+    for name in tainted {
+        for call in [".match(", ".test("] {
+            for optional in ["?", ""] {
+                let marker = format!("{name}{optional}{call}");
+                let Some(at) = source.find(&marker) else {
+                    continue;
+                };
+                let rest = &source[at + marker.len()..];
+                let Some(pattern) = regex_pattern(rest) else {
+                    continue;
+                };
+                if let Some((prefix, suffix)) = regex_scaffold(&pattern)
+                    && (!prefix.is_empty() || !suffix.is_empty())
+                {
+                    return Some(TextWrap { prefix, suffix });
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The two request inputs the two keys of a nested write `obj[outer][inner] = v` come from, for a
@@ -1804,7 +2183,7 @@ fn identifier_tokens(text: &str) -> Vec<String> {
 /// Identifiers that carry the tainted value in the handler source: the request parameter's own
 /// name and every local it was `assigned to` along the finding's trace. Used to find which
 /// argument of a `path.join(...)` is the attacker-controlled one.
-fn tainted_identifiers(finding: &Finding, entry: &Entry) -> Vec<String> {
+pub(crate) fn tainted_identifiers(finding: &Finding, entry: &Entry) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     match entry {
         Entry::Query(name)
@@ -9314,6 +9693,8 @@ module.exports = { activityValidators };\n";
             nosql_mutates: false,
             decode_base64: None,
             allow_tokens: Vec::new(),
+            stored_write: None,
+            text_wrap: None,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
         assert_eq!((part, target), ("headers", "backendurl"));
@@ -9871,6 +10252,7 @@ module.exports = { activityValidators };\n";
                 line: 1,
                 col: 1,
             },
+            stored_by: None,
             trace: Vec::<TraceStep>::new(),
             key: "k".to_owned(),
             fingerprint: "f".to_owned(),
@@ -10878,18 +11260,248 @@ module.exports = { activityValidators };\n";
     }
 
     #[test]
+    fn entry_from_request_expr_reads_body_query_and_param_accesses() {
+        assert_eq!(
+            entry_from_request_expr("req.body.username"),
+            Some(Entry::Body(Some("username".to_owned())))
+        );
+        assert_eq!(
+            entry_from_request_expr("req.query.q"),
+            Some(Entry::Query("q".to_owned()))
+        );
+        assert_eq!(
+            entry_from_request_expr("req.params.id"),
+            Some(Entry::PathParam("id".to_owned()))
+        );
+        assert_eq!(entry_from_request_expr("req.body[\'name\']"), None);
+        assert_eq!(entry_from_request_expr("req.headers.x"), None);
+        assert_eq!(entry_from_request_expr("req.body"), None);
+    }
+
+    #[test]
+    fn text_wrap_mines_the_literal_scaffold_around_a_regex_capture_group() {
+        // The Juice-Shop-style convention: a plain `.match()` guard, then a `.substring()` unwrap.
+        let source = "let username = user.username\n\
+            if (username?.match(/#{(.*)}/) !== null) {\n  \
+            const code = username?.substring(2, username.length - 1)\n  \
+            username = eval(code)\n}";
+        let tainted = vec!["code".to_owned(), "username".to_owned()];
+        let wrap = text_wrap(source, &tainted).expect("the wrap convention is found");
+        assert_eq!(wrap.prefix, "#{");
+        assert_eq!(wrap.suffix, "}");
+
+        // Found through whichever tainted alias the handler actually tests, not only the first.
+        let tainted_code_first = vec!["code".to_owned()];
+        assert!(text_wrap(source, &tainted_code_first).is_none());
+
+        // A handler that reaches the sink unwrapped has no such convention.
+        assert!(text_wrap("eval(username)", &tainted).is_none());
+
+        // A guard with no capturing group (nothing to unwrap) is not mistaken for a wrap.
+        assert!(text_wrap("if (username.match(/^[a-z]+$/)) eval(username)", &tainted).is_none());
+    }
+
+    #[test]
+    fn a_stored_source_plans_the_write_that_saves_it_and_the_read_that_reaches_the_sink() {
+        // The sink's own source is the loaded record's field (`user.username`); the finding carries
+        // the request that saved it (`POST /profile`, `req.body.username`).
+        let mut f = finding(
+            VulnClass::CodeInjection,
+            Auth::User,
+            Some("GET /profile"),
+            "user.username",
+        );
+        f.source.kind = "stored";
+        f.stored_by = Some(jss_core::StoredBy {
+            entry: Some("POST /profile".to_owned()),
+            expr: "req.body.username".to_owned(),
+            file: "routes/updateUserProfile.ts".to_owned(),
+            line: 38,
+        });
+        let probe = Probe::from_finding(&f).expect("a stored source should plan");
+        assert_eq!(probe.method, Method::Get);
+        assert_eq!(probe.path, "/profile");
+        let write = probe.stored_write.expect("the write that saves the value");
+        assert_eq!(write.method, Method::Post);
+        assert_eq!(write.path, "/profile");
+        assert_eq!(write.entry, Entry::Body(Some("username".to_owned())));
+        // Login-gated, like any other `auth: user` finding.
+        assert!(probe.auth.is_some_and(|b| b.route_gate));
+
+        // No write side known: skipped, not silently sent anonymously.
+        let mut no_write = f.clone();
+        no_write.stored_by = None;
+        assert_eq!(
+            Probe::from_finding(&no_write).unwrap_err().0,
+            "no entry point saves the value this sink reads back from the store"
+        );
+
+        // SQL/NoSQL second-order flows are not driven yet: skipped with a clear reason, not guessed.
+        let mut sql = f.clone();
+        sql.class = VulnClass::SqlInjection;
+        assert_eq!(
+            Probe::from_finding(&sql).unwrap_err().0,
+            "a second-order sql-injection (one request stores the value, another reads it back) is not driven by verify v1 yet"
+        );
+    }
+
+    #[test]
+    fn login_gated_findings_plan_with_a_pending_registered_session() {
+        // A route behind login middleware is planned, carrying a route-level bootstrap whose
+        // endpoints are mined later from the project's route sources.
+        let probe = Probe::from_finding(&finding(
+            VulnClass::PathTraversal,
+            Auth::User,
+            Some("GET /x"),
+            "req.query.n",
+        ))
+        .unwrap();
+        let boot = probe.auth.expect("a login-gated probe carries a bootstrap");
+        assert!(boot.route_gate);
+        assert!(!boot.default_credentials);
+        assert!(boot.login_paths.is_empty() && boot.register_paths.is_empty());
+        // The same route without auth carries none.
+        let open = Probe::from_finding(&finding(
+            VulnClass::PathTraversal,
+            Auth::NoneDetected,
+            Some("GET /x"),
+            "req.query.n",
+        ))
+        .unwrap();
+        assert!(open.auth.is_none());
+        // Command injection behind login is planned the same way.
+        let mut cmd = finding(
+            VulnClass::CommandInjection,
+            Auth::User,
+            Some("GET /x"),
+            "req.query.n",
+        );
+        cmd.sink.api = "child_process.exec".to_owned();
+        assert!(
+            Probe::from_finding(&cmd)
+                .unwrap()
+                .auth
+                .is_some_and(|b| b.route_gate)
+        );
+        // A file-create sink behind login is not: its oracle sends requests without the session.
+        let mut create = finding(
+            VulnClass::PathTraversal,
+            Auth::User,
+            Some("POST /x"),
+            "req.body.n",
+        );
+        create.sink.api = "fs.writeFile".to_owned();
+        assert_eq!(
+            Probe::from_finding(&create).unwrap_err().0,
+            "reaching it needs user authentication, and the file delete/create oracles do not carry a login session yet"
+        );
+    }
+
+    #[test]
+    fn registration_fields_come_from_the_module_that_reads_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("core")).unwrap();
+        // A passport signup strategy in its own module requires a confirmation and a display name.
+        std::fs::write(
+            root.join("core/passport.js"),
+            "if (req.body.email && req.body.password && req.body.username && req.body.cpassword && req.body['name']) {\n\
+             db.User.create({ role: req.body.role }) }\n",
+        )
+        .unwrap();
+        // Destructured from the body in another handler that reads a password.
+        std::fs::write(
+            root.join("core/account.js"),
+            "const { fullName, password: pw, isAdmin } = req.body;\n",
+        )
+        .unwrap();
+        // A module that reads no password contributes nothing.
+        std::fs::write(
+            root.join("core/notes.js"),
+            "const title = req.body.title; req.body.nickname;\n",
+        )
+        .unwrap();
+        let fields = registration_fields(root);
+        for expected in [
+            "email",
+            "password",
+            "username",
+            "cpassword",
+            "name",
+            "fullName",
+        ] {
+            assert!(
+                fields.iter().any(|f| f == expected),
+                "{expected} in {fields:?}"
+            );
+        }
+        // Never an attribute a visitor should not choose, nor a field from an unrelated module.
+        for absent in ["role", "isAdmin", "title", "nickname"] {
+            assert!(
+                !fields.iter().any(|f| f == absent),
+                "{absent} in {fields:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_auth_endpoints_mines_routes_split_across_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("routes")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+        std::fs::write(
+            root.join("routes/auth.js"),
+            "router.post('/api/auth/login-options', o);\nrouter.post('/api/auth/login', login);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("routes/users.js"),
+            "router.post('/api/users', create);\nrouter.get('/api/users/:id', show);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("routes/files.js"),
+            "router.get('/api/files', requireAuth, read);\n",
+        )
+        .unwrap();
+        // Dependencies are not the app's routes.
+        std::fs::write(
+            root.join("node_modules/dep/index.js"),
+            "app.post('/dep/signin', x);\n",
+        )
+        .unwrap();
+        let (login, register) = project_auth_endpoints(root);
+        // The exact-verb login ranks before the lookalike, across files.
+        assert_eq!(login, vec!["/api/auth/login", "/api/auth/login-options"]);
+        assert_eq!(register, vec!["/api/users"]);
+    }
+
+    #[test]
     fn ineligible_findings_are_skipped_with_a_reason() {
-        // Needs auth.
+        // A role gate: a self-registered account cannot reach it.
         assert_eq!(
             Probe::from_finding(&finding(
                 VulnClass::PathTraversal,
+                Auth::Admin,
+                Some("GET /x"),
+                "req.query.n"
+            ))
+            .unwrap_err()
+            .0,
+            "reaching it needs admin authentication, which verify v1 does not perform"
+        );
+        // A login gate in front of an oracle that does not carry the minted session.
+        assert_eq!(
+            Probe::from_finding(&finding(
+                VulnClass::SqlInjection,
                 Auth::User,
                 Some("GET /x"),
                 "req.query.n"
             ))
             .unwrap_err()
             .0,
-            "reaching it needs user authentication, which verify v1 does not perform"
+            "reaching it needs user authentication, and the sql-injection oracle does not carry a login session yet"
         );
         // Not an HTTP source.
         let mut dom = finding(

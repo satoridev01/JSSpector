@@ -20,6 +20,7 @@ pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     ),
     ("sql", include_str!("../../../../packs/sql.yaml")),
     ("nosql", include_str!("../../../../packs/nosql.yaml")),
+    ("stored", include_str!("../../../../packs/stored.yaml")),
     ("express", include_str!("../../../../packs/express.yaml")),
     ("koa", include_str!("../../../../packs/koa.yaml")),
     ("hono", include_str!("../../../../packs/hono.yaml")),
@@ -124,6 +125,9 @@ pub struct Pack {
     /// What makes a file a service worker, whose `request`s are the page's.
     #[serde(default)]
     pub service_worker: Option<ServiceWorkerSpec>,
+    /// How a request stores data that a later request reads (second-order flows).
+    #[serde(default)]
+    pub stored: StoredSpec,
     /// Object literals that define a tool for a language model: their handler's first
     /// parameter is the model's (attacker-steerable) input.
     #[serde(default)]
@@ -549,6 +553,24 @@ pub struct ResultSource {
     #[serde(default)]
     pub via: Vec<String>,
     pub kind: String,
+}
+
+/// How data is stored by one request and loaded by another (see `packs/stored.yaml`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredSpec {
+    /// Methods that save the fields of an object argument.
+    #[serde(default)]
+    pub write_methods: Vec<String>,
+    /// Methods that load a record of a model.
+    #[serde(default)]
+    pub read_methods: Vec<String>,
+    /// The project must use one of these packages for the methods to be a store's.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// Keys whose object value holds the saved fields (`{ data: { name } }`, `{ $set: { name } }`).
+    #[serde(default)]
+    pub wrappers: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1037,6 +1059,7 @@ pub struct Model {
     pub assertion_prefixes: Vec<String>,
     pub route_verbs: Vec<String>,
     pub service_worker: ServiceWorkerSpec,
+    pub stored: StoredSpec,
     pub tool_objects: Vec<ToolObjectSpec>,
     pub instances: BTreeMap<String, InstanceSpec>,
     pub jsx_html_props: Vec<String>,
@@ -1208,6 +1231,12 @@ impl Model {
         self.socket_builtin_events.extend(s.builtin_events);
         self.socket_ack_names.extend(s.ack_names);
         self.socket_any_methods.extend(s.any_methods);
+        self.stored.write_methods.extend(pack.stored.write_methods);
+        self.stored.read_methods.extend(pack.stored.read_methods);
+        self.sink_packages
+            .extend(pack.stored.requires.iter().cloned());
+        self.stored.requires.extend(pack.stored.requires);
+        self.stored.wrappers.extend(pack.stored.wrappers);
         self.client_sources.extend(pack.client_sources);
         self.validated_archives.extend(pack.validated_archives);
         self.result_sources.extend(pack.result_sources);

@@ -29,6 +29,8 @@ pub use discover::{
     DiscoverError, DiscoverOptions, Discovery, SourceFile, SourceKind, Work, discover,
     rel_path_string,
 };
-pub use finding::{Auth, EntryLoc, Finding, Severity, SinkLoc, SourceLoc, TraceStep, VulnClass};
+pub use finding::{
+    Auth, EntryLoc, Finding, Severity, SinkLoc, SourceLoc, StoredBy, TraceStep, VulnClass,
+};
 pub use line_index::{LineCol, LineIndex};
 pub use package_type::PackageType;

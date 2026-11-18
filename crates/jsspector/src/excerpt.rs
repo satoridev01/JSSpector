@@ -327,6 +327,7 @@ mod tests {
                 line: 20,
                 col: 3,
             },
+            stored_by: None,
             trace: vec![
                 TraceStep {
                     file: None,

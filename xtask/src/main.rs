@@ -283,6 +283,7 @@ const ENGINE_FILES: &[&str] = &[
 /// Generic labels the engine may use although a pack also mentions them.
 const ENGINE_LABELS: &[&str] = &[
     // Source-kind labels.
+    "stored",
     "http",
     "socket",
     "param",

@@ -1093,8 +1093,22 @@ fn browser_probe(finding: &Finding, source: Option<&str>) -> Result<BrowserProbe
             .unwrap_or_else(|| finding.file.clone()),
         vector,
         sink,
-        params: source.map(url_param_reads).unwrap_or_default(),
+        params: source.map(mined_url_params).unwrap_or_default(),
     })
+}
+
+/// Every parameter name worth trying first for this handler: the ones it reads via
+/// `URLSearchParams`/`.searchParams` ([`url_param_reads`]), then the ones a hand-rolled
+/// `key=value&key=value` split recognizes ([`manual_split_param_reads`]) -- two different,
+/// common ways a script names which query/hash key it wants.
+fn mined_url_params(source: &str) -> Vec<String> {
+    let mut out = url_param_reads(source);
+    for name in manual_split_param_reads(source) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// The query/hash parameter names a DOM script reads off the page URL through a `URLSearchParams`
@@ -1188,6 +1202,134 @@ fn assigned_url_params(source: &str, name: &str) -> bool {
         }
     }
     false
+}
+
+/// Parameter names a script reads off a hand-rolled `key=value&key=value` split of the URL
+/// (`hashStr.split('&').forEach(pair => { const [k, v] = pair.split('='); if (k && v)
+/// params[k] = v; })`), a common idiom predating `URLSearchParams` that [`url_param_reads`]
+/// does not recognize. Finds each `.split('&')` ... `.split('=')` pair, the object the loop
+/// assigns `[k]` into right after, and every property later read off that same object elsewhere
+/// in the file (`params.naics`, `params['naics']`) -- the keys the parser actually recognizes.
+/// Mined from the script source only, so nothing here is tied to a specific app.
+fn manual_split_param_reads(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut from = 0usize;
+    while let Some((at, len)) = find_first_of(source, from, &[".split('&')", ".split(\"&\")"]) {
+        from = at + len;
+        let window_end = (from + 400).min(source.len());
+        let Some((eq_at, eq_len)) = find_first_of(source, from, &[".split('=')", ".split(\"=\")"])
+            .filter(|(eq_at, _)| *eq_at < window_end)
+        else {
+            continue;
+        };
+        let after_eq = eq_at + eq_len;
+        let assign_end = (after_eq + 200).min(source.len());
+        if let Some(obj) = assigned_bracket_target(&source[after_eq..assign_end]) {
+            for name in object_property_reads(source, &obj) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+                if out.len() >= 8 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The earliest occurrence, at or after `from`, of any of `needles` in `source`, with its byte
+/// length. `None` if none occur.
+fn find_first_of(source: &str, from: usize, needles: &[&str]) -> Option<(usize, usize)> {
+    needles
+        .iter()
+        .filter_map(|needle| {
+            source[from..]
+                .find(needle)
+                .map(|rel| (from + rel, needle.len()))
+        })
+        .min_by_key(|(at, _)| *at)
+}
+
+/// The identifier of the first `IDENT[...] = ` (a single `=`, not `==`/`===`) found in `text`,
+/// treated as the object a manual query/hash parser's loop body writes decoded keys into.
+fn assigned_bracket_target(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < text.len() {
+        if bytes.get(i) != Some(&b'[') {
+            i += 1;
+            continue;
+        }
+        let start = bytes
+            .get(..i)
+            .unwrap_or_default()
+            .iter()
+            .rposition(|byte| !is_ident(*byte))
+            .map_or(0, |at| at + 1);
+        let name = &text[start..i];
+        if name.is_empty() {
+            i += 1;
+            continue;
+        }
+        let Some(close_rel) = text[i..].find(']') else {
+            i += 1;
+            continue;
+        };
+        let after = &text[i + close_rel + 1..];
+        let after = after.trim_start();
+        if let Some(rest) = after.strip_prefix('=')
+            && !rest.starts_with('=')
+        {
+            return Some(name.to_owned());
+        }
+        i += close_rel + 1;
+    }
+    None
+}
+
+/// Every property name read off `obj.prop` or `obj['prop']`/`obj["prop"]` in `source`, first-seen
+/// order, deduplicated. `obj` must be a plain local the manual parser assigned into, so this is
+/// not confused with a method call (`obj.hasOwnProperty(...)`) by excluding names immediately
+/// followed by `(`.
+fn object_property_reads(source: &str, obj: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = source.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = source[from..].find(obj) {
+        let at = from + rel;
+        from = at + obj.len();
+        if (at > 0 && bytes.get(at - 1).is_some_and(|byte| is_ident(*byte)))
+            || bytes.get(from).is_some_and(|byte| is_ident(*byte))
+        {
+            continue;
+        }
+        let rest = &source[from..];
+        if let Some(stripped) = rest.strip_prefix('.') {
+            let end = stripped
+                .as_bytes()
+                .iter()
+                .position(|byte| !is_ident(*byte))
+                .unwrap_or(stripped.len());
+            let name = &stripped[..end];
+            if !name.is_empty()
+                && !stripped[end..].starts_with('(')
+                && !out.iter().any(|n| n == name)
+            {
+                out.push(name.to_owned());
+            }
+        } else if let Some(stripped) = rest.strip_prefix('[')
+            && let Some(name) = string_literal_arg(stripped.split(']').next().unwrap_or("").trim())
+            && !name.is_empty()
+            && !out.iter().any(|n| n == &name)
+        {
+            out.push(name);
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
 }
 
 /// The URL part a DOM source reads from.
@@ -10488,6 +10630,45 @@ module.exports = { activityValidators };\n";
         assert_eq!(
             url_param_reads("new URL(location.href).searchParams.get('next')"),
             vec!["next".to_owned()]
+        );
+    }
+
+    #[test]
+    fn manual_split_param_reads_mines_a_hand_rolled_key_value_hash_parser() {
+        // The exact ModelEarth/localsite idiom: no URLSearchParams anywhere, a bare
+        // split('&')/split('=') loop writing into an object, read later by property name.
+        let source = "\
+            window.addEventListener('hashchange', function() {\n\
+                const hashStr = window.location.hash.substring(1);\n\
+                const params = {};\n\
+                hashStr.split('&').forEach(pair => {\n\
+                    const [k, v] = pair.split('=');\n\
+                    if (k && v) params[k] = decodeURIComponent(v);\n\
+                });\n\
+                if (params.state && params.naics && params.naics.indexOf(',') < 0) {\n\
+                    showIndustryDetail(params.naics);\n\
+                }\n\
+            });\n";
+        assert_eq!(
+            manual_split_param_reads(source),
+            vec!["state".to_owned(), "naics".to_owned()]
+        );
+        // Mixed into mined_url_params, a real URLSearchParams read still comes first.
+        let mixed = format!("new URLSearchParams(location.search).get('q');\n{source}");
+        assert_eq!(
+            mined_url_params(&mixed),
+            vec!["q".to_owned(), "state".to_owned(), "naics".to_owned()]
+        );
+    }
+
+    #[test]
+    fn manual_split_param_reads_ignores_an_unrelated_split_on_ampersand() {
+        // No `=`-split and no bracket-assigned object nearby: not the idiom, no false candidates.
+        assert!(
+            manual_split_param_reads(
+                "const parts = 'a&b&c'.split('&'); console.log(parts.length);"
+            )
+            .is_empty()
         );
     }
 

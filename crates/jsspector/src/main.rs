@@ -254,6 +254,10 @@ struct ExplainArgs {
 #[derive(Serialize)]
 struct ScanOutput<'a> {
     root: String,
+    /// The git checkout the scan ran on, so the report's fix diffs can be applied to the right
+    /// repository and commit; absent outside a git checkout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git: Option<GitInfo>,
     files_scanned: usize,
     findings: Vec<ReportedFinding<'a>>,
     /// Findings left out because they are in the baseline.
@@ -776,6 +780,63 @@ mod repository_input_tests {
     }
 
     #[test]
+    fn a_clone_url_loses_its_credentials() {
+        assert_eq!(
+            without_credentials("https://x-access-token:secret@github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            without_credentials("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            without_credentials("git@github.com:o/r.git"),
+            "git@github.com:o/r.git"
+        );
+    }
+
+    #[test]
+    fn the_report_names_the_checkout_a_scan_ran_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            ProcessCommand::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            eprintln!("git not available: skipped");
+            return;
+        }
+        std::fs::create_dir(root.join("app")).unwrap();
+        std::fs::write(root.join("app/index.js"), "x\n").unwrap();
+        assert!(git(&["add", "-A"]));
+        assert!(git(&["commit", "-qm", "base"]));
+        assert!(git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://user:token@github.com/o/r.git"
+        ]));
+        let info = git_info(&root.join("app")).unwrap();
+        assert_eq!(
+            info.repository.as_deref(),
+            Some("https://github.com/o/r.git")
+        );
+        assert_eq!(info.revision.len(), 40);
+        assert_eq!(info.path, "app");
+        assert!(!info.dirty);
+        std::fs::write(root.join("app/index.js"), "y\n").unwrap();
+        assert!(git_info(root).unwrap().dirty);
+        assert_eq!(git_info(root).unwrap().path, "");
+        // Outside a checkout there is nothing to report.
+        assert_eq!(git_info(tempfile::tempdir().unwrap().path()), None);
+    }
+
+    #[test]
     fn recovered_repository_scan_selects_only_its_accepted_fingerprints() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join(".satori")).unwrap();
@@ -1118,6 +1179,8 @@ fn scan(args: &ScanArgs) -> ExitCode {
         || path.to_string_lossy().into_owned(),
         |checkout| checkout.label.clone(),
     );
+    // Read before verification, which may install dependencies in the checkout.
+    let git = git_info(path);
     let loaded = match setup(path, &args.config) {
         Ok(loaded) => loaded,
         Err(code) => return code,
@@ -1236,6 +1299,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
             let verdicts = verdicts_by_fingerprint(&verification);
             let output = ScanOutput {
                 root: root_label,
+                git,
                 files_scanned: analysis.files_scanned,
                 findings: findings
                     .iter()
@@ -1605,6 +1669,64 @@ fn parse(args: &ParseArgs) -> ExitCode {
 }
 
 /// Prints `jsspector: <message>` to stderr and returns `code`.
+/// Where a scanned checkout came from.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct GitInfo {
+    /// The `origin` remote's URL, without credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+    /// The checked-out commit.
+    revision: String,
+    /// The scanned directory relative to the repository's top level (empty at the top level): fix
+    /// diffs are relative to the scanned directory.
+    path: String,
+    /// Whether tracked files had uncommitted changes, in which case a diff may not apply to
+    /// `revision` itself.
+    dirty: bool,
+}
+
+/// The git checkout `path` is in, if any.
+fn git_info(path: &Path) -> Option<GitInfo> {
+    let dir = if path.is_file() { path.parent()? } else { path };
+    let git = |args: &[&str]| -> Option<String> {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let revision = git(&["rev-parse", "HEAD"])?;
+    Some(GitInfo {
+        repository: git(&["remote", "get-url", "origin"])
+            .filter(|url| !url.is_empty())
+            .map(|url| without_credentials(&url)),
+        revision,
+        path: git(&["rev-parse", "--show-prefix"])
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_owned(),
+        dirty: git(&["status", "--porcelain", "--untracked-files=no"])
+            .is_some_and(|status| !status.is_empty()),
+    })
+}
+
+/// `url` without the user and password a clone URL may embed (`https://user:token@host/…`).
+fn without_credentials(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('@') {
+            Some((userinfo, host)) if !userinfo.contains('/') => format!("{scheme}://{host}"),
+            _ => url.to_owned(),
+        },
+        None => url.to_owned(),
+    }
+}
+
 /// `jsspector/fix-recipes` in the user's cache directory (`$XDG_CACHE_HOME`, else `~/.cache`).
 fn default_fix_recipes() -> Option<PathBuf> {
     std::env::var_os("XDG_CACHE_HOME")

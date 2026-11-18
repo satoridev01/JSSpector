@@ -535,10 +535,11 @@ fn llm_candidate(
     }
     let output = run_with_timeout(command, &prompt, remaining)?;
     let content = extract_file(&output).ok_or("the LLM reply carried no file")?;
-    let content = if original.ends_with('\n') && !content.ends_with('\n') {
-        format!("{content}\n")
-    } else {
-        content
+    // Keep the file's own ending: the reply's markers swallow a final newline, or add one.
+    let content = match (original.ends_with('\n'), content.ends_with('\n')) {
+        (true, false) => format!("{content}\n"),
+        (false, true) => content.trim_end_matches(['\n', '\r']).to_owned(),
+        _ => content,
     };
     let changed = changed_lines(original, &content);
     if changed > LLM_MAX_CHANGED_LINES {
@@ -712,8 +713,11 @@ fn changed_lines(old: &str, new: &str) -> usize {
 /// Line operations turning `old` into `new`: the common prefix and suffix kept as is, the middle by
 /// longest common subsequence (or replaced wholesale when it is too large to align cheaply).
 pub(super) fn line_ops<'a>(old: &'a str, new: &'a str) -> Vec<(Op, &'a str)> {
-    let a: Vec<&str> = old.lines().collect();
-    let b: Vec<&str> = new.lines().collect();
+    ops_between(old.lines().collect(), new.lines().collect())
+}
+
+/// Line operations turning lines `a` into lines `b`.
+fn ops_between<'a>(a: Vec<&'a str>, b: Vec<&'a str>) -> Vec<(Op, &'a str)> {
     let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let suffix = a
         .iter()
@@ -792,10 +796,15 @@ pub(super) fn line_ops<'a>(old: &'a str, new: &'a str) -> Vec<(Op, &'a str)> {
     ops
 }
 
-/// A unified diff (3 lines of context) turning `old` into `new`, both `file`.
+/// A unified diff (3 lines of context) turning `old` into `new`, both `file`, that `git apply`
+/// accepts as is: lines are compared with their terminators, so a CRLF file keeps its `\r` and a
+/// last line without a newline is marked `\ No newline at end of file`.
 pub fn unified_diff(file: &str, old: &str, new: &str) -> String {
     const CONTEXT: usize = 3;
-    let ops = line_ops(old, new);
+    let ops = ops_between(
+        old.split_inclusive('\n').collect(),
+        new.split_inclusive('\n').collect(),
+    );
     // Hunks: runs of changes no more than two contexts apart, as (first, last) op indexes.
     let mut hunks: Vec<(usize, usize)> = Vec::new();
     for (index, _) in ops
@@ -837,8 +846,16 @@ pub fn unified_diff(file: &str, old: &str, new: &str) -> String {
                 Op::Removed => '-',
                 Op::Added => '+',
             });
-            out.push_str(line);
-            out.push('\n');
+            match line.strip_suffix('\n') {
+                Some(text) => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                None => {
+                    out.push_str(line);
+                    out.push_str("\n\\ No newline at end of file\n");
+                }
+            }
         }
     }
     out
@@ -902,6 +919,39 @@ mod tests {
             "--- a/x.js\n+++ b/x.js\n@@ -1,7 +1,7 @@\n a\n b\n c\n-d\n+D\n e\n f\n g\n"
         );
         assert_eq!(changed_lines(old, new), 2);
+    }
+
+    #[test]
+    fn git_applies_the_diff_to_crlf_files_and_files_without_a_final_newline() {
+        let cases = [
+            ("a\r\nb\r\nc\r\n", "a\r\nB\r\nc\r\n"),
+            ("a\nb\nc", "a\nb\nC"),
+            ("a\nb\nc", "a\nB\nc"),
+            ("a\nb", "a\nb\n"),
+            ("a\nb\n", "a\nb\nc"),
+        ];
+        for (old, new) in cases {
+            let diff = unified_diff("f.js", old, new);
+            let Ok(dir) = tempfile::tempdir() else {
+                return;
+            };
+            std::fs::write(dir.path().join("f.js"), old).unwrap();
+            std::fs::write(dir.path().join("fix.diff"), &diff).unwrap();
+            let Ok(status) = std::process::Command::new("git")
+                .args(["apply", "fix.diff"])
+                .current_dir(dir.path())
+                .status()
+            else {
+                eprintln!("git not available: skipped");
+                return;
+            };
+            assert!(status.success(), "git apply refused:\n{diff}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("f.js")).unwrap(),
+                new,
+                "{diff}"
+            );
+        }
     }
 
     #[test]

@@ -1380,7 +1380,11 @@ mod tests {
             "commit concurrent test revision".to_owned(),
         )?;
         command_ok(
-            Command::new("git").current_dir(&writer).args(["push"]),
+            // Name the branch: the writer's local branch is whatever `init.defaultBranch` says,
+            // and a bare `git push` refuses when it differs from `main`.
+            Command::new("git")
+                .current_dir(&writer)
+                .args(["push", "origin", "HEAD:main"]),
             "push concurrent test revision".to_owned(),
         )?;
 

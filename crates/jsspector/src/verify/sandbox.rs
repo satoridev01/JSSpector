@@ -401,6 +401,11 @@ pub struct Session {
     /// disk for the local runtime), when preparing the app ran one: a source change only takes
     /// effect after it runs again (see [`Self::relaunch_with_files`]).
     rebuild: Option<(String, String)>,
+    /// When the app runs the TypeScript compiler's output, the directory to compile in (inside the
+    /// container for Docker, on disk for the local runtime): a changed TypeScript file is compiled
+    /// with the project's own `tsc` rather than through the whole build script, whose other steps
+    /// (a frontend bundle) may fail and leave the server's compiled code as it was.
+    typescript: Option<TypescriptBuild>,
     /// How the local runtime last launched the app successfully, so it can be relaunched the same
     /// way with a changed file. `None` for Docker, which restarts its container instead.
     local_launch: Option<LocalLaunch>,
@@ -736,6 +741,10 @@ impl Session {
             start_command: start_command.clone(),
             tls: false,
             rebuild,
+            typescript: typescript_build(&app_root).map(|no_emit_on_error| TypescriptBuild {
+                workdir: workdir.clone(),
+                no_emit_on_error,
+            }),
             local_launch: None,
             overwritten: Vec::new(),
             local_marker_port: None,
@@ -942,6 +951,11 @@ impl Session {
                 needs_redis,
             );
         }
+        let local_typescript =
+            typescript_build(&app_root).map(|no_emit_on_error| TypescriptBuild {
+                workdir: app_root.display().to_string(),
+                no_emit_on_error,
+            });
         let mut session = Self {
             runtime: Runtime::Local {
                 checkout_root: Box::new(root.to_path_buf()),
@@ -987,6 +1001,7 @@ impl Session {
             start_command: start_command.clone(),
             tls: false,
             rebuild: local_rebuild,
+            typescript: local_typescript,
             local_launch: None,
             overwritten: Vec::new(),
             local_marker_port,
@@ -2299,6 +2314,29 @@ impl Session {
         }
     }
 
+    /// The build step that makes `files` take effect: the project's TypeScript compiler when one
+    /// of them is TypeScript and the app runs the compiler's output, otherwise the app's own build.
+    fn rebuild_for(&self, files: &[(String, String)]) -> Option<Rebuild> {
+        let typescript_change = files.iter().any(|(rel, _)| {
+            [".ts", ".tsx", ".mts", ".cts"]
+                .iter()
+                .any(|ext| rel.ends_with(ext) && !rel.ends_with(".d.ts"))
+        });
+        match (&self.typescript, &self.rebuild) {
+            (Some(typescript), _) if typescript_change => Some(Rebuild {
+                workdir: typescript.workdir.clone(),
+                command: TSC_COMMAND.to_owned(),
+                typescript: Some(typescript.no_emit_on_error),
+            }),
+            (_, Some((workdir, command))) => Some(Rebuild {
+                workdir: workdir.clone(),
+                command: command.clone(),
+                typescript: None,
+            }),
+            _ => None,
+        }
+    }
+
     fn relaunch_docker(&mut self, files: &[(String, String)]) -> Result<(), String> {
         for (rel, content) in files {
             let target = container_dir(std::path::Path::new(rel))
@@ -2321,20 +2359,18 @@ impl Session {
             docker(&["cp", source, &format!("{}:{target}", self.app)])
                 .map_err(|e| format!("could not copy {rel} into the app: {e}"))?;
         }
-        if let Some((workdir, command)) = &self.rebuild {
+        if let Some(build) = self.rebuild_for(files) {
             let output = self.exec(
                 &self.app,
                 &[
                     "sh",
                     "-c",
-                    &format!("cd {} && {command}", shell_quote(workdir)),
+                    &format!("cd {} && {}", shell_quote(&build.workdir), build.command),
                 ],
             )?;
-            if !output.status.success() {
-                let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
-                log.push_str(&String::from_utf8_lossy(&output.stderr));
-                return Err(format!("the app's build step failed:\n{}", tail(&log, 20)));
-            }
+            let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
+            log.push_str(&String::from_utf8_lossy(&output.stderr));
+            build.check(output.status.success(), &log)?;
         }
         docker(&["restart", "-t", "2", &self.app])
             .map_err(|e| format!("could not restart the app: {e}"))?;
@@ -2356,11 +2392,22 @@ impl Session {
             }
             std::fs::write(&path, content).map_err(|e| format!("could not write {rel}: {e}"))?;
         }
-        if let (Some((dir, command)), Runtime::Local { tool_dir, .. }) =
-            (&self.rebuild, &self.runtime)
+        if let (Some(build), Runtime::Local { tool_dir, .. }) =
+            (self.rebuild_for(files), &self.runtime)
         {
-            run_local_setup(std::path::Path::new(dir), command, tool_dir.as_deref())
-                .map_err(|e| format!("the app's build step failed: {e}"))?;
+            let mut command = Command::new("sh");
+            if let Some(dir) = tool_dir.as_deref() {
+                command.env("PATH", path_with_tool_dir(dir));
+            }
+            let output = command
+                .args(["-c", &build.command])
+                .current_dir(&build.workdir)
+                .env("CI", "true")
+                .output()
+                .map_err(|e| format!("running the app's build step: {e}"))?;
+            let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
+            log.push_str(&String::from_utf8_lossy(&output.stderr));
+            build.check(output.status.success(), &log)?;
         }
         self.run_local_app(
             &launch.env,
@@ -6825,6 +6872,85 @@ fn build_command(pm: PackageManager, script: &str) -> String {
 /// a `compile` script is used only if `start` runs `node <file>` on a file absent from the
 /// checkout — the start then depends on generated output (`"start": "node dist/index.js"` with
 /// `"compile": "… cp -r server dist"`) and cannot launch without that step.
+/// The project's own TypeScript compiler, on its own `tsconfig.json`.
+const TSC_COMMAND: &str = "npx --no-install tsc -p tsconfig.json";
+
+/// Where to compile an app that runs the TypeScript compiler's output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypescriptBuild {
+    workdir: String,
+    /// `noEmitOnError`: a type error then leaves the compiled output as it was.
+    no_emit_on_error: bool,
+}
+
+/// One build step before a relaunch.
+struct Rebuild {
+    workdir: String,
+    command: String,
+    /// `Some(no_emit_on_error)` for the TypeScript compiler.
+    typescript: Option<bool>,
+}
+
+impl Rebuild {
+    /// Whether the change took effect. The app's own build script is best effort, as when the app
+    /// was prepared; the compiler must have emitted, or the app would run the old code and every
+    /// candidate would look like it failed to stop the exploit.
+    fn check(&self, success: bool, log: &str) -> Result<(), String> {
+        match self.typescript {
+            None => Ok(()),
+            Some(_) if success => Ok(()),
+            // Type errors, anywhere in the project, do not stop `tsc` from emitting.
+            Some(false) if log.contains("error TS") => Ok(()),
+            Some(_) => Err(format!(
+                "the change does not compile with the project's TypeScript compiler:\n{}",
+                tail(log, 20)
+            )),
+        }
+    }
+}
+
+/// `Some(noEmitOnError)` when the app in `app_root` runs the TypeScript compiler's output: a
+/// `tsconfig.json` with an `outDir` that the `start` script runs from, and `typescript` among the
+/// dependencies.
+fn typescript_build(app_root: &std::path::Path) -> Option<bool> {
+    let tsconfig = std::fs::read_to_string(app_root.join("tsconfig.json")).ok()?;
+    let manifest = std::fs::read_to_string(app_root.join("package.json")).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&manifest).ok()?;
+    let has_typescript = ["dependencies", "devDependencies"].iter().any(|section| {
+        json.get(section)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|deps| deps.contains_key("typescript"))
+    });
+    let start = json.get("scripts")?.get("start")?.as_str()?;
+    let out_dir = tsconfig_string(&tsconfig, "outDir")?;
+    let out_dir = out_dir.trim_start_matches("./").trim_end_matches('/');
+    let runs_output = !out_dir.is_empty()
+        && start.split_whitespace().any(|word| {
+            let word = word.trim_start_matches("./");
+            word == out_dir || word.starts_with(&format!("{out_dir}/"))
+        });
+    (has_typescript && runs_output).then(|| tsconfig_true(&tsconfig, "noEmitOnError"))
+}
+
+/// The string value of `"key": "…"` in a `tsconfig.json`, read as text (it may carry comments).
+fn tsconfig_string(text: &str, key: &str) -> Option<String> {
+    let after = text.split(&format!("\"{key}\"")).nth(1)?;
+    let value = after
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix('"')?;
+    Some(value.split('"').next()?.to_owned())
+}
+
+/// Whether `"key": true` appears in a `tsconfig.json`.
+fn tsconfig_true(text: &str, key: &str) -> bool {
+    text.split(&format!("\"{key}\""))
+        .nth(1)
+        .and_then(|after| after.trim_start().strip_prefix(':'))
+        .is_some_and(|value| value.trim_start().starts_with("true"))
+}
+
 fn build_script(manifest: &str, app_root: &std::path::Path) -> Option<&'static str> {
     if has_build_script(manifest) {
         return Some("build");
@@ -13852,6 +13978,66 @@ mod tests {
         let (start, missing) = local_redis_plan(true, false);
         assert!(!start);
         assert!(missing.is_some_and(|note| note.contains("redis-server")));
+    }
+
+    #[test]
+    fn an_app_that_runs_compiled_typescript_is_rebuilt_with_tsc() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path();
+        let manifest = |start: &str, deps: &str| {
+            std::fs::write(
+                app.join("package.json"),
+                format!(
+                    r#"{{"scripts":{{"start":"{start}","build":"npm run build:frontend && npm run build:server"}},"devDependencies":{{{deps}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        std::fs::write(
+            app.join("tsconfig.json"),
+            "{\n  // compiled server\n  \"compilerOptions\": { \"rootDir\": \"./\", \"outDir\": \"./build\" }\n}\n",
+        )
+        .unwrap();
+        manifest("node build/app", r#""typescript":"^5""#);
+        assert_eq!(typescript_build(app), Some(false));
+        // Run from source, or without the compiler installed: the build script stays in charge.
+        manifest("tsx app.ts", r#""typescript":"^5""#);
+        assert_eq!(typescript_build(app), None);
+        manifest("node build/app", r#""tsx":"^4""#);
+        assert_eq!(typescript_build(app), None);
+        std::fs::write(
+            app.join("tsconfig.json"),
+            r#"{"compilerOptions":{"outDir":"dist","noEmitOnError": true}}"#,
+        )
+        .unwrap();
+        manifest("node ./dist/index.js", r#""typescript":"^5""#);
+        assert_eq!(typescript_build(app), Some(true));
+    }
+
+    #[test]
+    fn a_change_the_compiler_did_not_emit_is_rejected_not_tried() {
+        let tsc = |no_emit_on_error| Rebuild {
+            workdir: "/app".to_owned(),
+            command: TSC_COMMAND.to_owned(),
+            typescript: Some(no_emit_on_error),
+        };
+        assert!(tsc(false).check(true, "").is_ok());
+        // Type errors still emit, unless the project turns that off.
+        let typed = "routes/login.ts(3,7): error TS2322: Type 'number' is not assignable";
+        assert!(tsc(false).check(false, typed).is_ok());
+        assert!(tsc(true).check(false, typed).is_err());
+        // A compiler that did not run at all leaves the old code running.
+        let missing = tsc(false)
+            .check(false, "npm error could not determine executable to run")
+            .unwrap_err();
+        assert!(missing.contains("does not compile"), "{missing}");
+        // The app's own build script stays best effort.
+        let script = Rebuild {
+            workdir: "/app".to_owned(),
+            command: "npm run build --if-present || true".to_owned(),
+            typescript: None,
+        };
+        assert!(script.check(false, "ng build failed").is_ok());
     }
 
     #[test]

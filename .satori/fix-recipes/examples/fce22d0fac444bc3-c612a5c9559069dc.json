@@ -1,0 +1,21 @@
+{
+  "recipe": "a29b89cd7e2e44e8",
+  "finding": "fce22d0fac444bc3",
+  "file": "backend/controllers/user.controller.js",
+  "repository": "https://github.com/mwakidenis/Kazi-Haven.git",
+  "revision": "c3f5b89395859e584974cbb779deedd14bf47d13",
+  "original_fingerprint": "c612a5c9559069dc",
+  "hunks": [
+    {
+      "line": 28,
+      "old": [
+        "    const checkExistingUser = await User.findOne({ email });"
+      ],
+      "new": [
+        "    const checkExistingUser = await User.findOne({ email: String(email) });"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request POST \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/api/user/register' \\\n  --header 'Content-Type: application/json' \\\n  --data-raw '{\"email\":{\"$ne\":\"18e97bb780c02cf8116e5a00\"},\"fullName\":\"jsspector\",\"password\":\"jsspector\",\"phoneNumber\":\"jsspector\",\"role\":\"student\"}'",
+  "benign_status": 500
+}

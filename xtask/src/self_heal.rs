@@ -6,7 +6,7 @@
 //! worktree. The controller, never the agent, decides success by rebuilding the candidate scanner
 //! and requiring structured dynamic proof for the exact historical source-to-sink identity.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -22,8 +22,6 @@ pub struct Options {
     pub root: PathBuf,
     pub bench: PathBuf,
     pub targets: PathBuf,
-    /// The tracked fix recipe store, committed with the identities.
-    pub recipes: PathBuf,
     pub cache: PathBuf,
     pub case: Option<String>,
     pub repo: Option<String>,
@@ -132,9 +130,6 @@ pub fn run(options: &Options) -> Result<()> {
     let source_dirty = !git_output(&options.root, &["status", "--porcelain"])?
         .trim()
         .is_empty();
-    // The dynamic scans prove a fix for what they verify and record it in a working copy of the
-    // fix recipe store; what they learned joins the tracked store right before the commit.
-    let recipes = RecipeWorkspace::create(&options.recipes, &recipe_workdir(options))?;
     let mut workspace = None;
     let mut passed = 0usize;
     let mut blocked = Vec::new();
@@ -213,8 +208,7 @@ pub fn run(options: &Options) -> Result<()> {
     for (case, fingerprint) in &recovered {
         persist_identity(&options.targets, case, fingerprint)?;
     }
-    recipes.record(&options.recipes)?;
-    commit_routine_records(options, &recovered)?;
+    commit_recovered_identities(options, &recovered)?;
     push_validated_changes(options, &recovered)?;
     eprintln!(
         "\nself-heal: verified={passed} blocked={} total={}",
@@ -464,7 +458,6 @@ fn evaluate(
         target,
         &static_report,
         &[],
-        &recipe_workdir(options),
         Duration::from_secs(900),
     )?;
     let report: Value = read_json(&static_report)?;
@@ -500,7 +493,6 @@ fn evaluate(
         target,
         &dynamic_report,
         std::slice::from_ref(&fingerprint),
-        &recipe_workdir(options),
         Duration::from_secs(1800),
     )?;
     let dynamic: Value = read_json(&dynamic_report)?;
@@ -540,7 +532,6 @@ fn scan(
     target: &Path,
     output: &Path,
     fingerprints: &[String],
-    recipes: &Path,
     timeout: Duration,
 ) -> Result<()> {
     let mut command = Command::new(scanner);
@@ -562,10 +553,7 @@ fn scan(
         .env("JSS_VERIFY_RUNTIME", "local")
         .env("JSS_VERIFY_DEBUG", "1");
     if !fingerprints.is_empty() {
-        command
-            .arg("--verify=strict")
-            .arg("--fix-recipes")
-            .arg(recipes);
+        command.arg("--verify=strict");
         for fingerprint in fingerprints {
             command.args(["--verify-fingerprint", fingerprint]);
         }
@@ -1023,48 +1011,29 @@ fn apply_repair_workspace(options: &Options, workspace: &RepairWorkspace) -> Res
     Ok(())
 }
 
-/// Commits what this run recorded, in one commit under the routine's identity: the identities it
-/// recovered and the fixes its dynamic scans proved.
-fn commit_routine_records(options: &Options, recovered: &[(Case, String)]) -> Result<()> {
-    let mut records = Vec::new();
-    if !recovered.is_empty() {
-        records.push((&options.targets, "recovered exploitability identities"));
-    }
-    records.push((&options.recipes, "proven fixes"));
-    let mut changed = Vec::new();
-    for (path, what) in records {
-        if !path.starts_with(&options.root) || !path.exists() {
-            continue;
-        }
-        command_ok(
-            Command::new("git")
-                .current_dir(&options.root)
-                .args(["add", "--"])
-                .arg(path),
-            format!("stage {what}"),
-        )?;
-        let status = Command::new("git")
-            .current_dir(&options.root)
-            .args(["diff", "--cached", "--quiet", "--"])
-            .arg(path)
-            .status()?;
-        match status.code() {
-            Some(0) => {}
-            Some(1) => changed.push((path, what)),
-            _ => bail!("could not inspect {what}"),
-        }
-    }
-    if changed.is_empty() {
+fn commit_recovered_identities(options: &Options, recovered: &[(Case, String)]) -> Result<()> {
+    if recovered.is_empty() || !options.targets.starts_with(&options.root) {
         return Ok(());
     }
-    let message = format!(
-        "Record {}",
-        changed
-            .iter()
-            .map(|(_, what)| *what)
-            .collect::<Vec<_>>()
-            .join(" and ")
-    );
+    command_ok(
+        Command::new("git")
+            .current_dir(&options.root)
+            .arg("add")
+            .arg("--")
+            .arg(&options.targets),
+        "stage recovered benchmark identities".to_owned(),
+    )?;
+    let status = Command::new("git")
+        .current_dir(&options.root)
+        .args(["diff", "--cached", "--quiet", "--"])
+        .arg(&options.targets)
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    if status.code() != Some(1) {
+        bail!("could not inspect recovered benchmark identities");
+    }
     command_ok(
         Command::new("git")
             .current_dir(&options.root)
@@ -1075,98 +1044,12 @@ fn commit_routine_records(options: &Options, recovered: &[(Case, String)]) -> Re
                 "user.email=self-heal@localhost.invalid",
                 "commit",
                 "-m",
-                &message,
+                "Record recovered exploitability identities",
                 "--",
             ])
-            .args(changed.iter().map(|(path, _)| path)),
-        format!("commit {}", message.to_lowercase()),
+            .arg(&options.targets),
+        "commit recovered benchmark identities".to_owned(),
     )
-}
-
-/// The working copy of the fix recipe store this process's dynamic scans record into. It is
-/// outside the checkout, so recording never dirties the tree the controller keeps checking.
-fn recipe_workdir(options: &Options) -> PathBuf {
-    options
-        .cache
-        .join("fix-recipes")
-        .join(std::process::id().to_string())
-}
-
-/// A working copy of the fix recipe store, seeded from the tracked store and removed on drop.
-struct RecipeWorkspace {
-    path: PathBuf,
-    seeded: BTreeMap<PathBuf, Vec<u8>>,
-}
-
-impl RecipeWorkspace {
-    fn create(tracked: &Path, path: &Path) -> Result<Self> {
-        if path.exists() {
-            std::fs::remove_dir_all(path)
-                .with_context(|| format!("remove stale {}", path.display()))?;
-        }
-        let seeded = store_files(tracked)?;
-        write_store_files(path, &seeded)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            seeded,
-        })
-    }
-
-    /// Copies what the scans recorded into `tracked`: new and changed files only, so this run does
-    /// not revert a file it never touched to the copy it started from.
-    fn record(&self, tracked: &Path) -> Result<()> {
-        let mut learned = store_files(&self.path)?;
-        learned.retain(|relative, content| self.seeded.get(relative) != Some(content));
-        write_store_files(tracked, &learned)
-    }
-}
-
-impl Drop for RecipeWorkspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// A recipe store's files by relative path, without its lock and temporary files (dot files).
-fn store_files(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
-    let mut files = BTreeMap::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        if !directory.is_dir() {
-            continue;
-        }
-        for entry in std::fs::read_dir(&directory)
-            .with_context(|| format!("read {}", directory.display()))?
-        {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            let path = entry.path();
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file() {
-                let content =
-                    std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-                files.insert(path.strip_prefix(root)?.to_path_buf(), content);
-            }
-        }
-    }
-    Ok(files)
-}
-
-fn write_store_files(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
-    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
-    for (relative, content) in files {
-        let path = root.join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
-    }
-    Ok(())
 }
 
 fn push_validated_changes(options: &Options, recovered: &[(Case, String)]) -> Result<()> {
@@ -1262,7 +1145,6 @@ fn validate_repaired_targets(
             &checkout,
             &static_report,
             &[],
-            &recipe_workdir(options),
             Duration::from_secs(900),
         )?;
         let report: Value = read_json(&static_report)?;
@@ -1289,7 +1171,6 @@ fn validate_repaired_targets(
             &checkout,
             &dynamic_report,
             std::slice::from_ref(expected_fingerprint),
-            &recipe_workdir(options),
             Duration::from_secs(1800),
         )?;
         let dynamic: Value = read_json(&dynamic_report)?;
@@ -1514,113 +1395,6 @@ mod tests {
             git_output(&writer, &["rev-parse", "HEAD"])?
         );
         assert_eq!(std::fs::read_to_string(worker.join("version"))?, "two\n");
-        Ok(())
-    }
-
-    #[test]
-    fn proven_fixes_are_committed_with_the_identities_or_on_their_own() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let root = directory.path().join("checkout");
-        let git = |args: &[&str]| -> Result<String> { git_output(&root, args) };
-        command_ok(
-            Command::new("git").args(["init", "-q"]).arg(&root),
-            "initialize test checkout".to_owned(),
-        )?;
-        let options = Options {
-            root: root.clone(),
-            bench: root.join(".satori/bench.json"),
-            targets: root.join(".satori/targets.json"),
-            recipes: root.join(".satori/fix-recipes"),
-            cache: directory.path().join("cache"),
-            case: None,
-            repo: None,
-            limit: None,
-            repair: false,
-            push: false,
-            repair_attempts: 1,
-            repair_model: String::new(),
-            repair_effort: String::new(),
-            repair_max_turns: 1,
-            repair_budget: Duration::from_secs(1),
-        };
-        let tracked = |relative: &str| options.recipes.join(relative);
-        std::fs::create_dir_all(tracked("recipes/ssrf"))?;
-        std::fs::write(&options.targets, "{}\n")?;
-        std::fs::write(tracked("recipes/ssrf/a.json"), "a\n")?;
-        std::fs::write(tracked("recipes/ssrf/b.json"), "b\n")?;
-        git(&["add", "."])?;
-        git(&[
-            "-c",
-            "user.name=JSSpector test",
-            "-c",
-            "user.email=test@localhost.invalid",
-            "commit",
-            "-qm",
-            "initial",
-        ])?;
-
-        let work = recipe_workdir(&options);
-        let recipes = RecipeWorkspace::create(&options.recipes, &work)?;
-        assert_eq!(
-            std::fs::read_to_string(work.join("recipes/ssrf/a.json"))?,
-            "a\n"
-        );
-        // The scans change one recipe and add an example; the store's lock and temporary files stay
-        // behind. Meanwhile the tracked copy of a recipe this run never touched moves on.
-        std::fs::write(work.join("recipes/ssrf/a.json"), "a2\n")?;
-        std::fs::create_dir_all(work.join("examples"))?;
-        std::fs::write(work.join("examples/f-c.json"), "example\n")?;
-        std::fs::write(work.join(".lock"), "")?;
-        std::fs::write(work.join("examples/.f-c.json.1.tmp"), "partial")?;
-        std::fs::write(tracked("recipes/ssrf/b.json"), "b-upstream\n")?;
-        git(&[
-            "-c",
-            "user.name=JSSpector test",
-            "-c",
-            "user.email=test@localhost.invalid",
-            "commit",
-            "-qam",
-            "upstream",
-        ])?;
-
-        recipes.record(&options.recipes)?;
-        commit_routine_records(&options, &[])?;
-        assert_eq!(
-            git(&["log", "-1", "--format=%s|%an"])?.trim(),
-            "Record proven fixes|JSSpector self-heal"
-        );
-        assert_eq!(
-            std::fs::read_to_string(tracked("recipes/ssrf/a.json"))?,
-            "a2\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(tracked("recipes/ssrf/b.json"))?,
-            "b-upstream\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(tracked("examples/f-c.json"))?,
-            "example\n"
-        );
-        assert_eq!(
-            git(&["status", "--porcelain", "--untracked-files=all"])?,
-            ""
-        );
-        assert!(!tracked(".lock").exists());
-
-        // Nothing new: no commit. Identities and fixes together: one commit.
-        commit_routine_records(&options, &[])?;
-        assert_eq!(git(&["rev-list", "--count", "HEAD"])?.trim(), "3");
-        std::fs::write(&options.targets, "{\"targets\": []}\n")?;
-        std::fs::write(tracked("examples/g-d.json"), "another\n")?;
-        commit_routine_records(&options, &[(case(), "fingerprint".to_owned())])?;
-        assert_eq!(
-            git(&["log", "-1", "--format=%s"])?.trim(),
-            "Record recovered exploitability identities and proven fixes"
-        );
-        assert_eq!(git(&["status", "--porcelain"])?, "");
-
-        drop(recipes);
-        assert!(!work.exists());
         Ok(())
     }
 

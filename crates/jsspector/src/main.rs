@@ -203,11 +203,6 @@ struct ScanArgs {
     /// same finding on the same file content.
     #[arg(long, requires = "verify")]
     no_fix_llm: bool,
-    /// The fix recipe store: proven fixes kept as recipes shown to the LLM and as examples replayed
-    /// on the same finding and file content [default: jsspector/fix-recipes in the user's cache
-    /// directory].
-    #[arg(long, value_name = "DIR", requires = "verify")]
-    fix_recipes: Option<PathBuf>,
     /// LLM fix candidates per verified finding [default: 3].
     #[arg(long, value_name = "N", requires = "verify")]
     fix_attempts: Option<usize>,
@@ -1280,7 +1275,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 timeout: args
                     .fix_timeout
                     .map_or(defaults.timeout, std::time::Duration::from_secs),
-                recipes: args.fix_recipes.clone().or_else(default_fix_recipes),
+                recipes: own_fix_recipes(),
                 repository: git.as_ref().and_then(|git| git.repository.clone()),
                 revision: git.as_ref().map(|git| git.revision.clone()),
             };
@@ -1729,13 +1724,14 @@ fn without_credentials(url: &str) -> String {
     }
 }
 
-/// `jsspector/fix-recipes` in the user's cache directory (`$XDG_CACHE_HOME`, else `~/.cache`).
-fn default_fix_recipes() -> Option<PathBuf> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .map(|cache| cache.join("jsspector").join("fix-recipes"))
+/// The fix recipe store of the JSSpector checkout this binary was built from, when that checkout
+/// is still there: proven fixes are committed and pushed to it.
+fn own_fix_recipes() -> Option<PathBuf> {
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    checkout
+        .join(".git")
+        .exists()
+        .then(|| checkout.join(".satori").join("fix-recipes"))
 }
 
 fn fail(code: u8, message: impl Display) -> ExitCode {

@@ -10,6 +10,10 @@
 //! request that reproduced the exploit (credentials redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the
 //! example's change is replayed — and proved again by the same three controls — without an LLM.
 //!
+//! The default store is the JSSpector checkout the binary was built from, and it publishes
+//! itself: after a fix is proven and recorded, the new files are committed and pushed, so what one
+//! run learned reaches the next without anyone doing anything.
+//!
 //! The store is a directory: `recipes/<class>/<id>.json` and `examples/<finding>-<file>.json`.
 //! Reads take no lock (every write is a rename); each write takes `.lock` once, for one
 //! read-modify-write, and calls nothing else that locks.
@@ -206,6 +210,61 @@ impl Book {
             )?;
         }
         Ok(())
+    }
+
+    /// Commits what a recorded fix added or changed, in the git checkout the store is in, and
+    /// pushes it. A push the remote rejects is rebased once and retried, never forced.
+    pub fn publish(&self) -> Result<String, String> {
+        let lock = std::fs::File::create(self.dir.join(".lock"))
+            .map_err(|e| format!("creating the recipe lock: {e}"))?;
+        lock.lock_exclusive()
+            .map_err(|e| format!("locking {}: {e}", self.dir.display()))?;
+        let git = |args: &[&str]| -> Result<std::process::Output, String> {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| format!("running git: {e}"))
+        };
+        let run = |args: &[&str]| -> Result<(), String> {
+            let output = git(args)?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "git {}: {}",
+                    args.first().unwrap_or(&""),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        };
+        run(&["add", "--", "recipes", "examples"])?;
+        if git(&["diff", "--cached", "--quiet", "--", "recipes", "examples"])?
+            .status
+            .success()
+        {
+            return Ok("nothing new to publish".to_owned());
+        }
+        run(&[
+            "commit",
+            "-q",
+            "-m",
+            "Record proven fixes",
+            "--",
+            "recipes",
+            "examples",
+        ])?;
+        if run(&["push", "-q"]).is_err() {
+            if let Err(error) = run(&["pull", "--rebase", "--autostash", "-q"]) {
+                let _ = run(&["rebase", "--abort"]);
+                return Err(format!("the remote moved and the rebase failed: {error}"));
+            }
+            run(&["push", "-q"])?;
+        }
+        Ok("committed and pushed".to_owned())
     }
 
     fn load(&self, class: &str, id: &str) -> Option<Recipe> {
@@ -798,6 +857,107 @@ router.post('/login', async (req, res) => {\n\
         assert!(kept.contains("eyJ is not a token"), "{kept}");
         // The redaction is stable: redacting again changes nothing.
         assert_eq!(redact(&kept), kept);
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@localhost.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn learn(book: &Book, fingerprint_: &str) {
+        let login = finding(VulnClass::NosqlInjection, "User.findOne", fingerprint_);
+        let changed = coerced();
+        book.record(&Learned {
+            finding: &login,
+            file: "routes/auth.js",
+            original: LOGIN,
+            repository: None,
+            revision: None,
+            proven: Some(&changed),
+            poc: None,
+            benign_status: 401,
+            offered: &[],
+            first_try: false,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_store_that_is_a_git_checkout_publishes_what_it_learned() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        let clone = dir.path().join("clone");
+        git(
+            dir.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(clone.join("README"), "store\n").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-qm", "initial"]);
+        git(&clone, &["push", "-q", "-u", "origin", "HEAD:main"]);
+
+        let book = Book::new(&clone);
+        learn(&book, "aaaa");
+        assert_eq!(book.publish().unwrap(), "committed and pushed");
+        assert_eq!(book.publish().unwrap(), "nothing new to publish");
+        assert_eq!(
+            git(&remote, &["log", "-1", "--format=%s", "main"]),
+            "Record proven fixes"
+        );
+        assert!(git(&remote, &["ls-tree", "-r", "--name-only", "main"]).contains("examples/"));
+        // The lock file never reaches the remote.
+        assert!(!git(&remote, &["ls-tree", "-r", "--name-only", "main"]).contains(".lock"));
+
+        // The remote moves on; the next publish rebases onto it and still pushes.
+        let other = dir.path().join("other");
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(other.join("NOTES"), "more\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-qm", "elsewhere"]);
+        git(&other, &["push", "-q"]);
+        learn(&book, "bbbb");
+        assert_eq!(book.publish().unwrap(), "committed and pushed");
+        let files = git(&remote, &["ls-tree", "-r", "--name-only", "main"]);
+        assert!(
+            files.contains("NOTES") && files.matches("examples/").count() == 2,
+            "{files}"
+        );
     }
 
     #[test]

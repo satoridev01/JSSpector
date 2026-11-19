@@ -1,0 +1,19 @@
+{
+  "recipe": "1c82d3417a4896b0",
+  "finding": "c0fb88f9bbd558eb",
+  "file": "backend/server.js",
+  "repository": "https://github.com/A-R-P-I-T-JAIN/Code2Concept.git",
+  "revision": "7e2aa103d8dcd4d735f23b7f36b53841834aca29",
+  "original_fingerprint": "b31f1a82c094a3f5",
+  "hunks": [
+    {
+      "line": 488,
+      "old": [],
+      "new": [
+        "    if (!videoDir.startsWith(videosDir + path.sep)) return res.status(400).json({ error: 'Invalid video id.' });"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request DELETE \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/api/cleanup/..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2F..%2Ftmp%2Fjss-canary-read.d%2Fjss-del-18e9795e4a60f0581f5fb-1%2Ftarget' \\\n  --header 'Content-Type: application/json' \\\n  --data-raw '{}'",
+  "benign_status": 404
+}

@@ -1,0 +1,17 @@
+{
+  "id": "1c82d3417a4896b0",
+  "class": "path-traversal",
+  "sink": "rmSync",
+  "introduces": [
+    "json",
+    "return",
+    "sep",
+    "startsWith",
+    "status"
+  ],
+  "before": "",
+  "after": "if (!videoDir.startsWith(videosDir + path.sep)) return res.status(400).json({ error: 'Invalid video id.' });",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

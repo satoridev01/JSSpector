@@ -1,0 +1,21 @@
+{
+  "recipe": "545694e690ecd89c",
+  "finding": "5f36279738bf4fb7",
+  "file": "serve.js",
+  "repository": "https://github.com/db-mobile/resonance.git",
+  "revision": "da03ffc3f8ad5f287188165f81c884c1223366ee",
+  "original_fingerprint": "f3216f2e105762e5",
+  "hunks": [
+    {
+      "line": 23,
+      "old": [
+        "    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {"
+      ],
+      "new": [
+        "    if (!path.resolve(filePath).startsWith(path.resolve(DIST) + path.sep) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request GET \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:1420/../../../etc/passwd'",
+  "benign_status": 200
+}

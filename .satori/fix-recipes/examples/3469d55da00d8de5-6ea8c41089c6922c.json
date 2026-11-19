@@ -1,0 +1,23 @@
+{
+  "recipe": "e24ba83c42292c48",
+  "finding": "3469d55da00d8de5",
+  "file": "preview-server.cjs",
+  "repository": "https://github.com/Henley04/SXSEditor.git",
+  "revision": "65b7076d6df0b32f0175201f349d49633e3a12db",
+  "original_fingerprint": "6ea8c41089c6922c",
+  "hunks": [
+    {
+      "line": 17,
+      "old": [],
+      "new": [
+        "  if (!filePath.startsWith(process.cwd() + path.sep)) {",
+        "    res.writeHead(404);",
+        "    res.end('404');",
+        "    return;",
+        "  }"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request GET \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:4173/../etc/passwd'",
+  "benign_status": 404
+}

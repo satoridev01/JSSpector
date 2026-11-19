@@ -105,7 +105,9 @@ JSSpector applies no fix pattern by itself. Candidates come from an LLM through 
 Every proven fix is kept in a recipe store (`--fix-recipes DIR`, by default `jsspector/fix-recipes` in the user's cache directory):
 
 - as a **recipe**: its class, the sink's callee, what the change introduced and a short before/after. Recipes of the same class, the same sink first, are shown to the LLM so later fixes of that pattern tend to pass on the first candidate. Each recipe counts the times it was shown and the times the first candidate was then proven. A few recipes ship with JSSpector as a starting point.
-- as an **example**: the finding's and the file's fingerprints, the exact change, the request that reproduced the exploit and the status a benign request kept. When the same finding shows up again on the same file content, the change is replayed and proved again, with no LLM. This is how a rescan of the same commit reproduces both the exploit and its fix deterministically.
+- as an **example**: the finding's and the file's fingerprints, the repository and commit it was proven on, the exact change, the request that reproduced the exploit (with credential headers and tokens redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the change is replayed and proved again, with no LLM. This is how a rescan of the same commit reproduces both the exploit and its fix deterministically.
+
+The store this repository keeps is [`.satori/fix-recipes`](.satori/fix-recipes), next to the exploitability identities. `cargo xtask self-heal` records into a working copy of it while its dynamic scans verify each case and prove its fix. Before committing, it copies back only the files those scans added or changed, and commits them with the recovered identities. With `--push` it then pushes that commit. Other scans keep the cache default, so nothing from them reaches this repository.
 
 ```sh
 jsspector scan . --verify                  # verify, then prove a fix for each verified finding

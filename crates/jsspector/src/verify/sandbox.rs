@@ -16870,6 +16870,8 @@ http.createServer((req, res) => {
                 finding: &finding,
                 file: "server.js",
                 original: FIX_FIXTURE,
+                repository: None,
+                revision: None,
                 proven: Some(&confined),
                 poc: None,
                 benign_status: 200,

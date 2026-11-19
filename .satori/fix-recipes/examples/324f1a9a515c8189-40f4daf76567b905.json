@@ -1,0 +1,24 @@
+{
+  "recipe": "b0df0208d034cbb1",
+  "finding": "324f1a9a515c8189",
+  "file": "routes/userProfile.ts",
+  "repository": "https://github.com/satoridev01/juice-shop.git",
+  "revision": "10bb0f51ed43956675c77c16739617aad77f1709",
+  "original_fingerprint": "40f4daf76567b905",
+  "hunks": [
+    {
+      "line": 65,
+      "old": [
+        "          username = eval(code) // eslint-disable-line no-eval"
+      ],
+      "new": [
+        "          if (!/^[\\w .@-]+$/.test(code)) {",
+        "            throw new Error('Username is not a plain value')",
+        "          }",
+        "          username = eval(JSON.stringify(code)) // eslint-disable-line no-eval"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request GET \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/profile' \\\n  --header 'Cookie: REDACTED' \\\n  --header 'Authorization: REDACTED'",
+  "benign_status": 400
+}

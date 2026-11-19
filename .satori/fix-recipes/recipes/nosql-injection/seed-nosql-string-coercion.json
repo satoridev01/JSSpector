@@ -1,0 +1,14 @@
+{
+  "id": "seed-nosql-string-coercion",
+  "class": "nosql-injection",
+  "sink": "",
+  "introduces": [
+    "String"
+  ],
+  "note": "Coerce every request value used in the query filter to a string, every field and not only the one the exploit used, so an object such as {\"$ne\": null} cannot become an operator.",
+  "before": "const { username, password } = req.body;\nconst user = await User.findOne({ username, password });",
+  "after": "const { username, password } = req.body;\nconst user = await User.findOne({ username: String(username), password: String(password) });",
+  "proven": 0,
+  "offered": 1,
+  "first_try": 1
+}

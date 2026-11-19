@@ -19,6 +19,8 @@
 *.findings.json
 /.satori/reports/
 /.satori/exploitability-regressions.json
+# The fix recipe store's lock and temporary files
+/.satori/fix-recipes/**/.*
 
 # OS / editor
 .DS_Store

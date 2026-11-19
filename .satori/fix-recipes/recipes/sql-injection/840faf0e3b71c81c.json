@@ -1,0 +1,13 @@
+{
+  "id": "840faf0e3b71c81c",
+  "class": "sql-injection",
+  "sink": "query",
+  "introduces": [
+    "String"
+  ],
+  "before": "models.sequelize.query(`SELECT * FROM Users WHERE email = '${req.body.email || ''}' AND password = '${security.hash(req.body.password || '')}' AND deletedAt IS NULL`, { model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge",
+  "after": "models.sequelize.query('SELECT * FROM Users WHERE email = $1 AND password = $2 AND deletedAt IS NULL', { bind: [String(req.body.email || ''), String(security.hash(req.body.password || ''))], model: UserModel, plain: true }) // vuln-code-snippet vuln-line loginAdminChallenge loginBenderChallenge loginJimChallenge",
+  "proven": 2,
+  "offered": 1,
+  "first_try": 1
+}

@@ -6,8 +6,8 @@
 //! elsewhere; they are never applied by themselves.
 //!
 //! An **example** is one proven fix as a deterministic reproduction case: the finding's and the
-//! original file's fingerprints, the exact change, the request that reproduced the exploit and the
-//! status a benign request kept. When the same finding shows up again on the same file content, the
+//! original file's fingerprints, the repository and commit it was proven on, the exact change, the
+//! request that reproduced the exploit (credentials redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the
 //! example's change is replayed — and proved again by the same three controls — without an LLM.
 //!
 //! The store is a directory: `recipes/<class>/<id>.json` and `examples/<finding>-<file>.json`.
@@ -69,10 +69,16 @@ pub struct Example {
     /// The finding's fingerprint.
     pub finding: String,
     pub file: String,
+    /// The repository the fix was proven in (the scanned checkout's `origin`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// The commit the fix was proven on, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     /// The fingerprint of the file content the change applies to.
     pub original_fingerprint: String,
     pub hunks: Vec<Hunk>,
-    /// The request that reproduced the exploit before the change.
+    /// The request that reproduced the exploit before the change, without credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poc: Option<String>,
     /// The status a benign request got before and after the change.
@@ -92,6 +98,9 @@ pub struct Learned<'a> {
     pub finding: &'a Finding,
     pub file: &'a str,
     pub original: &'a str,
+    /// The scanned checkout's repository and commit, when known.
+    pub repository: Option<&'a str>,
+    pub revision: Option<&'a str>,
     /// The content an LLM candidate was proven with, when one was.
     pub proven: Option<&'a str>,
     pub poc: Option<&'a str>,
@@ -184,9 +193,11 @@ impl Book {
                 recipe: recipe.id,
                 finding: learned.finding.fingerprint.clone(),
                 file: learned.file.to_owned(),
+                repository: learned.repository.map(str::to_owned),
+                revision: learned.revision.map(str::to_owned),
                 original_fingerprint: fingerprint(learned.original),
                 hunks: hunks(learned.original, proven),
-                poc: learned.poc.map(str::to_owned),
+                poc: learned.poc.map(redact),
                 benign_status: learned.benign_status,
             };
             write_json(
@@ -471,6 +482,90 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 /// Writes `value` to `path` through a temporary file and a rename, so a reader never sees half.
+/// Headers whose values are credentials.
+const CREDENTIAL_HEADERS: [&str; 9] = [
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "x-access-token",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-session-token",
+];
+/// What a redacted value reads.
+const REDACTED: &str = "REDACTED";
+
+/// `poc` without credentials: the values of credential headers and anything shaped like a JWT. A
+/// store may be shared or committed, and a PoC carries the test user's session.
+fn redact(poc: &str) -> String {
+    poc.split_inclusive('\n')
+        .map(|line| redact_jwts(&redact_header(line)))
+        .collect()
+}
+
+/// A `--header 'Name: value'` line with the value redacted when `Name` is a credential header.
+fn redact_header(line: &str) -> String {
+    const FLAG: &str = "--header '";
+    let Some(start) = line.find(FLAG).map(|at| at + FLAG.len()) else {
+        return line.to_owned();
+    };
+    let (Some(head), Some(rest)) = (line.get(..start), line.get(start..)) else {
+        return line.to_owned();
+    };
+    let Some((name, _)) = rest.split_once(':') else {
+        return line.to_owned();
+    };
+    let credential = CREDENTIAL_HEADERS
+        .iter()
+        .any(|header| name.trim().eq_ignore_ascii_case(header));
+    match rest.rfind('\'').and_then(|end| rest.get(end..)) {
+        Some(tail) if credential => format!("{head}{name}: {REDACTED}{tail}"),
+        _ => line.to_owned(),
+    }
+}
+
+/// `text` with every JWT (`eyJ….….…`) replaced.
+fn redact_jwts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("eyJ") {
+        let (before, candidate) = rest.split_at(at);
+        out.push_str(before);
+        let (kept, length) = match jwt_length(candidate) {
+            Some(length) => (REDACTED, length),
+            None => ("eyJ", 3),
+        };
+        out.push_str(kept);
+        rest = candidate.get(length..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The length of the JWT `text` starts with: three dot-separated base64url segments, the first two
+/// non-empty (the signature is empty for `alg: none`).
+fn jwt_length(text: &str) -> Option<usize> {
+    let segment = |from: usize| {
+        let tail = text.get(from..).unwrap_or_default();
+        tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(tail.len())
+    };
+    let mut end = segment(0);
+    for required in [true, false] {
+        if text.get(end..=end) != Some(".") {
+            return None;
+        }
+        let length = segment(end + 1);
+        if required && length == 0 {
+            return None;
+        }
+        end += 1 + length;
+    }
+    Some(end)
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let parent = path
         .parent()
@@ -613,6 +708,8 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
+            repository: None,
+            revision: None,
             proven: Some(&changed),
             poc: Some("curl -X POST /login"),
             benign_status: 401,
@@ -650,6 +747,60 @@ router.post('/login', async (req, res) => {\n\
     }
 
     #[test]
+    fn an_example_names_where_it_was_proven_and_keeps_no_credentials() {
+        let store = tempfile::tempdir().unwrap();
+        let book = Book::new(store.path());
+        let login = finding(VulnClass::NosqlInjection, "User.findOne", "aaaa");
+        let changed = coerced();
+        let jwt = "eyJ0eXAiOiJKV1QifQ.eyJpZCI6MjZ9.c2lnbmF0dXJl";
+        let poc = format!(
+            "curl -i -sS \\\n  --url 'http://TARGET_HOST:3000/profile?token={jwt}' \\\n  \
+             --header 'Cookie: token={jwt}; lang=en' \\\n  \
+             --header 'authorization: Bearer opaque-secret' \\\n  \
+             --header 'Content-Type: application/json' \\\n  \
+             --data-raw '{{\"note\":\"eyJ is not a token\"}}'"
+        );
+        book.record(&Learned {
+            finding: &login,
+            file: "routes/auth.js",
+            original: LOGIN,
+            repository: Some("https://github.com/owner/app.git"),
+            revision: Some("64c34c5"),
+            proven: Some(&changed),
+            poc: Some(&poc),
+            benign_status: 401,
+            offered: &[],
+            first_try: false,
+        })
+        .unwrap();
+
+        let example: Example = read_json(&book.example_path(&login, LOGIN)).unwrap();
+        assert_eq!(
+            example.repository.as_deref(),
+            Some("https://github.com/owner/app.git")
+        );
+        assert_eq!(example.revision.as_deref(), Some("64c34c5"));
+        let kept = example.poc.unwrap();
+        assert!(
+            !kept.contains(jwt) && !kept.contains("opaque-secret"),
+            "{kept}"
+        );
+        assert!(kept.contains("--header 'Cookie: REDACTED' \\\n"), "{kept}");
+        assert!(
+            kept.contains("--header 'authorization: REDACTED'"),
+            "{kept}"
+        );
+        assert!(kept.contains("profile?token=REDACTED'"), "{kept}");
+        assert!(
+            kept.contains("--header 'Content-Type: application/json'"),
+            "{kept}"
+        );
+        assert!(kept.contains("eyJ is not a token"), "{kept}");
+        // The redaction is stable: redacting again changes nothing.
+        assert_eq!(redact(&kept), kept);
+    }
+
+    #[test]
     fn offered_recipes_count_their_first_try_wins() {
         let store = tempfile::tempdir().unwrap();
         let book = Book::new(store.path());
@@ -660,6 +811,8 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
+            repository: None,
+            revision: None,
             proven: Some(&changed),
             poc: None,
             benign_status: 401,
@@ -671,6 +824,8 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
+            repository: None,
+            revision: None,
             proven: None,
             poc: None,
             benign_status: 401,

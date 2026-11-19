@@ -92,6 +92,10 @@ enum Task {
         /// Durable replay identities updated after successful verification.
         #[arg(long, default_value = ".satori/exploitability-targets.json")]
         targets: std::path::PathBuf,
+        /// Proven fix recipes and examples: the dynamic scans record into a copy of it, and what
+        /// they learned is committed with the identities.
+        #[arg(long, default_value = ".satori/fix-recipes")]
+        fix_recipes: std::path::PathBuf,
         /// Checkout, issue-snapshot and diagnostic cache.
         #[arg(long, default_value = "target/self-heal")]
         cache: std::path::PathBuf,
@@ -211,6 +215,7 @@ fn main() -> Result<()> {
         Task::SelfHeal {
             bench,
             targets,
+            fix_recipes,
             cache,
             case,
             repo,
@@ -236,11 +241,13 @@ fn main() -> Result<()> {
             };
             let bench = absolute(bench);
             let targets = absolute(targets);
+            let recipes = absolute(fix_recipes);
             let cache = absolute(cache);
             self_heal::run(&self_heal::Options {
                 root,
                 bench,
                 targets,
+                recipes,
                 cache,
                 case,
                 repo,

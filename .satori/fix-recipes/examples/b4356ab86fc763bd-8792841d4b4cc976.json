@@ -2,8 +2,6 @@
   "recipe": "840faf0e3b71c81c",
   "finding": "b4356ab86fc763bd",
   "file": "routes/login.ts",
-  "repository": "https://github.com/satoridev01/juice-shop.git",
-  "revision": "10bb0f51ed43956675c77c16739617aad77f1709",
   "original_fingerprint": "8792841d4b4cc976",
   "hunks": [
     {

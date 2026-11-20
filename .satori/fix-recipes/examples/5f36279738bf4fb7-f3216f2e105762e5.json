@@ -2,8 +2,6 @@
   "recipe": "545694e690ecd89c",
   "finding": "5f36279738bf4fb7",
   "file": "serve.js",
-  "repository": "https://github.com/db-mobile/resonance.git",
-  "revision": "da03ffc3f8ad5f287188165f81c884c1223366ee",
   "original_fingerprint": "f3216f2e105762e5",
   "hunks": [
     {

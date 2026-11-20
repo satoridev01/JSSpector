@@ -2,8 +2,6 @@
   "recipe": "c73386e48b76666c",
   "finding": "d90f21cf95794896",
   "file": "backend/utils/signup.js",
-  "repository": "https://github.com/NovaDrake76/KaniCasino.git",
-  "revision": "8a7de7b2f5a145173eb04457693e2e1dcb29c5ef",
   "original_fingerprint": "5b0a12c1ae7983ba",
   "hunks": [
     {

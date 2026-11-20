@@ -2,8 +2,6 @@
   "recipe": "70cafa0694c2c17c",
   "finding": "9ecdfb6cb073fd0b",
   "file": "routes/searchEngine.js",
-  "repository": "https://github.com/zczy-k/SmartNavora.git",
-  "revision": "367e33260762356ee1af6b26b7b2f957996b326e",
   "original_fingerprint": "d49a42559968f5c4",
   "hunks": [
     {

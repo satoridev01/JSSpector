@@ -2,8 +2,6 @@
   "recipe": "f18d77d22b894b3f",
   "finding": "2868a858b883c833",
   "file": "routes/profileImageUrlUpload.ts",
-  "repository": "https://github.com/satoridev01/juice-shop.git",
-  "revision": "10bb0f51ed43956675c77c16739617aad77f1709",
   "original_fingerprint": "f58663122c67dbe9",
   "hunks": [
     {

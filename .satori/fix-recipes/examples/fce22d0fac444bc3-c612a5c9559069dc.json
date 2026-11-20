@@ -2,8 +2,6 @@
   "recipe": "a29b89cd7e2e44e8",
   "finding": "fce22d0fac444bc3",
   "file": "backend/controllers/user.controller.js",
-  "repository": "https://github.com/mwakidenis/Kazi-Haven.git",
-  "revision": "c3f5b89395859e584974cbb779deedd14bf47d13",
   "original_fingerprint": "c612a5c9559069dc",
   "hunks": [
     {

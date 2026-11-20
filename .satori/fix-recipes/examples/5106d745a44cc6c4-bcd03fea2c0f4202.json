@@ -2,8 +2,6 @@
   "recipe": "17c0c651c76f8c5a",
   "finding": "5106d745a44cc6c4",
   "file": "routes/validate.js",
-  "repository": "https://github.com/gbv/jskos-server.git",
-  "revision": "76d96d574a261a1bd4f91b1bcc11582c3de6eb3b",
   "original_fingerprint": "bcd03fea2c0f4202",
   "hunks": [
     {

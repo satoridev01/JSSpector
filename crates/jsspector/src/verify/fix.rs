@@ -48,9 +48,6 @@ pub struct FixOptions {
     /// The recipe store, read for replays and prompts and written with what each search learned;
     /// none by default, so nothing is read or recorded unless a caller names one.
     pub recipes: Option<PathBuf>,
-    /// The scanned checkout's repository and commit, recorded with each proven example.
-    pub repository: Option<String>,
-    pub revision: Option<String>,
 }
 
 impl Default for FixOptions {
@@ -62,8 +59,6 @@ impl Default for FixOptions {
             attempts: 3,
             timeout: Duration::from_secs(600),
             recipes: None,
-            repository: None,
-            revision: None,
         }
     }
 }
@@ -165,8 +160,6 @@ pub fn prove(
                 finding,
                 file,
                 original: &original,
-                repository: options.repository.as_deref(),
-                revision: options.revision.as_deref(),
                 proven: search.proven_by_llm.as_deref(),
                 poc: poc.map(|poc| poc.command.as_str()),
                 benign_status,

@@ -1276,8 +1276,6 @@ fn scan(args: &ScanArgs) -> ExitCode {
                     .fix_timeout
                     .map_or(defaults.timeout, std::time::Duration::from_secs),
                 recipes: own_fix_recipes(),
-                repository: git.as_ref().and_then(|git| git.repository.clone()),
-                revision: git.as_ref().map(|git| git.revision.clone()),
             };
             match verify::run(&analysis.root, &selected, missing, &fix_options) {
                 Ok(verdicts) => verdicts,

@@ -2,8 +2,6 @@
   "recipe": "91762c557f5c11be",
   "finding": "f960af5ed4938219",
   "file": "backend/routes/media.js",
-  "repository": "https://github.com/TheYogMehta/StrawVerse.git",
-  "revision": "a6b0583cb98f0ce8b4f9bc85f04282c5140f9c7a",
   "original_fingerprint": "af500d8767b2bcd8",
   "hunks": [
     {

@@ -6,8 +6,9 @@
 //! elsewhere; they are never applied by themselves.
 //!
 //! An **example** is one proven fix as a deterministic reproduction case: the finding's and the
-//! original file's fingerprints, the repository and commit it was proven on, the exact change, the
-//! request that reproduced the exploit (credentials redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the
+//! original file's fingerprints, the file's path, the exact change, the request that reproduced
+//! the exploit (credentials redacted) and the status a benign request kept. It names no repository
+//! or commit: the fingerprints are what a replay matches, and the store may be published. When the same finding shows up again on the same file content, the
 //! example's change is replayed — and proved again by the same three controls — without an LLM.
 //!
 //! The default store is the JSSpector checkout the binary was built from, and it publishes
@@ -73,12 +74,6 @@ pub struct Example {
     /// The finding's fingerprint.
     pub finding: String,
     pub file: String,
-    /// The repository the fix was proven in (the scanned checkout's `origin`), when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository: Option<String>,
-    /// The commit the fix was proven on, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<String>,
     /// The fingerprint of the file content the change applies to.
     pub original_fingerprint: String,
     pub hunks: Vec<Hunk>,
@@ -102,9 +97,6 @@ pub struct Learned<'a> {
     pub finding: &'a Finding,
     pub file: &'a str,
     pub original: &'a str,
-    /// The scanned checkout's repository and commit, when known.
-    pub repository: Option<&'a str>,
-    pub revision: Option<&'a str>,
     /// The content an LLM candidate was proven with, when one was.
     pub proven: Option<&'a str>,
     pub poc: Option<&'a str>,
@@ -197,8 +189,6 @@ impl Book {
                 recipe: recipe.id,
                 finding: learned.finding.fingerprint.clone(),
                 file: learned.file.to_owned(),
-                repository: learned.repository.map(str::to_owned),
-                revision: learned.revision.map(str::to_owned),
                 original_fingerprint: fingerprint(learned.original),
                 hunks: hunks(learned.original, proven),
                 poc: learned.poc.map(redact),
@@ -767,8 +757,6 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
-            repository: None,
-            revision: None,
             proven: Some(&changed),
             poc: Some("curl -X POST /login"),
             benign_status: 401,
@@ -806,7 +794,7 @@ router.post('/login', async (req, res) => {\n\
     }
 
     #[test]
-    fn an_example_names_where_it_was_proven_and_keeps_no_credentials() {
+    fn an_example_names_no_repository_and_keeps_no_credentials() {
         let store = tempfile::tempdir().unwrap();
         let book = Book::new(store.path());
         let login = finding(VulnClass::NosqlInjection, "User.findOne", "aaaa");
@@ -823,8 +811,6 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
-            repository: Some("https://github.com/owner/app.git"),
-            revision: Some("64c34c5"),
             proven: Some(&changed),
             poc: Some(&poc),
             benign_status: 401,
@@ -833,12 +819,24 @@ router.post('/login', async (req, res) => {\n\
         })
         .unwrap();
 
-        let example: Example = read_json(&book.example_path(&login, LOGIN)).unwrap();
-        assert_eq!(
-            example.repository.as_deref(),
-            Some("https://github.com/owner/app.git")
+        let path = book.example_path(&login, LOGIN);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("\"repository\"") && !text.contains("\"revision\""),
+            "{text}"
         );
-        assert_eq!(example.revision.as_deref(), Some("64c34c5"));
+        assert!(text.contains("\"file\": \"routes/auth.js\""), "{text}");
+        // An example stored when examples named the repository and commit still replays.
+        let mut legacy: serde_json::Value = serde_json::from_str(&text).unwrap();
+        legacy["repository"] = "https://github.com/owner/app.git".into();
+        legacy["revision"] = "64c34c5".into();
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        assert_eq!(
+            book.replay(&login, "routes/auth.js", LOGIN).as_deref(),
+            Some(changed.as_str())
+        );
+
+        let example: Example = read_json(&path).unwrap();
         let kept = example.poc.unwrap();
         assert!(
             !kept.contains(jwt) && !kept.contains("opaque-secret"),
@@ -883,8 +881,6 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
-            repository: None,
-            revision: None,
             proven: Some(&changed),
             poc: None,
             benign_status: 401,
@@ -971,8 +967,6 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
-            repository: None,
-            revision: None,
             proven: Some(&changed),
             poc: None,
             benign_status: 401,
@@ -984,8 +978,6 @@ router.post('/login', async (req, res) => {\n\
             finding: &login,
             file: "routes/auth.js",
             original: LOGIN,
-            repository: None,
-            revision: None,
             proven: None,
             poc: None,
             benign_status: 401,

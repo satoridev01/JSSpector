@@ -144,11 +144,10 @@ struct ScanArgs {
     /// Repository workers used with --repos.
     #[arg(long, value_name = "N", requires = "repos")]
     parallel: Option<NonZeroUsize>,
-    /// Before scanning --repo, validate and repair the scanner against the historical benchmark
-    /// (needs a clean, published JSSpector checkout). Off by default: --repo otherwise clones and
-    /// scans directly.
+    /// Skip validating and repairing the scanner against the historical benchmark before
+    /// scanning --repo, and clone and scan directly. Without it, --repo self-heals first.
     #[arg(long, requires = "repo")]
-    self_heal: bool,
+    no_self_heal: bool,
     /// Number of threads [default: all available cores, or RAYON_NUM_THREADS].
     #[arg(long, value_name = "N")]
     threads: Option<NonZeroUsize>,
@@ -743,10 +742,11 @@ mod repository_input_tests {
     }
 
     #[test]
-    fn self_heal_defaults_off_and_is_set_with_repo() {
+    fn self_heal_defaults_on_and_is_skipped_with_no_self_heal() {
         assert!(
-            Cli::try_parse_from(["jsspector", "scan", "--repo", "owner/project"])
-                .is_ok_and(|cli| !matches!(cli.command, Command::Scan(ref scan) if scan.self_heal))
+            Cli::try_parse_from(["jsspector", "scan", "--repo", "owner/project"]).is_ok_and(
+                |cli| matches!(cli.command, Command::Scan(ref scan) if !scan.no_self_heal)
+            )
         );
         assert!(
             Cli::try_parse_from([
@@ -754,9 +754,9 @@ mod repository_input_tests {
                 "scan",
                 "--repo",
                 "owner/project",
-                "--self-heal"
+                "--no-self-heal"
             ])
-            .is_ok_and(|cli| matches!(cli.command, Command::Scan(ref scan) if scan.self_heal))
+            .is_ok_and(|cli| matches!(cli.command, Command::Scan(ref scan) if scan.no_self_heal))
         );
     }
 
@@ -1150,7 +1150,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
         };
     }
     if let Some(repository) = args.repo.as_deref()
-        && args.self_heal
+        && !args.no_self_heal
         && std::env::var_os("JSSPECTOR_SELF_HEAL_ACTIVE").is_none()
     {
         return match self_heal_repository_scan(repository) {

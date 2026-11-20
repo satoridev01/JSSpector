@@ -130,14 +130,14 @@ The backing services an app needs are provisioned on demand, only for an app tha
 
 ### Scanning a GitHub repository
 
-`scan --repo` accepts either the repository HEAD or a pinned revision, and clones and scans it
-directly. `--self-heal` first validates and repairs the scanner against the historical benchmark
-(it needs a clean, published JSSpector checkout):
+`scan --repo` accepts either the repository HEAD or a pinned revision, and clones and scans it.
+It first validates and repairs the scanner against the historical benchmark (it needs a
+clean, published JSSpector checkout); `--no-self-heal` skips that and scans directly:
 
 ```sh
 jsspector scan --repo owner/repository --verify
 jsspector scan --repo owner/repository@revision --verify
-jsspector scan --repo owner/repository --self-heal
+jsspector scan --repo owner/repository --no-self-heal
 ```
 
 To complete a pinned corpus with two independent workers:

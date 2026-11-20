@@ -171,7 +171,7 @@ pub fn prove(
                     "jsspector: recording the fix in {}: {error}",
                     book_dir(options)
                 ),
-                Ok(()) if learned.proven.is_some() => match book.publish() {
+                Ok(()) if learned.proven.is_some() => match book.publish(finding, file) {
                     Ok(what) => eprintln!("jsspector: {}: {what}", book_dir(options)),
                     Err(error) => eprintln!(
                         "jsspector: publishing the fix from {}: {error}",

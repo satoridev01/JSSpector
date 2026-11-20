@@ -202,9 +202,9 @@ impl Book {
         Ok(())
     }
 
-    /// Commits what a recorded fix added or changed, in the git checkout the store is in, and
-    /// pushes it. A push the remote rejects is rebased once and retried, never forced.
-    pub fn publish(&self) -> Result<String, String> {
+    /// Commits what the fix of `finding` in `file` added or changed, in the git checkout the store
+    /// is in, and pushes it. A push the remote rejects is rebased once and retried, never forced.
+    pub fn publish(&self, finding: &Finding, file: &str) -> Result<String, String> {
         let lock = std::fs::File::create(self.dir.join(".lock"))
             .map_err(|e| format!("creating the recipe lock: {e}"))?;
         lock.lock_exclusive()
@@ -238,15 +238,8 @@ impl Book {
         {
             return Ok("nothing new to publish".to_owned());
         }
-        run(&[
-            "commit",
-            "-q",
-            "-m",
-            "Record proven fixes",
-            "--",
-            "recipes",
-            "examples",
-        ])?;
+        let message = publish_message(finding, file);
+        run(&["commit", "-q", "-m", &message, "--", "recipes", "examples"])?;
         if run(&["push", "-q"]).is_err() {
             if let Err(error) = run(&["pull", "--rebase", "--autostash", "-q"]) {
                 let _ = run(&["rebase", "--abort"]);
@@ -290,6 +283,15 @@ fn seeds() -> Vec<Recipe> {
 /// The first-try rate, smoothed so an untried recipe ranks between a good and a bad one.
 fn rate(recipe: &Recipe) -> f64 {
     (f64::from(recipe.first_try) + 1.0) / (f64::from(recipe.offered) + 2.0)
+}
+
+/// The commit message for a proven fix: its class and file, then the sink it closes.
+fn publish_message(finding: &Finding, file: &str) -> String {
+    format!(
+        "Record proven {} fix in {file}\n\nSink: {}",
+        finding.class.name(),
+        finding.sink.api.trim_end_matches(" =")
+    )
 }
 
 /// The sink's callee: `findOne` for `User.findOne`.
@@ -874,7 +876,7 @@ router.post('/login', async (req, res) => {\n\
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
-    fn learn(book: &Book, fingerprint_: &str) {
+    fn learn(book: &Book, fingerprint_: &str) -> Finding {
         let login = finding(VulnClass::NosqlInjection, "User.findOne", fingerprint_);
         let changed = coerced();
         book.record(&Learned {
@@ -888,6 +890,7 @@ router.post('/login', async (req, res) => {\n\
             first_try: false,
         })
         .unwrap();
+        login
     }
 
     #[test]
@@ -921,12 +924,23 @@ router.post('/login', async (req, res) => {\n\
         git(&clone, &["push", "-q", "-u", "origin", "HEAD:main"]);
 
         let book = Book::new(&clone);
-        learn(&book, "aaaa");
-        assert_eq!(book.publish().unwrap(), "committed and pushed");
-        assert_eq!(book.publish().unwrap(), "nothing new to publish");
+        let login = learn(&book, "aaaa");
+        assert_eq!(
+            book.publish(&login, "routes/auth.js").unwrap(),
+            "committed and pushed"
+        );
+        assert_eq!(
+            book.publish(&login, "routes/auth.js").unwrap(),
+            "nothing new to publish"
+        );
+        // The commit says which fix it records.
         assert_eq!(
             git(&remote, &["log", "-1", "--format=%s", "main"]),
-            "Record proven fixes"
+            "Record proven nosql-injection fix in routes/auth.js"
+        );
+        assert_eq!(
+            git(&remote, &["log", "-1", "--format=%b", "main"]),
+            "Sink: User.findOne"
         );
         assert!(git(&remote, &["ls-tree", "-r", "--name-only", "main"]).contains("examples/"));
         // The lock file never reaches the remote.
@@ -947,8 +961,11 @@ router.post('/login', async (req, res) => {\n\
         git(&other, &["add", "."]);
         git(&other, &["commit", "-qm", "elsewhere"]);
         git(&other, &["push", "-q"]);
-        learn(&book, "bbbb");
-        assert_eq!(book.publish().unwrap(), "committed and pushed");
+        let again = learn(&book, "bbbb");
+        assert_eq!(
+            book.publish(&again, "routes/auth.js").unwrap(),
+            "committed and pushed"
+        );
         let files = git(&remote, &["ls-tree", "-r", "--name-only", "main"]);
         assert!(
             files.contains("NOTES") && files.matches("examples/").count() == 2,

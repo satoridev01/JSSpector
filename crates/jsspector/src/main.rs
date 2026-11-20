@@ -142,11 +142,11 @@ struct ScanArgs {
     #[arg(long, value_name = "FILE", conflicts_with_all = ["path", "repo"])]
     repos: Option<PathBuf>,
     /// Repository workers used with --repos.
-    #[arg(long, value_name = "N", requires = "repos")]
+    #[arg(long, value_name = "N", requires = "repos", conflicts_with_all = ["path", "repo"])]
     parallel: Option<NonZeroUsize>,
     /// Skip validating and repairing the scanner against the historical benchmark before
     /// scanning --repo, and clone and scan directly. Without it, --repo self-heals first.
-    #[arg(long, requires = "repo")]
+    #[arg(long, requires = "repo", conflicts_with_all = ["path", "repos"])]
     no_self_heal: bool,
     /// Number of threads [default: all available cores, or RAYON_NUM_THREADS].
     #[arg(long, value_name = "N")]
@@ -761,6 +761,94 @@ mod repository_input_tests {
     }
 
     #[test]
+    fn repository_flags_are_refused_on_a_path_scan() {
+        assert!(Cli::try_parse_from(["jsspector", "scan", ".", "--no-self-heal"]).is_err());
+        assert!(Cli::try_parse_from(["jsspector", "scan", ".", "--parallel", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from(["jsspector", "scan", "--repos", "list.txt", "--no-self-heal"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "jsspector",
+                "scan",
+                "--repo",
+                "owner/project",
+                "--parallel",
+                "2"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "jsspector",
+                "scan",
+                "--repos",
+                "list.txt",
+                "--parallel",
+                "2"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn self_heal_is_skipped_where_it_cannot_run() {
+        let checkout = tempfile::tempdir().unwrap();
+        let organization = std::ffi::OsStr::new("13");
+        // A binary away from its checkout scans without self-heal.
+        assert!(self_heal_unavailable(None, Some(organization)).is_some());
+        let missing = self_heal_unavailable(Some(checkout.path()), Some(organization)).unwrap();
+        assert!(missing.contains("JSSPECTOR_SOURCE_ROOT"), "{missing}");
+        std::fs::create_dir_all(checkout.path().join(".satori")).unwrap();
+        std::fs::write(checkout.path().join(".satori/self-heal.sh"), "").unwrap();
+        // No organization is assumed.
+        let unset = self_heal_unavailable(Some(checkout.path()), None).unwrap();
+        assert!(unset.contains("SATORI_ORGANIZATION"), "{unset}");
+        assert!(
+            self_heal_unavailable(Some(checkout.path()), Some(std::ffi::OsStr::new(""))).is_some()
+        );
+        let reason = || self_heal_unavailable(Some(checkout.path()), Some(organization));
+        assert!(reason().unwrap().contains("not a git checkout"));
+
+        // A published, clean checkout self-heals; one self-heal.sh would refuse does not.
+        let git = |dir: &Path, args: &[&str]| {
+            let status = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@localhost.invalid",
+                ])
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "-q", "--bare"]);
+        git(checkout.path(), &["init", "-q"]);
+        git(checkout.path(), &["add", "-A"]);
+        git(checkout.path(), &["commit", "-qm", "base"]);
+        assert!(reason().unwrap().contains("no upstream"));
+        git(
+            checkout.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        git(checkout.path(), &["push", "-q", "-u", "origin", "HEAD"]);
+        assert_eq!(reason(), None);
+        std::fs::write(checkout.path().join("NOTES"), "draft\n").unwrap();
+        assert!(reason().unwrap().contains("uncommitted changes"));
+        git(checkout.path(), &["add", "-A"]);
+        git(checkout.path(), &["commit", "-qm", "local"]);
+        assert!(reason().unwrap().contains("unpublished commits"));
+    }
+
+    #[test]
     fn local_runtime_is_a_verify_option() {
         assert!(
             Cli::try_parse_from(["jsspector", "scan", ".", "--verify"])
@@ -965,25 +1053,84 @@ fn checkout_repository(value: &str) -> Result<RemoteCheckout, String> {
     })
 }
 
-fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
-    let compiled_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| "the compiled JSSpector source root is unavailable".to_owned())?;
-    let source_root = std::env::var_os("JSSPECTOR_SOURCE_ROOT")
+/// The JSSpector checkout self-heal runs from: `JSSPECTOR_SOURCE_ROOT`, or the one this binary was
+/// compiled from.
+fn self_heal_source_root() -> Option<PathBuf> {
+    std::env::var_os("JSSPECTOR_SOURCE_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| compiled_root.to_path_buf());
+        .or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+}
+
+/// Why a --repo scan cannot self-heal here, if it cannot: a binary away from its JSSpector
+/// checkout, no Satori organization to read the benchmark from, or a checkout self-heal would
+/// refuse to synchronize (uncommitted changes, unpublished commits, no upstream). Such a scan
+/// goes on without self-heal instead of failing.
+fn self_heal_unavailable(
+    source_root: Option<&Path>,
+    organization: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    let Some(source_root) = source_root else {
+        return Some(
+            "the JSSpector source checkout is unknown; set JSSPECTOR_SOURCE_ROOT".to_owned(),
+        );
+    };
     let workflow = source_root.join(".satori/self-heal.sh");
     if !workflow.is_file() {
-        return Err(format!(
-            "automatic scanner repair needs a JSSpector source checkout; set \
-             JSSPECTOR_SOURCE_ROOT (looked for {})",
-            workflow.display()
+        return Some(format!(
+            "no JSSpector source checkout at {}; set JSSPECTOR_SOURCE_ROOT",
+            source_root.display()
         ));
     }
+    if organization.is_none_or(std::ffi::OsStr::is_empty) {
+        return Some("SATORI_ORGANIZATION is not set".to_owned());
+    }
+    let git = |args: &[&str]| {
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(source_root)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    match git(&["status", "--porcelain"]) {
+        None => {
+            return Some(format!("{} is not a git checkout", source_root.display()));
+        }
+        Some(changes) if !changes.is_empty() => {
+            return Some(format!(
+                "the JSSpector checkout at {} has uncommitted changes",
+                source_root.display()
+            ));
+        }
+        Some(_) => {}
+    }
+    match git(&["rev-list", "--count", "@{upstream}..HEAD"]).as_deref() {
+        Some("0") => None,
+        Some(_) => Some(format!(
+            "the JSSpector checkout at {} has unpublished commits",
+            source_root.display()
+        )),
+        None => Some(format!(
+            "the JSSpector checkout at {} has no upstream branch",
+            source_root.display()
+        )),
+    }
+}
+
+fn self_heal_repository_scan(source_root: &Path, repository: &str) -> Result<ExitCode, String> {
+    let workflow = source_root.join(".satori/self-heal.sh");
     eprintln!("jsspector: validating and repairing scanner support for {repository}");
     let status = ProcessCommand::new(&workflow)
-        .current_dir(&source_root)
+        .current_dir(source_root)
         .args(["--repo", repository])
         .status()
         .map_err(|error| format!("start automatic scanner repair: {error}"))?;
@@ -991,7 +1138,7 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
         return Err(format!("automatic scanner repair failed with {status}"));
     }
     let status = ProcessCommand::new("cargo")
-        .current_dir(&source_root)
+        .current_dir(source_root)
         .args(["build", "--release", "--locked", "-p", "jsspector"])
         .status()
         .map_err(|error| format!("rebuild repaired JSSpector: {error}"))?;
@@ -1011,7 +1158,7 @@ fn self_heal_repository_scan(repository: &str) -> Result<ExitCode, String> {
     let fingerprints = if already_filtered {
         Vec::new()
     } else {
-        recovered_fingerprints(&source_root, repository)?
+        recovered_fingerprints(source_root, repository)?
     };
     let restart_args = recovered_scan_arguments(original_args, &fingerprints);
     let mut command = ProcessCommand::new(scanner);
@@ -1153,10 +1300,23 @@ fn scan(args: &ScanArgs) -> ExitCode {
         && !args.no_self_heal
         && std::env::var_os("JSSPECTOR_SELF_HEAL_ACTIVE").is_none()
     {
-        return match self_heal_repository_scan(repository) {
-            Ok(code) => code,
-            Err(error) => fail(EXIT_ENGINE, error),
-        };
+        let source_root = self_heal_source_root();
+        let organization = std::env::var_os("SATORI_ORGANIZATION");
+        match (
+            self_heal_unavailable(source_root.as_deref(), organization.as_deref()),
+            source_root,
+        ) {
+            (None, Some(source_root)) => {
+                return match self_heal_repository_scan(&source_root, repository) {
+                    Ok(code) => code,
+                    Err(error) => fail(EXIT_ENGINE, error),
+                };
+            }
+            (reason, _) => eprintln!(
+                "jsspector: scanning {repository} without self-heal: {}",
+                reason.unwrap_or_default()
+            ),
+        }
     }
     let started = Instant::now();
     let remote = match args.repo.as_deref().map(checkout_repository).transpose() {

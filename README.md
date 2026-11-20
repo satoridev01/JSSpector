@@ -155,6 +155,7 @@ The repair agent works in an isolated JSSpector worktree and cannot edit the sca
 benchmark or trusted controller. A candidate is incorporated only after the controller independently
 rebuilds the scanner and reproduces the exact finding with a structured PoC. Validated generations
 are committed and pushed so another computer starts from the new capability. This standalone flow
-requires authenticated Satori, repair-agent and GitHub CLIs;
-it does not require a supervising agent. Organization 12 is the default and can be overridden with
-`SATORI_ORGANIZATION`.
+requires authenticated Satori, repair-agent and GitHub CLIs and `SATORI_ORGANIZATION` (no
+organization is assumed); it does not require a supervising agent. A `--repo` scan without a
+JSSpector checkout, without `SATORI_ORGANIZATION`, or from a checkout with uncommitted changes or
+unpublished commits says so and scans without self-heal.

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Satori organization holding the benchmark's historical issues; none is assumed.
+: "${SATORI_ORGANIZATION:?self-heal: set SATORI_ORGANIZATION to the Satori organization}"
+export SATORI_ORGANIZATION
+
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
@@ -19,7 +23,7 @@ fi
 if [[ ! -f .satori/exploitability-regressions.json ]]; then
   mkdir -p target/self-heal
   python3 .satori/build-regression-manifest.py \
-    --organization "${SATORI_ORGANIZATION:-12}" \
+    --organization "$SATORI_ORGANIZATION" \
     --monitor-runs target/self-heal/no-monitor-runs \
     --targets-output target/self-heal/generated-targets.txt \
     --index-output target/self-heal/generated-targets.json

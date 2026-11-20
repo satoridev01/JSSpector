@@ -162,7 +162,11 @@ def advisory_poc(description: str) -> dict[str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--organization", default="12")
+    parser.add_argument(
+        "--organization",
+        default=os.environ.get("SATORI_ORGANIZATION") or None,
+        help="Satori organization [default: SATORI_ORGANIZATION]",
+    )
     parser.add_argument(
         "--monitor-runs",
         type=Path,
@@ -185,6 +189,8 @@ def main() -> int:
         default=Path(".satori/exploitability-targets.json"),
     )
     args = parser.parse_args()
+    if not args.organization:
+        parser.error("--organization or SATORI_ORGANIZATION is required")
 
     if not shutil.which("satori-v2"):
         parser.error("satori-v2 is required")

@@ -1,6 +1,6 @@
 # Corpus research (seed data, 2026-10-31)
 
-These files come from the planning session that produced [`docs/PLAN.md`](../../docs/PLAN.md). All data is public: published GitHub security advisories and repository metadata, collected with `gh api`. No repository code was executed.
+These files come from the planning session for JSSpector. All data is public: published GitHub security advisories and repository metadata, collected with `gh api`. No repository code was executed.
 
 | File | Contents |
 |---|---|

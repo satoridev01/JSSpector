@@ -15,6 +15,6 @@
   "before": "const data = await fetch(url).then(res => res.json())",
   "after": "import net from \"node:net\"\nimport dns from \"node:dns/promises\"\nconst forbiddenAddresses = new net.BlockList()\nforbiddenAddresses.addSubnet(\"0.0.0.0\", 8, \"ipv4\")\nforbiddenAddresses.addSubnet(\"10.0.0.0\", 8, \"ipv4\")\nforbiddenAddresses.addSubnet(\"100.64.0.0\", 10, \"ipv4\")\nforbiddenAddresses.addSubnet(\"127.0.0.0\", 8, \"ipv4\")\nforbiddenAddresses.addSubnet(\"169.254.0.0\", 16, \"ipv4\")\nforbiddenAddresses.addSubnet(\"172.16.0.0\", 12, \"ipv4\")\nforbiddenAddresses.addSubnet(\"192.0.0.0\", 24, \"ipv4\")\nforbiddenAddresses.addSubnet(\"192.168.0.0\", 16, \"ipv4\")\nforbiddenAddresses.addSubnet(\"198.18.0.0\", 15, \"ipv4\")",
   "proven": 1,
-  "offered": 1,
+  "offered": 2,
   "first_try": 0
 }

@@ -1,0 +1,19 @@
+{
+  "recipe": "f0df3fa57de935e2",
+  "finding": "d9edec576e7eb50d",
+  "file": "app.js",
+  "original_fingerprint": "6dcc97c3ec204eba",
+  "hunks": [
+    {
+      "line": 35,
+      "old": [
+        "    res.status(400).send(`<h1>${name}</h1>`); // Send a response with the name in an h1 tag and set the status to 400"
+      ],
+      "new": [
+        "    res.status(400).send(`<h1>${String(name).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;')}</h1>`); // Send a response with the name in an h1 tag and set the status to 400"
+      ]
+    }
+  ],
+  "poc": "open 'http://TARGET_HOST/test/%3Cscript%3Edocument.write%2860991%2A14217%29%3C%2Fscript%3E'",
+  "benign_status": 400
+}

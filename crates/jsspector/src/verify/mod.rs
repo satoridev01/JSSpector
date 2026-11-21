@@ -527,6 +527,47 @@ pub fn run(
         }
     }
 
+    // A coarse `req.query` SSRF whose handler is a query-selector dispatcher (`const q = req.query;
+    // switch (q.action) { case 'x': fetchHelper(q.url) }`) reaches the request sink only inside the
+    // branch the selector chooses, and picks the outbound host from another query member it reads there.
+    // The engine resolves the entry to one of those members, but with no selector the request takes no
+    // branch and never reaches the sink. Mine each dispatch branch, plus the path(s) the entry wrapper
+    // dispatches on (a module worker that routes `url.pathname === '/api'` to the handler), so the marker
+    // is driven in each candidate member under the right branch and route.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.class == jss_core::VulnClass::Ssrf
+            && matches!(probe.entry, plan::Entry::Query(_))
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let dispatch = plan::query_dispatch_cases(&source);
+            if !dispatch.is_empty() {
+                let files = [
+                    finding.entry_at.as_ref().map(|at| at.file.as_str()),
+                    Some(finding.file.as_str()),
+                    finding.sink.file.as_deref(),
+                ];
+                for file in files.into_iter().flatten() {
+                    let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+                        continue;
+                    };
+                    for gate in plan::gate_paths(&src) {
+                        if !probe.gate_paths.contains(&gate) {
+                            probe.gate_paths.push(gate);
+                        }
+                    }
+                }
+                if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                    eprintln!(
+                        "[verify] query-dispatch entry={:?} gates={:?} cases={dispatch:?}",
+                        probe.entry, probe.gate_paths,
+                    );
+                }
+                probe.query_dispatch = dispatch;
+            }
+        }
+    }
+
     // A URL-sourced forward proxy / file sink that reads several query parameters off the parsed
     // request URL reaches its sink only when the parameters other than the payload carrier are also
     // present and valid (`if (!url || !type) return`; `const filter = FILTERS[type]; if (!filter)

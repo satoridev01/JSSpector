@@ -256,6 +256,28 @@ pub struct Probe {
     /// first to save the payload, so a later request to [`Self::path`] loads it back into the sink.
     /// `None` for the ordinary case where the payload rides the same request that reaches the sink.
     pub stored_write: Option<StoredWrite>,
+    /// For a coarse `req.query`-sourced SSRF whose handler is a query-selector dispatcher
+    /// (`const q = req.query; switch (q.action) { case 'x': fetchHelper(q.url) }`,
+    /// `if (q.action === 'x') { ... }`): the branches that forward a query member onward, each with the
+    /// selector field, the branch's selector value, and the candidate URL-bearing query members read in
+    /// that branch. The marker URL is tried in each member with the branch's selector carried, under
+    /// each gate path, so the request takes the branch that reaches the request sink. Empty for a
+    /// handler with no such query dispatch. Mined from the handler source only; nothing here is
+    /// target-specific.
+    pub query_dispatch: Vec<QueryDispatch>,
+}
+
+/// One branch of a query-selector dispatcher that forwards a query member toward the request sink
+/// (see [`Probe::query_dispatch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryDispatch {
+    /// The query field the handler dispatches on (`q.action` -> `action`).
+    pub selector: String,
+    /// The literal value of this branch (`case 'addon_check'` -> `addon_check`).
+    pub value: String,
+    /// Candidate URL-bearing query members read inside this branch (`q.url` -> `url`), other than the
+    /// selector field.
+    pub params: Vec<String>,
 }
 
 /// Where and how a second-order finding's payload is saved before the read that reaches the sink
@@ -1527,6 +1549,7 @@ impl Probe {
                 decode_base64: None,
                 allow_tokens: Vec::new(),
                 stored_write: None,
+                query_dispatch: Vec::new(),
                 text_wrap: None,
             });
         }
@@ -1728,6 +1751,7 @@ impl Probe {
             decode_base64,
             allow_tokens,
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         })
     }
@@ -1799,6 +1823,7 @@ impl Probe {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         })
     }
@@ -1888,6 +1913,7 @@ impl Probe {
                 path: write_path,
                 entry: write_input,
             }),
+            query_dispatch: Vec::new(),
             text_wrap: None,
         })
     }
@@ -4571,7 +4597,9 @@ fn first_isin_literal(window: &str) -> Option<String> {
 }
 
 /// Parameter names read by explicit member access on a request part (`request.query.name`,
-/// `req.body["name"]`): the parameters a handler names one by one.
+/// `req.body["name"]`): the parameters a handler names one by one. Reads through a local bound to the
+/// whole part (`const cfg = req.body; cfg.host`) count too, so the fields a handler reads off such an
+/// alias are recovered just like direct `req.body.host` reads.
 fn member_params(source: &str, part: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (needle, bracket) in [(format!(".{part}."), false), (format!(".{part}["), true)] {
@@ -4580,6 +4608,60 @@ fn member_params(source: &str, part: &str) -> Vec<String> {
             let at = from + rel;
             from = at + needle.len();
             if !receiver_before(&source[..at]) {
+                continue;
+            }
+            let after = &source[at + needle.len()..];
+            let name = if bracket {
+                bracket_literal(after)
+            } else {
+                let ident: String = after.chars().take_while(|c| is_ident(*c as u8)).collect();
+                (!ident.is_empty()).then_some(ident)
+            };
+            if let Some(name) = name {
+                out.push(name);
+            }
+        }
+    }
+    for alias in part_aliases(source, part) {
+        out.extend(alias_member_reads(source, &alias));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Local identifiers a handler binds to the whole request part (`const connectionConfig = req.body`,
+/// `const q = request.query || {}`): their `.member` reads are reads of that part's fields. Mined from
+/// the handler source only via [`locals_bound_from_expr`] over each request receiver; nothing here is
+/// tied to a specific application.
+fn part_aliases(source: &str, part: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for recv in ["req", "request", "ctx"] {
+        for local in locals_bound_from_expr(source, &format!("{recv}.{part}")) {
+            if !out.contains(&local) {
+                out.push(local);
+            }
+        }
+    }
+    out
+}
+
+/// The member names read off a local `alias` by explicit member access (`alias.host`, `alias["port"]`),
+/// with a word boundary before the alias so a longer identifier or another object's member is not
+/// mistaken for it. Used to recover the request fields a handler reads through a whole-part alias.
+fn alias_member_reads(source: &str, alias: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    for (needle, bracket) in [(format!("{alias}."), false), (format!("{alias}["), true)] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            if at > 0
+                && bytes
+                    .get(at - 1)
+                    .is_some_and(|b| is_ident(*b) || *b == b'.')
+            {
                 continue;
             }
             let after = &source[at + needle.len()..];
@@ -4998,6 +5080,369 @@ fn trailing_string(text: &str) -> Option<String> {
     Some(body[start + 1..].to_owned())
 }
 
+/// Branches of a query-selector dispatcher that forward a query member toward the request sink, for a
+/// coarse `req.query`-sourced SSRF (see [`Probe::query_dispatch`]). A handler that binds the whole
+/// request query to a local (`const q = req.query`) and dispatches on one of its fields — a
+/// `switch (q.action) { case 'x': ... }` or an `if (q.action === 'x') { ... }` — reaches the request
+/// sink only inside the matching branch, and chooses the outbound host through another query member it
+/// reads there (`addonInfo(q.url)`). For each branch this returns the selector field, the branch's
+/// literal value, and the other query members read inside it, so the verifier can drive the marker in
+/// each member under the branch the selector chooses. A bounded scan of the handler source only; empty
+/// when the handler has no such query dispatch, so nothing here is tied to one app.
+pub fn query_dispatch_cases(source: &str) -> Vec<QueryDispatch> {
+    const MAX: usize = 32;
+    let receivers = query_receivers(source);
+    if receivers.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<QueryDispatch> = Vec::new();
+    for receiver in &receivers {
+        switch_dispatch_cases(source, receiver, &receivers, &mut out);
+        if_equality_dispatch_cases(source, receiver, &receivers, &mut out);
+        if out.len() >= MAX {
+            break;
+        }
+    }
+    out.truncate(MAX);
+    out
+}
+
+/// The receiver expressions through which a handler reads members of the request query: a local bound
+/// from the whole query object (`const q = req.query` -> `q`) and the direct member form
+/// (`req.query`/`request.query`) when the handler accesses it that way. Mined from the handler source
+/// only.
+fn query_receivers(source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for prefix in ["req.query", "request.query"] {
+        if source.contains(&format!("{prefix}.")) && !out.iter().any(|r| r == prefix) {
+            out.push(prefix.to_owned());
+        }
+        for local in locals_bound_from_expr(source, prefix) {
+            if !out.contains(&local) {
+                out.push(local);
+            }
+        }
+    }
+    out
+}
+
+/// Locals a `const`/`let`/`var` binds to the whole expression `expr` (`const q = req.query || {}` ->
+/// `q`): the declared name whose right-hand side begins with `expr` taken as a whole (not a member or
+/// longer identifier of it). A destructuring binding (`const { x } = req.query`) names no such local
+/// and is skipped. Mined from the handler source only.
+fn locals_bound_from_expr(source: &str, expr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for kw in ["const ", "let ", "var "] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(kw) {
+            let at = from + rel;
+            from = at + kw.len();
+            if at > 0 && source.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
+                continue;
+            }
+            let after = &source[at + kw.len()..];
+            let name: String = after
+                .bytes()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let rhs = after[name.len()..].trim_start();
+            let Some(rhs) = rhs.strip_prefix('=') else {
+                continue;
+            };
+            let rhs = rhs.trim_start();
+            if let Some(tail) = rhs.strip_prefix(expr)
+                && !tail
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '.' || c == '_' || c.is_ascii_alphanumeric())
+            {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// The field a `switch (<receiver>.<field>)` dispatches on, when the parenthesized condition is exactly
+/// that member access and nothing more.
+fn member_of(receiver: &str, expr: &str) -> Option<String> {
+    let tail = expr.strip_prefix(receiver)?.strip_prefix('.')?;
+    let field: String = tail
+        .bytes()
+        .take_while(|b| is_ident(*b))
+        .map(|b| b as char)
+        .collect();
+    if field.is_empty()
+        || field.len() != tail.len()
+        || field.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    Some(field)
+}
+
+/// Appends a [`QueryDispatch`] for each `case '<value>':` of a `switch (<receiver>.<field>)` whose body
+/// reads another query member, to `out`. Mined from the handler source only.
+fn switch_dispatch_cases(
+    source: &str,
+    receiver: &str,
+    receivers: &[String],
+    out: &mut Vec<QueryDispatch>,
+) {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("switch") {
+        let kw = from + rel;
+        from = kw + "switch".len();
+        if kw > 0 && bytes.get(kw - 1).is_some_and(|b| is_ident(*b)) {
+            continue;
+        }
+        if bytes.get(kw + 6).is_some_and(|b| is_ident(*b)) {
+            continue;
+        }
+        let Some(popen) = source[kw + 6..].find('(').map(|r| kw + 6 + r) else {
+            continue;
+        };
+        if !source[kw + 6..popen].trim().is_empty() {
+            continue;
+        }
+        let Some(pclose) = matching_close_paren(source, popen) else {
+            continue;
+        };
+        let cond = source[popen + 1..pclose].trim();
+        let Some(field) = member_of(receiver, cond) else {
+            continue;
+        };
+        let after = &source[pclose + 1..];
+        let ws = after.len() - after.trim_start().len();
+        if !after[ws..].starts_with('{') {
+            continue;
+        }
+        let bopen = pclose + 1 + ws;
+        let Some(bclose) = matching_close_brace(source, bopen) else {
+            continue;
+        };
+        for (value, body) in switch_case_bodies(&source[bopen + 1..bclose]) {
+            let params = members_read(body, receivers, &field);
+            if !params.is_empty() {
+                push_dispatch(out, &field, &value, params);
+            }
+        }
+        from = bclose;
+    }
+}
+
+/// Appends a [`QueryDispatch`] for each `if (<receiver>.<field> === '<value>')` whose block reads
+/// another query member, to `out`. Covers a handler that dispatches with an if/else-if chain rather
+/// than a switch. Mined from the handler source only.
+fn if_equality_dispatch_cases(
+    source: &str,
+    receiver: &str,
+    receivers: &[String],
+    out: &mut Vec<QueryDispatch>,
+) {
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    while i + 2 <= source.len() {
+        let at_boundary = i == 0 || bytes.get(i - 1).is_some_and(|b| !is_ident(*b));
+        if at_boundary
+            && bytes.get(i) == Some(&b'i')
+            && bytes.get(i + 1) == Some(&b'f')
+            && bytes.get(i + 2).is_none_or(|b| !is_ident(*b))
+            && let Some(popen) = source[i + 2..].find('(').map(|r| i + 2 + r)
+            && source[i + 2..popen].trim().is_empty()
+            && let Some(pclose) = matching_close_paren(source, popen)
+        {
+            let cond = &source[popen + 1..pclose];
+            if let Some((field, value)) = equality_dispatch(receiver, cond) {
+                let after = &source[pclose + 1..];
+                let ws = after.len() - after.trim_start().len();
+                if after[ws..].starts_with('{') {
+                    let bopen = pclose + 1 + ws;
+                    if let Some(bclose) = matching_close_brace(source, bopen) {
+                        let params = members_read(&source[bopen + 1..bclose], receivers, &field);
+                        if !params.is_empty() {
+                            push_dispatch(out, &field, &value, params);
+                        }
+                    }
+                }
+            }
+            i = popen + 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// The `(field, value)` of an `<receiver>.<field> === '<value>'` equality (either operand order), or
+/// `None` when the condition is not such a comparison against a string literal.
+fn equality_dispatch(receiver: &str, cond: &str) -> Option<(String, String)> {
+    for op in ["===", "=="] {
+        if let Some((lhs, rhs)) = cond.split_once(op) {
+            let (lhs, rhs) = (lhs.trim(), rhs.trim());
+            if let Some(field) = member_of(receiver, lhs)
+                && let Some(value) = string_literal_arg(rhs)
+            {
+                return Some((field, value));
+            }
+            if let Some(field) = member_of(receiver, rhs)
+                && let Some(value) = string_literal_arg(lhs)
+            {
+                return Some((field, value));
+            }
+        }
+    }
+    None
+}
+
+/// The `(value, body)` of each top-level `case '<value>':` inside a switch block's inner text: the
+/// string-literal label and the source between that label and the next `case`/`default` (or the end).
+/// Nested braces, parens, brackets, strings and comments are skipped so a `case` token inside a nested
+/// block or string is not mistaken for a label.
+fn switch_case_bodies(body: &str) -> Vec<(String, &str)> {
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    // (label value or None for `default`, keyword start, body start)
+    let mut markers: Vec<(Option<String>, usize, usize)> = Vec::new();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    let byte = |at: usize| bytes.get(at).copied();
+    while i < len {
+        let Some(c) = byte(i) else {
+            break;
+        };
+        match c {
+            b'{' | b'(' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b')' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' | b'\'' | b'`' => {
+                i += 1;
+                while i < len && byte(i) != Some(c) {
+                    if byte(i) == Some(b'\\') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < len && byte(i) != Some(b'\n') {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < len && !(byte(i) == Some(b'*') && byte(i + 1) == Some(b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            _ if depth == 0
+                && !i.checked_sub(1).and_then(byte).is_some_and(is_ident)
+                && (body[i..].starts_with("case")
+                    && bytes.get(i + 4).is_some_and(|b| !is_ident(*b))) =>
+            {
+                let after = &body[i + 4..];
+                if let Some(colon_rel) = after.find(':') {
+                    let label = after[..colon_rel].trim();
+                    let body_start = i + 4 + colon_rel + 1;
+                    markers.push((string_literal_arg(label), i, body_start));
+                    i = body_start;
+                    continue;
+                }
+                i += 1;
+            }
+            _ if depth == 0
+                && !i.checked_sub(1).and_then(byte).is_some_and(is_ident)
+                && body[i..].starts_with("default")
+                && bytes.get(i + 7).is_some_and(|b| !is_ident(*b)) =>
+            {
+                if let Some(colon_rel) = body[i + 7..].find(':') {
+                    let body_start = i + 7 + colon_rel + 1;
+                    markers.push((None, i, body_start));
+                    i = body_start;
+                    continue;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let mut out = Vec::new();
+    for (idx, (value, _, body_start)) in markers.iter().enumerate() {
+        let Some(value) = value else {
+            continue;
+        };
+        let end = markers.get(idx + 1).map(|(_, kw, _)| *kw).unwrap_or(len);
+        if *body_start <= end {
+            out.push((value.clone(), &body[*body_start..end]));
+        }
+    }
+    out
+}
+
+/// The distinct query members a branch reads through any query `receiver` (`q.url` -> `url`), other
+/// than the selector field `exclude`. The outbound host of the request sink is chosen through one of
+/// these, so each is a candidate to carry the marker. Mined from the branch source only.
+fn members_read(body: &str, receivers: &[String], exclude: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for receiver in receivers {
+        let needle = format!("{receiver}.");
+        let mut from = 0;
+        while let Some(rel) = body[from..].find(&needle) {
+            let at = from + rel;
+            from = at + needle.len();
+            if at > 0 && body.as_bytes().get(at - 1).is_some_and(|b| is_ident(*b)) {
+                continue;
+            }
+            let member: String = body[at + needle.len()..]
+                .bytes()
+                .take_while(|b| is_ident(*b))
+                .map(|b| b as char)
+                .collect();
+            if member.is_empty()
+                || member.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                || member == exclude
+                || out.contains(&member)
+            {
+                continue;
+            }
+            out.push(member);
+        }
+    }
+    out
+}
+
+/// Records a dispatch branch, merging its members into an existing `(selector, value)` entry rather
+/// than duplicating it.
+fn push_dispatch(out: &mut Vec<QueryDispatch>, selector: &str, value: &str, params: Vec<String>) {
+    if let Some(existing) = out
+        .iter_mut()
+        .find(|d| d.selector == selector && d.value == value)
+    {
+        for param in params {
+            if !existing.params.contains(&param) {
+                existing.params.push(param);
+            }
+        }
+        return;
+    }
+    out.push(QueryDispatch {
+        selector: selector.to_owned(),
+        value: value.to_owned(),
+        params,
+    });
+}
+
 /// The prefix a plug-in-style app mounts a module's routes under, when the module declares it as
 /// a literal: `mountPath: "/auth"` or `mountPath = '/auth'`. The routes are registered on a
 /// router the host mounts at that path at startup, which no call in the module shows.
@@ -5062,6 +5507,25 @@ pub fn gate_paths(source: &str) -> Vec<String> {
         let Some(&c) = bytes.get(i) else {
             break;
         };
+        // Skip comments so an apostrophe inside one (`// Anivexa's getMedia`) is not mistaken for a
+        // string-literal opener, which would swallow real path comparisons until the next quote.
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes.get(i) != Some(&b'\n') {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len()
+                && !(bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/'))
+            {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
         if matches!(c, b'"' | b'\'' | b'`') {
             // A string literal; keep it only when its surroundings are a path comparison.
             if let Some(end) = source[i + 1..].find(c as char) {
@@ -5933,6 +6397,15 @@ fn best_entry(finding: &Finding, path: &str, source: Option<&str>) -> Option<Ent
     if let Some(entry) = coarse_part_field_entry(finding, path, source) {
         return Some(entry);
     }
+    // A coarse `req.body`/`req.query` source whose specific member is read only in a callee, where the
+    // whole part was bound to the callee's parameter (`testTrinoConnection(req.body)` then `config
+    // .galaxyDomain` in the sink). The handler source never shows `req.body.<member>`, but the sink
+    // argument interpolates `<tainted>.<member>` where `<tainted>` is an alias of the whole part
+    // recorded in the flow trace. Resolve that member so the payload rides the exact field the sink
+    // reads instead of a generic default or the vaguer whole-part body.
+    if let Some(entry) = coarse_sink_member_entry(finding, path) {
+        return Some(entry);
+    }
     let mut candidates: Vec<Entry> = Vec::new();
     for text in [finding.sink.arg.as_str(), finding.source.expr.as_str()] {
         for accessor in request_accessors(text) {
@@ -6062,6 +6535,34 @@ fn coarse_part_field_entry(finding: &Finding, path: &str, source: Option<&str>) 
         && let [only] = fields.as_slice()
     {
         return source_entry(&format!("request.{part}.{only}"), path);
+    }
+    None
+}
+
+/// When the finding's source is a coarse request part with no specific member (`req.body`, `req.query`)
+/// and the sink argument interpolates `<tainted>.<member>` — a member access on an identifier the flow
+/// trace records the whole part being assigned to (`const connectionConfig = req.body;
+/// testTrinoConnection(connectionConfig)` then `config.galaxyDomain` at the sink) — the request entry
+/// for that `<member>`. This resolves the field a cross-function sink reads off the part even though the
+/// handler source never shows `req.<part>.<member>` directly. Keyed on the sink argument and the flow
+/// trace only; nothing here is tied to a specific application.
+fn coarse_sink_member_entry(finding: &Finding, path: &str) -> Option<Entry> {
+    let part = strip_request_receiver(finding.source.expr.trim()).or_else(|| {
+        matches!(finding.source.expr.trim(), "body" | "query").then_some(finding.source.expr.trim())
+    })?;
+    // Only a bare part with no member of its own; a source that already names the member is resolved by
+    // the generic member-access logic.
+    if !matches!(part, "body" | "query") {
+        return None;
+    }
+    let tainted = tainted_identifiers(finding, &Entry::Url);
+    let arg = finding.sink.arg.as_str();
+    for ident in &tainted {
+        for member in alias_member_reads(arg, ident) {
+            if let Some(entry) = source_entry(&format!("request.{part}.{member}"), path) {
+                return Some(entry);
+            }
+        }
     }
     None
 }
@@ -9845,6 +10346,7 @@ module.exports = { activityValidators };\n";
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
         let (part, target) = probe.entry_part().expect("a header entry takes siblings");
@@ -10998,6 +11500,64 @@ module.exports = { activityValidators };\n";
     }
 
     #[test]
+    fn a_whole_body_ssrf_resolves_the_member_a_callee_reads_off_an_alias() {
+        // The handler binds the whole body to a local and forwards it to a callee; the sink (in that
+        // callee) interpolates `config.galaxyDomain`, where `config` is the callee's parameter — an
+        // alias of the whole body recorded in the flow trace. The specific body member `galaxyDomain`
+        // must be resolved from the sink argument even though the handler source never shows
+        // `req.body.galaxyDomain`, or the payload rides a generic field the request never reads.
+        let mut f = finding(
+            VulnClass::Ssrf,
+            Auth::NoneDetected,
+            Some("POST /api/testtrino/testtrino"),
+            "req.body",
+        );
+        f.sink.arg = "`${config.galaxyDomain}/oauth/v2/token`".to_owned();
+        f.trace = vec![
+            TraceStep {
+                file: None,
+                line: 12,
+                col: 11,
+                note: "assigned to `connectionConfig`".to_owned(),
+            },
+            TraceStep {
+                file: None,
+                line: 3,
+                col: 36,
+                note: "assigned to `config`".to_owned(),
+            },
+        ];
+        let probe = Probe::from_finding(&f).unwrap();
+        assert_eq!(probe.entry, Entry::Body(Some("galaxyDomain".to_owned())));
+    }
+
+    #[test]
+    fn required_siblings_read_the_fields_a_guard_checks_through_a_whole_body_alias() {
+        // The handler binds the whole body to a local (`const cfg = req.body`) and rejects the request
+        // unless several of its fields are present (`if (!cfg.host || !cfg.port) return 400`). Those
+        // fields are reads of the body part through the alias, so they are required siblings the probe
+        // must carry alongside the payload field, or the request is rejected before the sink.
+        let source = r#"
+          router.post("/testtrino", async (req, res) => {
+            const cfg = req.body;
+            if (!cfg.host || !cfg.port || !cfg.user || !cfg.password) {
+              return res.status(400).json({ success: false });
+            }
+            await testTrinoConnection(cfg);
+          });
+        "#;
+        let siblings = required_siblings(source, "body", "galaxyDomain");
+        let names: Vec<&str> = siblings.iter().map(|(name, _)| name.as_str()).collect();
+        for field in ["host", "port", "user", "password"] {
+            assert!(names.contains(&field), "missing {field} in {names:?}");
+        }
+        assert!(
+            siblings.iter().all(|(_, value)| !value.is_empty()),
+            "every sibling needs a presence-satisfying value: {siblings:?}"
+        );
+    }
+
+    #[test]
     fn an_upgrade_entry_is_a_get_marked_for_upgrade() {
         let probe = Probe::from_finding(&finding(
             VulnClass::Ssrf,
@@ -11050,6 +11610,71 @@ module.exports = { activityValidators };\n";
         // -1`): the path it recognizes is mined so the payload rides a URL it accepts.
         let substring = "if (request.url.indexOf('/api/ids') !== -1) {}\n";
         assert!(super::gate_paths(substring).contains(&"/api/ids".to_owned()));
+    }
+
+    #[test]
+    fn gate_paths_ignores_an_apostrophe_inside_a_comment() {
+        // An apostrophe in a comment (`Anivexa's`) must not be read as a string-literal opener, which
+        // would swallow the following source and hide a real path comparison below it.
+        let source = "// every lookup of that media id (Anivexa's getMedia) is answered from it\n\
+             const u = typeof input === 'string' ? input : '';\n\
+             if (url.pathname === '/api' || url.pathname === '/api/') return runApi(request);\n";
+        assert!(
+            super::gate_paths(source).contains(&"/api".to_owned()),
+            "{:?}",
+            super::gate_paths(source)
+        );
+    }
+
+    #[test]
+    fn query_dispatch_cases_resolve_the_selector_and_forwarded_members() {
+        // A handler that binds the whole query (`const q = req.query`) and dispatches on `q.action`
+        // via a switch reaches the request sink only inside the matching case, where it forwards
+        // another query member (`q.url`). The branch's selector, value and that member are recovered.
+        let source = "async function handle(req, res) {\n\
+             const q = req.query || {};\n\
+             switch (q.action) {\n\
+               case 'search':\n\
+                 return send(res, await search(q.q));\n\
+               case 'addon_check':\n\
+                 return send(res, await addonInfo(q.url));\n\
+               default:\n\
+                 return send(res, 404);\n\
+             }\n\
+           }\n";
+        let cases = super::query_dispatch_cases(source);
+        let addon = cases
+            .iter()
+            .find(|d| d.selector == "action" && d.value == "addon_check")
+            .expect("addon_check branch is mined");
+        assert_eq!(addon.params, vec!["url".to_owned()]);
+        let search = cases
+            .iter()
+            .find(|d| d.value == "search")
+            .expect("search branch is mined");
+        assert_eq!(search.params, vec!["q".to_owned()]);
+        // The selector field itself is never offered as a URL-bearing member.
+        assert!(
+            cases
+                .iter()
+                .all(|d| !d.params.contains(&"action".to_owned()))
+        );
+
+        // The if/else-if equality form of the same dispatch is recovered too.
+        let chained = "function h(req, res) {\n\
+             const q = req.query;\n\
+             if (q.action === 'addon_check') { return addonInfo(q.url); }\n\
+           }\n";
+        let chained_cases = super::query_dispatch_cases(chained);
+        assert!(
+            chained_cases
+                .iter()
+                .any(|d| d.selector == "action" && d.value == "addon_check" && d.params == ["url"]),
+            "{chained_cases:?}"
+        );
+
+        // A handler with no query dispatch yields nothing.
+        assert!(super::query_dispatch_cases("function h(req){ return req.query.q; }").is_empty());
     }
 
     #[test]

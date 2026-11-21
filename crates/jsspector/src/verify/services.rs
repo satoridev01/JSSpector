@@ -231,7 +231,7 @@ pub fn plan(root: &Path, app_root: &Path, mongo: bool) -> ServicePlan {
         plan.sql = sidecars_from_dependencies(app_root, mongo, &repo);
     }
     if mongo && plan.mongo_image.is_none() {
-        plan.mongo_image = repo.mongo.clone();
+        plan.mongo_image = repo.mongo.clone().or_else(|| legacy_mongo_image(app_root));
     }
     let sources = env_reads(app_root);
     complete_env(&mut plan, &sources, mongo);
@@ -615,6 +615,66 @@ fn sidecars_from_dependencies(app_root: &Path, mongo: bool, repo: &RepoImages) -
         ));
     }
     out
+}
+
+/// The MongoDB server image to start for an app whose installed MongoDB driver predates the
+/// OP_MSG-only wire protocol, or `None` for a current driver (the sandbox then uses its default
+/// image). MongoDB 5.1 removed the legacy OP_QUERY opcode; the `mongodb` 3.x driver (bundled by
+/// Mongoose 5 and earlier) still issues commands such as `aggregate` over OP_QUERY, so running one of
+/// those apps against a 5.1+ server makes the driver's own query fail — the app throws and the
+/// container exits, and the handler never reaches its database. `mongo:4.4` is the last release that
+/// still speaks the legacy opcode and also accepts OP_MSG, so it serves both old and new drivers. The
+/// driver version comes from the app's own lockfile (what actually installs) first, then its manifest
+/// range; nothing names a specific application.
+fn legacy_mongo_image(app_root: &Path) -> Option<String> {
+    let legacy = match dependency_major(app_root, "mongodb") {
+        Some(major) => major < 4,
+        None => dependency_major(app_root, "mongoose").is_some_and(|major| major < 6),
+    };
+    legacy.then(|| "mongo:4.4".to_owned())
+}
+
+/// The installed major version of a dependency: its resolved version in the lockfile (the version
+/// that actually installs, in either the v1 `dependencies` map or the v2/v3 `packages` map), falling
+/// back to the major of its declared range in the manifest. `None` when the dependency is absent or
+/// its version cannot be read (an open `*` range with no lockfile pins nothing).
+fn dependency_major(app_root: &Path, name: &str) -> Option<u32> {
+    if let Ok(text) = std::fs::read_to_string(app_root.join("package-lock.json"))
+        && let Ok(lock) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        let resolved = lock
+            .get("packages")
+            .and_then(|packages| packages.get(format!("node_modules/{name}")))
+            .and_then(|entry| entry.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                lock.get("dependencies")
+                    .and_then(|deps| deps.get(name))
+                    .and_then(|entry| entry.get("version"))
+                    .and_then(serde_json::Value::as_str)
+            });
+        if let Some(major) = resolved.and_then(major_version) {
+            return Some(major);
+        }
+    }
+    let manifest = std::fs::read_to_string(app_root.join("package.json")).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&manifest).ok()?;
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .filter_map(|section| json.get(section).and_then(serde_json::Value::as_object))
+        .find_map(|deps| deps.get(name).and_then(serde_json::Value::as_str))
+        .and_then(major_version)
+}
+
+/// The leading major version of an npm version or range string (`^5.3.7` -> 5, `5.3.7` -> 5,
+/// `>=4.0` -> 4), or `None` when it names no concrete version (`*`, `latest`, a git/url spec).
+fn major_version(spec: &str) -> Option<u32> {
+    let digits: String = spec
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Fills database settings the app reads from `process.env` but nothing set yet, by the naming
@@ -1108,6 +1168,72 @@ mod tests {
 
     fn plan_for(root: &Path) -> ServicePlan {
         plan(root, root, false)
+    }
+
+    #[test]
+    fn a_legacy_mongodb_driver_pins_a_server_that_still_speaks_the_old_wire_protocol() {
+        // A lockfile pinning the legacy `mongodb` 3.x driver (Mongoose 5 bundles it) cannot run
+        // `aggregate` against MongoDB 5.1+, which removed OP_QUERY: default to the last server that
+        // still speaks it. Both the v1 `dependencies` map and the v2/v3 `packages` map are read.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", r#"{"dependencies":{"mongoose":"*"}}"#);
+        write(
+            root,
+            "package-lock.json",
+            r#"{"lockfileVersion":1,"dependencies":{"mongoose":{"version":"5.3.7"},"mongodb":{"version":"3.1.6"}}}"#,
+        );
+        assert_eq!(
+            plan(root, root, true).mongo_image.as_deref(),
+            Some("mongo:4.4")
+        );
+
+        // A current driver keeps the sandbox default (no image pinned here).
+        let modern = tempfile::tempdir().unwrap();
+        write(
+            modern.path(),
+            "package.json",
+            r#"{"dependencies":{"mongoose":"^8.0.0"}}"#,
+        );
+        write(
+            modern.path(),
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"node_modules/mongoose":{"version":"8.2.0"},"node_modules/mongodb":{"version":"6.3.0"}}}"#,
+        );
+        assert_eq!(plan(modern.path(), modern.path(), true).mongo_image, None);
+
+        // A declared range with no lockfile is read from the manifest.
+        let ranged = tempfile::tempdir().unwrap();
+        write(
+            ranged.path(),
+            "package.json",
+            r#"{"dependencies":{"mongoose":"^5.13.0"}}"#,
+        );
+        assert_eq!(
+            plan(ranged.path(), ranged.path(), true)
+                .mongo_image
+                .as_deref(),
+            Some("mongo:4.4")
+        );
+
+        // A Compose/CI pin still wins over the driver-derived default.
+        let pinned = tempfile::tempdir().unwrap();
+        write(
+            pinned.path(),
+            "package.json",
+            r#"{"dependencies":{"mongoose":"5"}}"#,
+        );
+        write(
+            pinned.path(),
+            "docker-compose.yml",
+            "services:\n  mongo:\n    image: mongo:7\n  web:\n    build: .\n",
+        );
+        assert_eq!(
+            plan(pinned.path(), pinned.path(), true)
+                .mongo_image
+                .as_deref(),
+            Some("mongo:7")
+        );
     }
 
     #[test]

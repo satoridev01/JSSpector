@@ -333,6 +333,12 @@ pub struct Session {
     mongo_aliases: Vec<String>,
     /// The MongoDB image the repository pins (Compose or CI); [`DB_IMAGE`] otherwise.
     mongo_image: Option<String>,
+    /// Database names the app connects to by name in its own source (`mongodb://host/<name>`). A
+    /// read-only query sink against such a database never writes, so MongoDB never creates it on disk
+    /// and `listDatabases` (and so `getDBNames()`) omits it. Naming it lets the verifier enable
+    /// profiling on the exact database the sink queries, so the query is recorded and its collection
+    /// can be seeded for the match-all/match-none differential. Discovered by [`mongo_database_names`].
+    mongo_databases: Vec<String>,
     /// The shell the MongoDB image ships (`mongosh` from 5.0 on, `mongo` before), found once.
     mongo_shell: std::cell::Cell<Option<&'static str>>,
     /// The app's environment for those databases (from its Compose service and its own
@@ -714,6 +720,11 @@ impl Session {
             );
         }
 
+        let mongo_databases = if db.is_some() {
+            mongo_database_names(&app_root)
+        } else {
+            Default::default()
+        };
         let mut session = Self {
             runtime: Runtime::Docker,
             tag,
@@ -727,6 +738,7 @@ impl Session {
             sql,
             mongo_aliases,
             mongo_image,
+            mongo_databases,
             mongo_shell: std::cell::Cell::new(None),
             service_env,
             canary,
@@ -988,6 +1000,11 @@ impl Session {
             sql: Vec::new(),
             mongo_aliases: Vec::new(),
             mongo_image: None,
+            mongo_databases: if needs_db {
+                mongo_database_names(&root.join(app_path))
+            } else {
+                Default::default()
+            },
             mongo_shell: std::cell::Cell::new(None),
             service_env: Vec::new(),
             canary,
@@ -1136,6 +1153,7 @@ impl Session {
         let mut mongodb_callback_promises = false;
         let mut scratch_dirs = Vec::new();
         let mut cert_files: Vec<String> = Vec::new();
+        let mut cred_files: Vec<String> = Vec::new();
         let mut dotenv_files: Vec<String> = Vec::new();
         let mut generated_config_retry = false;
         let mut next_development_retry = false;
@@ -1184,6 +1202,8 @@ impl Session {
                 .filter(|(path, _)| !cert_files.iter().any(|have| have == path));
             let new_dotenv = missing_dotenv_file(&err)
                 .filter(|path| !dotenv_files.iter().any(|have| have == path));
+            let new_cred = missing_service_account_json(&err, &self.root)
+                .filter(|path| !cred_files.iter().any(|have| have == path));
             let retry_generated_config = !generated_config_retry && generated_startup_config(&err);
             let next_development_available = match &self.runtime {
                 Runtime::Local { app_root, .. } => {
@@ -1208,6 +1228,7 @@ impl Session {
                 && !enable_mongodb_callback_promises
                 && new_dir.is_none()
                 && new_cert.is_none()
+                && new_cred.is_none()
                 && new_dotenv.is_none()
                 && !retry_generated_config
                 && !retry_next_development
@@ -1230,6 +1251,14 @@ impl Session {
             if let Some(path) = new_dotenv {
                 self.stage_local_dotenv_file(&path)?;
                 dotenv_files.push(path);
+            }
+            if let Some(path) = new_cred {
+                self.stage_local_checkout_file(
+                    &path,
+                    SERVICE_ACCOUNT_JSON.as_bytes(),
+                    "service-account credential",
+                )?;
+                cred_files.push(path);
             }
         }
         Err("the app still could not start after five launch attempts".to_owned())
@@ -1552,6 +1581,10 @@ impl Session {
         // (see [`missing_tls_material`]); staged from the self-signed marker pair on the next
         // attempt so the server can bind. Each entry is (container path, is_key).
         let mut cert_files: Vec<(String, bool)> = Vec::new();
+        // Service-account credential JSON files the app reads to initialize the Firebase Admin SDK
+        // before it listens (see [`missing_service_account_json`]); staged from the inert placeholder
+        // on the next attempt so the app can bind.
+        let mut cred_files: Vec<String> = Vec::new();
         let mut generated_config_retry = false;
         for _ in 0..5 {
             self.tls = !cert_files.is_empty();
@@ -1561,6 +1594,7 @@ impl Session {
                 mongodb_callback_promises,
                 &scratch_dirs,
                 &cert_files,
+                &cred_files,
             )?;
             let err = match self.wait_until_listening() {
                 Ok(port) => {
@@ -1587,12 +1621,15 @@ impl Session {
             let new_dir = missing_write_dir(&err).filter(|dir| !scratch_dirs.contains(dir));
             let new_cert = missing_tls_material(&err)
                 .filter(|(path, _)| cert_files.iter().all(|(have, _)| have != path));
+            let new_cred = missing_service_account_json(&err, &self.root)
+                .filter(|path| cred_files.iter().all(|have| have != path));
             let retry_generated_config = !generated_config_retry && generated_startup_config(&err);
             if missing.is_empty()
                 && !enable_module_stub
                 && !enable_mongodb_callback_promises
                 && new_dir.is_none()
                 && new_cert.is_none()
+                && new_cred.is_none()
                 && !retry_generated_config
             {
                 return Err(err);
@@ -1608,6 +1645,9 @@ impl Session {
             if let Some(cert) = new_cert {
                 cert_files.push(cert);
             }
+            if let Some(cred) = new_cred {
+                cred_files.push(cred);
+            }
         }
         Err("the app still could not start after five launch attempts".to_owned())
     }
@@ -1622,6 +1662,7 @@ impl Session {
         mongodb_callback_promises: bool,
         scratch_dirs: &[String],
         cert_files: &[(String, bool)],
+        cred_files: &[String],
     ) -> Result<(), String> {
         // The app: on the private network, hardened, its scratch space in tmpfs, no extra
         // privileges, bounded memory, CPUs and processes.
@@ -1749,7 +1790,7 @@ impl Session {
         // read, then `exec` the app's own launch command unchanged. This satisfies a genuine runtime
         // precondition — a server needs a certificate to serve TLS — without altering the app, and
         // the key/cert are a matching pair so the handshake the driver performs is real.
-        if let Some(command) = self.cert_staging_command(cert_files) {
+        if let Some(command) = self.startup_staging_command(cert_files, cred_files) {
             args.push("sh".to_owned());
             args.push("-c".to_owned());
             args.push(command);
@@ -1759,13 +1800,18 @@ impl Session {
         Ok(())
     }
 
-    /// The `sh -c` launch wrapper that stages each requested TLS key/cert file from the baked
-    /// self-signed marker pair (`/jss-marker.key`, `/jss-marker.crt`) and then `exec`s the app's own
-    /// launch command (the image `CMD`), or `None` when nothing needs staging. The app's command is
-    /// taken verbatim from its manifest/entry (see [`start_command`]); only a filesystem fixture is
-    /// added ahead of it.
-    fn cert_staging_command(&self, cert_files: &[(String, bool)]) -> Option<String> {
-        if cert_files.is_empty() {
+    /// The `sh -c` launch wrapper that stages each requested startup fixture from a baked file and then
+    /// `exec`s the app's own launch command (the image `CMD`), or `None` when nothing needs staging.
+    /// TLS key/cert files are copied from the self-signed marker pair (`/jss-marker.key`,
+    /// `/jss-marker.crt`); service-account credential JSON files from the inert placeholder
+    /// (`/jss-service-account.json`). The app's command is taken verbatim from its manifest/entry (see
+    /// [`start_command`]); only a filesystem fixture is added ahead of it.
+    fn startup_staging_command(
+        &self,
+        cert_files: &[(String, bool)],
+        cred_files: &[String],
+    ) -> Option<String> {
+        if cert_files.is_empty() && cred_files.is_empty() {
             return None;
         }
         let argv: Vec<String> = serde_json::from_str(&self.start_command).ok()?;
@@ -1785,6 +1831,12 @@ impl Session {
                 "/jss-marker.crt"
             };
             script.push_str(&format!("cp {} {} && ", source, shell_quote(path)));
+        }
+        for path in cred_files {
+            script.push_str(&format!(
+                "cp /jss-service-account.json {} && ",
+                shell_quote(path)
+            ));
         }
         script.push_str(&format!("exec {exec}"));
         Some(script)
@@ -2167,15 +2219,20 @@ impl Session {
         let Some(db) = self.db.as_deref() else {
             return;
         };
-        let _ = self.exec(
-            db,
-            &[
-                self.mongo_shell(),
-                "--quiet",
-                "--eval",
-                ENABLE_PROFILING_SCRIPT,
-            ],
-        );
+        // Profile every database that already holds data (from `getDBNames()`), plus every database
+        // the app names in its own connection string. A read-only sink's database is never created on
+        // disk, so `getDBNames()` omits it and its query would go unrecorded; naming it (each name is
+        // restricted to MongoDB-legal identifier characters, so it cannot break out of the script
+        // literal) enables profiling on the exact database the sink queries. Enabling profiling on a
+        // not-yet-existing named database creates it, which is also what lets the recorded collection
+        // be seeded for the differential.
+        let mut script = String::from(ENABLE_PROFILING_SCRIPT);
+        for name in &self.mongo_databases {
+            script.push_str(&format!(
+                "try{{db.getSiblingDB('{name}').setProfilingLevel(2);}}catch(e){{}}"
+            ));
+        }
+        let _ = self.exec(db, &[self.mongo_shell(), "--quiet", "--eval", &script]);
     }
 
     /// Read the profiler log written since [`Session::enable_db_profiling`], and for every collection
@@ -3580,7 +3637,18 @@ impl Session {
     /// response identical, so a parameterized (safe) sink never reproduces. Several comment styles are
     /// tried so a statement one marker fails to neutralize is still reached by another.
     fn exercise_sql_value(&self, probe: &Probe) -> Outcome {
-        let cases = payload::sql_value_cases(probe, &self.canary);
+        // Each boolean-differential case is tried as sent (JSON body for a body source) and, for a
+        // body source, also as its form-urlencoded twin: an Express app that mounts only
+        // `express.urlencoded` before the route never parses a JSON body, so the tainted value would
+        // never reach the sink in JSON form. The twin carries the same fields as a form submission so
+        // such a form-only route is still reached; a route with a JSON parser ignores the extra legs.
+        let cases: Vec<payload::SqlValueCase> = payload::sql_value_cases(probe, &self.canary)
+            .into_iter()
+            .flat_map(|case| {
+                let twin = payload::sql_value_case_twin(&case);
+                std::iter::once(case).chain(twin)
+            })
+            .collect();
         let tried = cases.len() * 3;
         for case in &cases {
             let (Some(truthy), Some(falsy_a), Some(falsy_b)) = (
@@ -6130,6 +6198,79 @@ fn uses_node_sqlite(root: &std::path::Path, _app_root: &std::path::Path) -> bool
     scan(root, &mut budget)
 }
 
+/// Database names the app connects to by name in a MongoDB connection string written in its own
+/// source (`mongodb://host/<name>`, `mongodb+srv://host/<name>`). A read-only query sink against such
+/// a database never writes, so MongoDB never creates it on disk and `listDatabases` omits it; the
+/// verifier needs the name to enable profiling on (and so materialize and seed) the exact database the
+/// sink queries. A bounded, source-only scan under the app directory, skipping `node_modules` and
+/// dot-directories; nothing names a specific application.
+fn mongo_database_names(app_root: &std::path::Path) -> Vec<String> {
+    fn scan(dir: &std::path::Path, budget: &mut u32, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if *budget == 0 {
+                return;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                scan(&path, budget, out);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx" | "json" | "yml" | "yaml")
+            ) {
+                *budget -= 1;
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    extract_mongo_databases(&text, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut budget = 3000u32;
+    scan(app_root, &mut budget, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Appends the database name of each MongoDB connection string in `text` to `out`: the path segment
+/// after the authority (`mongodb://user:pass@host:27017/<name>?opts` -> `<name>`). Only names made of
+/// MongoDB-legal identifier characters are kept, so an interpolated or malformed URI contributes
+/// nothing and nothing unsafe reaches the shell script that later uses the name.
+fn extract_mongo_databases(text: &str, out: &mut Vec<String>) {
+    for scheme in ["mongodb://", "mongodb+srv://"] {
+        for (idx, _) in text.match_indices(scheme) {
+            let after = &text[idx + scheme.len()..];
+            let end = after
+                .find(|c: char| {
+                    matches!(c, '"' | '\'' | '`' | ' ' | '\t' | '\n' | '\r' | '\\' | ')')
+                })
+                .unwrap_or(after.len());
+            let uri = &after[..end];
+            let Some(slash) = uri.find('/') else {
+                continue;
+            };
+            let path = &uri[slash + 1..];
+            let name_end = path.find(['/', '?']).unwrap_or(path.len());
+            let name = &path[..name_end];
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                out.push(name.to_owned());
+            }
+        }
+    }
+}
+
 /// Node's built-in modules, by the root segment that appears in an import specifier (`fs/promises`
 /// -> `fs`). Specifiers naming these are never installed from a registry, so they are not weighed
 /// when choosing a dependency provider.
@@ -7298,6 +7439,7 @@ fn dockerfile(
          RUN echo {} | base64 -d > /jss-marker.js\n\
          RUN echo {} | base64 -d > /jss-marker.crt\n\
          RUN echo {} | base64 -d > /jss-marker.key\n\
+         RUN echo {} | base64 -d > /jss-service-account.json\n\
          RUN echo {} | base64 -d > /jss-launch-shim.js\n\
          RUN echo {} | base64 -d > /jss-electron-shim.js\n\
          RUN echo {} | base64 -d > /jss-esm-hook.mjs\n\
@@ -7317,6 +7459,7 @@ fn dockerfile(
         base64(MARKER_JS.as_bytes()),
         base64(MARKER_CERT.as_bytes()),
         base64(MARKER_KEY.as_bytes()),
+        base64(SERVICE_ACCOUNT_JSON.as_bytes()),
         base64(LAUNCH_SHIM_JS.as_bytes()),
         base64(ELECTRON_SHIM_JS.as_bytes()),
         base64(LAUNCH_ESM_HOOK_JS.as_bytes()),
@@ -7572,6 +7715,96 @@ fn missing_tls_material(log: &str) -> Option<(String, bool)> {
     // `server-cert.pem`/`server.pem`); a bare `.pem` with no hint is treated as the certificate.
     let is_key = lower.ends_with(".key") || (lower.ends_with(".pem") && lower.contains("key"));
     Some((path.to_owned(), is_key))
+}
+
+/// The last single-quoted path in the `ENOENT: no such file or directory` line of a startup failure
+/// (`... open '/app/Server/service-account.json'`), or `None` when the log carries no such line. A
+/// rename/copy reports source then destination; the last quoted segment is the operand that failed.
+fn enoent_path(log: &str) -> Option<&str> {
+    let line = log
+        .lines()
+        .find(|line| line.contains("ENOENT: no such file or directory"))?;
+    let mut path: Option<&str> = None;
+    let mut rest = line;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let close = after.find('\'')?;
+        path = Some(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    path
+}
+
+/// When startup fails because the app tried to *read* a Google service-account credential JSON that is
+/// not in the checkout, the absolute path the app expected. The Firebase Admin SDK is initialized from
+/// a service-account file (`admin.credential.cert(JSON.parse(readFileSync('service-account.json')))`)
+/// that the repository deliberately does not commit, so the Admin SDK reads it at startup and the
+/// process exits before it binds. The sandbox stages an inert, syntactically valid placeholder
+/// ([`SERVICE_ACCOUNT_JSON`]) there on the next attempt — a genuine deployment precondition (the
+/// operator supplies this credential), not an input neutralization: the placeholder authenticates no
+/// request and relaxes no auth check, since the SDK only mints a token when the app verifies a Firebase
+/// ID token, which an anonymous route under test never does.
+///
+/// Qualifying is deliberately narrow, so conjuring this file can never mask a genuinely-required input:
+/// the failure must be a read of a `.json` file, and the application's own source must initialize the
+/// Firebase Admin credential from a certificate (`credential.cert(`) — the authoritative Admin SDK API
+/// for a service-account file. Keyed on the SDK's ecosystem API only; nothing names a specific
+/// application or filename.
+fn missing_service_account_json(log: &str, root: &std::path::Path) -> Option<String> {
+    if !log.contains("ENOENT") {
+        return None;
+    }
+    const READ_OPS: [&str; 4] = ["readFileSync", "readFile", "createReadStream", "read("];
+    if !READ_OPS.iter().any(|op| log.contains(op)) {
+        return None;
+    }
+    let path = enoent_path(log)?;
+    if !path.starts_with('/') || !path.to_ascii_lowercase().ends_with(".json") {
+        return None;
+    }
+    reads_firebase_service_account(root).then(|| path.to_owned())
+}
+
+/// Whether the application's own source initializes the Firebase Admin SDK from a service-account
+/// certificate (`admin.credential.cert(...)` / `firebaseAdmin.credential.cert(...)`). A bounded,
+/// source-only scan under the repository, skipping `node_modules` and dot-directories; it looks for
+/// the Admin SDK's `credential.cert(` call, the ecosystem signal that a service-account JSON file is a
+/// required startup credential. Nothing here names a specific application.
+fn reads_firebase_service_account(root: &std::path::Path) -> bool {
+    fn scan(dir: &std::path::Path, budget: &mut u32) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if *budget == 0 {
+                return false;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                if scan(&path, budget) {
+                    return true;
+                }
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx")
+            ) {
+                *budget -= 1;
+                if let Ok(text) = std::fs::read_to_string(&path)
+                    && text.contains("credential.cert(")
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    let mut budget = 4000u32;
+    scan(root, &mut budget)
 }
 
 /// Returns a missing dotenv file that a startup loader explicitly refused to run without. An empty
@@ -8247,6 +8480,36 @@ fn start_command(root: &std::path::Path, entry: Option<&std::path::Path>) -> Opt
         && is_standalone_server(&root.join(&file))
     {
         return Some(node_file_command(&file));
+    }
+    // A repository can ship several standalone server entry files that mount different routers on the
+    // same port. The finding's own file is a mountable router/app module: it publishes the route under
+    // test but never listens, so a parent server wires it in (`app.use(require('./routes/products'))`).
+    // When the launch the manifest or convention would otherwise pick runs a server that never pulls in
+    // this router — so the route under test is never served under it — but another standalone server in
+    // the repo does require it (directly or transitively), launch the server that actually mounts the
+    // finding's route. Keyed only on the module require graph, never on a filename.
+    if let Some(rel) = entry.and_then(|path| path.to_str())
+        && let Some(module) = package_file(root, rel)
+        && (is_express_router_module(&root.join(&module))
+            || is_express_app_module(&root.join(&module)))
+    {
+        let default_file = manifest_start_command(root)
+            .as_deref()
+            .and_then(node_command_file);
+        let default_mounts = default_file.as_deref().is_some_and(|file| {
+            file == module
+                || module_reachable_from(
+                    root,
+                    std::path::Path::new(file),
+                    std::path::Path::new(&module),
+                )
+        });
+        if !default_mounts
+            && let Some(server) = server_mounting_module(root, &module)
+            && Some(&server) != default_file.as_ref()
+        {
+            return Some(node_file_command(&server));
+        }
     }
     if let Some(command) = manifest_start_command(root) {
         // A manifest whose only launch is the Azure Functions host (`func start`) depends on the Azure
@@ -9192,6 +9455,201 @@ fn only_exports_uninvoked_server_start(src: &str) -> bool {
 
 fn node_file_command(file: &str) -> String {
     serde_json::json!(["node", file]).to_string()
+}
+
+/// The file a `["node","<file>", ...]` launch command runs, when the command is exactly that shape.
+/// `None` for an `npm`/shell launcher, where the entry file is not named directly.
+fn node_command_file(command: &str) -> Option<String> {
+    let argv: Vec<String> = serde_json::from_str(command).ok()?;
+    match argv.as_slice() {
+        [program, file, ..] if program == "node" => Some(file.clone()),
+        _ => None,
+    }
+}
+
+/// A standalone server source file in the repo that mounts the finding's own router/app module — it
+/// requires that module directly or transitively and binds a listener itself. Used to launch the
+/// server that actually serves the route under test when the manifest/convention launch runs a
+/// different server that never pulls the module in. Among candidates, the shortest path wins, then
+/// lexicographic order, for a deterministic choice. Never the module itself.
+fn server_mounting_module(root: &std::path::Path, module_rel: &str) -> Option<String> {
+    let module = std::path::Path::new(module_rel);
+    let mut best: Option<String> = None;
+    for candidate in repo_js_files(root) {
+        let Some(rel) = candidate.to_str() else {
+            continue;
+        };
+        if rel == module_rel {
+            continue;
+        }
+        if !is_standalone_server(&root.join(&candidate)) {
+            continue;
+        }
+        if !module_reachable_from(root, &candidate, module) {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some(current) => {
+                let a = rel.matches('/').count();
+                let b = current.matches('/').count();
+                (a, rel) < (b, current.as_str())
+            }
+        };
+        if better {
+            best = Some(rel.to_owned());
+        }
+    }
+    best
+}
+
+/// Every JavaScript source file in the repo (relative to `root`), by a bounded walk that skips
+/// dependency and build directories.
+fn repo_js_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    const SKIP_DIRS: [&str; 6] = ["node_modules", ".git", "dist", "build", "coverage", "out"];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 6 || out.len() >= 2000 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_dir() {
+                if !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref()) {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if matches!(
+                std::path::Path::new(name.as_ref())
+                    .extension()
+                    .and_then(|ext| ext.to_str()),
+                Some("js" | "mjs" | "cjs")
+            ) && let Ok(rel) = entry.path().strip_prefix(root)
+            {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+    out
+}
+
+/// Whether `target_rel` is reachable from `start_rel` by following relative `require`/`import`
+/// specifiers through the repo's own source files (never into `node_modules`). A bounded breadth
+/// walk; returns `true` as soon as an edge resolves to `target_rel`.
+fn module_reachable_from(
+    root: &std::path::Path,
+    start_rel: &std::path::Path,
+    target_rel: &std::path::Path,
+) -> bool {
+    let target = normalize_rel(target_rel);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![start_rel.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        if seen.len() > 500 {
+            break;
+        }
+        let norm = normalize_rel(&current);
+        if !seen.insert(norm.clone()) {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(root.join(&current)) else {
+            continue;
+        };
+        for spec in relative_specifiers(&src) {
+            if let Some(dep) = resolve_relative_module(root, &current, &spec) {
+                if normalize_rel(&dep) == target {
+                    return true;
+                }
+                stack.push(dep);
+            }
+        }
+    }
+    false
+}
+
+/// The relative module specifiers (those starting with `.`) a source imports via `require(...)`,
+/// `import ... from '...'`, or a bare `import '...'`. Bare package specifiers are ignored: only the
+/// repo's own files form edges in the require graph.
+fn relative_specifiers(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for needle in ["require(", "from", "import"] {
+        let mut from = 0usize;
+        while let Some(pos) = src[from..].find(needle) {
+            let after = from + pos + needle.len();
+            from = after;
+            let rest = src[after..].trim_start();
+            let Some(quote) = rest.chars().next() else {
+                continue;
+            };
+            if quote != '\'' && quote != '"' && quote != '`' {
+                continue;
+            }
+            if let Some(end) = rest[quote.len_utf8()..].find(quote) {
+                let spec = &rest[quote.len_utf8()..quote.len_utf8() + end];
+                if spec.starts_with('.') {
+                    out.push(spec.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolves a relative module specifier against the directory of the file that imports it, applying
+/// Node's extension and `index` resolution, and returns the matching repo file (relative to `root`),
+/// or `None` when nothing resolves to a real file.
+fn resolve_relative_module(
+    root: &std::path::Path,
+    from_rel: &std::path::Path,
+    spec: &str,
+) -> Option<std::path::PathBuf> {
+    let base = from_rel.parent().unwrap_or(std::path::Path::new(""));
+    let joined = normalize_rel(&base.join(spec));
+    const EXTS: [&str; 4] = ["js", "cjs", "mjs", "json"];
+    if root.join(&joined).is_file() {
+        return Some(joined);
+    }
+    for ext in EXTS {
+        let candidate = joined.with_extension(ext);
+        if root.join(&candidate).is_file() {
+            return Some(candidate);
+        }
+    }
+    for ext in EXTS {
+        let candidate = joined.join(format!("index.{ext}"));
+        if root.join(&candidate).is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Normalizes a relative path by resolving `.` and `..` components lexically, without touching the
+/// filesystem. Leading `..` that would climb above the root are kept so distinct inputs stay distinct.
+fn normalize_rel(path: &std::path::Path) -> std::path::PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(parts.last().map(|p| p.as_os_str()), Some(last) if last != "..") {
+                    parts.pop();
+                } else {
+                    parts.push(std::ffi::OsString::from(".."));
+                }
+            }
+            std::path::Component::Normal(part) => parts.push(part.to_os_string()),
+            _ => {}
+        }
+    }
+    parts.iter().collect()
 }
 
 /// Whether a JavaScript file is an Electron main-process entry: it pulls in the `electron` module and
@@ -11630,6 +12088,31 @@ SqwRqIrWiDKu9S43xShSlHI=
 -----END PRIVATE KEY-----
 "#;
 
+/// A syntactically valid, inert Google service-account credential, baked in as a startup fixture —
+/// not a secret. An app that initializes the Firebase Admin SDK from a service-account JSON read off
+/// the filesystem (`admin.credential.cert(JSON.parse(readFileSync('service-account.json')))`) exits
+/// on startup when that file is absent, because the credential file is a deployment secret the repo
+/// intentionally does not commit. Staging this placeholder at the exact path the app read satisfies
+/// that deployment precondition so the app can bind, exactly as staging the marker TLS pair satisfies
+/// an `https` server's need for a certificate. The key is a throwaway RSA key that signs nothing the
+/// verifier relies on: the Admin SDK validates the fields and parses the key at `initializeApp`, but
+/// only ever mints a token when the app actively verifies a Firebase ID token — which an anonymous
+/// route under test never does — so this neither authenticates a request nor relaxes any auth check.
+const SERVICE_ACCOUNT_JSON: &str = r#"{
+  "type": "service_account",
+  "project_id": "jss-verify",
+  "private_key_id": "jssverify0000000000000000000000000000000",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDetaXGRPVj5cQP\nnMGpneQ2pizPGwHCDRo0meudBxMBytDySIY7/j29xq2B0erNe6vzFJNJUCRSa8aP\nfC1sQQCJLEVgnQZtAChjLmyxjQ0k8rQmb103LaT8R4VXUtZxpJ7xjSeiJYfB5QTL\nK0ZwBejoar5u3NOZ9sPRE9K6US2kqqYOC+n1Wq3dnIrsZdso6fMcl9CpUumtcAE1\n5rB14Rw7r1Vk6Rifuy/7PqbvrRPhhwqg7XxyKXJVhhD6oaq/8I5n5uc16Vi0IaQU\nQiINXm3oTESYlHGhZpCxk6uTb7dwcHh+0x859tX0QXzGNVR02IIiiaNCRmBwOpj4\nyZzO1SozAgMBAAECggEAGonXxsAZ470R93BNDYrAkpiLt2Q2+eo4yLLcxjn9FFYY\nPv7QbB64OcCOlW0vxyupCk7V3EMeCOpJ33hDK2a1iyMI42HizaNarLLwBdpSiigX\nuorDt1sLkXpuU8ENx73/qLYS1noVatABGbq+6oNxxRxPNAPBfVPP8r6jektJHpl0\nKrTRoZHkBZBrPffgzDWeE5M/RC2AtmaIoA0xy4AINFiIKWQvNNxp3vtH55VMqC47\ndyYS9OX4dn0CA4ArlhcLBjwhCh02RiALjviLbZcm6RsqJSV+gWAIlTA59fMLU1sO\npYnrjyVLE5n164pYvebfh4k6Sokmi3j27DjNxwTt1QKBgQD+J+6eSPc1jreCYvkX\n7SIzAtqq2kif0wbQ4s+/ct6/cng2ZPqIqINtvihEUaMPvpvd9kMmtTwNGA8vXWQZ\n82ZBoldFUwcOcBF2F/7ukNI1w2IOuZdQbHorpZ2FeP4+gQo+083CVwodBsjg9s1d\nEOaZRZpXGRkhLvofN+RJ91xYtQKBgQDgU06aWbcXGUzje2g/H/f+ecZ+z32EDurV\nzFWjrQw9NLYlR5yXX2P9ERt4TmAn2fxH+g8EXHCnS1kROk16TY91hnhEZ4nq1J15\nbe0CBCRanvRdOvdv8zJyveJo+E1W1IoagcfhL8zNnZmaAdjBT4kHxzFbJjp4rrS4\nEDN0xoBQRwKBgDs6wSBALuRbWybWu+g4ijTLIHyanDwq6La7dODP+1swaRV8GOrK\nIr7rhuTNBaxApoBmyKV3rQP8LGXEZPSrRZRcKexs+gMCWP9lfjLIq0R+QRbfZ4UF\nkr8jPH+Df/S/C80yfQwiTqgPEbdjrN5YdvUXRG2x2qpiEUY/N0OJkwrVAoGBAJDq\nIFAj/txEMuCN22VUIJ/bSTioj9wcyuX8z6Ih61Mq1zQ0E9vR+sUEJSvN7d4wuwJA\nby0RDpF0YoB3mo+UxUVV7iG6hWUXnvdP5Rk1VcrY/uGvcyN2BzQKqNXI+iVKvkCr\ncFVvzK1Tz2OnJ8CRweMtchwBESrfKc3yYVth1IiHAoGBANOVvJutQqHNVXGFS2jN\n4k6wFpztmQmtFnRR/mgzantO9IYElRKyyis1WPcB+zynVs6c6DEi8CYVdOJ+ZjH4\nRN4DqSWFpEfVsT70Q9pwWC1r3rWs4lkJQXKXNGt4LFzY7r3ROvBkIyFXiGCiCFv9\nkBwAhNQ+uobtmBoZt53oukwC\n-----END PRIVATE KEY-----\n",
+  "client_email": "jss-verify@jss-verify.iam.gserviceaccount.com",
+  "client_id": "000000000000000000000",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/jss-verify%40jss-verify.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
+"#;
+
 // ----- browser phase (DOM-source XSS and client-side redirects) ---------------------------------
 
 /// The browser-phase base image: Playwright's, which carries Node, Chromium and its system
@@ -13708,6 +14191,50 @@ mod tests {
         assert_eq!(missing_write_dir(root_log), None);
     }
 
+    /// A startup failure where the Firebase Admin SDK reads an absent service-account JSON yields the
+    /// path to stage the inert placeholder; a missing JSON in an app that does not initialize a Firebase
+    /// credential, or a non-JSON read, yields nothing.
+    #[test]
+    fn missing_service_account_json_fires_only_for_a_firebase_credential_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "src/server.js",
+            "import admin from 'firebase-admin';\n\
+             const sa = JSON.parse(readFileSync('../service-account.json'));\n\
+             admin.initializeApp({ credential: admin.credential.cert(sa) });\n",
+        );
+        let log = "node:fs:560\n  return binding.open(\n\
+            Error: ENOENT: no such file or directory, open '/app/Server/service-account.json'\n\
+            \x20   at Object.openSync (node:fs:560:18)\n\
+            \x20   at readFileSync (node:fs:444:35)\n";
+        assert_eq!(
+            missing_service_account_json(log, root).as_deref(),
+            Some("/app/Server/service-account.json")
+        );
+
+        // A write failure (not a read) must not conjure the file.
+        let write_log = "Error: ENOENT: no such file or directory, open '/app/Server/service-account.json'\n\
+            \x20   at Object.writeFileSync (node:fs:2430:20)\n";
+        assert_eq!(missing_service_account_json(write_log, root), None);
+
+        // A non-JSON read is never a service-account credential.
+        let other = "Error: ENOENT: no such file or directory, open '/app/Server/settings.yml'\n\
+            \x20   at Object.readFileSync (node:fs:444:35)\n";
+        assert_eq!(missing_service_account_json(other, root), None);
+
+        // An app that does not initialize a Firebase credential is left untouched, even for a missing
+        // JSON read: conjuring the file could mask a genuinely required input.
+        let plain = tempfile::tempdir().unwrap();
+        write(
+            plain.path(),
+            "src/server.js",
+            "const cfg = JSON.parse(readFileSync('./config.json'));\n",
+        );
+        assert_eq!(missing_service_account_json(log, plain.path()), None);
+    }
+
     /// A startup failure where an `https`/`tls` server reads a key/cert file that is absent yields the
     /// path to stage from the self-signed marker pair, with the key/cert role inferred from the name;
     /// a write, or a read of a non-TLS file, yields nothing.
@@ -14138,6 +14665,34 @@ mod tests {
         ] {
             assert_eq!(docker_args_with_label(&args, Some("run_42")), args);
         }
+    }
+
+    #[test]
+    fn mongo_connection_strings_yield_the_database_name() {
+        let mut out = Vec::new();
+        // An inline connection string, single-quoted as in the app's own source.
+        extract_mongo_databases("mongoose.connect('mongodb://localhost/aggTest');", &mut out);
+        assert_eq!(out, vec!["aggTest".to_owned()]);
+
+        // Credentials, a port, and query options around the database name.
+        out.clear();
+        extract_mongo_databases(
+            "const u = \"mongodb://user:pass@db:27017/mydb?retryWrites=true\";",
+            &mut out,
+        );
+        assert_eq!(out, vec!["mydb".to_owned()]);
+
+        // SRV scheme.
+        out.clear();
+        extract_mongo_databases("mongodb+srv://cluster.example.net/shop", &mut out);
+        assert_eq!(out, vec!["shop".to_owned()]);
+
+        // No database path, and an interpolated name (illegal characters) contribute nothing, so
+        // nothing unsafe can reach the profiling script that interpolates the name.
+        out.clear();
+        extract_mongo_databases("mongodb://localhost:27017", &mut out);
+        extract_mongo_databases("mongodb://host/${dbName}", &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -15815,6 +16370,59 @@ mod tests {
     }
 
     #[test]
+    fn the_router_finding_launches_the_server_that_mounts_it_not_the_manifest_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The manifest `main` is a standalone server that never mounts the finding's router, while a
+        // sibling standalone server requires and mounts it. The launch must pick the mounting server
+        // so the route under test is actually served.
+        write(root, "package.json", r#"{"main":"index.js"}"#);
+        write(
+            root,
+            "index.js",
+            "const express = require('express');\n\
+             const app = express();\n\
+             app.get('/', (req, res) => res.send('home'));\n\
+             app.listen(8080);\n",
+        );
+        write(
+            root,
+            "app.js",
+            "const express = require('express');\n\
+             const app = express();\n\
+             const products = require('./routes/products');\n\
+             app.use('/products', products);\n\
+             app.listen(8080);\n",
+        );
+        write(
+            root,
+            "routes/products.js",
+            "const express = require('express');\n\
+             const router = express.Router();\n\
+             router.get('/:id', (req, res) => res.send(`id ${req.params.id}`));\n\
+             module.exports = router;\n",
+        );
+        assert_eq!(
+            start_command(root, Some(std::path::Path::new("routes/products.js"))).as_deref(),
+            Some(r#"["node","app.js"]"#)
+        );
+        // When the manifest main itself mounts the router, the override does not fire.
+        write(
+            root,
+            "index.js",
+            "const express = require('express');\n\
+             const app = express();\n\
+             const products = require('./routes/products');\n\
+             app.use('/products', products);\n\
+             app.listen(8080);\n",
+        );
+        assert_eq!(
+            start_command(root, Some(std::path::Path::new("routes/products.js"))).as_deref(),
+            Some(r#"["node","index.js"]"#)
+        );
+    }
+
+    #[test]
     fn a_filesystem_route_handler_module_is_hosted_when_no_manifest_can_be() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -16621,6 +17229,7 @@ http.createServer((req, res) => {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
         let confined = Probe {
@@ -16660,6 +17269,7 @@ http.createServer((req, res) => {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
         let command = Probe {
@@ -16699,6 +17309,7 @@ http.createServer((req, res) => {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
         let visible_command = Probe {
@@ -16742,6 +17353,7 @@ http.createServer((req, res) => {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
         let vulnerable = session.exercise(&traversal);
@@ -16930,6 +17542,7 @@ http.createServer((req, res) => {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
 
@@ -17073,6 +17686,7 @@ socket.on('error', (e) => { console.error('database unreachable: ' + e.message);
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
         let outcome = session.exercise(&read);
@@ -17289,6 +17903,7 @@ http.createServer((req, res) => {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         };
 

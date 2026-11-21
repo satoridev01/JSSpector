@@ -489,6 +489,40 @@ pub fn attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<Attempt> {
                 }
                 return out;
             }
+            if probe.class == VulnClass::Ssrf && !probe.query_dispatch.is_empty() {
+                // A coarse `req.query` SSRF dispatcher: the handler reaches the request sink only inside
+                // the branch its selector chooses, where it reads the outbound host from another query
+                // member. Send the marker URL in each such member with the branch's selector carried,
+                // under each gate path (plus the entry's own route), so the request takes the branch that
+                // reaches the sink. The plain placement stays first; a wrong pairing simply does not
+                // reproduce.
+                let mut out = vec![place(probe, verb, &value, signal.clone())];
+                let mut gates: Vec<String> = probe.gate_paths.clone();
+                if !probe.path.contains('{') && !gates.contains(&probe.path) {
+                    gates.push(probe.path.clone());
+                }
+                for disp in &probe.query_dispatch {
+                    for gate in &gates {
+                        for param in &disp.params {
+                            let target = format!(
+                                "{gate}?{}={}&{}={}",
+                                encode(&disp.selector),
+                                encode(&disp.value),
+                                encode(param),
+                                encode(&value),
+                            );
+                            out.push(Attempt {
+                                verb,
+                                target,
+                                body: None,
+                                headers: Vec::new(),
+                                signal: signal.clone(),
+                            });
+                        }
+                    }
+                }
+                return out;
+            }
             if !matches!(probe.entry, Entry::Body(None)) {
                 return vec![place(probe, verb, &value, signal)];
             }
@@ -1235,6 +1269,20 @@ pub fn sql_value_cases(probe: &Probe, canary: &Canary) -> Vec<SqlValueCase> {
             }
         })
         .collect()
+}
+
+/// A form-urlencoded twin of a value-position boolean case, for a body-sourced injection on a route
+/// whose body parser reads form submissions but not JSON. An Express app that mounts only
+/// `express.urlencoded` (never `express.json`) before the route leaves `req.body` unparsed for a JSON
+/// request — so a JSON-body leg never carries the tainted value to the sink — while the same fields in
+/// `application/x-www-form-urlencoded` reach the handler. Returns `None` when any leg has no faithful
+/// urlencoded form (see [`urlencoded_twin`]), e.g. a query- or path-sourced case with no body.
+pub fn sql_value_case_twin(case: &SqlValueCase) -> Option<SqlValueCase> {
+    Some(SqlValueCase {
+        truthy: urlencoded_twin(&case.truthy)?,
+        falsy_a: urlencoded_twin(&case.falsy_a)?,
+        falsy_b: urlencoded_twin(&case.falsy_b)?,
+    })
 }
 
 /// Three otherwise-identical NoSQL requests: one match-all operator and two independent
@@ -2868,6 +2916,7 @@ mod tests {
             decode_base64: None,
             allow_tokens: Vec::new(),
             stored_write: None,
+            query_dispatch: Vec::new(),
             text_wrap: None,
         }
     }
@@ -4255,6 +4304,59 @@ mod tests {
         // Without a value-position plan there is nothing to drive.
         p.sql_value = None;
         assert!(sql_value_cases(&p, &canary).is_empty());
+    }
+
+    #[test]
+    fn sql_value_case_twin_carries_the_same_fields_as_a_form_submission() {
+        use super::super::plan::SqlValue;
+        let mut p = probe(
+            VulnClass::SqlInjection,
+            "/login",
+            Entry::Body(Some("username".to_owned())),
+        );
+        p.method = Method::Post;
+        p.sql_value = Some(SqlValue {
+            quote: '\'',
+            open_parens: 0,
+        });
+        let canary = Canary::new("abc123".to_owned());
+
+        // A body-sourced case converts to a form-urlencoded twin: an app that mounts only
+        // `express.urlencoded` (never `express.json`) leaves a JSON body unparsed, so the twin is the
+        // only leg whose tainted value reaches the sink.
+        let case = &sql_value_cases(&p, &canary)[0];
+        let twin = sql_value_case_twin(case).expect("a flat body case has a form twin");
+        assert_eq!(
+            twin.truthy.body.as_deref(),
+            Some("username=jssqlvabc123%27%20OR%201%3D1--%20")
+        );
+        assert!(
+            twin.truthy
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Content-Type" && v == "application/x-www-form-urlencoded")
+        );
+        // The three legs still differ only in the injected boolean's truth value.
+        assert_eq!(
+            twin.falsy_a.body.as_deref(),
+            Some("username=jssqlvabc123%27%20OR%201%3D2--%20")
+        );
+        assert_eq!(twin.truthy.verb, "POST");
+        assert_eq!(twin.truthy.target, "/login");
+
+        // A query-sourced case has no body, so there is no faithful form twin.
+        let mut q = probe(
+            VulnClass::SqlInjection,
+            "/search",
+            Entry::Query("q".to_owned()),
+        );
+        q.method = Method::Get;
+        q.sql_value = Some(SqlValue {
+            quote: '\'',
+            open_parens: 0,
+        });
+        let query_case = &sql_value_cases(&q, &canary)[0];
+        assert!(sql_value_case_twin(query_case).is_none());
     }
 
     #[test]

@@ -778,6 +778,40 @@ pub fn delete_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Option<Delet
     let unique = format!("jss-del-{}-{nonce}", canary.token);
     let dir = format!("/tmp/{PLANTED_DIR}/{unique}");
     let climb = "../".repeat(12);
+    // A removal that enumerates children of the tainted directory (`for (const f of
+    // fs.readdirSync(dir)) fs.unlinkSync(dir + '/' + f)`): the tainted value climbs to the directory,
+    // which is then enumerated, so the climbed path must be planted as a *directory* holding a matching
+    // child (the target, which disappears) — not as a file the value names directly. A sibling control
+    // outside the enumerated directory, never named by the request, survives.
+    if let Some(filter) = &probe.removed_child_marker {
+        let mut place_probe = probe.clone();
+        // The appended request fields are directory segments of the enumerated folder, not its leaf; a
+        // handler that coerces such a segment to a number (`Number(req.body.version)`) rejects a word,
+        // so pin each to a numeric-safe segment and plant the directory under it.
+        let mut segments: Vec<String> = Vec::new();
+        for field in probe.appended_fields.clone() {
+            set_sibling(&mut place_probe.siblings, &field, "0");
+            segments.push("0".to_owned());
+        }
+        let enumerated_dir = if segments.is_empty() {
+            dir.clone()
+        } else {
+            format!("{dir}/{}", segments.join("/"))
+        };
+        // The target's name carries the handler's filename filter so the removal loop selects it; the
+        // control sits directly under the planted root, outside the enumerated directory, so it is never
+        // listed and survives whether or not the handler confines the path.
+        let target_path = format!("{enumerated_dir}/jss-del-target{filter}");
+        let control_path = format!("{dir}/jss-del-keep");
+        let present_value = format!("{climb}tmp/{PLANTED_DIR}/{unique}");
+        let present = place_traversal(&place_probe, &present_value)?;
+        return Some(DeleteOracle {
+            present,
+            dir: enumerated_dir,
+            target_path,
+            control_path,
+        });
+    }
     // When the handler appends further request fields after the tainted segment (`path.join(base,
     // type, id)`), the tainted value is only a directory prefix: it climbs to the planted directory
     // and the appended fields spell the terminal leaf. Pin each appended field to a fixed segment,
@@ -2908,6 +2942,7 @@ mod tests {
             sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
+            removed_child_marker: None,
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
@@ -3150,6 +3185,36 @@ mod tests {
         assert!(!body.contains("\"id\":\"jsspector\""));
         assert!(body.contains(&format!("{PLANTED_DIR}/jss-del-tok-7\"")));
         assert!(!body.contains("/target\""));
+    }
+
+    #[test]
+    fn a_delete_oracle_plants_a_matching_child_for_an_enumerated_removal() {
+        let canary = Canary::new("tok".to_owned());
+        // A removal that enumerates children of the tainted directory and deletes those matching a
+        // `.png` filter: the climbed path must be planted as a directory holding a matching child
+        // (the target), and the appended directory segment must be numeric-safe so a `Number(...)`
+        // coercion does not reject it.
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/save",
+            Entry::Body(Some("id".to_owned())),
+        );
+        p.removes = true;
+        p.appended_fields = vec!["version".to_owned()];
+        p.removed_child_marker = Some(".png".to_owned());
+        let oracle =
+            delete_oracle(&p, &canary, 7).expect("an enumerated-removal sink has an oracle");
+        // The target is a filter-matching child inside the enumerated directory; the control is a
+        // sibling outside it, so it is never listed and survives.
+        assert!(oracle.target_path.ends_with("/jss-del-target.png"));
+        assert!(oracle.target_path.contains("jss-del-tok-7/0/"));
+        assert!(oracle.control_path.ends_with("/jss-del-keep"));
+        assert!(!oracle.control_path.starts_with(&format!("{}/", oracle.dir)));
+        assert_ne!(oracle.target_path, oracle.control_path);
+        // The appended directory segment is pinned to a numeric-safe value in the body.
+        let body = oracle.present.body.expect("a body probe sends JSON");
+        assert!(body.contains("\"version\":0"));
+        assert!(body.contains(&format!("{PLANTED_DIR}/jss-del-tok-7\"")));
     }
 
     #[test]

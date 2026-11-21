@@ -169,6 +169,16 @@ pub struct Probe {
     /// Mined from the handler source only; empty for the common case where the tainted value ends the
     /// path or only fixed literals follow it.
     pub appended_fields: Vec<String>,
+    /// For a path-traversal *removal* sink whose argument is not the tainted value itself but a child
+    /// enumerated from the tainted directory (`for (const f of fs.readdirSync(dir)) unlink(dir/f)`),
+    /// the filename substring an entry must contain for the handler to remove it — the
+    /// `.indexOf('.png') > -1` / `.endsWith('.png')` filter on the loop variable, or an empty string
+    /// when the handler removes every child unfiltered. When set, the delete oracle plants the climbed
+    /// path as a *directory* holding a matching child (the target, which disappears) rather than as a
+    /// file the value names directly, so a sink that removes directory entries is exercised honestly.
+    /// `None` for the common removal whose tainted value directly names the removed entry. Mined from
+    /// the handler source only.
+    pub removed_child_marker: Option<String>,
     /// For a prototype-pollution finding whose sink is a nested object write `obj[k1][k2] = v` with
     /// both keys attacker-controlled, how to drive it: the request input that chooses the *outer* key
     /// (driven with `__proto__`, so `obj["__proto__"]` resolves to `Object.prototype`) and the one
@@ -1537,6 +1547,7 @@ impl Probe {
                 sql_value: None,
                 array_element: false,
                 appended_fields: Vec::new(),
+                removed_child_marker: None,
                 proto_pollution: None,
                 alt_paths: Vec::new(),
                 auth: None,
@@ -1631,6 +1642,20 @@ impl Probe {
         let lists_dir =
             finding.class == VulnClass::PathTraversal && sink_lists_directory(&finding.sink.api);
         let removes = finding.class == VulnClass::PathTraversal && sink_removes(&finding.sink.api);
+        // A removal whose argument is a child enumerated from the tainted directory
+        // (`fs.unlinkSync(dir + '/' + f)` with `f` from `fs.readdirSync(dir)`): the tainted value is
+        // the directory, not the removed leaf, so the oracle must plant a matching child inside it.
+        let removed_child_marker = (removes)
+            .then(|| {
+                source.and_then(|src| {
+                    removed_dir_child_marker(
+                        handler_source(src, finding.source.line),
+                        &finding.sink.arg,
+                        &tainted,
+                    )
+                })
+            })
+            .flatten();
         let removes_dir =
             finding.class == VulnClass::PathTraversal && sink_removes_dir(&finding.sink.api);
         let creates = finding.class == VulnClass::PathTraversal && sink_creates(&finding.sink.api);
@@ -1739,6 +1764,7 @@ impl Probe {
             sql_value: None,
             array_element,
             appended_fields,
+            removed_child_marker,
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: login_gated.then(AuthBootstrap::route_gate),
@@ -1811,6 +1837,7 @@ impl Probe {
             sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
+            removed_child_marker: None,
             proto_pollution: Some(ProtoPollution { outer, inner }),
             alt_paths: Vec::new(),
             auth: None,
@@ -1897,6 +1924,7 @@ impl Probe {
             sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
+            removed_child_marker: None,
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: (finding.auth == Auth::User).then(AuthBootstrap::route_gate),
@@ -2601,6 +2629,140 @@ fn appended_concat_fields(source: &str, names: &[String], fields: &[String]) -> 
         }
     }
     Vec::new()
+}
+
+/// For a removal sink whose argument is a child *enumerated* from the tainted directory, the filename
+/// substring an entry must contain to be removed, or an empty string when the handler removes every
+/// child unfiltered. `None` when the removed path is the tainted value itself (the common direct-name
+/// removal, handled by the ordinary delete oracle). The argument must be `dir + '/' + child` (string
+/// concatenation) or `path.join(dir, child)` whose final operand is a local bound from a directory
+/// listing (`fs.readdirSync`/`fs.opendirSync`/`fs.readdir`) of a tainted directory; the filter is read
+/// from a `.indexOf('x') > -1` / `.includes` / `.endsWith` / `.startsWith` guard on that loop
+/// variable. Mined from the handler source only; nothing here is tied to a specific application.
+fn removed_dir_child_marker(source: &str, sink_arg: &str, tainted: &[String]) -> Option<String> {
+    let child = removed_child_operand(sink_arg)?;
+    let child_base = ident_prefix(&child)?;
+    // A child that is itself the tainted value names the removed entry directly — not an enumeration.
+    if tainted.contains(&child_base) {
+        return None;
+    }
+    if !bound_from_directory_listing(source, &child_base, tainted) {
+        return None;
+    }
+    Some(child_name_filter(source, &child_base).unwrap_or_default())
+}
+
+/// The final operand of a removal sink's path argument: the last `path.join(...)` argument, or the
+/// last non-literal operand of a `+`-concatenation. Fixed string-literal separators are ignored.
+fn removed_child_operand(sink_arg: &str) -> Option<String> {
+    if let Some(rel) = sink_arg.find(".join(") {
+        let open = rel + ".join(".len();
+        if let Some(args) = balanced_arg(&sink_arg[open..])
+            && let Some(last) = split_top_level_commas(args).last()
+        {
+            return Some(last.trim().to_owned());
+        }
+    }
+    let bytes = sink_arg.as_bytes();
+    let mut i = 0usize;
+    let mut last: Option<String> = None;
+    loop {
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        if i >= sink_arg.len() {
+            break;
+        }
+        let (operand, next) = concat_operand(sink_arg, i);
+        let operand = operand.trim();
+        if !operand.is_empty() && string_literal_arg(operand).is_none() {
+            last = Some(operand.to_owned());
+        }
+        i = next;
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'+') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    last
+}
+
+/// The leading identifier of an expression (`currFiles[i]` -> `currFiles`, `files` -> `files`), or
+/// `None` when it does not begin with an identifier character.
+fn ident_prefix(expr: &str) -> Option<String> {
+    let ident: String = expr.chars().take_while(|c| is_ident(*c as u8)).collect();
+    ident
+        .bytes()
+        .next()
+        .is_some_and(|b| !b.is_ascii_digit())
+        .then_some(ident)
+}
+
+/// Whether `child` is a local bound from a directory listing (`fs.readdirSync`/`fs.opendirSync`/
+/// `fs.readdir`) whose argument mentions a tainted directory. Honors ASI so a semicolon-free binding
+/// does not bleed into the next statement.
+fn bound_from_directory_listing(source: &str, child: &str, tainted: &[String]) -> bool {
+    for kw in ["const ", "let ", "var "] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(kw) {
+            let at = from + rel + kw.len();
+            from = at;
+            let rest = &source[at..];
+            let ident: String = rest.chars().take_while(|c| is_ident(*c as u8)).collect();
+            if ident != child {
+                continue;
+            }
+            let tail = rest[ident.len()..].trim_start();
+            let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
+                continue;
+            };
+            let end = binding_rhs_end(rhs).min(300);
+            let stmt = &rhs[..end];
+            if (stmt.contains("readdir") || stmt.contains("opendir"))
+                && tainted.iter().any(|name| mentions(stmt, name))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The filename substring a `.indexOf('x') > -1` / `.includes('x')` / `.endsWith('x')` /
+/// `.startsWith('x')` guard whose receiver mentions `child` requires, or `None` when the handler
+/// removes every enumerated child without a name filter.
+fn child_name_filter(source: &str, child: &str) -> Option<String> {
+    for marker in [".indexOf(", ".includes(", ".endsWith(", ".startsWith("] {
+        let mut from = 0;
+        while let Some(rel) = source[from..].find(marker) {
+            let at = from + rel;
+            from = at + marker.len();
+            // The receiver is the trailing run of member/index characters ending at the `.`; take it
+            // by char boundaries so a multibyte character earlier in the source cannot split a slice.
+            let recv_start = source[..at]
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| {
+                    c.is_ascii_alphanumeric() || matches!(c, '_' | '[' | ']' | '.')
+                })
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(at);
+            if !mentions(source.get(recv_start..at).unwrap_or(""), child) {
+                continue;
+            }
+            if let Some(lit) = leading_string(source[at + marker.len()..].trim_start())
+                && !lit.is_empty()
+            {
+                return Some(lit);
+            }
+        }
+    }
+    None
 }
 
 /// Walks the `+`-concatenation operands that follow position `start`, collecting request-part fields
@@ -4900,6 +5062,91 @@ fn derived_locals(source: &str, name: &str) -> Vec<String> {
     out
 }
 
+/// The length of a binding's right-hand side up to the statement boundary, honouring automatic
+/// semicolon insertion. Scanning stops at a `;` at bracket depth 0, or at a newline at depth 0 that
+/// is not a line continuation — the text so far does not end with an operator/opening bracket and the
+/// next non-blank character does not begin a continuation (`.`, `?`, `:`, `)`, `]`, `}`, or a binary
+/// operator). A balanced `(`/`[`/`{` keeps a multi-line object/array/call RHS together.
+fn binding_rhs_end(rhs: &str) -> usize {
+    let bytes = rhs.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    let mut last_significant: Option<u8> = None;
+    while let Some(byte) = bytes.get(i).copied() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 0 => depth -= 1,
+            b';' if depth == 0 => return i,
+            b'\n' if depth == 0 => {
+                // A newline before any content is still part of the assignment (`const x =\n value`),
+                // so it never ends the statement; otherwise continue only across an explicit operator
+                // at either side of the break.
+                let continues_before = last_significant.is_none_or(is_continuation_before);
+                let next = rhs[i + 1..].bytes().find(|b| !b.is_ascii_whitespace());
+                let continues_after = next.is_some_and(is_continuation_after);
+                if !continues_before && !continues_after {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        if !byte.is_ascii_whitespace() {
+            last_significant = Some(byte);
+        }
+        i += 1;
+    }
+    rhs.len()
+}
+
+/// Whether a line ending with `byte` continues onto the next line (a trailing operator or an open
+/// bracket, so the statement is unfinished).
+fn is_continuation_before(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'+' | b'-'
+            | b'*'
+            | b'/'
+            | b'%'
+            | b'&'
+            | b'|'
+            | b'^'
+            | b'<'
+            | b'>'
+            | b'='
+            | b','
+            | b'.'
+            | b'?'
+            | b':'
+            | b'('
+            | b'['
+            | b'{'
+    )
+}
+
+/// Whether a line starting with `byte` continues the previous line (a leading operator, member
+/// access, ternary arm, or a closing bracket of a multi-line expression).
+fn is_continuation_after(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'.' | b'?'
+            | b':'
+            | b')'
+            | b']'
+            | b'}'
+            | b'+'
+            | b'-'
+            | b'*'
+            | b'/'
+            | b'%'
+            | b'&'
+            | b'|'
+            | b'^'
+            | b'<'
+            | b'>'
+            | b'='
+    )
+}
+
 /// Local variables bound directly from `<receiver>.<part>.<name>`
 /// (`const responseType = request.query.response_type ?? ...` -> `responseType`).
 fn aliases(source: &str, part: &str, name: &str) -> Vec<String> {
@@ -4920,9 +5167,12 @@ fn aliases(source: &str, part: &str, name: &str) -> Vec<String> {
             let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
                 continue;
             };
-            // A statement ends at `;`; it may span lines, so do not stop at a newline. Capped so a
-            // missing semicolon cannot scan the whole file.
-            let end = rhs.find(';').unwrap_or(rhs.len()).min(300);
+            // A statement ends at `;`, or — under automatic semicolon insertion, common in
+            // semicolon-free code — at a newline that is not a line continuation. Without ASI
+            // handling a `var a = req.body.a` with no trailing `;` would swallow the following
+            // statements and borrow their literals (`var b = req.body.b == "true" ? ...`),
+            // pinning `a` to `"true"`. Capped so a runaway scan cannot read the whole file.
+            let end = binding_rhs_end(rhs).min(300);
             let stmt = &rhs[..end];
             if let Some(pos) = stmt.find(&access)
                 && receiver_before(&stmt[..pos])
@@ -10334,6 +10584,7 @@ module.exports = { activityValidators };\n";
             sql_value: None,
             array_element: false,
             appended_fields: Vec::new(),
+            removed_child_marker: None,
             proto_pollution: None,
             alt_paths: Vec::new(),
             auth: None,
@@ -10488,6 +10739,63 @@ module.exports = { activityValidators };\n";
         "#;
         let siblings = required_siblings(source, "query", "name");
         assert_eq!(siblings, vec![("mode".to_owned(), "strict".to_owned())]);
+    }
+
+    #[test]
+    fn required_siblings_do_not_borrow_a_later_fields_literal_without_semicolons() {
+        // Semicolon-free code (ASI): the `shortHandVal` binding must end at its own newline and resolve
+        // to a neutral filler, not the `"true"` literal that `makenew == "true"` pins two lines down.
+        // Over-spanning the right-hand side (the original bug) pinned every field to `"true"`, so the
+        // handler crashed writing a boolean where it expected a string.
+        let source = r#"
+          var id = req.body.id
+          var makenew = req.body.makenew == "true" ? true : false
+          var shortHandVal = req.body.shortHandVal
+          fs.writeFileSync(folder + '/x', shortHandVal)
+          use(id, makenew)
+        "#;
+        let siblings = required_siblings(source, "body", "id");
+        let short = siblings
+            .iter()
+            .find(|(k, _)| k == "shortHandVal")
+            .expect("shortHandVal is a required sibling");
+        assert_eq!(short.1, "jsspector");
+        let makenew = siblings
+            .iter()
+            .find(|(k, _)| k == "makenew")
+            .expect("makenew is a required sibling");
+        assert_eq!(makenew.1, "true");
+    }
+
+    #[test]
+    fn removed_dir_child_marker_reads_an_enumerated_removals_filter() {
+        // `fs.unlinkSync(dir + '/' + f)` where `f` iterates `fs.readdirSync(dir)` and is filtered by
+        // `.indexOf('.png')`: the removed leaf is a child enumerated from the tainted directory, so the
+        // oracle must plant a `.png` child inside the climbed directory.
+        let source = r#"
+          var currFiles = fs.readdirSync(folder + '/')
+          for (var i=0;i<currFiles.length;i++) {
+            if (currFiles[i].indexOf('.png') > -1)
+              fs.unlinkSync(folder + '/' + currFiles[i])
+          }
+        "#;
+        let tainted = vec!["folder".to_owned(), "id".to_owned()];
+        assert_eq!(
+            removed_dir_child_marker(source, "folder + '/' + currFiles[i]", &tainted),
+            Some(".png".to_owned())
+        );
+    }
+
+    #[test]
+    fn removed_dir_child_marker_is_none_for_a_direct_name_removal() {
+        // The tainted value itself names the removed entry: not an enumeration, so the ordinary delete
+        // oracle (which plants the named file directly) applies and this returns `None`.
+        let source = "fs.unlinkSync(path.join(base, name))";
+        let tainted = vec!["name".to_owned()];
+        assert_eq!(
+            removed_dir_child_marker(source, "path.join(base, name)", &tainted),
+            None
+        );
     }
 
     #[test]

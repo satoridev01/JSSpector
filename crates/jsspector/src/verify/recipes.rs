@@ -922,6 +922,10 @@ router.post('/login', async (req, res) => {\n\
         git(&clone, &["add", "."]);
         git(&clone, &["commit", "-qm", "initial"]);
         git(&clone, &["push", "-q", "-u", "origin", "HEAD:main"]);
+        // `publish` commits as the checkout's own identity, which a CI runner does not have
+        // globally.
+        git(&clone, &["config", "user.name", "test"]);
+        git(&clone, &["config", "user.email", "test@localhost.invalid"]);
 
         let book = Book::new(&clone);
         let login = learn(&book, "aaaa");

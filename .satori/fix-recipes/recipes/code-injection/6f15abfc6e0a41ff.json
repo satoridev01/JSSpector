@@ -11,7 +11,7 @@
   ],
   "before": "",
   "after": "if (expression !== undefined && (typeof expression !== 'string' || !/^[\\d\\s+\\-*/%().]*$/.test(expression))) {\n  throw new Error('Expression is not plain arithmetic');\n}",
-  "proven": 1,
-  "offered": 0,
-  "first_try": 0
+  "proven": 2,
+  "offered": 1,
+  "first_try": 1
 }

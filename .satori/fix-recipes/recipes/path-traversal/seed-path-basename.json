@@ -9,6 +9,6 @@
   "before": "const filepath = path.join(FILES, req.params.filename);",
   "after": "const filepath = path.join(FILES, path.basename(req.params.filename));",
   "proven": 0,
-  "offered": 8,
-  "first_try": 8
+  "offered": 11,
+  "first_try": 9
 }

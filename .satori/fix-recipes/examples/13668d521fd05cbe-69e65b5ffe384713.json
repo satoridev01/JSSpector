@@ -1,0 +1,50 @@
+{
+  "recipe": "391282c86548a8ca",
+  "finding": "13668d521fd05cbe",
+  "file": "app.js",
+  "original_fingerprint": "69e65b5ffe384713",
+  "hunks": [
+    {
+      "line": 52,
+      "old": [],
+      "new": [
+        "// Reduce a request value to a single path segment so it cannot leave its base folder.",
+        "function safeSegment(value) {",
+        "  var segment = path.basename(String(value).split('\\\\').join('/'))",
+        "  return segment == '..' ? '' : segment",
+        "}",
+        ""
+      ]
+    },
+    {
+      "line": 108,
+      "old": [
+        "  var id = req.body.id",
+        "  var oldId = req.body.id"
+      ],
+      "new": [
+        "  var id = safeSegment(req.body.id)",
+        "  var oldId = safeSegment(req.body.id)"
+      ]
+    },
+    {
+      "line": 115,
+      "old": [
+        "  var tempId = req.body.tempId // temp music folder"
+      ],
+      "new": [
+        "  var tempId = req.body.tempId == undefined ? undefined : safeSegment(req.body.tempId) // temp music folder"
+      ]
+    },
+    {
+      "line": 407,
+      "old": [
+        "",
+        ""
+      ],
+      "new": []
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request POST \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/save' \\\n  --header 'Content-Type: application/json' \\\n  --data-raw '{\"id\":\"../../../../../../../../../../../../tmp/jss-canary-read.d/jss-mk-18ea0db4ec21a0281397c-1\",\"hasFiles\":true,\"keepVersion\":true,\"lilyPondVal\":true,\"makenew\":true,\"shortHandVal\":true,\"tempId\":true,\"version\":true}'",
+  "benign_status": 500
+}

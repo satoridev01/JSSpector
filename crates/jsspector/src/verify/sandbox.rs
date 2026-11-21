@@ -13067,6 +13067,17 @@ const { chromium } = require('playwright');
 mod tests {
     use super::*;
 
+    /// Tests that start servers or browsers on this machine, or read every port listening on it,
+    /// run one at a time: a listener one opens would otherwise be taken for the app another one
+    /// probes, and their load skews the others' process timings.
+    static LOCAL_LISTENERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn local_listeners() -> std::sync::MutexGuard<'static, ()> {
+        LOCAL_LISTENERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn interrupted_local_fixtures_are_recognized_without_claiming_arbitrary_files() {
         let path = std::path::Path::new("/tmp/jss-canary-read.json");
@@ -13147,6 +13158,7 @@ mod tests {
 
     #[test]
     fn listening_probe_disambiguates_multiple_bound_ports_over_http() {
+        let _serial = local_listeners();
         // An app that fixes its own HTTP port and also stands up a WebSocket sidecar binds two ports;
         // the probe must still become ready by choosing the one that serves plain HTTP, not give up as
         // ambiguous. The requested `PORT` is still preferred when the app honors it.
@@ -16336,6 +16348,7 @@ mod tests {
     /// there (where `/proc/net/tcp` is absent, the only port it can try).
     #[test]
     fn the_listening_probe_reports_the_port_answering() {
+        let _serial = local_listeners();
         if Command::new("node").arg("--version").output().is_err() {
             return;
         }
@@ -16364,6 +16377,7 @@ mod tests {
 
     #[test]
     fn the_listening_probe_never_accepts_an_excluded_wanted_port() {
+        let _serial = local_listeners();
         if Command::new("node").arg("--version").output().is_err() {
             return;
         }
@@ -16389,6 +16403,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_exited_launcher_keeps_the_local_app_running_while_its_group_has_children() {
+        let _serial = local_listeners();
         use std::os::unix::process::CommandExt;
 
         let mut command = Command::new("sh");
@@ -17459,6 +17474,7 @@ http.createServer((req, res) => {
 
     #[test]
     fn a_reflected_xss_fix_is_proven_only_when_it_keeps_showing_the_value() {
+        let _serial = local_listeners();
         use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
         use super::super::plan::{Entry, Method, ReflectedXss};
         use super::super::recipes::{Book, Learned};
@@ -17654,6 +17670,7 @@ document.getElementById('out').innerHTML = 'Hello ' + (params.get('name') || 'wo
 
     #[test]
     fn a_dom_xss_fix_is_proven_only_when_the_page_keeps_showing_the_value() {
+        let _serial = local_listeners();
         use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
         use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
         use super::super::recipes::{Book, Learned};
@@ -17798,6 +17815,7 @@ if (next) location.href = next;\n";
 
     #[test]
     fn a_dom_navigation_fix_is_proven_only_when_ordinary_urls_still_navigate() {
+        let _serial = local_listeners();
         use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
         use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
         use super::super::recipes::{Book, Learned};
@@ -17935,6 +17953,7 @@ if (next) location.href = next;\n";
 
     #[test]
     fn a_fix_for_a_dom_xss_reached_only_through_the_harness_is_proven_there() {
+        let _serial = local_listeners();
         use super::super::fix::{self, FixOptions, FixOutcome};
         use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
         use super::super::recipes::{Book, Learned};
@@ -18041,6 +18060,7 @@ if (next) location.href = next;\n";
 
     #[test]
     fn a_reflected_xss_fix_is_proven_in_docker_with_a_browser_on_the_app_network() {
+        let _serial = local_listeners();
         use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
         use super::super::plan::{Entry, Method, ReflectedXss};
         use super::super::recipes::{Book, Learned};
@@ -18164,6 +18184,7 @@ if (next) location.href = next;\n";
 
     #[test]
     fn a_dom_xss_fix_is_proven_in_docker_by_serving_the_change_in_the_container() {
+        let _serial = local_listeners();
         use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
         use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
         use super::super::recipes::{Book, Learned};

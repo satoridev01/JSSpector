@@ -7,7 +7,7 @@
   ],
   "before": "const user = await User.findOne({ username, password });",
   "after": "const user = await User.findOne({ username: String(username), password: String(password) });",
-  "proven": 3,
-  "offered": 3,
-  "first_try": 3
+  "proven": 4,
+  "offered": 4,
+  "first_try": 4
 }

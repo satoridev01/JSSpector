@@ -651,10 +651,14 @@ pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<ReadOracle
     // Where the canary that must be *found* sits. A directory when the sink appends a fixed segment
     // after the tainted input; otherwise the planted text file, plus the planted image for a sink
     // that re-encodes the file (so its found-branch renders rather than erroring like a miss).
-    let present_names: Vec<String> = if probe.read_suffix.is_some() {
-        // The suffix document is planted at `/tmp/<dir>/<suffix>`. Keep `tmp/` in the climbed
-        // value: enough `..` segments normalize to the filesystem root, so using only `<dir>` would
-        // incorrectly look for `/<dir>/<suffix>` and make every fixed-suffix oracle a miss.
+    let present_names: Vec<String> = if probe.read_suffix.is_some() || probe.lists_dir {
+        // The suffix document is planted at `/tmp/<dir>/<suffix>`, and the listing canary directory
+        // is planted at `/tmp/<dir>`; either way the found branch must reach the planted *directory*.
+        // Keep `tmp/` in the climbed value: enough `..` segments normalize to the filesystem root, so
+        // using only `<dir>` would incorrectly look for `/<dir>` and make the oracle a miss. A
+        // directory-listing sink (`fs.readdirSync`) never echoes the listing and its only planted
+        // fixture is this directory; the bare file/image canaries are not planted for it and would
+        // make the sink error identically to a miss, so the directory is the sole found branch.
         vec![canary.planted_dir().trim_start_matches('/').to_owned()]
     } else {
         vec![
@@ -3859,6 +3863,42 @@ mod tests {
         );
         // The found canary's path never carries the token: the differential, not reflected content,
         // is the proof, so a handler that merely echoes the request cannot satisfy it.
+        assert!(
+            oracles
+                .iter()
+                .all(|o| !o.present_value.contains(&canary.token))
+        );
+    }
+
+    #[test]
+    fn a_directory_listing_read_oracle_climbs_to_the_planted_canary_directory() {
+        // A `fs.readdirSync` sink lists a directory and never echoes the listing. Its only planted
+        // fixture is the canary *directory*; the bare file/image canaries are not planted for it and
+        // would make the sink error like a miss. The fallback read oracle must therefore climb to the
+        // planted directory so the handler's found branch (a real directory to enumerate) differs
+        // from a not-found path.
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/latest",
+            Entry::Query("id".to_owned()),
+        );
+        p.lists_dir = true;
+
+        let oracles = read_oracle(&p, &canary, 1);
+        assert!(!oracles.is_empty());
+        assert!(
+            oracles
+                .iter()
+                .all(|oracle| oracle.present_value.ends_with("tmp/jss-canary-read.d")),
+            "listing oracle did not target the planted /tmp directory: {:?}",
+            oracles
+                .iter()
+                .map(|oracle| &oracle.present_value)
+                .collect::<Vec<_>>()
+        );
+        // The found directory's path never carries the token: the differential, not reflected
+        // content, is the proof.
         assert!(
             oracles
                 .iter()

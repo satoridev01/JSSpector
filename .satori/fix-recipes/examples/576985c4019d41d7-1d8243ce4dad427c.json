@@ -1,0 +1,58 @@
+{
+  "recipe": "4082176cb7999347",
+  "finding": "576985c4019d41d7",
+  "file": "Server/src/databaseHandlers/trino.handler.js",
+  "original_fingerprint": "1d8243ce4dad427c",
+  "hunks": [
+    {
+      "line": 2,
+      "old": [],
+      "new": [
+        "import net from \"node:net\";",
+        "import dns from \"node:dns/promises\";"
+      ]
+    },
+    {
+      "line": 3,
+      "old": [],
+      "new": [
+        "const forbiddenAddresses = new net.BlockList();",
+        "[[\"0.0.0.0\", 8], [\"10.0.0.0\", 8], [\"100.64.0.0\", 10], [\"127.0.0.0\", 8], [\"169.254.0.0\", 16], [\"172.16.0.0\", 12], [\"192.0.0.0\", 24], [\"192.168.0.0\", 16], [\"198.18.0.0\", 15], [\"224.0.0.0\", 3]]",
+        "  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv4\"));",
+        "[[\"::\", 127], [\"::ffff:0:0\", 96], [\"64:ff9b::\", 96], [\"fc00::\", 7], [\"fe80::\", 10], [\"ff00::\", 8]]",
+        "  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv6\"));",
+        "",
+        "const assertPublicUrl = async (url) => {",
+        "  const { protocol, hostname } = new URL(url);",
+        "  if (!/^https?:$/.test(protocol)) throw new Error(\"Galaxy domain not allowed\");",
+        "  const addresses = await dns.lookup(hostname.replace(/^\\[|\\]$/g, \"\"), { all: true });",
+        "  if (",
+        "    !addresses.length ||",
+        "    addresses.some(({ address, family }) =>",
+        "      forbiddenAddresses.check(address, family === 6 ? \"ipv6\" : \"ipv4\")",
+        "    )",
+        "  ) {",
+        "    throw new Error(\"Galaxy domain not allowed\");",
+        "  }",
+        "};",
+        ""
+      ]
+    },
+    {
+      "line": 9,
+      "old": [],
+      "new": [
+        "    await assertPublicUrl(`${config.galaxyDomain}/oauth/v2/token`);"
+      ]
+    },
+    {
+      "line": 13,
+      "old": [],
+      "new": [
+        "        maxRedirects: 0,"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request POST \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/api/testtrino/testtrino' \\\n  --header 'Content-Type: application/json' \\\n  --data-raw '{\"galaxyDomain\":\"http://CALLBACK_HOST\",\"host\":\"jsspector\",\"password\":\"jsspector\",\"port\":\"jsspector\",\"user\":\"jsspector\"}'",
+  "benign_status": 200
+}

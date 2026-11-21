@@ -1,0 +1,14 @@
+{
+  "id": "505af8bc83cf0773",
+  "class": "path-traversal",
+  "sink": "readFileSync",
+  "introduces": [
+    "sep",
+    "startsWith"
+  ],
+  "before": "if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {",
+  "after": "if (filePath.startsWith(__dirname + path.sep) && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

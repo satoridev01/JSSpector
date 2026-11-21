@@ -1,0 +1,13 @@
+{
+  "id": "6cd366b5e6dbfdb6",
+  "class": "nosql-injection",
+  "sink": "aggregate",
+  "introduces": [
+    "String"
+  ],
+  "before": "\"website\": website",
+  "after": "\"website\": String(website)",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

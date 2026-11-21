@@ -1,0 +1,28 @@
+{
+  "recipe": "6cd366b5e6dbfdb6",
+  "finding": "0e342d568fee5b01",
+  "file": "aggregate/app.js",
+  "original_fingerprint": "18114f5b49c4b169",
+  "hunks": [
+    {
+      "line": 58,
+      "old": [
+        "                \"website\": website"
+      ],
+      "new": [
+        "                \"website\": String(website)"
+      ]
+    },
+    {
+      "line": 100,
+      "old": [
+        "",
+        "",
+        ""
+      ],
+      "new": []
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request POST \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:5001/search' \\\n  --header 'Content-Type: application/json' \\\n  --data-raw '{\"website\":{\"$ne\":\"18e9fa87557201081f3e2000\"}}'",
+  "benign_status": 200
+}

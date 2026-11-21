@@ -8,7 +8,7 @@
   ],
   "before": "res.send(\"<h1>User Profile Page by User Id: \" + req.params.userId + \"</h1>\");",
   "after": "res.send(\"<h1>User Profile Page by User Id: \" + String(req.params.userId).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;') + \"</h1>\");",
-  "proven": 1,
-  "offered": 0,
-  "first_try": 0
+  "proven": 2,
+  "offered": 1,
+  "first_try": 1
 }

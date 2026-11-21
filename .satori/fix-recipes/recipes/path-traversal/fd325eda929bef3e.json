@@ -9,7 +9,7 @@
   ],
   "before": "var id = req.body.id\nvar oldId = req.body.id\nvar tempId = req.body.tempId // temp music folder",
   "after": "var id = path.basename(String(req.body.id)).replace(/^\\.+$/, '')\nvar oldId = id\nvar tempId = req.body.tempId == undefined ? undefined : path.basename(String(req.body.tempId)).replace(/^\\.+$/, '') // temp music folder",
-  "proven": 1,
-  "offered": 0,
-  "first_try": 0
+  "proven": 2,
+  "offered": 1,
+  "first_try": 1
 }

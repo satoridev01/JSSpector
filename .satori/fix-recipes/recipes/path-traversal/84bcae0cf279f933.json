@@ -9,6 +9,6 @@
   "before": "if (absolutePath.includes(path.resolve('.'))) {",
   "after": "if (absolutePath.startsWith(path.resolve('uploads/complaints') + path.sep)) {",
   "proven": 1,
-  "offered": 10,
-  "first_try": 9
+  "offered": 11,
+  "first_try": 10
 }

@@ -792,8 +792,7 @@ pub fn run(
                             let outcome = session.qualify(outcome);
                             if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
                                 fix = Some(fix::prove(
-                                    session,
-                                    probe,
+                                    fix::Target::Http { session, probe },
                                     finding,
                                     root,
                                     &outcome,
@@ -815,7 +814,17 @@ pub fn run(
                     match http.get_mut(index).map(|(_, session)| session) {
                         Some(Ok(session)) => {
                             let outcome = session.exercise_reflected_xss(probe);
-                            session.qualify(outcome)
+                            let outcome = session.qualify(outcome);
+                            if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                                fix = Some(fix::prove(
+                                    fix::Target::ReflectedXss { session, probe },
+                                    finding,
+                                    root,
+                                    &outcome,
+                                    fix_options,
+                                ));
+                            }
+                            outcome
                         }
                         Some(Err(err)) => Outcome::Skipped {
                             reason: format!("the app could not be launched: {err}"),
@@ -826,7 +835,19 @@ pub fn run(
                     }
                 }
                 Ok(plan::Plan::Browser(probe)) => match browser.as_mut() {
-                    Some(Ok(session)) => session.exercise(probe),
+                    Some(Ok(session)) => {
+                        let outcome = session.exercise(probe);
+                        if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                            fix = Some(fix::prove(
+                                fix::Target::Browser { session, probe },
+                                finding,
+                                root,
+                                &outcome,
+                                fix_options,
+                            ));
+                        }
+                        outcome
+                    }
                     Some(Err(err)) => Outcome::Skipped {
                         reason: format!("the browser phase could not start: {err}"),
                     },
@@ -835,14 +856,6 @@ pub fn run(
                     },
                 },
             };
-            // A browser-driven reproduction runs the page, not the server process a candidate
-            // change can be relaunched in.
-            if fix.is_none() && fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
-                fix = Some(FixOutcome::Unsupported {
-                    reason: "proving a fix for a browser-driven finding is not supported yet"
-                        .to_owned(),
-                });
-            }
             Verdict {
                 fix,
                 ..verdict(finding, outcome)

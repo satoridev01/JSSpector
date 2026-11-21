@@ -318,6 +318,9 @@ pub struct Session {
     tag: String,
     network: String,
     app: String,
+    /// Docker runtime: the browser container a reflected XSS is loaded in, on the app's private
+    /// network, started on the first reflected-XSS probe.
+    xss_browser: Option<String>,
     marker: String,
     db: Option<String>,
     db_env: Vec<(String, String)>,
@@ -752,6 +755,7 @@ impl Session {
             unavailable_services: Vec::new(),
             service_path: None,
             torn_down: false,
+            xss_browser: None,
         };
         if let Err(err) = session.boot() {
             session.teardown();
@@ -1009,6 +1013,7 @@ impl Session {
             unavailable_services,
             service_path,
             torn_down: false,
+            xss_browser: None,
         };
         session.start_local_services()?;
         session.local_baseline_ports = local_listening_ports();
@@ -2300,6 +2305,32 @@ impl Session {
             .and_then(|(_, status, _)| status)
     }
 
+    /// The status the route gives a plain `value` placed where a reflected-XSS payload rides, and
+    /// whether it answers with an HTML page that shows the value, fetched without a browser: what a
+    /// fix must keep serving. A page answered as `text/plain` or JSON shows nothing as HTML.
+    pub fn reflected_benign(
+        &self,
+        probe: &super::plan::ReflectedXss,
+        value: &str,
+    ) -> Option<(u16, bool)> {
+        let attempt = Attempt {
+            verb: "GET",
+            target: super::reflected::benign_target(probe, value),
+            body: None,
+            headers: Vec::new(),
+            signal: Signal::InResponse,
+        };
+        let spec = request_spec(&attempt, self.port, !self.omit_forwarding.get(), self.tls);
+        let output = self
+            .exec(&self.app, &["node", "/jss-driver.js", &spec])
+            .ok()?;
+        let body = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let (status, _) = parse_driver_meta(&stderr);
+        let html = driver_content_type(&stderr).is_none_or(|kind| is_html_content_type(&kind));
+        Some((status?, html && body.contains(value)))
+    }
+
     /// Replaces each `(path, content)` (relative to the repository root), runs the app's build step
     /// again when it has one, relaunches the app and waits until it listens: the very app the
     /// finding reproduced against, now with a candidate change. Datastore sidecars keep running.
@@ -2765,9 +2796,11 @@ impl Session {
     /// reason.
     pub fn exercise_reflected_xss(&mut self, probe: &super::plan::ReflectedXss) -> Outcome {
         self.nonce += 1;
-        let executable = match &self.runtime {
+        // Where each attempt is loaded: the host's Chromium against the local app, or a browser
+        // container on the Docker app's private network.
+        let (executable, origin) = match &self.runtime {
             Runtime::Local { .. } => match local_browser_executable() {
-                Some(executable) => executable,
+                Some(executable) => (Some(executable), format!("http://127.0.0.1:{}", self.port)),
                 None => {
                     return Outcome::Skipped {
                         reason:
@@ -2778,11 +2811,13 @@ impl Session {
                 }
             },
             Runtime::Docker => {
-                return Outcome::Skipped {
-                    reason: "reflected XSS verification runs in the local browser runtime \
-                             (JSS_VERIFY_RUNTIME=local)"
-                        .to_owned(),
-                };
+                if let Err(error) = self.ensure_xss_browser() {
+                    return Outcome::Skipped {
+                        reason: format!("the reflected-XSS browser could not start: {error}"),
+                    };
+                }
+                let scheme = if self.tls { "https" } else { "http" };
+                (None, format!("{scheme}://{}:{}", self.app, self.port))
             }
         };
         let attempts = super::reflected::reflected_xss_attempts(probe, self.nonce);
@@ -2794,14 +2829,21 @@ impl Session {
             };
         }
         let mut outcome = Outcome::NotReproduced { tried };
+        let mut failed_loads = 0usize;
         for attempt in &attempts {
-            let url = format!("http://127.0.0.1:{}{}", self.port, attempt.request_target);
-            let dom = match run_local_browser_capture(&executable, &url, &helper_dir) {
+            let url = format!("{origin}{}", attempt.request_target);
+            let loaded = match (&executable, &self.xss_browser) {
+                (Some(executable), _) => run_local_browser_capture(executable, &url, &helper_dir),
+                (None, Some(browser)) => docker_browser_capture(browser, &url),
+                (None, None) => Err("no browser".to_owned()),
+            };
+            let dom = match loaded {
                 Ok(dom) => dom,
                 Err(error) => {
                     if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
                         eprintln!("[verify] reflected-xss browser load {url} failed: {error}");
                     }
+                    failed_loads += 1;
                     continue;
                 }
             };
@@ -2839,7 +2881,37 @@ impl Session {
             }
         }
         let _ = std::fs::remove_dir_all(&helper_dir);
-        outcome
+        with_failed_loads(outcome, failed_loads, tried)
+    }
+
+    /// The browser container for reflected-XSS probes, started once per session on the app's
+    /// private network (it reaches the app by its container name).
+    fn ensure_xss_browser(&mut self) -> Result<(), String> {
+        if self.xss_browser.is_some() {
+            return Ok(());
+        }
+        let tag = ensure_xss_browser_image()?;
+        let name = format!("{}-xss-browser", self.app);
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--network",
+            &self.network,
+            "--security-opt",
+            "no-new-privileges",
+            "--shm-size",
+            "512m",
+            "--memory",
+            "2g",
+            "--entrypoint",
+            "sleep",
+            &tag,
+            "infinity",
+        ])?;
+        self.xss_browser = Some(name);
+        Ok(())
     }
 
     /// Confirms a path-traversal read whose content is not reflected, by a differential oracle: a
@@ -4793,6 +4865,9 @@ impl Session {
             Runtime::Docker => {
                 remove_container(&self.app);
                 remove_container(&self.marker);
+                if let Some(browser) = &self.xss_browser {
+                    remove_container(browser);
+                }
                 if let Some(db) = &self.db {
                     remove_container(db);
                 }
@@ -9573,6 +9648,25 @@ enum SessionCred {
 }
 
 /// The HTTP status and `Set-Cookie` headers from the driver's tagged metadata line on stderr.
+/// The response's `Content-Type`, from the driver's metadata line, when it sent one.
+fn driver_content_type(stderr: &str) -> Option<String> {
+    stderr.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("__JSS_META__")?;
+        let value = serde_json::from_str::<serde_json::Value>(rest).ok()?;
+        value
+            .get("contentType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+/// Whether a `Content-Type` is one a browser renders as an HTML page.
+fn is_html_content_type(kind: &str) -> bool {
+    let essence = kind.split(';').next().unwrap_or_default().trim();
+    essence.eq_ignore_ascii_case("text/html")
+        || essence.eq_ignore_ascii_case("application/xhtml+xml")
+}
+
 fn parse_driver_meta(stderr: &str) -> (Option<u16>, Vec<String>) {
     for line in stderr.lines() {
         let Some(rest) = line.trim().strip_prefix("__JSS_META__") else {
@@ -11419,7 +11513,7 @@ function attempt(){
     // Emit the response status and any Set-Cookie on stderr, tagged, so the verifier can detect an
     // authentication challenge and capture a session the app's own login issued. stdout stays the
     // response body, unchanged, so body-based comparisons are unaffected.
-    try{process.stderr.write('__JSS_META__'+JSON.stringify({status:res.statusCode||0,setCookie:res.headers['set-cookie']||null})+'\n');}catch(e){}
+    try{process.stderr.write('__JSS_META__'+JSON.stringify({status:res.statusCode||0,setCookie:res.headers['set-cookie']||null,contentType:res.headers['content-type']||null})+'\n');}catch(e){}
     let data='';
     // Cap how much is kept (a large body is only compared, never parsed), but still emit what was
     // collected: dropping it entirely would make a large success response read as empty and hide,
@@ -11577,6 +11671,67 @@ fn spawn_process_group(command: &mut Command, name: &str) -> Result<Child, Strin
         .map_err(|error| format!("starting {name}: {error}"))
 }
 
+/// The DOM `url` renders to in the browser container `browser`, or why it did not load.
+fn docker_browser_capture(browser: &str, url: &str) -> Result<String, String> {
+    docker(&[
+        "exec",
+        "-e",
+        "JSS_DUMP=1",
+        browser,
+        "node",
+        "/jss-browser.js",
+        url,
+    ])
+}
+
+/// The image the reflected-XSS browser container runs: the browser phase's Playwright browser
+/// and driver, without the repository. Built once and kept, keyed by its content.
+fn ensure_xss_browser_image() -> Result<String, String> {
+    use std::hash::{Hash, Hasher};
+    let dockerfile = format!(
+        "FROM {BROWSER_IMAGE}\n\
+         RUN mkdir -p /opt/pw && cd /opt/pw && npm init -y >/dev/null 2>&1 && \
+             PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm install playwright@1.49.1 --no-audit --no-fund\n\
+         RUN echo {} | base64 -d > /jss-browser.js\n\
+         ENV NODE_PATH=/opt/pw/node_modules\n",
+        base64(BROWSER_JS.as_bytes()),
+    );
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dockerfile.hash(&mut hasher);
+    let tag = format!("jsspector-verify-xss-browser:{:016x}", hasher.finish());
+    if docker(&["image", "inspect", &tag]).is_ok() {
+        return Ok(tag);
+    }
+    let context = tempfile::tempdir().map_err(|error| format!("build context: {error}"))?;
+    let context_path = context
+        .path()
+        .to_str()
+        .ok_or_else(|| "the build context path is not valid UTF-8".to_owned())?;
+    build_from_dockerfile(&dockerfile, &tag, context_path)?;
+    Ok(tag)
+}
+
+/// The framed page's DOM a harness load mirrored into its own (`m=1`), if it did.
+fn mirrored(dom: &str) -> Option<&str> {
+    const MARK: &str = "__JSS_MIRROR__";
+    let start = dom.find(MARK)? + MARK.len();
+    let end = start + dom.get(start..)?.find(MARK)?;
+    dom.get(start..end)
+}
+
+/// A browser-driven outcome with the loads that failed taken into account. An attempt the browser
+/// never loaded was not tried: without a hit, a failed load leaves the finding undecided rather than
+/// not reproduced, so a fix proof never mistakes a browser that could not load the changed page for
+/// an exploit that stopped.
+fn with_failed_loads(outcome: Outcome, failed_loads: usize, tried: usize) -> Outcome {
+    if failed_loads > 0 && matches!(outcome, Outcome::NotReproduced { .. }) {
+        return Outcome::Skipped {
+            reason: format!("the browser failed to load {failed_loads} of {tried} attempts"),
+        };
+    }
+    outcome
+}
+
 /// A built browser-phase image, a private network, a marker service, a static file server for the
 /// repo, and a browser container — one per `--verify` run that has DOM findings.
 enum BrowserRuntime {
@@ -11602,11 +11757,239 @@ pub struct BrowserSession {
     root: std::path::PathBuf,
     runtime: BrowserRuntime,
     torn_down: bool,
+    /// Files a fix candidate overwrote in the checkout, with their original content, written back by
+    /// [`Self::restore_files`] (and teardown).
+    overwritten: Vec<(String, String)>,
 }
 
 impl BrowserSession {
-    /// Builds the browser-phase image from `root` and starts the marker service, the static file
-    /// server and the browser, or returns why it could not.
+    /// Whether a fix candidate can be tried: the static server reads each file on every request
+    /// (the checkout itself locally, the image's copy in Docker), so a changed file takes effect on
+    /// the next load.
+    pub fn can_relaunch(&self) -> bool {
+        !self.torn_down
+    }
+
+    /// Writes each `(path, content)` (relative to the repository root) where the static server
+    /// serves it from — the checkout locally, the app container in Docker — remembering each
+    /// original for [`Self::restore_files`]. The browser starts each load with a fresh profile,
+    /// so the next load serves the change.
+    pub fn relaunch_with_files(&mut self, files: &[(String, String)]) -> Result<(), String> {
+        for (rel, content) in files {
+            if std::path::Path::new(rel)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(format!("unsupported path `{rel}`"));
+            }
+            if !self.overwritten.iter().any(|(name, _)| name == rel) {
+                let original = std::fs::read_to_string(self.root.join(rel))
+                    .map_err(|error| format!("could not read {rel}: {error}"))?;
+                self.overwritten.push((rel.clone(), original));
+            }
+            self.serve_file(rel, content)?;
+        }
+        Ok(())
+    }
+
+    /// Writes back every file a fix candidate overwrote.
+    pub fn restore_files(&mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for (rel, original) in std::mem::take(&mut self.overwritten) {
+            if let Err(error) = self.serve_file(&rel, &original) {
+                failures.push(format!("{rel}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not restore files a fix candidate changed: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    /// Makes the static server serve `content` as `rel`.
+    fn serve_file(&self, rel: &str, content: &str) -> Result<(), String> {
+        match &self.runtime {
+            BrowserRuntime::Local { .. } => std::fs::write(self.root.join(rel), content)
+                .map_err(|error| format!("could not write {rel}: {error}")),
+            BrowserRuntime::Docker => {
+                let staged = tempfile::NamedTempFile::new()
+                    .map_err(|e| format!("could not stage {rel}: {e}"))?;
+                std::fs::write(staged.path(), content)
+                    .map_err(|e| format!("could not stage {rel}: {e}"))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o644))
+                        .map_err(|e| format!("could not stage {rel}: {e}"))?;
+                }
+                let source = staged
+                    .path()
+                    .to_str()
+                    .ok_or_else(|| format!("could not stage {rel}: non-UTF-8 temp path"))?;
+                docker(&["cp", source, &format!("{}:/app/{rel}", self.app)])
+                    .map(|_| ())
+                    .map_err(|e| format!("could not copy {rel} into the static server: {e}"))
+            }
+        }
+    }
+
+    /// The rendered DOM of `url` (a served path), or `None` when the page did not load.
+    fn capture(&self, url: &str) -> Option<String> {
+        match &self.runtime {
+            BrowserRuntime::Local {
+                executable,
+                helper_dir,
+                ..
+            } => run_local_browser_capture(
+                executable,
+                &format!("http://127.0.0.1:{}{url}", self.port),
+                helper_dir,
+            )
+            .ok(),
+            BrowserRuntime::Docker => {
+                docker_browser_capture(&self.browser, &format!("http://jss-app:{}{url}", self.port))
+                    .ok()
+            }
+        }
+    }
+
+    /// The benign loads for `probe`, in a fixed order — the page the script ships in first, then
+    /// the pages the harness pass hosts it in — each with whether it is hosted in the harness.
+    /// `carried` is the value placed where the payload rides.
+    fn benign_loads(
+        &self,
+        probe: &super::plan::BrowserProbe,
+        carried: &str,
+    ) -> Vec<(String, bool)> {
+        let mut loads: Vec<(String, bool)> = self
+            .find_page(&probe.file)
+            .ok()
+            .iter()
+            .flat_map(|page| super::browser::benign_urls(probe, page, carried))
+            .map(|url| (url, false))
+            .collect();
+        let seeds = seeds_json(&self.local_storage_seeds());
+        for host in self.find_pages(&probe.file).iter().take(MAX_HARNESS_PAGES) {
+            for url in super::browser::benign_urls(probe, host, carried)
+                .iter()
+                .take(MAX_HARNESS_ATTEMPTS_PER_PAGE)
+            {
+                // `m=1`: the harness mirrors the frame's DOM into its own, where the dump reads it.
+                loads.push((format!("{}&m=1", harness_url(url, &seeds)), true));
+            }
+        }
+        loads
+    }
+
+    /// The HTTP status of the page the script is served in, and which benign load (an index into
+    /// [`Self::benign_loads`]) still shows the page's legitimate job with a benign value placed
+    /// where the payload rides: an HTML sink shows the plain `value` in the rendered DOM; a
+    /// navigation sink, given an ordinary `http` URL (the marker service's, under a fresh token),
+    /// still navigates to it. `only` rechecks just the load that showed it before a change, so a
+    /// candidate that drops the value is rejected after one load, not after every page. `None` when
+    /// no page could be loaded at all (no host page, a browser that failed every load) or for a
+    /// module-import sink.
+    pub fn benign_shows(
+        &mut self,
+        probe: &super::plan::BrowserProbe,
+        value: &str,
+        only: Option<usize>,
+    ) -> Option<(u16, Option<usize>)> {
+        if !self.can_relaunch() || probe.sink == super::plan::BrowserSink::Import {
+            return None;
+        }
+        let navigates = probe.sink == super::plan::BrowserSink::Navigation;
+        let token = navigates.then(|| {
+            self.nonce += 1;
+            format!("{}-benign-{}", self.canary.token, self.nonce)
+        });
+        let carried = token.as_deref().map_or_else(
+            || value.to_owned(),
+            |token| self.canary.service_url_for_token(token),
+        );
+        let status = self
+            .find_page(&probe.file)
+            .ok()
+            .into_iter()
+            .chain(
+                self.find_pages(&probe.file)
+                    .into_iter()
+                    .take(MAX_HARNESS_PAGES),
+            )
+            .find_map(|page| self.page_status(&page))?;
+        let loads = self.benign_loads(probe, &carried);
+        let mut loaded = false;
+        for (index, (url, hosted)) in loads.iter().enumerate() {
+            if only.is_some_and(|only| only != index) {
+                continue;
+            }
+            let shows = match &token {
+                Some(token) => self.drive(url, token, None),
+                None => self.capture(url).map(|dom| {
+                    // The harness page itself names the value in its frame's `src`: only what the
+                    // framed page rendered counts.
+                    let rendered = if *hosted {
+                        mirrored(&dom)
+                    } else {
+                        Some(dom.as_str())
+                    };
+                    rendered.is_some_and(|rendered| rendered.contains(value))
+                }),
+            };
+            match shows {
+                Some(true) => return Some((status, Some(index))),
+                Some(false) => loaded = true,
+                None => {}
+            }
+        }
+        loaded.then_some((status, None))
+    }
+
+    /// The HTTP status the static server answers `page` (a served path) with.
+    fn page_status(&self, page: &str) -> Option<u16> {
+        let path = if page.starts_with('/') {
+            page.to_owned()
+        } else {
+            format!("/{page}")
+        };
+        match &self.runtime {
+            BrowserRuntime::Local { .. } => {
+                use std::io::{Read, Write};
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).ok()?;
+                let timeout = Some(std::time::Duration::from_secs(5));
+                stream.set_read_timeout(timeout).ok()?;
+                stream.set_write_timeout(timeout).ok()?;
+                write!(
+                    stream,
+                    "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                )
+                .ok()?;
+                let mut head = [0u8; 64];
+                let read = stream.read(&mut head).ok()?;
+                let line = String::from_utf8_lossy(head.get(..read)?);
+                line.split_whitespace().nth(1)?.parse().ok()
+            }
+            // The static server is reachable only inside the private network.
+            BrowserRuntime::Docker => docker(&[
+                "exec",
+                &self.browser,
+                "node",
+                "-e",
+                "require('http').get(process.argv[1], r => { process.stdout.write(String(r.statusCode)); \
+                 r.resume(); r.on('end', () => process.exit(0)); }).on('error', () => process.exit(1));",
+                &format!("http://jss-app:{}{path}", self.port),
+            ])
+            .ok()?
+            .trim()
+            .parse()
+            .ok(),
+        }
+    }
+
     pub fn start(root: &std::path::Path) -> Result<Self, String> {
         if local_runtime_requested() {
             return Self::start_local(root);
@@ -11625,6 +12008,7 @@ impl BrowserSession {
             root: root.to_path_buf(),
             runtime: BrowserRuntime::Docker,
             torn_down: false,
+            overwritten: Vec::new(),
         };
         build_browser_image(root, &session.tag, session.port)?;
         docker(&["network", "create", "--internal", &session.network])
@@ -11711,6 +12095,7 @@ impl BrowserSession {
                 executable,
             },
             torn_down: false,
+            overwritten: Vec::new(),
         })
     }
 
@@ -11820,13 +12205,16 @@ impl BrowserSession {
         let referrer = super::browser::via_referrer(probe)
             .then(|| super::browser::referrer_payload(probe, &self.canary, self.nonce));
         let mut tried = 0usize;
+        let mut failed = 0usize;
         for attempt in &attempts {
             let hit = referrer
                 .as_ref()
                 .map_or(attempt.token.as_str(), |(_, t)| t.as_str());
             tried += 1;
-            if self.drive(&attempt.url, hit, referrer.as_ref()) {
-                return browser_verified(&attempt.url, hit);
+            match self.drive(&attempt.url, hit, referrer.as_ref()) {
+                Some(true) => return browser_verified(&attempt.url, hit),
+                Some(false) => {}
+                None => failed += 1,
             }
         }
         // Harness pass: only a URL-delivered HTML/navigation probe can be driven this way (a
@@ -11841,14 +12229,16 @@ impl BrowserSession {
                 for attempt in host_attempts.iter().take(MAX_HARNESS_ATTEMPTS_PER_PAGE) {
                     let url = harness_url(&attempt.url, &seeds_json);
                     tried += 1;
-                    if self.drive(&url, &attempt.token, None) {
+                    match self.drive(&url, &attempt.token, None) {
                         // The reproduction is the real page URL the victim opens, not our driver.
-                        return browser_verified(&attempt.url, &attempt.token);
+                        Some(true) => return browser_verified(&attempt.url, &attempt.token),
+                        Some(false) => {}
+                        None => failed += 1,
                     }
                 }
             }
         }
-        Outcome::NotReproduced { tried }
+        with_failed_loads(Outcome::NotReproduced { tried }, failed, tried)
     }
 
     /// The bookmarklet body of `script` if it is one: a script whose first non-space bytes are
@@ -11870,22 +12260,34 @@ impl BrowserSession {
         let attempts =
             super::browser::bookmarklet_attempts(&probe.file, source, &self.canary, self.nonce);
         let mut tried = 0usize;
+        let mut failed = 0usize;
         for attempt in attempts
             .iter()
             .take(MAX_HARNESS_PAGES * MAX_HARNESS_ATTEMPTS_PER_PAGE)
         {
             tried += 1;
-            if self.drive(&attempt.url, &attempt.token, None) {
-                return bookmarklet_verified(&probe.file, &attempt.url, &attempt.token);
+            match self.drive(&attempt.url, &attempt.token, None) {
+                Some(true) => {
+                    return bookmarklet_verified(&probe.file, &attempt.url, &attempt.token);
+                }
+                Some(false) => {}
+                None => failed += 1,
             }
         }
-        Outcome::NotReproduced { tried }
+        with_failed_loads(Outcome::NotReproduced { tried }, failed, tried)
     }
 
     /// Loads one URL (relative to the served app) in the browser and reports whether the canary
     /// reached the marker service with `hit`. `referrer`, when set, carries the payload as the
     /// Referer header for a referrer-sourced probe.
-    fn drive(&self, attempt_url: &str, hit: &str, referrer: Option<&(String, String)>) -> bool {
+    /// Loads one attempt: `Some(true)` when the marker received `hit`, `Some(false)` when the page
+    /// loaded without it, `None` when the local browser failed to load the page at all.
+    fn drive(
+        &self,
+        attempt_url: &str,
+        hit: &str,
+        referrer: Option<&(String, String)>,
+    ) -> Option<bool> {
         match &self.runtime {
             BrowserRuntime::Docker => {
                 let url = format!("http://jss-app:{}{}", self.port, attempt_url);
@@ -11895,7 +12297,7 @@ impl BrowserSession {
                 }
                 let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
                 let _ = exec_in(&self.browser, &args);
-                marker_hit(&tail_logs(&self.marker), hit).is_some()
+                Some(marker_hit(&tail_logs(&self.marker), hit).is_some())
             }
             BrowserRuntime::Local {
                 executable,
@@ -11917,7 +12319,7 @@ impl BrowserSession {
                         tail(&logs, 8)
                     );
                 }
-                reached
+                (reached || browser_result.is_ok()).then_some(reached)
             }
         }
     }
@@ -12025,6 +12427,9 @@ impl BrowserSession {
             return;
         }
         self.torn_down = true;
+        if let Err(error) = self.restore_files() {
+            eprintln!("jsspector: {error}");
+        }
         match &mut self.runtime {
             BrowserRuntime::Docker => {
                 remove_container(&self.app);
@@ -12581,6 +12986,16 @@ const HARNESS = `<!doctype html><meta charset="utf-8"><body><script>
   }
   f.addEventListener('load', function(){ setTimeout(kick, 100); setTimeout(kick, 500); setTimeout(kick, 1400); });
   setTimeout(kick, 900); setTimeout(kick, 2400);
+  // m=1: mirror the framed page's DOM as text into this document, for a DOM dump to read.
+  if (q.get('m') === '1') setTimeout(function(){
+    try {
+      var mirror = document.createElement('pre');
+      mirror.hidden = true;
+      var mark = '__JSS_' + 'MIRROR__';
+      mirror.textContent = mark + f.contentDocument.documentElement.outerHTML + mark;
+      document.body.appendChild(mirror);
+    } catch (e) {}
+  }, 2800);
 })();
 </script>`;
 http.createServer((req, res) => {
@@ -12626,15 +13041,25 @@ const { chromium } = require('playwright');
 (async () => {
   const url = process.argv[2];
   const referer = process.argv[3];
+  // JSS_DUMP=1: print the rendered DOM; a page that never loaded exits 2 instead.
+  const dump = process.env.JSS_DUMP === '1';
   const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
-  const context = await browser.newContext(referer ? { extraHTTPHeaders: { Referer: referer } } : {});
+  const options = { ignoreHTTPSErrors: true };
+  if (referer) options.extraHTTPHeaders = { Referer: referer };
+  const context = await browser.newContext(options);
   const page = await context.newPage();
   page.on('dialog', d => { try { d.dismiss(); } catch (e) {} });
   page.on('pageerror', () => {});
-  try { await page.goto(url, { waitUntil: 'load', timeout: 8000 }); } catch (e) {}
-  try { await page.waitForTimeout(1200); } catch (e) {}
+  let loaded = true;
+  try { await page.goto(url, { waitUntil: 'load', timeout: 8000 }); } catch (e) { loaded = false; }
+  try { await page.waitForTimeout(dump ? 3500 : 1200); } catch (e) {}
+  let code = 0;
+  if (dump) {
+    if (!loaded) code = 2;
+    else { try { process.stdout.write(await page.content()); } catch (e) { code = 2; } }
+  }
   try { await browser.close(); } catch (e) {}
-  process.exit(0);
+  process.exit(code);
 })();
 "#;
 
@@ -16883,8 +17308,10 @@ http.createServer((req, res) => {
             ..FixOptions::default()
         };
         let proven = fix::prove(
-            &mut session,
-            &probe,
+            fix::Target::Http {
+                session: &mut session,
+                probe: &probe,
+            },
             &finding,
             dir.path(),
             &outcome,
@@ -16914,13 +17341,20 @@ http.createServer((req, res) => {
             file: "server.js".to_owned(),
             content: format!("throw new Error('broken');\n{FIX_FIXTURE}"),
         };
+        let benign = fix::Benign {
+            status: 200,
+            shows: None,
+            at: None,
+        };
         let crashed = fix::check(
-            &mut session,
-            &probe,
+            &mut fix::Target::Http {
+                session: &mut session,
+                probe: &probe,
+            },
             &finding,
             dir.path(),
             &broken,
-            200,
+            &benign,
             &mut state,
         );
         // A change that drops the route stops the exploit too, but the benign request's status gives
@@ -16931,12 +17365,14 @@ http.createServer((req, res) => {
             content: FIX_FIXTURE.replace("'/read'", "'/gone'"),
         };
         let dropped = fix::check(
-            &mut session,
-            &probe,
+            &mut fix::Target::Http {
+                session: &mut session,
+                probe: &probe,
+            },
             &finding,
             dir.path(),
             &gone,
-            200,
+            &benign,
             &mut state,
         );
         session.teardown();
@@ -16946,6 +17382,912 @@ http.createServer((req, res) => {
         assert!(
             dropped.contains("HTTP 404 instead of HTTP 200"),
             "{dropped}"
+        );
+    }
+
+    #[test]
+    fn only_an_html_content_type_is_a_page() {
+        let meta = |kind: &str| format!("__JSS_META__{{\"status\":200,\"contentType\":{kind}}}\n");
+        assert_eq!(
+            driver_content_type(&meta("\"text/html; charset=utf-8\"")).as_deref(),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(driver_content_type(&meta("null")), None);
+        assert!(is_html_content_type("text/html; charset=utf-8"));
+        assert!(is_html_content_type("Application/XHTML+XML"));
+        assert!(!is_html_content_type("text/plain; charset=utf-8"));
+        assert!(!is_html_content_type("application/json"));
+    }
+
+    #[test]
+    fn only_the_mirrored_frame_counts_in_a_harness_dump() {
+        let dump = "<iframe src=\"/p.html?name=plain1\"></iframe>\
+<pre hidden>__JSS_MIRROR__&lt;div&gt;Hello&lt;/div&gt;__JSS_MIRROR__</pre>";
+        let rendered = mirrored(dump).unwrap();
+        assert!(rendered.contains("Hello") && !rendered.contains("plain1"));
+        assert_eq!(
+            mirrored("<iframe src=\"/p.html?name=plain1\"></iframe>"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_browser_load_that_failed_leaves_the_outcome_undecided() {
+        let skipped = with_failed_loads(Outcome::NotReproduced { tried: 11 }, 2, 11);
+        assert!(
+            matches!(&skipped, Outcome::Skipped { reason } if reason.contains("2 of 11")),
+            "{skipped:?}"
+        );
+        assert!(matches!(
+            with_failed_loads(Outcome::NotReproduced { tried: 11 }, 0, 11),
+            Outcome::NotReproduced { tried: 11 }
+        ));
+        let verified = Outcome::Verified {
+            how: "browser load".to_owned(),
+            poc: Reproduction {
+                command: String::new(),
+                method: "BROWSER".to_owned(),
+                target: String::new(),
+                headers: Vec::new(),
+                body: None,
+                evidence: String::new(),
+                response: String::new(),
+                controls: Vec::new(),
+            },
+        };
+        // A hit is a hit whatever other loads did.
+        assert!(matches!(
+            with_failed_loads(verified, 3, 11),
+            Outcome::Verified { .. }
+        ));
+    }
+
+    const REFLECTED_FIXTURE: &str = r#"const http = require('http');
+const url = require('url');
+http.createServer((req, res) => {
+  const u = url.parse(req.url, true);
+  if (u.pathname === '/hello') {
+    const name = (u.query.name || 'world').toString();
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end('<!doctype html><html><body><h1>Hello ' + name + '</h1></body></html>');
+    return;
+  }
+  res.statusCode = 404;
+  res.end('x');
+}).listen(process.env.PORT || 3000, '0.0.0.0');
+"#;
+
+    #[test]
+    fn a_reflected_xss_fix_is_proven_only_when_it_keeps_showing_the_value() {
+        use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
+        use super::super::plan::{Entry, Method, ReflectedXss};
+        use super::super::recipes::{Book, Learned};
+        use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, VulnClass};
+
+        if local_browser_executable().is_none() || !command_available("node") {
+            eprintln!("reflected XSS fix proof: skipped (needs node and a local Chromium/Chrome)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"reflected-fixture","version":"1.0.0","scripts":{"start":"node server.js"}}"#,
+        );
+        write(dir.path(), "server.js", REFLECTED_FIXTURE);
+        let finding = Finding {
+            file: "server.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "res.end".to_owned(),
+                arg: "name".to_owned(),
+                line: 8,
+                col: 5,
+            },
+            class: VulnClass::Xss,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "<anonymous>".to_owned(),
+            entry: Some("GET /hello".to_owned()),
+            entry_at: None,
+            source: SourceLoc {
+                kind: "http",
+                expr: "u.query".to_owned(),
+                line: 6,
+                col: 19,
+            },
+            stored_by: None,
+            trace: Vec::new(),
+            key: "k".to_owned(),
+            fingerprint: "reflected".to_owned(),
+        };
+        let probe = ReflectedXss {
+            method: Method::Get,
+            path: "/hello".to_owned(),
+            entry: Entry::Query("name".to_owned()),
+        };
+
+        let mut session = Session::start_local(dir.path(), std::path::Path::new(""), None, &[])
+            .expect("the reflected fixture should start locally");
+        let outcome = session.exercise_reflected_xss(&probe);
+        if !matches!(outcome, Outcome::Verified { .. }) {
+            session.teardown();
+            panic!("the unescaped reflection should verify first, got {outcome:?}");
+        }
+        // A fix proven earlier for this finding on this file content: encoding the value before it
+        // is written. It is replayed and proved again, with no LLM.
+        let store = tempfile::tempdir().unwrap();
+        let encoded = REFLECTED_FIXTURE.replace(
+            "    const name = (u.query.name || 'world').toString();\n",
+            "    const name = (u.query.name || 'world').toString()\n      \
+             .replace(/[&<>\"']/g, (c) => '&#' + c.charCodeAt(0) + ';');\n",
+        );
+        assert_ne!(encoded, REFLECTED_FIXTURE);
+        Book::new(store.path())
+            .record(&Learned {
+                finding: &finding,
+                file: "server.js",
+                original: REFLECTED_FIXTURE,
+                proven: Some(&encoded),
+                poc: None,
+                benign_status: 200,
+                offered: &[],
+                first_try: false,
+            })
+            .unwrap();
+        let options = FixOptions {
+            llm: false,
+            recipes: Some(store.path().to_path_buf()),
+            ..FixOptions::default()
+        };
+        let proven = fix::prove(
+            fix::Target::ReflectedXss {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &outcome,
+            &options,
+        );
+        let FixOutcome::Proven {
+            strategy,
+            benign_status,
+            ..
+        } = &proven
+        else {
+            session.teardown();
+            panic!("the recorded encoding fix should be proven, got {proven:?}");
+        };
+        assert_eq!(strategy, "replay");
+        assert_eq!(*benign_status, 200);
+        // The checkout is back to its original content once the proof is over.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("server.js")).unwrap(),
+            REFLECTED_FIXTURE
+        );
+
+        let benign = Benign {
+            status: 200,
+            shows: Some("showing the plain value `jsspectorbenign` in a page".to_owned()),
+            at: None,
+        };
+        let mut state = fix::ProofState::default();
+        // A change that stops echoing the value stops the exploit too, but the benign value no
+        // longer shows.
+        let silent = Candidate {
+            strategy: "test:silent".to_owned(),
+            file: "server.js".to_owned(),
+            content: REFLECTED_FIXTURE.replace("Hello ' + name + '", "Hello there"),
+        };
+        assert_ne!(silent.content, REFLECTED_FIXTURE);
+        let silenced = fix::check(
+            &mut fix::Target::ReflectedXss {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &silent,
+            &benign,
+            &mut state,
+        );
+        // A change that answers as plain text: the browser no longer runs the payload, but the page
+        // is gone too.
+        let plain = Candidate {
+            strategy: "test:plain-text".to_owned(),
+            file: "server.js".to_owned(),
+            content: REFLECTED_FIXTURE.replace("'text/html; charset=utf-8'", "'text/plain'"),
+        };
+        assert_ne!(plain.content, REFLECTED_FIXTURE);
+        let as_text = fix::check(
+            &mut fix::Target::ReflectedXss {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &plain,
+            &benign,
+            &mut state,
+        );
+        // A change that drops the route: the benign request's status gives it away.
+        let gone = Candidate {
+            strategy: "test:route-gone".to_owned(),
+            file: "server.js".to_owned(),
+            content: REFLECTED_FIXTURE.replace("'/hello'", "'/gone'"),
+        };
+        let dropped = fix::check(
+            &mut fix::Target::ReflectedXss {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &gone,
+            &benign,
+            &mut state,
+        );
+        session.teardown();
+        let silenced = silenced.expect_err("a change that drops the reflection is not a fix");
+        assert!(
+            silenced.contains("no longer keeps showing the plain value"),
+            "{silenced}"
+        );
+        let as_text = as_text.expect_err("a change that answers as plain text is not a fix");
+        assert!(
+            as_text.contains("no longer keeps showing the plain value"),
+            "{as_text}"
+        );
+        let dropped = dropped.expect_err("a change that drops the route is not a fix");
+        assert!(
+            dropped.contains("HTTP 404 instead of HTTP 200"),
+            "{dropped}"
+        );
+    }
+
+    const DOM_PAGE: &str = "<!doctype html><html><body><div id=\"out\"></div>\
+<script src=\"app.js\"></script></body></html>\n";
+    const DOM_SCRIPT: &str = "const params = new URLSearchParams(location.search);\n\
+document.getElementById('out').innerHTML = 'Hello ' + (params.get('name') || 'world');\n";
+
+    #[test]
+    fn a_dom_xss_fix_is_proven_only_when_the_page_keeps_showing_the_value() {
+        use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
+        use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
+        use super::super::recipes::{Book, Learned};
+        use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, VulnClass};
+
+        if local_browser_executable().is_none() || !command_available("node") {
+            eprintln!("DOM XSS fix proof: skipped (needs node and a local Chromium/Chrome)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.html", DOM_PAGE);
+        write(dir.path(), "app.js", DOM_SCRIPT);
+        let finding = Finding {
+            file: "app.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "innerHTML =".to_owned(),
+                arg: "'Hello ' + (params.get('name') || 'world')".to_owned(),
+                line: 2,
+                col: 1,
+            },
+            class: VulnClass::Xss,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "<module>".to_owned(),
+            entry: None,
+            entry_at: None,
+            source: SourceLoc {
+                kind: "dom",
+                expr: "location.search".to_owned(),
+                line: 1,
+                col: 37,
+            },
+            stored_by: None,
+            trace: Vec::new(),
+            key: "k".to_owned(),
+            fingerprint: "dom".to_owned(),
+        };
+        let probe = BrowserProbe {
+            file: "app.js".to_owned(),
+            vector: UrlVector::Search,
+            sink: BrowserSink::Html,
+            params: vec!["name".to_owned()],
+        };
+
+        let mut session =
+            BrowserSession::start_local(dir.path()).expect("the browser phase should start");
+        let outcome = session.exercise(&probe);
+        if !matches!(outcome, Outcome::Verified { .. }) {
+            session.teardown();
+            panic!("the unescaped innerHTML write should verify first, got {outcome:?}");
+        }
+        // Writing the value as text instead of markup replaces the sink call: a fix all the same,
+        // since the page keeps showing the value.
+        let store = tempfile::tempdir().unwrap();
+        let as_text = DOM_SCRIPT.replace(".innerHTML =", ".textContent =");
+        Book::new(store.path())
+            .record(&Learned {
+                finding: &finding,
+                file: "app.js",
+                original: DOM_SCRIPT,
+                proven: Some(&as_text),
+                poc: None,
+                benign_status: 200,
+                offered: &[],
+                first_try: false,
+            })
+            .unwrap();
+        let options = FixOptions {
+            llm: false,
+            recipes: Some(store.path().to_path_buf()),
+            ..FixOptions::default()
+        };
+        let proven = fix::prove(
+            fix::Target::Browser {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &outcome,
+            &options,
+        );
+        let FixOutcome::Proven { strategy, diff, .. } = &proven else {
+            session.teardown();
+            panic!("the recorded textContent fix should be proven, got {proven:?}");
+        };
+        assert_eq!(strategy, "replay");
+        assert!(
+            diff.contains("+document.getElementById('out').textContent ="),
+            "{diff}"
+        );
+        // The served checkout is back to its original content once the proof is over.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("app.js")).unwrap(),
+            DOM_SCRIPT
+        );
+
+        // A change that stops writing the value stops the exploit too, but the page no longer
+        // shows the benign value.
+        let benign = Benign {
+            status: 200,
+            shows: Some("showing the plain value `jsspectorbenign` in a page".to_owned()),
+            at: None,
+        };
+        let silent = Candidate {
+            strategy: "test:silent".to_owned(),
+            file: "app.js".to_owned(),
+            content: DOM_SCRIPT.replace("'Hello ' + (params.get('name') || 'world')", "'Hello'"),
+        };
+        assert_ne!(silent.content, DOM_SCRIPT);
+        let mut state = fix::ProofState::default();
+        let silenced = fix::check(
+            &mut fix::Target::Browser {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &silent,
+            &benign,
+            &mut state,
+        );
+        session.teardown();
+        // Teardown writes back what the last candidate changed.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("app.js")).unwrap(),
+            DOM_SCRIPT
+        );
+        let silenced = silenced.expect_err("a change that drops the write is not a fix");
+        assert!(
+            silenced.contains("no longer keeps showing the plain value"),
+            "{silenced}"
+        );
+    }
+
+    const NAV_PAGE: &str =
+        "<!doctype html><html><body><script src=\"nav.js\"></script></body></html>\n";
+    const NAV_SCRIPT: &str = "const next = new URLSearchParams(location.search).get('next');\n\
+if (next) location.href = next;\n";
+
+    #[test]
+    fn a_dom_navigation_fix_is_proven_only_when_ordinary_urls_still_navigate() {
+        use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
+        use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
+        use super::super::recipes::{Book, Learned};
+        use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, VulnClass};
+
+        if local_browser_executable().is_none() || !command_available("node") {
+            eprintln!("DOM navigation fix proof: skipped (needs node and a local Chromium/Chrome)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.html", NAV_PAGE);
+        write(dir.path(), "nav.js", NAV_SCRIPT);
+        let finding = Finding {
+            file: "nav.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "location.href =".to_owned(),
+                arg: "next".to_owned(),
+                line: 2,
+                col: 11,
+            },
+            class: VulnClass::Xss,
+            severity: Severity::Medium,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "<module>".to_owned(),
+            entry: None,
+            entry_at: None,
+            source: SourceLoc {
+                kind: "dom",
+                expr: "location.search".to_owned(),
+                line: 1,
+                col: 34,
+            },
+            stored_by: None,
+            trace: Vec::new(),
+            key: "k".to_owned(),
+            fingerprint: "nav".to_owned(),
+        };
+        let probe = BrowserProbe {
+            file: "nav.js".to_owned(),
+            vector: UrlVector::Search,
+            sink: BrowserSink::Navigation,
+            params: vec!["next".to_owned()],
+        };
+
+        let mut session =
+            BrowserSession::start_local(dir.path()).expect("the browser phase should start");
+        let outcome = session.exercise(&probe);
+        if !matches!(outcome, Outcome::Verified { .. }) {
+            session.teardown();
+            panic!("the unchecked navigation should verify first, got {outcome:?}");
+        }
+        // Navigating only to http(s) URLs keeps the redirect working for ordinary links.
+        let store = tempfile::tempdir().unwrap();
+        let checked = NAV_SCRIPT.replace(
+            "if (next) location.href = next;",
+            "if (next && /^https?:\\/\\//i.test(next)) location.href = next;",
+        );
+        assert_ne!(checked, NAV_SCRIPT);
+        Book::new(store.path())
+            .record(&Learned {
+                finding: &finding,
+                file: "nav.js",
+                original: NAV_SCRIPT,
+                proven: Some(&checked),
+                poc: None,
+                benign_status: 200,
+                offered: &[],
+                first_try: false,
+            })
+            .unwrap();
+        let options = FixOptions {
+            llm: false,
+            recipes: Some(store.path().to_path_buf()),
+            ..FixOptions::default()
+        };
+        let proven = fix::prove(
+            fix::Target::Browser {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &outcome,
+            &options,
+        );
+        let FixOutcome::Proven { strategy, .. } = &proven else {
+            session.teardown();
+            panic!("the recorded scheme check should be proven, got {proven:?}");
+        };
+        assert_eq!(strategy, "replay");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nav.js")).unwrap(),
+            NAV_SCRIPT
+        );
+
+        // A change that never navigates stops the exploit too, but ordinary URLs no longer work.
+        let benign = Benign {
+            status: 200,
+            shows: Some("navigating to an ordinary http URL".to_owned()),
+            at: None,
+        };
+        let never = Candidate {
+            strategy: "test:never".to_owned(),
+            file: "nav.js".to_owned(),
+            content: NAV_SCRIPT.replace("if (next)", "if (false && next)"),
+        };
+        assert_ne!(never.content, NAV_SCRIPT);
+        let mut state = fix::ProofState::default();
+        let stopped = fix::check(
+            &mut fix::Target::Browser {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &never,
+            &benign,
+            &mut state,
+        );
+        session.teardown();
+        let stopped = stopped.expect_err("a change that never navigates is not a fix");
+        assert!(
+            stopped.contains("no longer keeps navigating to an ordinary http URL"),
+            "{stopped}"
+        );
+    }
+
+    const SPA_PAGE: &str = "<!doctype html><html><body><div id=\"out\"></div>\
+<script src=\"spa.js\"></script></body></html>\n";
+    const SPA_SCRIPT: &str = "window.addEventListener('popstate', function () {\n\
+  document.getElementById('out').innerHTML = new URLSearchParams(location.search).get('name') || '';\n\
+});\n";
+
+    #[test]
+    fn a_fix_for_a_dom_xss_reached_only_through_the_harness_is_proven_there() {
+        use super::super::fix::{self, FixOptions, FixOutcome};
+        use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
+        use super::super::recipes::{Book, Learned};
+        use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, VulnClass};
+
+        if local_browser_executable().is_none() || !command_available("node") {
+            eprintln!(
+                "harness DOM XSS fix proof: skipped (needs node and a local Chromium/Chrome)"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.html", SPA_PAGE);
+        write(dir.path(), "spa.js", SPA_SCRIPT);
+        let finding = Finding {
+            file: "spa.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "innerHTML =".to_owned(),
+                arg: "name".to_owned(),
+                line: 2,
+                col: 3,
+            },
+            class: VulnClass::Xss,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "<anonymous>".to_owned(),
+            entry: None,
+            entry_at: None,
+            source: SourceLoc {
+                kind: "dom",
+                expr: "location.search".to_owned(),
+                line: 2,
+                col: 66,
+            },
+            stored_by: None,
+            trace: Vec::new(),
+            key: "k".to_owned(),
+            fingerprint: "spa".to_owned(),
+        };
+        let probe = BrowserProbe {
+            file: "spa.js".to_owned(),
+            vector: UrlVector::Search,
+            sink: BrowserSink::Html,
+            params: vec!["name".to_owned()],
+        };
+
+        let mut session =
+            BrowserSession::start_local(dir.path()).expect("the browser phase should start");
+        let outcome = session.exercise(&probe);
+        if !matches!(outcome, Outcome::Verified { .. }) {
+            session.teardown();
+            panic!("the popstate-only write should verify through the harness, got {outcome:?}");
+        }
+        // A plain load never runs the sink: the benign value shows only in the harness.
+        let store = tempfile::tempdir().unwrap();
+        let as_text = SPA_SCRIPT.replace(".innerHTML =", ".textContent =");
+        Book::new(store.path())
+            .record(&Learned {
+                finding: &finding,
+                file: "spa.js",
+                original: SPA_SCRIPT,
+                proven: Some(&as_text),
+                poc: None,
+                benign_status: 200,
+                offered: &[],
+                first_try: false,
+            })
+            .unwrap();
+        let options = FixOptions {
+            llm: false,
+            recipes: Some(store.path().to_path_buf()),
+            ..FixOptions::default()
+        };
+        let proven = fix::prove(
+            fix::Target::Browser {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &outcome,
+            &options,
+        );
+        session.teardown();
+        let FixOutcome::Proven {
+            strategy,
+            benign_status,
+            ..
+        } = &proven
+        else {
+            panic!(
+                "the recorded textContent fix should be proven through the harness, got {proven:?}"
+            );
+        };
+        assert_eq!(strategy, "replay");
+        assert_eq!(*benign_status, 200);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("spa.js")).unwrap(),
+            SPA_SCRIPT
+        );
+    }
+
+    #[test]
+    fn a_reflected_xss_fix_is_proven_in_docker_with_a_browser_on_the_app_network() {
+        use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
+        use super::super::plan::{Entry, Method, ReflectedXss};
+        use super::super::recipes::{Book, Learned};
+        use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, VulnClass};
+
+        if !available() {
+            eprintln!("reflected XSS fix proof in Docker: skipped (no Docker daemon reachable)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"reflected-fixture","version":"1.0.0","scripts":{"start":"node server.js"}}"#,
+        );
+        write(dir.path(), "server.js", REFLECTED_FIXTURE);
+        let finding = Finding {
+            file: "server.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "res.end".to_owned(),
+                arg: "name".to_owned(),
+                line: 8,
+                col: 5,
+            },
+            class: VulnClass::Xss,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "<anonymous>".to_owned(),
+            entry: Some("GET /hello".to_owned()),
+            entry_at: None,
+            source: SourceLoc {
+                kind: "http",
+                expr: "u.query".to_owned(),
+                line: 6,
+                col: 19,
+            },
+            stored_by: None,
+            trace: Vec::new(),
+            key: "k".to_owned(),
+            fingerprint: "reflected-docker".to_owned(),
+        };
+        let probe = ReflectedXss {
+            method: Method::Get,
+            path: "/hello".to_owned(),
+            entry: Entry::Query("name".to_owned()),
+        };
+        let mut session = Session::start(dir.path()).expect("the fixture sandbox should start");
+        let outcome = session.exercise_reflected_xss(&probe);
+        if !matches!(outcome, Outcome::Verified { .. }) {
+            session.teardown();
+            panic!("the unescaped reflection should verify in Docker, got {outcome:?}");
+        }
+        let store = tempfile::tempdir().unwrap();
+        let encoded = REFLECTED_FIXTURE.replace(
+            "    const name = (u.query.name || 'world').toString();\n",
+            "    const name = (u.query.name || 'world').toString()\n      \
+             .replace(/[&<>\"']/g, (c) => '&#' + c.charCodeAt(0) + ';');\n",
+        );
+        Book::new(store.path())
+            .record(&Learned {
+                finding: &finding,
+                file: "server.js",
+                original: REFLECTED_FIXTURE,
+                proven: Some(&encoded),
+                poc: None,
+                benign_status: 200,
+                offered: &[],
+                first_try: false,
+            })
+            .unwrap();
+        let options = FixOptions {
+            llm: false,
+            recipes: Some(store.path().to_path_buf()),
+            ..FixOptions::default()
+        };
+        let proven = fix::prove(
+            fix::Target::ReflectedXss {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &outcome,
+            &options,
+        );
+        if !matches!(&proven, FixOutcome::Proven { strategy, .. } if strategy == "replay") {
+            session.teardown();
+            panic!("the recorded encoding fix should be proven in Docker, got {proven:?}");
+        }
+        let benign = Benign {
+            status: 200,
+            shows: Some("showing the plain value `jsspectorbenign` in a page".to_owned()),
+            at: None,
+        };
+        let plain = Candidate {
+            strategy: "test:plain-text".to_owned(),
+            file: "server.js".to_owned(),
+            content: REFLECTED_FIXTURE.replace("'text/html; charset=utf-8'", "'text/plain'"),
+        };
+        let mut state = fix::ProofState::default();
+        let as_text = fix::check(
+            &mut fix::Target::ReflectedXss {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &plain,
+            &benign,
+            &mut state,
+        );
+        session.teardown();
+        let as_text = as_text.expect_err("a change that answers as plain text is not a fix");
+        assert!(
+            as_text.contains("no longer keeps showing the plain value"),
+            "{as_text}"
+        );
+    }
+
+    #[test]
+    fn a_dom_xss_fix_is_proven_in_docker_by_serving_the_change_in_the_container() {
+        use super::super::fix::{self, Benign, Candidate, FixOptions, FixOutcome};
+        use super::super::plan::{BrowserProbe, BrowserSink, UrlVector};
+        use super::super::recipes::{Book, Learned};
+        use jss_core::{Auth, Finding, Severity, SinkLoc, SourceLoc, VulnClass};
+
+        if !available() || local_runtime_requested() {
+            eprintln!("DOM XSS fix proof in Docker: skipped (no Docker daemon reachable)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.html", DOM_PAGE);
+        write(dir.path(), "app.js", DOM_SCRIPT);
+        let finding = Finding {
+            file: "app.js".to_owned(),
+            sink: SinkLoc {
+                file: None,
+                api: "innerHTML =".to_owned(),
+                arg: "'Hello ' + (params.get('name') || 'world')".to_owned(),
+                line: 2,
+                col: 1,
+            },
+            class: VulnClass::Xss,
+            severity: Severity::High,
+            confidence: "heuristic",
+            auth: Auth::NoneDetected,
+            function: "<module>".to_owned(),
+            entry: None,
+            entry_at: None,
+            source: SourceLoc {
+                kind: "dom",
+                expr: "location.search".to_owned(),
+                line: 1,
+                col: 37,
+            },
+            stored_by: None,
+            trace: Vec::new(),
+            key: "k".to_owned(),
+            fingerprint: "dom-docker".to_owned(),
+        };
+        let probe = BrowserProbe {
+            file: "app.js".to_owned(),
+            vector: UrlVector::Search,
+            sink: BrowserSink::Html,
+            params: vec!["name".to_owned()],
+        };
+        let mut session =
+            BrowserSession::start(dir.path()).expect("the browser phase should start");
+        let outcome = session.exercise(&probe);
+        if !matches!(outcome, Outcome::Verified { .. }) {
+            session.teardown();
+            panic!("the unescaped innerHTML write should verify in Docker, got {outcome:?}");
+        }
+        let store = tempfile::tempdir().unwrap();
+        let as_text = DOM_SCRIPT.replace(".innerHTML =", ".textContent =");
+        Book::new(store.path())
+            .record(&Learned {
+                finding: &finding,
+                file: "app.js",
+                original: DOM_SCRIPT,
+                proven: Some(&as_text),
+                poc: None,
+                benign_status: 200,
+                offered: &[],
+                first_try: false,
+            })
+            .unwrap();
+        let options = FixOptions {
+            llm: false,
+            recipes: Some(store.path().to_path_buf()),
+            ..FixOptions::default()
+        };
+        let proven = fix::prove(
+            fix::Target::Browser {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &outcome,
+            &options,
+        );
+        let FixOutcome::Proven {
+            strategy,
+            benign_status,
+            ..
+        } = &proven
+        else {
+            session.teardown();
+            panic!("the recorded textContent fix should be proven in Docker, got {proven:?}");
+        };
+        assert_eq!(strategy, "replay");
+        assert_eq!(*benign_status, 200);
+        let benign = Benign {
+            status: 200,
+            shows: Some("showing the plain value `jsspectorbenign` in a page".to_owned()),
+            at: Some(0),
+        };
+        let silent = Candidate {
+            strategy: "test:silent".to_owned(),
+            file: "app.js".to_owned(),
+            content: DOM_SCRIPT.replace("'Hello ' + (params.get('name') || 'world')", "'Hello'"),
+        };
+        let mut state = fix::ProofState::default();
+        let silenced = fix::check(
+            &mut fix::Target::Browser {
+                session: &mut session,
+                probe: &probe,
+            },
+            &finding,
+            dir.path(),
+            &silent,
+            &benign,
+            &mut state,
+        );
+        session.teardown();
+        // The checkout on disk was never touched: Docker served the change from the container.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("app.js")).unwrap(),
+            DOM_SCRIPT
+        );
+        let silenced = silenced.expect_err("a change that drops the write is not a fix");
+        assert!(
+            silenced.contains("no longer keeps showing the plain value"),
+            "{silenced}"
         );
     }
 

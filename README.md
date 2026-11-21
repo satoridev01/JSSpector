@@ -97,10 +97,16 @@ With `--verify`, every verified finding also gets a `fix`: a minimal code change
 same sandbox that reproduced the exploit, to stop it. A change counts as `proven` only when the
 app still starts with it, the same probe no longer reproduces, and a benign request to the route
 still gets the HTTP status it got before the change — so a change that merely breaks the route
-never passes. The scanned checkout is never modified; the report carries the change as a unified
-diff, with the original file's fingerprint so the diff can be re-applied and re-proved later.
+never passes. For an XSS (server-reflected or DOM, in Docker or the local runtime) the probe is the
+same headless-browser load, every one of which must actually load, and the page must keep its legitimate
+behavior with a benign value sent the same way — still showing a plain value in an HTML page, or for
+a DOM navigation sink still navigating to an ordinary `http` URL — so a change that merely drops the
+value, or answers it as plain text, never passes either. The scanned checkout is not left modified: Docker keeps the
+change in the container, and the local runtime writes it back once the proof is over. The report
+carries the change as a unified diff, with the original file's fingerprint so the diff can be
+re-applied and re-proved later.
 
-JSSpector applies no fix pattern by itself. Candidates come from an LLM through the `claude` CLI, which is told why each earlier candidate failed and shown the fix recipes already proven for the finding's class. The outcome is `proven` (with the diff and its strategy), `unproven` (every candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be tried here, such as a browser-driven finding, or no LLM and no recorded fix).
+JSSpector applies no fix pattern by itself. Candidates come from an LLM through the `claude` CLI, which is told why each earlier candidate failed and shown the fix recipes already proven for the finding's class. The outcome is `proven` (with the diff and its strategy), `unproven` (every candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be tried here, such as a DOM XSS that imports a module from the URL, or no LLM and no recorded fix).
 
 Every proven fix is kept in a recipe store, [`.satori/fix-recipes`](.satori/fix-recipes) in the JSSpector checkout the binary was built from:
 

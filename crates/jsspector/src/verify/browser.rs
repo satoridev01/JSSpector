@@ -71,6 +71,41 @@ pub fn browser_attempts(
     out
 }
 
+/// The page loads that carry a plain `value` where [`browser_attempts`] places the payload: the
+/// legitimate use a fix must keep showing. Empty for a referrer-sourced probe, whose value does not
+/// ride in the page URL.
+pub fn benign_urls(probe: &BrowserProbe, page: &str, value: &str) -> Vec<String> {
+    let encoded = encode(value);
+    let params = param_names(probe);
+    let mut out = Vec::new();
+    match probe.vector {
+        UrlVector::Search => {
+            out.extend(
+                params
+                    .iter()
+                    .map(|param| format!("{page}?{param}={encoded}")),
+            );
+        }
+        UrlVector::Hash => {
+            out.push(format!("{page}#{encoded}"));
+            out.extend(
+                params
+                    .iter()
+                    .map(|param| format!("{page}#{param}={encoded}")),
+            );
+        }
+        UrlVector::Href => {
+            for param in &params {
+                out.push(format!("{page}?{param}={encoded}"));
+                out.push(format!("{page}#{param}={encoded}"));
+            }
+            out.push(format!("{page}#{encoded}"));
+        }
+        UrlVector::Referrer => {}
+    }
+    out
+}
+
 /// The parameter names to try for a URL-sourced probe: the ones the script actually reads off the
 /// page URL (mined from its source) first, then the generic candidates for anything not already
 /// covered. Trying the real name first means a page reading an uncommon parameter is driven on the
@@ -258,6 +293,33 @@ mod tests {
             sink,
             params: Vec::new(),
         }
+    }
+
+    #[test]
+    fn benign_urls_carry_the_plain_value_where_the_payload_goes() {
+        let mut search = probe(UrlVector::Search, BrowserSink::Html);
+        search.params = vec!["state".to_owned()];
+        let urls = benign_urls(&search, "/index.html", "plain1");
+        assert_eq!(urls.first().unwrap(), "/index.html?state=plain1");
+        assert!(urls.contains(&"/index.html?q=plain1".to_owned()));
+        let hash = benign_urls(
+            &probe(UrlVector::Hash, BrowserSink::Html),
+            "/p.html",
+            "plain1",
+        );
+        assert_eq!(hash.first().unwrap(), "/p.html#plain1");
+        assert!(
+            benign_urls(
+                &probe(UrlVector::Referrer, BrowserSink::Html),
+                "/p.html",
+                "x"
+            )
+            .is_empty()
+        );
+        // Every URL the attempts use has a benign twin in the same slot.
+        let canary = Canary::new("t".to_owned());
+        let attempts = browser_attempts(&search, "/index.html", &canary, 1);
+        assert_eq!(attempts.len(), urls.len());
     }
 
     #[test]

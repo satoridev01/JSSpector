@@ -98,6 +98,12 @@ fn factors(seed: u32, index: u32) -> (u32, u32) {
     (a, b)
 }
 
+/// The request target carrying a plain `value` where the payload would ride: the legitimate
+/// request a fix must keep answering, and keep showing `value` in, when it showed it before.
+pub fn benign_target(probe: &ReflectedXss, value: &str) -> String {
+    place_payload(&probe.entry, &probe.path, value)
+}
+
 /// Places the percent-encoded payload into the request target for the probe's entry: a query
 /// parameter, a path segment, or an appended URL segment. Any other `{slot}` in the path is filled
 /// with a neutral `1` so the route still matches.
@@ -208,6 +214,14 @@ mod tests {
         assert!(first.request_target.starts_with("/u/1/"));
         assert!(!first.request_target.contains("{name}"));
         assert!(!first.request_target.contains("{id}"));
+    }
+
+    #[test]
+    fn the_benign_target_carries_the_plain_value_in_the_payload_slot() {
+        let query = probe(Entry::Query("q".to_owned()), "/search");
+        assert_eq!(benign_target(&query, "plain1"), "/search?q=plain1");
+        let slot = probe(Entry::PathParam("name".to_owned()), "/hello/{name}/{id}");
+        assert_eq!(benign_target(&slot, "plain1"), "/hello/plain1/1");
     }
 
     #[test]

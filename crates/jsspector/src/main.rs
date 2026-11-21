@@ -742,6 +742,25 @@ mod repository_input_tests {
     }
 
     #[test]
+    fn only_a_main_checkout_keeps_a_recipe_store() {
+        let main = tempfile::tempdir().unwrap();
+        std::fs::create_dir(main.path().join(".git")).unwrap();
+        assert_eq!(
+            recipe_store_of(main.path()),
+            Some(main.path().join(".satori").join("fix-recipes"))
+        );
+        // A linked worktree's `.git` is a file pointing at the main repository.
+        let linked = tempfile::tempdir().unwrap();
+        std::fs::write(
+            linked.path().join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/x\n",
+        )
+        .unwrap();
+        assert_eq!(recipe_store_of(linked.path()), None);
+        assert_eq!(recipe_store_of(tempfile::tempdir().unwrap().path()), None);
+    }
+
+    #[test]
     fn self_heal_defaults_on_and_is_skipped_with_no_self_heal() {
         assert!(
             Cli::try_parse_from(["jsspector", "scan", "--repo", "owner/project"]).is_ok_and(
@@ -1867,10 +1886,17 @@ fn without_credentials(url: &str) -> String {
 /// The fix recipe store of the JSSpector checkout this binary was built from, when that checkout
 /// is still there: proven fixes are committed and pushed to it.
 fn own_fix_recipes() -> Option<PathBuf> {
-    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    recipe_store_of(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
+/// The recipe store of `checkout`, only when it is a repository's main checkout (its `.git` is a
+/// directory). A linked worktree — where a repair agent builds and checks a candidate scanner —
+/// records nothing: a fix it proved would be an edit outside the repair's allowed paths, and its
+/// branch is no place to publish from.
+fn recipe_store_of(checkout: &Path) -> Option<PathBuf> {
     checkout
         .join(".git")
-        .exists()
+        .is_dir()
         .then(|| checkout.join(".satori").join("fix-recipes"))
 }
 

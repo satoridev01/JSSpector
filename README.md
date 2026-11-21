@@ -108,7 +108,7 @@ re-applied and re-proved later.
 
 JSSpector applies no fix pattern by itself. Candidates come from an LLM through the `claude` CLI, which is told why each earlier candidate failed and shown the fix recipes already proven for the finding's class. The outcome is `proven` (with the diff and its strategy), `unproven` (every candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be tried here, such as a DOM XSS that imports a module from the URL, or no LLM and no recorded fix).
 
-Every proven fix is kept in a recipe store, [`.satori/fix-recipes`](.satori/fix-recipes) in the JSSpector checkout the binary was built from:
+Every proven fix is kept in a recipe store, [`.satori/fix-recipes`](.satori/fix-recipes) in the JSSpector checkout the binary was built from (its main checkout: a binary built in a linked worktree, such as a repair agent's, records nothing):
 
 - as a **recipe**: its class, the sink's callee, what the change introduced and a short before/after. Recipes of the same class, the same sink first, are shown to the LLM so later fixes of that pattern tend to pass on the first candidate. Each recipe counts the times it was shown and the times the first candidate was then proven. A few recipes ship with JSSpector as a starting point.
 - as an **example**: the finding's and the file's fingerprints, the file's path, the exact change, the request that reproduced the exploit (with credential headers and tokens redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the change is replayed and proved again, with no LLM. This is how a rescan of the same commit reproduces both the exploit and its fix deterministically.

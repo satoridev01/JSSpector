@@ -1,0 +1,19 @@
+{
+  "recipe": "f0df3fa57de935e2",
+  "finding": "013985570ad79f17",
+  "file": "routes/users.js",
+  "original_fingerprint": "8d858aedd749b0ee",
+  "hunks": [
+    {
+      "line": 25,
+      "old": [
+        "    <p>User ID: ${req.params.id}</p>"
+      ],
+      "new": [
+        "    <p>User ID: ${String(req.params.id).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;')}</p>"
+      ]
+    }
+  ],
+  "poc": "open 'http://TARGET_HOST/users/%3Cscript%3Edocument.write%2860991%2A14217%29%3C%2Fscript%3E'",
+  "benign_status": 200
+}

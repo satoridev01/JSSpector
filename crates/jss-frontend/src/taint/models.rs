@@ -107,6 +107,10 @@ pub struct Pack {
     pub sanitizers: Sanitizers,
     #[serde(default)]
     pub html_props: Vec<String>,
+    /// Methods of a response object that return the response itself (`res.status(404)`), so a
+    /// sink named on the response (`res.send`) is still that sink at the end of the chain.
+    #[serde(default)]
+    pub receiver_methods: Vec<String>,
     /// Source kinds of a page in the browser (`location.hash`, messages): a finding they
     /// reach is labeled with its page when no route reaches it.
     #[serde(default)]
@@ -273,7 +277,7 @@ pub struct SinkSpec {
     pub assign: Vec<String>,
     pub class: VulnClassName,
     pub severity: SeverityName,
-    /// `any:N`, `built:N`, `url:N`, `html:N` or `object:N`.
+    /// `any:N`, `built:N`, `url:N`, `html:N`, `markup:N` or `object:N`.
     pub args: Vec<String>,
     /// Option keys (in a later object argument) that confine the sink: `sendFile(p, { root })`.
     #[serde(default)]
@@ -946,6 +950,9 @@ pub enum ArgRule {
     UrlPrefix(usize),
     /// Tainted and built (string HTML), not a bare value.
     Html(usize),
+    /// Tainted and built with HTML markup in its literal text: a response body that is a page
+    /// (`res.send('<h1>' + name + '</h1>')`), not text that happens to be built.
+    Markup(usize),
     /// A tainted value that can be an object: a NoSQL query where `{ "$ne": null }` changes it.
     Object(usize),
     /// [`Self::Object`], when the argument before it names a collection or class with a
@@ -969,6 +976,7 @@ impl ArgRule {
             "url" => Self::UrlPrefix(index),
             "start" => Self::Start(index),
             "html" => Self::Html(index),
+            "markup" => Self::Markup(index),
             "object" => Self::Object(index),
             "object-after-name" => Self::ObjectAfterName(index),
             "fragment" => Self::Fragment(index),
@@ -1085,6 +1093,7 @@ pub struct Model {
     pub rejected_markers: Vec<String>,
     pub escapers: BTreeMap<String, Vec<String>>,
     pub html_props: Vec<String>,
+    pub receiver_methods: Vec<String>,
     pub plain_constructors: Vec<String>,
     pub node_factories: Vec<String>,
     pub sql_keywords: Vec<String>,
@@ -1355,6 +1364,7 @@ impl Model {
             self.escapers.entry(class).or_default().extend(calls);
         }
         self.html_props.extend(pack.html_props);
+        self.receiver_methods.extend(pack.receiver_methods);
         self.page_kinds.extend(pack.page_kinds);
         self.plain_constructors.extend(pack.plain_constructors);
         self.node_factories.extend(pack.node_factories);

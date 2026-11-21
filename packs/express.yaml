@@ -29,7 +29,19 @@ routes:
   promise_methods: [then, catch, finally]
   # `api.get(url, params, (err, result) => ...)`: an error-first callback answers a request sent.
   callback_error_params: [err, error]
+# Response methods that return the response itself: `res.status(404).send(...)` is `res.send(...)`.
+receiver_methods: [status, type, contentType, set, header, append, cookie, clearCookie, location, vary,
+  links, attachment]
 sinks:
+  # A string body is answered as an HTML page: a request value built into it is reflected XSS.
+  # Markup in the literal text makes it a page for sure; Express's `send` also answers plain built
+  # text as `text/html`, a weaker sign. A browser's own data never reaches a server response.
+  - {methods: [res.send, response.send], class: xss, severity: high, args: ["markup:0"],
+     also: [{args: ["built:0"], severity: medium}],
+     ignore_kinds: [dom, props, ext-message, ext-internal, postmessage]}
+  # Node's raw `write`/`end` set no content type of their own: only a body with markup is a page.
+  - {methods: [res.write, res.end, response.write, response.end], class: xss, severity: high,
+     args: ["markup:0"], ignore_kinds: [dom, props, ext-message, ext-internal, postmessage]}
   # A `root` option confines these (engine rule).
   # Never a browser's `chrome.downloads.download()`: browser-side sources do not reach Express.
   - {methods: [sendFile, download], class: path-traversal, severity: high, args: ["any:0"], confined_by: [root],

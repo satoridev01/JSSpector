@@ -52,6 +52,8 @@ pub struct Origin {
     pub prefix: bool,
     /// Concatenated with literal text that looks like SQL.
     pub sqlish: bool,
+    /// Concatenated with literal text that holds HTML markup (`<h1>`, `</p>`).
+    pub htmlish: bool,
     /// Summary pass only: this is the value of the enclosing function's parameter `n`.
     pub param: Option<usize>,
     /// Can be an object (JSON body, qs query, socket payload), not only a string.
@@ -251,6 +253,7 @@ impl Origin {
             built: false,
             prefix: true,
             sqlish: false,
+            htmlish: false,
             escaped: 0,
             param: None,
             object: true,
@@ -904,6 +907,7 @@ fn join(a: &mut Origin, b: &Origin) {
     a.prefix |= b.prefix;
     a.built |= b.built;
     a.sqlish |= b.sqlish;
+    a.htmlish |= b.htmlish;
     a.escaped &= b.escaped;
 }
 
@@ -1531,6 +1535,7 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
             Some(Origin {
                 built: a.built || b.built,
                 sqlish: a.sqlish || b.sqlish,
+                htmlish: a.htmlish || b.htmlish,
                 // Escaped only if every part is.
                 escaped: a.escaped & b.escaped,
                 upload: a.upload && b.upload,
@@ -1561,6 +1566,31 @@ fn auth_call_level(init: &Expression<'_>) -> Option<Auth> {
 
 /// The literal text in a `+` chain or a template: `'SELECT *' + ' WHERE n = '` gives both
 /// parts (other operands are skipped).
+/// The object a chain of receiver-returning calls starts from: `res` for `res.status(404).type('html')`
+/// (see [`Pack::receiver_methods`]); any other expression is its own receiver.
+fn receiver_of_chain<'a, 'b>(mut expr: &'a Expression<'b>) -> &'a Expression<'b> {
+    while let Expression::CallExpression(call) = expr.get_inner_expression() {
+        let Some(member) = call.callee.get_inner_expression().as_member_expression() else {
+            break;
+        };
+        if !member
+            .static_property_name()
+            .is_some_and(|name| has(&m().receiver_methods, name.as_str().unwrap_or("")))
+        {
+            break;
+        }
+        expr = member.object();
+    }
+    expr
+}
+
+/// Literal text that holds HTML markup: a tag opening or closing (`<h1`, `</p`, `<!--`).
+fn looks_like_markup(text: &str) -> bool {
+    text.as_bytes().windows(2).any(|pair| {
+        matches!(pair, [b'<', next] if next.is_ascii_alphabetic() || matches!(next, b'/' | b'!'))
+    })
+}
+
 fn literal_parts<'a>(expr: &'a Expression<'_>, out: &mut Vec<&'a str>) {
     match expr.get_inner_expression() {
         Expression::StringLiteral(lit) => {
@@ -1804,6 +1834,7 @@ fn response_of_value(mut o: Origin, s: &Summary) -> Origin {
         o.object = true;
         o.built = false;
         o.sqlish = false;
+        o.htmlish = false;
         o.prefix = true;
         o.escaped = 0;
         o.primary_escaped = 0;
@@ -2813,6 +2844,7 @@ fn summary_returns(
             origin.map(|mut o| {
                 o.built |= at.built;
                 o.sqlish |= at.sqlish;
+                o.htmlish |= at.htmlish;
                 o.prefix &= at.prefix;
                 o.object &= at.object;
                 o.escaped |= at.escaped;
@@ -5304,6 +5336,7 @@ impl Walker<'_> {
                                 built: false,
                                 prefix: true,
                                 sqlish: false,
+                                htmlish: false,
                                 escaped: 0,
                                 param: None,
                                 // As for `req.body`: only a parsed body or query can hold objects.
@@ -5891,6 +5924,7 @@ impl Walker<'_> {
                     built: false,
                     prefix: true,
                     sqlish: false,
+                    htmlish: false,
                     escaped: 0,
                     param: None,
                     // `@Param('id')`, `@Headers()`: strings.
@@ -5940,6 +5974,7 @@ impl Walker<'_> {
                     built: false,
                     prefix: true,
                     sqlish: false,
+                    htmlish: false,
                     escaped: 0,
                     param: Some(index),
                     object: true,
@@ -6042,6 +6077,7 @@ impl Walker<'_> {
                         built: false,
                         prefix: true,
                         sqlish: false,
+                        htmlish: false,
                         escaped: 0,
                         param: None,
                         // GraphQL arguments are typed by the schema.
@@ -6963,6 +6999,10 @@ impl Walker<'_> {
                             .quasis
                             .iter()
                             .any(|q| m().looks_like_sql(q.value.raw.as_str()));
+                        origin.htmlish |= template
+                            .quasis
+                            .iter()
+                            .any(|q| looks_like_markup(q.value.raw.as_str()));
                         let leading = index == 0
                             && template.quasis.first().is_some_and(|q| {
                                 q.value
@@ -6994,19 +7034,21 @@ impl Walker<'_> {
                 let right = self.expr(&binary.right, env);
                 if binary.operator == BinaryOperator::Addition {
                     // Any literal text on either side: `'SELECT ...' + ' WHERE n = ' + x`.
-                    let sqlish = [&binary.left, &binary.right].iter().any(|side| {
-                        let mut parts = Vec::new();
-                        literal_parts(side, &mut parts);
-                        parts.iter().any(|t| m().looks_like_sql(t))
-                    });
+                    let mut parts = Vec::new();
+                    literal_parts(&binary.left, &mut parts);
+                    literal_parts(&binary.right, &mut parts);
+                    let sqlish = parts.iter().any(|t| m().looks_like_sql(t));
+                    let htmlish = parts.iter().any(|t| looks_like_markup(t));
                     let left = left.map(|mut o| {
                         o.built = true;
                         o.sqlish |= sqlish;
+                        o.htmlish |= htmlish;
                         o
                     });
                     let right = right.map(|mut o| {
                         o.built = true;
                         o.sqlish |= sqlish;
+                        o.htmlish |= htmlish;
                         o.prefix = false;
                         o.step(binary.span.start, "concatenated".to_owned())
                     });
@@ -7937,6 +7979,7 @@ impl Walker<'_> {
                 object: true,
                 built: false,
                 sqlish: false,
+                htmlish: false,
                 escaped: 0,
                 primary_escaped: 0,
                 response: true,
@@ -8583,6 +8626,7 @@ impl Walker<'_> {
                 built: false,
                 prefix: true,
                 sqlish: false,
+                htmlish: false,
                 escaped: 0,
                 param: None,
                 object: property.as_deref().is_some_and(|p| {
@@ -8917,6 +8961,12 @@ impl Walker<'_> {
                             // held in a field, or a framework router read off a host object
                             // (`RED.httpAdmin.post(...)`): keep the member path when it names a
                             // router so the registration is attributed to it.
+                            // `res.status(404).send(...)`: named after the response the chain of
+                            // receiver-returning calls starts from.
+                            Expression::CallExpression(_) => match receiver_of_chain(object) {
+                                Expression::Identifier(id) => Some(id.name.as_str().to_owned()),
+                                _ => None,
+                            },
                             other => member_path(other)
                                 .filter(|path| self.routers.contains(path) || self.is_router(path)),
                         };
@@ -9865,12 +9915,13 @@ impl Walker<'_> {
                 ..
             } if env.plain.contains(object) => None,
             Callee::Method { method, .. } => {
-                // `document.write(...)` before any `write(...)`.
+                // `document.write(...)` before any `write(...)`; `res.status(404).send(...)` is
+                // `res.send(...)` when `status` returns its receiver.
                 let qualified = call
                     .callee
                     .get_inner_expression()
                     .as_member_expression()
-                    .and_then(|mem| guards::path_key(mem.object()))
+                    .and_then(|mem| guards::path_key(receiver_of_chain(mem.object())))
                     .map(|object| format!("{object}.{method}"));
                 qualified
                     .and_then(|q| m().method_sink(&q))
@@ -10229,6 +10280,7 @@ impl Walker<'_> {
                 let Some(origin) = origin.map(|mut o| {
                     o.built |= at.built;
                     o.sqlish |= at.sqlish;
+                    o.htmlish |= at.htmlish;
                     o.prefix &= at.prefix;
                     o.object &= at.object;
                     o.escaped |= at.escaped;
@@ -10344,6 +10396,7 @@ impl Walker<'_> {
                             built: false,
                             prefix: true,
                             sqlish: false,
+                            htmlish: false,
                             escaped: 0,
                             param: None,
                             object: true,
@@ -10445,6 +10498,7 @@ impl Walker<'_> {
                         built: false,
                         prefix: true,
                         sqlish: false,
+                        htmlish: false,
                         escaped: 0,
                         param: None,
                         object: true,
@@ -13563,6 +13617,7 @@ impl Walker<'_> {
             }
             let built = at_sink.built || origin.built;
             let sqlish = at_sink.sqlish || origin.sqlish;
+            let htmlish = at_sink.htmlish || origin.htmlish;
             // A raw SQL fragment (`orderByRaw`) is SQL whatever the text looks like.
             let fragment = sink_for_api(&summary.api)
                 .is_some_and(|s| s.args.iter().any(|r| matches!(r, ArgRule::Fragment(_))));
@@ -13570,6 +13625,14 @@ impl Walker<'_> {
                 continue;
             }
             if summary.class == VulnClass::Xss && !built {
+                continue;
+            }
+            // A response body is HTML only with markup in it, unless the sink also takes plain
+            // built text (Express answers a string as HTML).
+            if sink_for_api(&summary.api).is_some_and(|s| {
+                s.args.iter().any(|r| matches!(r, ArgRule::Markup(_))) && s.also.is_empty()
+            }) && !htmlish
+            {
                 continue;
             }
             // Route params and headers are strings: no NoSQL operator objects.
@@ -13589,6 +13652,7 @@ impl Walker<'_> {
             let mut origin = origin;
             origin.built = built;
             origin.sqlish = sqlish;
+            origin.htmlish = htmlish;
             let mut origin = origin.step(call_span.start, format!("passed to `{name}()`"));
             for step in summary.steps.iter().filter(|_| summary.ext.is_none()) {
                 if origin.steps.len() < MAX_STEPS {
@@ -13829,6 +13893,13 @@ impl Walker<'_> {
                         .cloned()
                         .flatten()
                         .filter(|o| o.built || (self.summarize && o.param.is_some())),
+                ),
+                // A response body built with HTML markup in its literal text.
+                ArgRule::Markup(index) => (
+                    index,
+                    taints.get(index).cloned().flatten().filter(|o| {
+                        (o.built && o.htmlish) || (self.summarize && o.param.is_some())
+                    }),
                 ),
                 ArgRule::Object(index) => (index, self.object_query(index, arguments, taints, env)),
                 // `knex('t').orderByRaw('"t"."' + field + '"')`: text that is SQL by contract.
@@ -16261,6 +16332,73 @@ mod tests {
         );
         // A read keyed by attacker data out of a fixed table is the table's.
         assert!(scan("const ALLOWED = new Map([['a', '/a']]); location.href = ALLOWED.get(location.hash.slice(1)) || '/';").is_empty());
+    }
+
+    #[test]
+    fn a_request_value_built_into_an_html_response_is_reflected_xss() {
+        let xss = |src: &str| -> Vec<(Severity, String)> {
+            scan(src)
+                .into_iter()
+                .filter(|f| f.0 == VulnClass::Xss)
+                .map(|f| (f.1, f.2))
+                .collect()
+        };
+        // Markup in the text: a page for sure.
+        assert_eq!(
+            xss(
+                "app.get('/hi', (req, res) => { res.send('<h1>Hello ' + req.query.name + '</h1>'); });"
+            ),
+            vec![(Severity::High, "res.send".to_owned())]
+        );
+        assert_eq!(
+            xss(
+                "app.get('/hi', (req, res) => { res.send(`<p>${req.params.id} not found</p>`); });"
+            )
+            .len(),
+            1
+        );
+        // At the end of a chain of calls that return the response.
+        assert_eq!(
+            xss(
+                "app.get('/hi', (req, res) => { res.status(404).send('<p>No ' + req.query.q + '</p>'); });"
+            ),
+            vec![(Severity::High, "res.send".to_owned())]
+        );
+        // Through a variable.
+        assert_eq!(
+            xss("app.get('/hi', (req, res) => { const page = '<div>' + req.query.q + '</div>'; res.send(page); });")
+                .len(),
+            1
+        );
+        // Express answers plain built text as HTML too: a weaker sign.
+        assert_eq!(
+            xss(
+                "app.get('/hi', (req, res) => { res.send('User ' + req.params.id + ' not found'); });"
+            ),
+            vec![(Severity::Medium, "res.send".to_owned())]
+        );
+        // Node's raw response: only a body with markup is a page.
+        assert_eq!(
+            xss("http.createServer((req, res) => { const q = new URL(req.url, 'http://x').searchParams.get('q'); res.end('<b>' + q + '</b>'); });")
+                .len(),
+            1
+        );
+        assert!(xss("http.createServer((req, res) => { res.end('id=' + req.url); });").is_empty());
+        // Escaped, a bare value, or an object answered as JSON: no page markup from the request.
+        assert!(
+            xss("app.get('/hi', (req, res) => { res.send('<h1>' + escapeHtml(req.query.name) + '</h1>'); });")
+                .is_empty()
+        );
+        assert!(xss("app.get('/hi', (req, res) => { res.send(req.query.name); });").is_empty());
+        assert!(
+            xss("app.get('/hi', (req, res) => { res.send({ name: req.query.name }); });")
+                .is_empty()
+        );
+        // Another object's `send` is no response.
+        assert!(
+            xss("app.get('/hi', (req, res) => { socket.send('<b>' + req.query.q + '</b>'); });")
+                .is_empty()
+        );
     }
 
     #[test]

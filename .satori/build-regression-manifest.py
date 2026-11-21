@@ -165,7 +165,7 @@ def main() -> int:
     parser.add_argument(
         "--organization",
         default=os.environ.get("SATORI_ORGANIZATION") or None,
-        help="Satori organization [default: SATORI_ORGANIZATION]",
+        help="Satori organization [default: SATORI_ORGANIZATION, else the Satori CLI's own]",
     )
     parser.add_argument(
         "--monitor-runs",
@@ -189,8 +189,6 @@ def main() -> int:
         default=Path(".satori/exploitability-targets.json"),
     )
     args = parser.parse_args()
-    if not args.organization:
-        parser.error("--organization or SATORI_ORGANIZATION is required")
 
     if not shutil.which("satori-v2"):
         parser.error("satori-v2 is required")
@@ -203,7 +201,8 @@ def main() -> int:
         if line.strip() and not line.lstrip().startswith("#")
     }
     env = os.environ.copy()
-    env["SATORI_ORGANIZATION"] = str(args.organization)
+    if args.organization:
+        env["SATORI_ORGANIZATION"] = str(args.organization)
     response = command_json(["satori-v2", "advisories", "--json", "-l", "200"], env=env)
     advisories = [
         advisory
@@ -256,7 +255,7 @@ def main() -> int:
     manifest = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source_organization": str(args.organization),
+        "source_organization": str(args.organization) if args.organization else None,
         "repositories": len({case["repository"] for case in cases}),
         "positive_repositories": len(
             {

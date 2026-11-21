@@ -795,20 +795,13 @@ mod repository_input_tests {
     #[test]
     fn self_heal_is_skipped_where_it_cannot_run() {
         let checkout = tempfile::tempdir().unwrap();
-        let organization = std::ffi::OsStr::new("13");
         // A binary away from its checkout scans without self-heal.
-        assert!(self_heal_unavailable(None, Some(organization)).is_some());
-        let missing = self_heal_unavailable(Some(checkout.path()), Some(organization)).unwrap();
+        assert!(self_heal_unavailable(None).is_some());
+        let missing = self_heal_unavailable(Some(checkout.path())).unwrap();
         assert!(missing.contains("JSSPECTOR_SOURCE_ROOT"), "{missing}");
         std::fs::create_dir_all(checkout.path().join(".satori")).unwrap();
         std::fs::write(checkout.path().join(".satori/self-heal.sh"), "").unwrap();
-        // No organization is assumed.
-        let unset = self_heal_unavailable(Some(checkout.path()), None).unwrap();
-        assert!(unset.contains("SATORI_ORGANIZATION"), "{unset}");
-        assert!(
-            self_heal_unavailable(Some(checkout.path()), Some(std::ffi::OsStr::new(""))).is_some()
-        );
-        let reason = || self_heal_unavailable(Some(checkout.path()), Some(organization));
+        let reason = || self_heal_unavailable(Some(checkout.path()));
         assert!(reason().unwrap().contains("not a git checkout"));
 
         // A published, clean checkout self-heals; one self-heal.sh would refuse does not.
@@ -1067,13 +1060,9 @@ fn self_heal_source_root() -> Option<PathBuf> {
 }
 
 /// Why a --repo scan cannot self-heal here, if it cannot: a binary away from its JSSpector
-/// checkout, no Satori organization to read the benchmark from, or a checkout self-heal would
-/// refuse to synchronize (uncommitted changes, unpublished commits, no upstream). Such a scan
-/// goes on without self-heal instead of failing.
-fn self_heal_unavailable(
-    source_root: Option<&Path>,
-    organization: Option<&std::ffi::OsStr>,
-) -> Option<String> {
+/// checkout, or a checkout self-heal would refuse to synchronize (uncommitted changes,
+/// unpublished commits, no upstream). Such a scan goes on without self-heal instead of failing.
+fn self_heal_unavailable(source_root: Option<&Path>) -> Option<String> {
     let Some(source_root) = source_root else {
         return Some(
             "the JSSpector source checkout is unknown; set JSSPECTOR_SOURCE_ROOT".to_owned(),
@@ -1085,9 +1074,6 @@ fn self_heal_unavailable(
             "no JSSpector source checkout at {}; set JSSPECTOR_SOURCE_ROOT",
             source_root.display()
         ));
-    }
-    if organization.is_none_or(std::ffi::OsStr::is_empty) {
-        return Some("SATORI_ORGANIZATION is not set".to_owned());
     }
     let git = |args: &[&str]| {
         ProcessCommand::new("git")
@@ -1301,11 +1287,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
         && std::env::var_os("JSSPECTOR_SELF_HEAL_ACTIVE").is_none()
     {
         let source_root = self_heal_source_root();
-        let organization = std::env::var_os("SATORI_ORGANIZATION");
-        match (
-            self_heal_unavailable(source_root.as_deref(), organization.as_deref()),
-            source_root,
-        ) {
+        match (self_heal_unavailable(source_root.as_deref()), source_root) {
             (None, Some(source_root)) => {
                 return match self_heal_repository_scan(&source_root, repository) {
                     Ok(code) => code,

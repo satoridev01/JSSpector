@@ -1,0 +1,40 @@
+{
+  "recipe": "b7cdc20222bc3d34",
+  "finding": "0fdb31e93b1d30d6",
+  "file": "app.js",
+  "original_fingerprint": "69e65b5ffe384713",
+  "hunks": [
+    {
+      "line": 108,
+      "old": [
+        "  var id = req.body.id",
+        "  var oldId = req.body.id"
+      ],
+      "new": [
+        "  var id = path.basename(String(req.body.id))",
+        "  var oldId = id"
+      ]
+    },
+    {
+      "line": 115,
+      "old": [
+        "  var tempId = req.body.tempId // temp music folder"
+      ],
+      "new": [
+        "  var tempId = req.body.tempId == undefined ? undefined : path.basename(String(req.body.tempId)) // temp music folder",
+        "  if (id == '.' || id == '..' || tempId == '.' || tempId == '..')",
+        "    return res.status(400).send({error: 'invalid id'})"
+      ]
+    },
+    {
+      "line": 407,
+      "old": [
+        "",
+        ""
+      ],
+      "new": []
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request POST \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/save' \\\n  --header 'Content-Type: application/json' \\\n  --data-raw '{\"tempId\":\"../../../../../../../../../../../../tmp/jss-canary-read.d\",\"id\":\"jsspector\",\"lilyPondVal\":\"jsspector\",\"makenew\":\"true\",\"shortHandVal\":\"jsspector\",\"version\":\"jsspector\"}'",
+  "benign_status": 500
+}

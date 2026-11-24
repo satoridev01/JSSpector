@@ -1,0 +1,408 @@
+{
+  "admission": "xtask corpus verify must resolve >=1 in-scope advisory per repo and >=15 per batch; failing repos are swapped from reserves",
+  "batches": [
+    {
+      "batch": 1,
+      "milestone": "M1",
+      "repos": [
+        {
+          "repo": "mongo-express/mongo-express"
+        },
+        {
+          "repo": "louislam/dockge"
+        },
+        {
+          "repo": "louislam/uptime-kuma"
+        },
+        {
+          "repo": "frangoteam/FUXA"
+        },
+        {
+          "repo": "ether/etherpad"
+        },
+        {
+          "repo": "advplyr/audiobookshelf"
+        },
+        {
+          "repo": "SillyTavern/SillyTavern"
+        },
+        {
+          "repo": "chartbrew/chartbrew"
+        },
+        {
+          "repo": "MagicMirrorOrg/MagicMirror"
+        },
+        {
+          "repo": "NodeBB/NodeBB"
+        }
+      ],
+      "theme": "Smoke: small Express/socket.io"
+    },
+    {
+      "batch": 2,
+      "milestone": "M2",
+      "repos": [
+        {
+          "repo": "hedgedoc/hedgedoc",
+          "scan_hint": "advisories target 1.x: replay on release tags"
+        },
+        {
+          "repo": "apostrophecms/apostrophe"
+        },
+        {
+          "repo": "saltcorn/saltcorn"
+        },
+        {
+          "repo": "node-red/node-red"
+        },
+        {
+          "repo": "docmost/docmost"
+        },
+        {
+          "repo": "Unleash/unleash"
+        },
+        {
+          "repo": "verdaccio/verdaccio"
+        },
+        {
+          "repo": "Mintplex-Labs/anything-llm"
+        },
+        {
+          "repo": "Chocobozzz/PeerTube"
+        },
+        {
+          "repo": "samanhappy/mcphub"
+        }
+      ],
+      "theme": "Medium Express/Koa/Fastify apps"
+    },
+    {
+      "batch": 3,
+      "milestone": "M2",
+      "repos": [
+        {
+          "repo": "fastify/fastify"
+        },
+        {
+          "repo": "koajs/koa"
+        },
+        {
+          "repo": "honojs/hono"
+        },
+        {
+          "repo": "feathersjs/feathers"
+        },
+        {
+          "repo": "nestjs/nest"
+        },
+        {
+          "repo": "h3js/h3"
+        },
+        {
+          "repo": "plankanban/planka"
+        },
+        {
+          "repo": "parse-community/parse-server"
+        },
+        {
+          "repo": "socketio/socket.io"
+        },
+        {
+          "repo": "sveltejs/kit"
+        }
+      ],
+      "theme": "Framework cores (raw node:http sources)"
+    },
+    {
+      "batch": 4,
+      "milestone": "M3",
+      "repos": [
+        {
+          "repo": "umami-software/umami"
+        },
+        {
+          "repo": "ChatGPTNextWeb/NextChat"
+        },
+        {
+          "repo": "decolua/9router"
+        },
+        {
+          "repo": "Dokploy/dokploy"
+        },
+        {
+          "repo": "baptisteArno/typebot.io"
+        },
+        {
+          "repo": "calcom/cal.diy"
+        },
+        {
+          "repo": "lukevella/rallly"
+        },
+        {
+          "repo": "homarr-labs/homarr"
+        },
+        {
+          "repo": "Mail-0/Zero"
+        },
+        {
+          "repo": "karakeep-app/karakeep"
+        }
+      ],
+      "theme": "Next.js / Remix / Workers apps"
+    },
+    {
+      "batch": 5,
+      "milestone": "M3",
+      "repos": [
+        {
+          "repo": "keystonejs/keystone"
+        },
+        {
+          "repo": "vendurehq/vendure"
+        },
+        {
+          "repo": "hoppscotch/hoppscotch"
+        },
+        {
+          "repo": "twentyhq/twenty"
+        },
+        {
+          "repo": "heyform/heyform"
+        },
+        {
+          "repo": "requarks/wiki",
+          "scan_hint": "advisories target v2: replay on release tags"
+        },
+        {
+          "repo": "directus/directus"
+        },
+        {
+          "repo": "teableio/teable"
+        },
+        {
+          "repo": "payloadcms/payload"
+        },
+        {
+          "repo": "strapi/strapi"
+        }
+      ],
+      "theme": "GraphQL / NestJS / headless CMS"
+    },
+    {
+      "batch": 6,
+      "milestone": "M4",
+      "repos": [
+        {
+          "repo": "electerm/electerm"
+        },
+        {
+          "repo": "Eugeny/tabby"
+        },
+        {
+          "repo": "dbgate/dbgate"
+        },
+        {
+          "repo": "laurent22/joplin"
+        },
+        {
+          "repo": "TriliumNext/Trilium"
+        },
+        {
+          "repo": "Foundry376/Mailspring"
+        },
+        {
+          "repo": "usebruno/bruno"
+        },
+        {
+          "repo": "dyad-sh/dyad"
+        },
+        {
+          "repo": "streetwriters/notesnook"
+        },
+        {
+          "repo": "siyuan-note/siyuan",
+          "scan_hint": "TS/Electron parts only (Go kernel out of scope)"
+        }
+      ],
+      "theme": "Electron / IPC"
+    },
+    {
+      "batch": 7,
+      "milestone": "M4",
+      "repos": [
+        {
+          "repo": "jupyterlab/jupyterlab"
+        },
+        {
+          "repo": "scalar/scalar"
+        },
+        {
+          "repo": "mozilla/pdf.js"
+        },
+        {
+          "repo": "decaporg/decap-cms"
+        },
+        {
+          "repo": "jellyfin/jellyfin-web"
+        },
+        {
+          "repo": "mermaid-js/mermaid"
+        },
+        {
+          "repo": "open-webui/open-webui",
+          "scan_hint": "frontend only (Python backend out of scope)"
+        },
+        {
+          "repo": "angular/angular"
+        },
+        {
+          "repo": "tinacms/tinacms"
+        },
+        {
+          "repo": "remix-run/react-router"
+        }
+      ],
+      "theme": "DOM / SPA / client rendering"
+    },
+    {
+      "batch": 8,
+      "milestone": "M4",
+      "repos": [
+        {
+          "repo": "vitejs/vite"
+        },
+        {
+          "repo": "webpack/webpack-dev-server"
+        },
+        {
+          "repo": "storybookjs/storybook"
+        },
+        {
+          "repo": "modelcontextprotocol/inspector"
+        },
+        {
+          "repo": "cloudflare/workers-sdk"
+        },
+        {
+          "repo": "nuxt/nuxt"
+        },
+        {
+          "repo": "withastro/astro"
+        },
+        {
+          "repo": "QwikDev/qwik"
+        },
+        {
+          "repo": "renovatebot/renovate"
+        },
+        {
+          "repo": "orval-labs/orval"
+        }
+      ],
+      "theme": "Dev servers / CLI / MCP"
+    },
+    {
+      "batch": 9,
+      "milestone": "M5",
+      "repos": [
+        {
+          "repo": "outline/outline"
+        },
+        {
+          "repo": "misskey-dev/misskey"
+        },
+        {
+          "repo": "immich-app/immich"
+        },
+        {
+          "repo": "activepieces/activepieces"
+        },
+        {
+          "repo": "triggerdotdev/trigger.dev"
+        },
+        {
+          "repo": "Openpanel-dev/openpanel"
+        },
+        {
+          "repo": "gitroomhq/postiz-app"
+        },
+        {
+          "repo": "LibreChat-AI/LibreChat"
+        },
+        {
+          "repo": "OneUptime/oneuptime"
+        },
+        {
+          "repo": "FlowiseAI/Flowise",
+          "scan_hint": "archived: replay only"
+        }
+      ],
+      "theme": "Large AI / queue-heavy apps"
+    },
+    {
+      "batch": 10,
+      "milestone": "M5",
+      "repos": [
+        {
+          "repo": "n8n-io/n8n"
+        },
+        {
+          "repo": "openclaw/openclaw",
+          "scan_hint": "gateway packages only"
+        },
+        {
+          "repo": "Budibase/budibase"
+        },
+        {
+          "repo": "nocodb/nocodb"
+        },
+        {
+          "repo": "RocketChat/Rocket.Chat"
+        },
+        {
+          "repo": "wekan/wekan"
+        },
+        {
+          "repo": "vercel/next.js",
+          "scan_hint": "packages/next"
+        },
+        {
+          "repo": "TryGhost/Ghost",
+          "scan_hint": "ghost/core"
+        },
+        {
+          "repo": "backstage/backstage",
+          "scan_hint": "*-backend plugins"
+        },
+        {
+          "repo": "react/react",
+          "scan_hint": "RSC/Flight + react-dom server packages"
+        }
+      ],
+      "theme": "Huge monorepos (package-scoped)"
+    }
+  ],
+  "generated": "2026-10-31",
+  "holdout": {
+    "drawn_from": "reserves",
+    "rule": "fixed seed at M0; never debugged against",
+    "size": 10
+  },
+  "reserves": [
+    "labring/FastGPT",
+    "lobehub/lobehub",
+    "Shelf-nu/shelf.nu",
+    "logto-io/logto",
+    "nocobase/nocobase",
+    "firecrawl/firecrawl",
+    "paperclipai/paperclip",
+    "zereight/gitlab-mcp",
+    "better-auth/better-auth",
+    "documenso/documenso",
+    "linkwarden/linkwarden",
+    "actualbudget/actual",
+    "rajnandan1/kener",
+    "gethomepage/homepage",
+    "novuhq/novu"
+  ]
+}

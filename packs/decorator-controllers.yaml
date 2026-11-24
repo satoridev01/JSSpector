@@ -1,0 +1,10 @@
+# Decorator-based controllers besides NestJS: routing-controllers and n8n's @n8n/decorators.
+name: decorator-controllers
+routes:
+  controller_decorators: [RestController, JsonController]
+  route_decorators: [Get, Post, Put, Patch, Delete, Head, Options, All]
+  # n8n: every @RestController route requires a logged-in user unless the route says otherwise.
+  controller_auth: {RestController: user}
+  public_options: [skipAuth, allowUnauthorized, isPublic]
+request:
+  decorators: [QueryParam, QueryParams, BodyParam, HeaderParam, HeaderParams, CookieParam, CookieParams, Params, UploadedFile, UploadedFiles]

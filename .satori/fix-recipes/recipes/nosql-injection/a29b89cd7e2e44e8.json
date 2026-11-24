@@ -1,0 +1,13 @@
+{
+  "id": "a29b89cd7e2e44e8",
+  "class": "nosql-injection",
+  "sink": "findOne",
+  "introduces": [
+    "String"
+  ],
+  "before": "const user = await User.findOne({ username, password });",
+  "after": "const user = await User.findOne({ username: String(username), password: String(password) });",
+  "proven": 5,
+  "offered": 6,
+  "first_try": 6
+}

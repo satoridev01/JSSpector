@@ -1,0 +1,14 @@
+{
+  "id": "84bcae0cf279f933",
+  "class": "path-traversal",
+  "sink": "createWriteStream",
+  "introduces": [
+    "sep",
+    "startsWith"
+  ],
+  "before": "if (absolutePath.includes(path.resolve('.'))) {",
+  "after": "if (absolutePath.startsWith(path.resolve('uploads/complaints') + path.sep)) {",
+  "proven": 1,
+  "offered": 16,
+  "first_try": 13
+}

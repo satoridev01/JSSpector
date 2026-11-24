@@ -1,0 +1,15 @@
+{
+  "id": "545694e690ecd89c",
+  "class": "path-traversal",
+  "sink": "createReadStream",
+  "introduces": [
+    "resolve",
+    "sep",
+    "startsWith"
+  ],
+  "before": "if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {",
+  "after": "if (!path.resolve(filePath).startsWith(path.resolve(DIST) + path.sep) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

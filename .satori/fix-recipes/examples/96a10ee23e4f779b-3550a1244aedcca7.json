@@ -1,0 +1,19 @@
+{
+  "recipe": "f0df3fa57de935e2",
+  "finding": "96a10ee23e4f779b",
+  "file": "app.js",
+  "original_fingerprint": "3550a1244aedcca7",
+  "hunks": [
+    {
+      "line": 24,
+      "old": [
+        "    ? res.send(`<h1>Você está na página do Produto #${id}</h1>`)"
+      ],
+      "new": [
+        "    ? res.send(`<h1>Você está na página do Produto #${String(id).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;')}</h1>`)"
+      ]
+    }
+  ],
+  "poc": "open 'http://TARGET_HOST/produtos/%3Cscript%3Edocument.write%2860991%2A14217%29%3C%2Fscript%3E'",
+  "benign_status": 200
+}

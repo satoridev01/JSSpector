@@ -1,0 +1,14 @@
+# The n8n node SDK (n8n-workflow), which every n8n node and community node is written against.
+name: n8n-nodes
+result_sources:
+  # Node parameters: set in the workflow editor (an editor-level attacker).
+  - {methods: [getNodeParameter], kind: workflow-param}
+  # Webhook and Form triggers: the request (unauthenticated by default).
+  - {methods: [getBodyData, getQueryData, getHeaderData, getParamsData, getRequestObject], kind: http}
+  # Items from upstream nodes.
+  - {methods: [assertBinaryData, getInputData, getBinaryDataBuffer], kind: workflow-item}
+sinks:
+  - {methods: [copyBinaryFile, writeContentToFile], class: path-traversal, severity: high, args: ["any:0"]}
+severity_caps:
+  workflow-param: high
+  workflow-item: medium

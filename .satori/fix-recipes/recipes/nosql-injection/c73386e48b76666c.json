@@ -1,0 +1,14 @@
+{
+  "id": "c73386e48b76666c",
+  "class": "nosql-injection",
+  "sink": "exists",
+  "introduces": [
+    "String",
+    "typeof"
+  ],
+  "before": "if (slug) or.push({ slug }, { pastSlugs: slug });\nif (ignoreId) query._id = { $ne: ignoreId };",
+  "after": "if (typeof name !== \"string\") name = String(name || \"\");\nif (slug) or.push({ slug: String(slug) }, { pastSlugs: String(slug) });\nif (ignoreId) query._id = { $ne: String(ignoreId) };",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

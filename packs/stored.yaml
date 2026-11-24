@@ -1,0 +1,18 @@
+# Data a request stores through an ORM or ODM, read back by a later request (second-order flows):
+# a field an object-literal write sets from request data is attacker-controlled wherever a record
+# loaded from the same store reads it. The engine links the write and the read by field name across
+# the project.
+name: stored
+stored:
+  # Methods that save the fields of an object argument.
+  write_methods: [update, updateOne, updateMany, create, upsert, bulkCreate, insertOne, insertMany, findOrCreate,
+    findByIdAndUpdate, findOneAndUpdate, save, set]
+  # Methods that load a record (or records) of a model.
+  read_methods: [findByPk, findOne, findAll, findById, findUnique, findFirst, findOneBy, findOneOrFail,
+    findUniqueOrThrow, findFirstOrThrow, findOneAndUpdate]
+  # Keys whose object value holds the saved fields (`{ data: { name } }`, `{ $set: { name } }`).
+  wrappers: [data, defaults, $set, values, set]
+  # Only where the project uses one of these: elsewhere `update` and `findOne` are the app's own methods.
+  requires: [sequelize, mongoose, "@prisma/client", prisma, typeorm, "@mikro-orm/core", objection, bookshelf,
+    "sequelize-typescript", "@nestjs/typeorm", "@nestjs/mongoose", "@nestjs/sequelize", typegoose,
+    "@typegoose/typegoose", waterline, mongodb]

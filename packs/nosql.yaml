@@ -1,0 +1,17 @@
+# MongoDB / Mongoose: a tainted value that may be an object (`{ "$ne": null }`) used as a query.
+name: nosql
+sinks:
+  - methods: [find, findOne, findOneAndUpdate, findOneAndDelete, findOneAndReplace, updateOne, updateMany,
+      deleteOne, deleteMany, countDocuments, findById, exists, aggregate, distinct, replaceOne]
+    class: nosql-injection
+    severity: high
+    args: ["object:0", "object-after-name:1"]
+    # Only where a MongoDB driver (or a Meteor app's collections) is in the project: elsewhere
+    # `.find()` is an ORM's or the app's own method.
+    requires: [mongoose, mongodb, monk, mongojs, mongoist, "@nestjs/mongoose", "@typegoose/typegoose",
+      typegoose, nedb, "@seald-io/nedb", nedb-promises, "@mikro-orm/mongodb", camo, papr, mongorito, meteor]
+  - {methods: [$where], class: code-injection, severity: critical, args: ["any:0"]}
+# The operand of these operators is compared as a value: `{ email: { $eq: x } }` is safe.
+literal_operators: [$eq, $ne, $in, $nin, $gt, $gte, $lt, $lte, $all, $size]
+# ORM options that wrap a filter (TypeORM, Sequelize): their operators cannot come from JSON.
+orm_options: [where, select, order, orderBy, include, attributes, relations, skip, take, limit]

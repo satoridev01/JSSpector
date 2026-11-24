@@ -1,0 +1,8 @@
+# Multipart form parsers (busboy, @fastify/busboy, formidable, multiparty): field values, field
+# names and file names (`info.filename`, `file.originalFilename`) arrive in parser events. The
+# temporary path and generated name of a stored upload are the server's.
+name: multipart
+client_sources:
+  - {methods: [on, once], event: field, params: all, kind: http}
+  - {methods: [on, once], event: file, params: all, kind: http, server_fields: [path, filepath, newFilename, size, hash]}
+  - {methods: [on, once], event: fileBegin, params: all, kind: http, server_fields: [path, filepath, newFilename, size, hash]}

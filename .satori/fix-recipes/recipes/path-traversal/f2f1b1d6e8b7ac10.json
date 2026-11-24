@@ -1,0 +1,14 @@
+{
+  "id": "f2f1b1d6e8b7ac10",
+  "class": "path-traversal",
+  "sink": "unlinkSync",
+  "introduces": [
+    "String",
+    "replace"
+  ],
+  "before": "var id = req.body.id\nvar oldId = req.body.id",
+  "after": "var id = String(req.body.id).replace(/[^A-Za-z0-9_-]/g, '')\nvar oldId = id",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

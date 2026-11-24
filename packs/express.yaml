@@ -1,0 +1,48 @@
+# Express, and the request shape Fastify, Hapi and Node's IncomingMessage share.
+name: express
+request:
+  server_factories: [createServer]
+  names: [req, request]
+  props: [body, query, params, headers, cookies, signedCookies, payload, files, file, url, originalUrl, path]
+  methods: [get, param, header, json, text, formData, query, parseBody]
+  upload_server_fields: [path, filename, destination, size]
+  upload_objects: [file, files]
+  sub_objects: [request, req]
+  object_props: [body, query, payload]
+  # Express 5 parses the query string with the simple parser: strings and arrays, no objects.
+  scalar_props_from: [{package: express, major: 5, props: [query]}]
+routes:
+  methods: [get, post, put, patch, delete, del, all, use, options, head, route]
+  mount_methods: [use]
+  # `app.route('/book').get(list).post(create)`
+  chain_methods: [route]
+  # `router.route('POST', '/users', handler)` (parse-server's PromiseRouter and the like)
+  verb_first_methods: [route]
+  # A mount path held in a variable named like one (`app.use(config.panelPath, guard)`): what is
+  # mounted there guards a path the walker cannot read, not every route.
+  mount_path_words: [path, prefix, url, route, base, mount, endpoint]
+  verbs: [get, post, put, patch, delete, del, head, options, all]
+  factories: [express, Router, express.Router, createServer, polka, connect]
+  names: [app, router, server, api, routes, route, apirouter, application, express]
+  # `api.get('/users', params).then(...)`, `await api.put(url, data)`: a client's request (a
+  # registration returns its router, not a promise).
+  promise_methods: [then, catch, finally]
+  # `api.get(url, params, (err, result) => ...)`: an error-first callback answers a request sent.
+  callback_error_params: [err, error]
+# Response methods that return the response itself: `res.status(404).send(...)` is `res.send(...)`.
+receiver_methods: [status, type, contentType, set, header, append, cookie, clearCookie, location, vary,
+  links, attachment]
+sinks:
+  # A string body is answered as an HTML page: a request value built into it is reflected XSS.
+  # Markup in the literal text makes it a page for sure; Express's `send` also answers plain built
+  # text as `text/html`, a weaker sign. A browser's own data never reaches a server response.
+  - {methods: [res.send, response.send], class: xss, severity: high, args: ["markup:0"],
+     also: [{args: ["built:0"], severity: medium}],
+     ignore_kinds: [dom, props, ext-message, ext-internal, postmessage]}
+  # Node's raw `write`/`end` set no content type of their own: only a body with markup is a page.
+  - {methods: [res.write, res.end, response.write, response.end], class: xss, severity: high,
+     args: ["markup:0"], ignore_kinds: [dom, props, ext-message, ext-internal, postmessage]}
+  # A `root` option confines these (engine rule).
+  # Never a browser's `chrome.downloads.download()`: browser-side sources do not reach Express.
+  - {methods: [sendFile, download], class: path-traversal, severity: high, args: ["any:0"], confined_by: [root],
+     ignore_kinds: [dom, props, ext-message, ext-internal, postmessage]}

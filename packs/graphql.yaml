@@ -1,0 +1,19 @@
+# GraphQL resolvers: `(parent, args, context, info)`; `args` is client data.
+name: graphql
+client_sources:
+  - {methods: [Query, Mutation, Subscription], shape: resolver-map, params: second, kind: graphql}
+request:
+  # Resolver arguments are typed by the schema: no operator objects.
+  scalar_kinds: [graphql]
+tool_objects:
+  # graphql-js field configs: `{ type, args: {...}, resolve(source, args, context) }`.
+  - schema_keys: [args]
+    handler_keys: [resolve]
+    params: second
+    kind: graphql
+  # graphql-relay mutations: `mutationWithClientMutationId({ inputFields, mutateAndGetPayload(input) })`.
+  - schema_keys: [inputFields]
+    handler_keys: [mutateAndGetPayload]
+    params: first
+    name_keys: [name]
+    kind: graphql

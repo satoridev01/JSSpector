@@ -1,0 +1,19 @@
+{
+  "recipe": "840faf0e3b71c81c",
+  "finding": "58647121dab68bdb",
+  "file": "routes/search.ts",
+  "original_fingerprint": "dbf42996384f5faa",
+  "hunks": [
+    {
+      "line": 23,
+      "old": [
+        "    models.sequelize.query(`SELECT * FROM Products WHERE ((name LIKE '%${criteria}%' OR description LIKE '%${criteria}%') AND deletedAt IS NULL) ORDER BY name`) // vuln-code-snippet vuln-line unionSqlInjectionChallenge dbSchemaChallenge"
+      ],
+      "new": [
+        "    models.sequelize.query('SELECT * FROM Products WHERE ((name LIKE $1 OR description LIKE $2) AND deletedAt IS NULL) ORDER BY name', { bind: [`%${String(criteria)}%`, `%${String(criteria)}%`] }) // vuln-code-snippet vuln-line unionSqlInjectionChallenge dbSchemaChallenge"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request GET \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/rest/products/search?q=jssqlv18e93fd774a4898011235d%27%29%29%20OR%201%3D1--%20'",
+  "benign_status": 200
+}

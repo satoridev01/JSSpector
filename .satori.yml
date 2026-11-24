@@ -1,0 +1,40 @@
+settings:
+  name: "JSSpector: test/s"
+  description: "Builds jsspector and creates one online Satori report per repository in CORPUS; use class:<finding-class> to replay one vulnerability class"
+  image: node:24-bookworm
+  cpu: 8192
+  memory: 16384
+  timeout: 43200
+  redacted:
+    - SATORI_TOKEN
+  example: satori-v2 run . --visibility private -d CORPUS=.satori/exploitability-targets.txt -d SATORI_ORGANIZATION=13 -d SATORI_TOKEN="$SATORI_TOKEN" --sync --report
+
+install:
+  setShell: true
+  run:
+    - apt-get update -qq && apt-get install -y -qq build-essential ca-certificates chromium curl git gnupg jq libssl-dev pkg-config procps python3 python3-venv redis-server
+    - service redis-server stop >/dev/null 2>&1 || true
+    - curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | gpg --batch --yes --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main" > /etc/apt/sources.list.d/mongodb-org-8.0.list && apt-get update -qq && apt-get install -y -qq mongodb-org-server mongodb-mongosh
+    - curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - python3 -m venv /opt/satori-cli && /opt/satori-cli/bin/pip install --quiet git+https://github.com/satorici/cli-v2@aca8315bdf74f489fee3895bb3c1bb53502455fb
+
+corpus:
+  assertReturnCode: 0
+  run:
+    - |
+      export PATH="/opt/satori-cli/bin:$HOME/.cargo/bin:$PATH"
+      export JSSPECTOR_BINARY="$PWD/target/release/jsspector"
+      export JSSPECTOR_ROOT="$PWD"
+      export CORPUS="${{CORPUS}}"
+      export SATORI_ORGANIZATION="${{SATORI_ORGANIZATION}}"
+      export SATORI_TOKEN="${{SATORI_TOKEN}}"
+      satori-v2 config token "${{SATORI_TOKEN}}" >/dev/null
+      export JSS_VERIFY_RUNTIME=local
+      export JSS_VERIFY_DEBUG="${JSS_VERIFY_DEBUG:-1}"
+      # Build from the uploaded checkout in the non-cached execution phase. Building in `install`
+      # can reuse an older binary even when this run contains newer verifier source.
+      cargo build --release --locked -p jsspector
+      scan_rc=0
+      sh .satori/run-local-reports.sh || scan_rc=$?
+      cargo clean
+      exit "$scan_rc"

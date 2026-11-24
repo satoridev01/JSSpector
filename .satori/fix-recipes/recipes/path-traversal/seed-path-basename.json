@@ -1,0 +1,14 @@
+{
+  "id": "seed-path-basename",
+  "class": "path-traversal",
+  "sink": "",
+  "introduces": [
+    "basename"
+  ],
+  "note": "Reduce the request-controlled segment to its base name before joining it to the base directory, so ../ sequences cannot leave it.",
+  "before": "const filepath = path.join(FILES, req.params.filename);",
+  "after": "const filepath = path.join(FILES, path.basename(req.params.filename));",
+  "proven": 0,
+  "offered": 14,
+  "first_try": 11
+}

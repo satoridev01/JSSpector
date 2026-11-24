@@ -1,0 +1,73 @@
+{
+  "recipe": "f18d77d22b894b3f",
+  "finding": "2868a858b883c833",
+  "file": "routes/profileImageUrlUpload.ts",
+  "original_fingerprint": "f58663122c67dbe9",
+  "hunks": [
+    {
+      "line": 7,
+      "old": [],
+      "new": [
+        "import net from 'node:net'",
+        "import dns from 'node:dns/promises'"
+      ]
+    },
+    {
+      "line": 16,
+      "old": [],
+      "new": [
+        "const forbiddenAddresses = new net.BlockList()",
+        "forbiddenAddresses.addSubnet('0.0.0.0', 8, 'ipv4')",
+        "forbiddenAddresses.addSubnet('10.0.0.0', 8, 'ipv4')",
+        "forbiddenAddresses.addSubnet('100.64.0.0', 10, 'ipv4')",
+        "forbiddenAddresses.addSubnet('127.0.0.0', 8, 'ipv4')",
+        "forbiddenAddresses.addSubnet('169.254.0.0', 16, 'ipv4')",
+        "forbiddenAddresses.addSubnet('172.16.0.0', 12, 'ipv4')",
+        "forbiddenAddresses.addSubnet('192.0.0.0', 24, 'ipv4')",
+        "forbiddenAddresses.addSubnet('192.168.0.0', 16, 'ipv4')",
+        "forbiddenAddresses.addSubnet('198.18.0.0', 15, 'ipv4')",
+        "forbiddenAddresses.addSubnet('224.0.0.0', 4, 'ipv4')",
+        "forbiddenAddresses.addSubnet('240.0.0.0', 4, 'ipv4')",
+        "forbiddenAddresses.addSubnet('::', 127, 'ipv6')",
+        "forbiddenAddresses.addSubnet('::ffff:0:0', 96, 'ipv6')",
+        "forbiddenAddresses.addSubnet('64:ff9b::', 96, 'ipv6')",
+        "forbiddenAddresses.addSubnet('fc00::', 7, 'ipv6')",
+        "forbiddenAddresses.addSubnet('fe80::', 10, 'ipv6')",
+        "forbiddenAddresses.addSubnet('ff00::', 8, 'ipv6')",
+        "",
+        "async function assertPublicHttpUrl (url: unknown) {",
+        "  if (typeof url !== 'string') {",
+        "    throw new Error('image url must be a string')",
+        "  }",
+        "  const parsed = new URL(url)",
+        "  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {",
+        "    throw new Error('image url uses a forbidden protocol')",
+        "  }",
+        "  const hostname = parsed.hostname.replace(/^\\[/, '').replace(/\\]$/, '')",
+        "  const addresses = await dns.lookup(hostname, { all: true })",
+        "  if (addresses.length === 0) {",
+        "    throw new Error('image url host could not be resolved')",
+        "  }",
+        "  for (const { address, family } of addresses) {",
+        "    if (forbiddenAddresses.check(address, family === 6 ? 'ipv6' : 'ipv4')) {",
+        "      throw new Error('image url points to a forbidden address')",
+        "    }",
+        "  }",
+        "}",
+        ""
+      ]
+    },
+    {
+      "line": 24,
+      "old": [
+        "          const response = await fetch(url)"
+      ],
+      "new": [
+        "          await assertPublicHttpUrl(url)",
+        "          const response = await fetch(url, { redirect: 'error' })"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request POST \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/profile/image/url' \\\n  --header 'Cookie: REDACTED' \\\n  --header 'Authorization: REDACTED' \\\n  --header 'Content-Type: application/x-www-form-urlencoded' \\\n  --data-raw 'imageUrl=http%3A%2F%2Fjss-marker%2F18e93ffe35b133f011235d-1solve%2Fchallenges%2Fserver-sidex'",
+  "benign_status": 302
+}

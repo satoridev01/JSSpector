@@ -1,0 +1,1468 @@
+//! The entry-point inventory: every route with its full path, linked across files.
+//!
+//! Each file reports the routes it registers (on a router variable), the routers it mounts under
+//! a prefix, and its exports and resolved imports. Mounts are followed across files (imports
+//! resolve to a file, exports name the router there), prefixes are joined, and file-system
+//! conventions (Next.js `app/**/route.ts`, `pages/api/**`) give the path of file routes.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+use jss_core::Auth;
+use serde::Serialize;
+
+use crate::scan::{ScanReport, ScanStatus};
+
+/// One entry point.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Route {
+    /// HTTP method, `ANY`, or the event kind (`SOCKET`, `IPC`, `QUEUE`, ...).
+    pub method: String,
+    /// Full path with mount prefixes (OpenAPI style: `{id}`), or the event name.
+    pub path: String,
+    pub file: String,
+    pub line: u32,
+    /// For a route a helper registers: its own `router.get(...)` call (file, line).
+    #[serde(skip)]
+    pub at: Option<(String, u32)>,
+    pub handler: String,
+    /// What the IR resolves the handler by: the handler, or a function written in another file
+    /// (`<at>:file#name`, a route a helper registers inline).
+    #[serde(skip)]
+    pub handler_ref: String,
+    /// Named middleware reached before `handler_ref`, with authentication in force at each one.
+    #[serde(skip)]
+    pub handler_refs: Vec<(String, Auth)>,
+    pub auth: Auth,
+    /// `http`, `socket`, `ipc`, `graphql`, `trpc`, `queue`, ...
+    pub kind: String,
+    /// Request inputs the handler reads: `query.q`, `body.email`.
+    pub inputs: Vec<String>,
+    /// An inline handler walked as part of `handler` (its enclosing function): the handler's
+    /// first and last lines. It reaches the findings there, not the whole of `handler`.
+    #[serde(skip)]
+    pub lines: Option<(u32, u32)>,
+}
+
+/// Links findings to the entry points that reach them: each route's handler is resolved to a
+/// function through the IR, the call graph is followed from the handlers, and every finding in a
+/// reached function gets the route (`entry`) and, when stronger, the route's authentication (an
+/// admin-only route lowers the severity one level).
+pub fn attach_entries(root: &Path, reports: &mut [ScanReport]) {
+    let (scoped, routes): (Vec<Route>, Vec<Route>) = inventory(root, reports)
+        .into_iter()
+        .partition(|r| r.lines.is_some());
+    let modules: Vec<jss_core::ir::Module> = reports.iter().map(|r| r.module.clone()).collect();
+    let by_file: BTreeMap<&str, &jss_core::ir::Module> =
+        modules.iter().map(|m| (m.file.as_str(), m)).collect();
+    let graph = jss_core::ir::link(&modules);
+    // Weakest authentication first: a function reached from a public route and from an admin
+    // route is reachable without logging in.
+    let mut entries: Vec<(Auth, String, jss_core::ir::FunctionId, jss_core::EntryLoc)> = routes
+        .iter()
+        .flat_map(|route| {
+            std::iter::once((&route.handler_ref, route.auth))
+                .chain(
+                    route
+                        .handler_refs
+                        .iter()
+                        .map(|(handler, auth)| (handler, *auth)),
+                )
+                .filter_map(|(handler, auth)| {
+                    jss_core::ir::resolve_reference(&by_file, &route.file, handler).map(|target| {
+                        (
+                            auth,
+                            format!("{} {}", route.method, route.path),
+                            target,
+                            match &route.at {
+                                Some((file, line)) => jss_core::EntryLoc {
+                                    file: file.clone(),
+                                    line: *line,
+                                },
+                                None => jss_core::EntryLoc {
+                                    file: route.file.clone(),
+                                    line: route.line,
+                                },
+                            },
+                        )
+                    })
+                })
+        })
+        .collect();
+    entries.sort();
+    let roots: Vec<jss_core::ir::FunctionId> = entries
+        .iter()
+        .map(|(_, _, target, _)| target.clone())
+        .collect();
+    let labels: Vec<(String, Auth, jss_core::EntryLoc)> = entries
+        .into_iter()
+        .map(|(auth, label, _, at)| (label, auth, at))
+        .collect();
+    let reached = jss_core::ir::reachable(&graph, &roots);
+    // For a request-sourced finding, prefer the route that actually forwards the request object
+    // into the function reading it. A route whose call graph reaches the function only by passing a
+    // freshly constructed object (a background job rebuilding `{ query, body }`) does not deliver the
+    // attacker's `req.query.<field>` there, so it is not a genuine HTTP entry; fall back to plain
+    // reachability when no route forwards a request (nothing is lost that was linked before).
+    let reached_fwd = jss_core::ir::reachable_forwarding(&modules, &roots);
+    let model = crate::taint::models::model();
+    for report in reports.iter_mut() {
+        for finding in &mut report.findings {
+            let id = (finding.file.clone(), finding.function.clone());
+            let index = if finding.source.kind == "http" {
+                reached_fwd.get(&id).or_else(|| reached.get(&id))
+            } else {
+                reached.get(&id)
+            };
+            let Some((label, auth, at)) = index.and_then(|index| labels.get(*index)) else {
+                // Browser-side data no route reaches: the page or the component it enters.
+                let kind: &str = finding.source.kind;
+                if model.page_kinds.iter().any(|k| k == kind) {
+                    finding.entry = Some(format!("PAGE {}", finding.file));
+                } else if model.props_kind.as_deref() == Some(kind) {
+                    finding.entry = Some(format!("COMPONENT {}", finding.function));
+                }
+                continue;
+            };
+            finding.entry = Some(label.clone());
+            finding.entry_at = Some(at.clone());
+            raise_auth(finding, *auth);
+        }
+    }
+    // Inline handlers walked inside another function: the findings whose source and sink both
+    // lie in the handler's lines (and in this file), weakest authentication first.
+    let mut scoped = scoped;
+    scoped.sort_by_key(|r| r.auth);
+    // A `stored` source is read where an earlier request saved it: name that request.
+    let stored = crate::scan::stored_fields(reports);
+    for report in reports.iter_mut() {
+        for finding in &mut report.findings {
+            if finding.source.kind != "stored" {
+                continue;
+            }
+            let Some(write) = finding
+                .source
+                .expr
+                .rsplit('.')
+                .next()
+                .and_then(|field| stored.get(field))
+            else {
+                continue;
+            };
+            // The function the write is in: the last one that starts at or before it.
+            let writer = by_file.get(write.file.as_str()).and_then(|module| {
+                module
+                    .functions
+                    .iter()
+                    .filter(|function| function.line <= write.line)
+                    .max_by_key(|function| function.line)
+                    .map(|function| (write.file.clone(), function.name.clone()))
+            });
+            let entry = writer
+                .and_then(|id| reached.get(&id))
+                .and_then(|index| labels.get(*index))
+                .map(|(label, _, _)| label.clone())
+                .or_else(|| {
+                    scoped
+                        .iter()
+                        .find(|r| {
+                            r.file == write.file
+                                && r.lines.is_some_and(|(first, last)| {
+                                    (first..=last).contains(&write.line)
+                                })
+                        })
+                        .map(|r| format!("{} {}", r.method, r.path))
+                });
+            finding.stored_by = Some(jss_core::StoredBy {
+                entry,
+                expr: write.expr.clone(),
+                file: write.file.clone(),
+                line: write.line,
+            });
+        }
+    }
+    for report in reports.iter_mut() {
+        for finding in &mut report.findings {
+            if finding.entry.is_some() || finding.sink.file.is_some() {
+                continue;
+            }
+            let Some(route) = scoped.iter().find(|r| {
+                r.file == finding.file
+                    && r.handler_ref == finding.function
+                    && r.lines.is_some_and(|(first, last)| {
+                        (first..=last).contains(&finding.sink.line)
+                            && (first..=last).contains(&finding.source.line)
+                    })
+            }) else {
+                continue;
+            };
+            finding.entry = Some(format!("{} {}", route.method, route.path));
+            finding.entry_at = Some(jss_core::EntryLoc {
+                file: route.file.clone(),
+                line: route.line,
+            });
+            raise_auth(finding, route.auth);
+        }
+    }
+}
+
+/// A finding takes the stronger authentication of the entry that reaches it; an admin-only
+/// entry lowers its severity one level.
+fn raise_auth(finding: &mut jss_core::Finding, auth: Auth) {
+    if auth > finding.auth {
+        if auth == Auth::Admin && finding.auth != Auth::Admin {
+            finding.severity = match finding.severity {
+                jss_core::Severity::Critical => jss_core::Severity::High,
+                jss_core::Severity::High => jss_core::Severity::Medium,
+                _ => jss_core::Severity::Low,
+            };
+        }
+        finding.auth = auth;
+    }
+}
+
+/// A router: a variable in a file.
+type RouterId = (String, String);
+
+/// A `use` registration whose mounted value is a middleware the factory returns rather than a
+/// sub-router (`app.use('/mcp', createMcpProxy(base))`). Turned into a `USE` route entry on the
+/// returned handler.
+struct HandlerMount {
+    /// The router the middleware is registered on (file, variable).
+    parent: RouterId,
+    /// The path prefix it is mounted under.
+    prefix: String,
+    /// Authentication middleware applied alongside the mount.
+    auth: Auth,
+    /// The file defining the returned handler.
+    handler_file: String,
+    /// The returned handler's function name.
+    handler: String,
+    /// The handler's definition line.
+    line: u32,
+    /// The `app.use(...)` registration site (file, line) — where the route, and any config gate
+    /// enabling it, is written.
+    at: (String, u32),
+}
+
+/// Whether a mount's resolved child is a request-handler function (middleware) rather than a
+/// sub-router, with its definition line. A `use` mount's value is either a router or a middleware;
+/// a router is always a *variable* (`const r = Router()`, or what a factory returns), never one of
+/// the module's own functions, so a child that names a defined function is middleware. This covers a
+/// handler mounted directly (`app.use('/mcp', mcpProxy)`) and one a factory returns
+/// (`app.use('/mcp', createMcpProxy(base))`, which resolves through the factory's returned function).
+fn middleware_handler(by_file: &BTreeMap<&str, &ScanReport>, child: &RouterId) -> Option<u32> {
+    by_file
+        .get(child.0.as_str())?
+        .module
+        .functions
+        .iter()
+        .find(|f| f.name == child.1)
+        .map(|f| f.line)
+}
+
+/// Builds the inventory from scan reports.
+pub fn inventory(root: &Path, reports: &[ScanReport]) -> Vec<Route> {
+    let by_file: BTreeMap<&str, &ScanReport> = reports
+        .iter()
+        .filter(|r| r.status == ScanStatus::Scanned)
+        .map(|r| (r.rel_path.as_str(), r))
+        .collect();
+    let next_middleware = next_middleware_policies(root, reports);
+    // Directory-prefix routing applied by `@fastify/autoload` (computed once for the repo).
+    let autoload_dirs = autoload_dir_names(root);
+
+    // Mount edges: child router -> (parent router, prefix).
+    let mut parents: BTreeMap<RouterId, Vec<(RouterId, String, Auth)>> = BTreeMap::new();
+    // `app.use('/mcp', createMcpProxy(base))`: a mount whose "child" is not a sub-router but the
+    // request handler a factory returns (`return function mcpProxy(req, res) { ... }`). Recorded
+    // as a `USE` entry on that returned handler once the parent's own prefixes are known, so the
+    // sink inside the handler has a drivable entry instead of being lost as an empty router mount.
+    let mut handler_mounts: Vec<HandlerMount> = Vec::new();
+    for (file, report) in &by_file {
+        for mount in &report.module.mounts {
+            let Some(parent) = &mount.receiver else {
+                continue;
+            };
+            let child = match (&mount.target, &mount.target_file) {
+                (Some(local), _) => resolve_local(&by_file, file, local),
+                (None, Some(target_file)) => locate_export(
+                    &by_file,
+                    target_file,
+                    mount.target_export.as_deref().unwrap_or("default"),
+                    0,
+                ),
+                (None, None) => None,
+            };
+            if let Some(child) = child {
+                if let Some(line) = middleware_handler(&by_file, &child) {
+                    handler_mounts.push(HandlerMount {
+                        parent: (file.to_string(), parent.clone()),
+                        prefix: mount.prefix.clone(),
+                        auth: mount.auth,
+                        handler: child.1,
+                        handler_file: child.0,
+                        line,
+                        at: (file.to_string(), mount.line),
+                    });
+                    continue;
+                }
+                parents.entry(child).or_default().push((
+                    (file.to_string(), parent.clone()),
+                    mount.prefix.clone(),
+                    mount.auth,
+                ));
+            }
+        }
+    }
+
+    let mut routes = BTreeSet::new();
+    let mut memo = BTreeMap::new();
+    // A middleware-factory mount (`app.use('/mcp', createMcpProxy(base))`) becomes a `USE` entry on
+    // the handler the factory returns, under every prefix the parent router is itself reachable at.
+    for hm in &handler_mounts {
+        for (prefix, mount_auth) in prefixes(&parents, &hm.parent, &mut memo) {
+            routes.insert(Route {
+                method: "USE".to_owned(),
+                path: join(&prefix, &hm.prefix),
+                file: hm.handler_file.clone(),
+                line: hm.line,
+                // Report the entry at the `app.use(...)` registration site, not the handler body.
+                at: Some(hm.at.clone()),
+                handler: hm.handler.clone(),
+                handler_ref: hm.handler.clone(),
+                handler_refs: Vec::new(),
+                auth: hm.auth.max(mount_auth),
+                kind: "http".to_owned(),
+                inputs: Vec::new(),
+                lines: None,
+            });
+        }
+    }
+    // Registrations a caller resolved onto one of its routers: a registrar's route instantiated
+    // where a router is handed in (`files(router)`), by the registrar's own call site, with the
+    // routers it landed on.
+    let mut resolved: BTreeMap<(&str, u32, &str), Vec<RouterId>> = BTreeMap::new();
+    // Call sites recorded directly where they are written (on the registrar's router parameter).
+    let mut direct: BTreeSet<(&str, u32, &str)> = BTreeSet::new();
+    for (file, report) in &by_file {
+        for entry in &report.module.entries {
+            match (&entry.at, &entry.receiver) {
+                (Some((site, line)), Some(receiver)) => {
+                    let owner = entry.receiver_file.as_deref().unwrap_or(file);
+                    let routers = resolved
+                        .entry((site.as_str(), *line, entry.method.as_str()))
+                        .or_default();
+                    let router = (owner.to_string(), receiver.clone());
+                    if !routers.contains(&router) {
+                        routers.push(router);
+                    }
+                }
+                (None, _) => {
+                    direct.insert((*file, entry.line, entry.method.as_str()));
+                }
+                _ => {}
+            }
+        }
+    }
+    for (file, report) in &by_file {
+        for entry in &report.module.entries {
+            // A registration written on the registrar's router parameter is reported once, from its
+            // own call site (where its handler resolves), under the prefixes of the routers its
+            // callers hand in. The copies instantiated at those callers, and a middle registrar's
+            // copy that knows no router, only repeat it.
+            if let Some((site, line)) = &entry.at {
+                let key = (site.as_str(), *line, entry.method.as_str());
+                if direct.contains(&key) && resolved.contains_key(&key) {
+                    continue;
+                }
+                if entry.receiver.is_none() && resolved.contains_key(&key) {
+                    continue;
+                }
+            }
+            let handed_in = entry
+                .at
+                .is_none()
+                .then(|| resolved.get(&(*file, entry.line, entry.method.as_str())))
+                .flatten();
+            let prefixes = match (handed_in, &entry.receiver) {
+                (Some(routers), _) => {
+                    let mut all: Vec<(String, Auth)> = Vec::new();
+                    for router in routers {
+                        for prefix in prefixes(&parents, router, &mut memo) {
+                            if !all.contains(&prefix) {
+                                all.push(prefix);
+                            }
+                        }
+                    }
+                    all
+                }
+                // A route added through another file's helper is on that file's router.
+                (None, Some(receiver)) => {
+                    let owner = entry.receiver_file.as_deref().unwrap_or(file);
+                    prefixes(&parents, &(owner.to_string(), receiver.clone()), &mut memo)
+                }
+                (None, None) => vec![(String::new(), Auth::NoneDetected)],
+            };
+            let path = match entry.kind.as_str() {
+                kind @ ("file-route" | "default-export") => match file_route_path(file, kind) {
+                    Some(path) => path,
+                    None => continue,
+                },
+                _ => entry.path.clone(),
+            };
+            let provider = resource_prefix(root, file, entry.line).unwrap_or_default();
+            let autoload = autoload_prefix(&autoload_dirs, file).unwrap_or_default();
+            for (prefix, mount_auth) in prefixes {
+                let full = if entry.kind == "http" || entry.kind == "file-route" {
+                    openapi_path(&join(&prefix, &join(&autoload, &join(&provider, &path))))
+                } else {
+                    path.clone()
+                };
+                let middleware_auth =
+                    matches!(entry.kind.as_str(), "file-route" | "default-export")
+                        .then(|| next_middleware_auth(&next_middleware, file, &full))
+                        .unwrap_or_default();
+                let auth = entry.auth.max(mount_auth).max(middleware_auth);
+                routes.insert(Route {
+                    method: entry.method.clone(),
+                    path: full,
+                    file: file.to_string(),
+                    line: entry.line,
+                    at: entry.at.clone(),
+                    // `<at>:src/api/admin.js#POST /x` reads as the function's name.
+                    handler: entry
+                        .handler
+                        .strip_prefix(jss_core::ir::ELSEWHERE)
+                        .and_then(|r| r.split_once('#'))
+                        .map_or_else(|| entry.handler.clone(), |(_, name)| name.to_owned()),
+                    handler_ref: entry.handler.clone(),
+                    handler_refs: entry
+                        .handlers
+                        .iter()
+                        .map(|handler| {
+                            (
+                                handler.handler.clone(),
+                                handler.auth.max(mount_auth).max(middleware_auth),
+                            )
+                        })
+                        .collect(),
+                    auth,
+                    kind: if entry.kind == "default-export" || entry.kind == "file-route" {
+                        "http".to_owned()
+                    } else {
+                        entry.kind.clone()
+                    },
+                    inputs: entry
+                        .inputs
+                        .iter()
+                        .map(|(l, n)| format!("{l}.{n}"))
+                        .collect(),
+                    lines: entry.lines,
+                });
+            }
+        }
+    }
+    routes.into_iter().collect()
+}
+
+#[derive(Debug)]
+struct NextMiddleware {
+    scope: String,
+    exclusions: Vec<String>,
+}
+
+/// Authentication enforced by a Next.js `middleware.ts` before file-system routes run.
+///
+/// Middleware is project-wide and therefore cannot be attached while scanning one route file.
+/// Recover the conservative, common shape here: a cookie/session/authorization check that returns
+/// a `NextResponse.redirect` (or a 401/403 response), with either no matcher or a negative-lookahead
+/// matcher whose literal public prefixes can be honored exactly.
+fn next_middleware_policies(root: &Path, reports: &[ScanReport]) -> Vec<NextMiddleware> {
+    reports
+        .iter()
+        .filter(|report| report.status == ScanStatus::Scanned)
+        .filter_map(|report| {
+            let path = Path::new(&report.rel_path);
+            let name = path.file_name()?.to_str()?;
+            if !matches!(name, "middleware.js" | "middleware.ts") {
+                return None;
+            }
+            let source = std::fs::read_to_string(root.join(path)).ok()?;
+            let lower = source.to_ascii_lowercase();
+            let reads_identity = [
+                "authorization",
+                "accesstoken",
+                "access_token",
+                "idtoken",
+                "id_token",
+                "session",
+                "currentuser",
+                "current_user",
+                "gettoken(",
+                "get_token(",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker));
+            let rejects = lower.contains("nextresponse.redirect")
+                || lower.contains("status: 401")
+                || lower.contains("status:401")
+                || lower.contains("status: 403")
+                || lower.contains("status:403");
+            if !reads_identity || !rejects {
+                return None;
+            }
+            let mut exclusions = next_matcher_exclusions(&source)?;
+            exclusions.extend(next_middleware_public_prefixes(&source));
+            exclusions.sort();
+            exclusions.dedup();
+            let parent = path.parent()?;
+            let scope = if parent.file_name().and_then(|part| part.to_str()) == Some("src") {
+                parent.parent().unwrap_or_else(|| Path::new(""))
+            } else {
+                parent
+            };
+            Some(NextMiddleware {
+                scope: scope.to_string_lossy().trim_matches('/').to_owned(),
+                exclusions,
+            })
+        })
+        .collect()
+}
+
+/// Literal public prefixes in `/((?!api/auth|_next/static|...).*)`; an unfamiliar explicit
+/// matcher is left unclassified rather than claiming authentication outside its scope.
+fn next_matcher_exclusions(source: &str) -> Option<Vec<String>> {
+    if !source.contains("matcher") {
+        return Some(Vec::new());
+    }
+    let after = source.split_once("(?!")?.1;
+    let group = after.split_once(')')?.0;
+    let exclusions: Vec<String> = group
+        .split('|')
+        .map(|part| part.trim().trim_start_matches('^').trim_start_matches('/'))
+        .filter(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
+        })
+        .map(str::to_owned)
+        .collect();
+    (!exclusions.is_empty()).then_some(exclusions)
+}
+
+/// Literal pathname prefixes that an authentication middleware deliberately lets through.
+///
+/// Next applications often use a broad matcher and perform the real exclusion in the guard:
+///
+/// ```js
+/// const isApiRoute = pathname.startsWith("/api/");
+/// if (!token && !isApiRoute) return NextResponse.redirect(...);
+/// ```
+///
+/// The matcher alone makes `/api/x` look authenticated. Recover only the conservative form above:
+/// a named `pathname.startsWith(<literal>)` predicate used as a negated conjunct of the condition
+/// that redirects unauthenticated traffic. Conditions containing `||` are intentionally ignored,
+/// because the named predicate would not necessarily suppress the redirect by itself.
+fn next_middleware_public_prefixes(source: &str) -> Vec<String> {
+    let bindings = next_path_prefix_bindings(source);
+    let mut public = BTreeSet::new();
+    for condition in next_redirect_conditions(source) {
+        if condition.contains("||") {
+            continue;
+        }
+        for (name, prefixes) in &bindings {
+            if contains_negated_identifier(&condition, name) {
+                public.extend(prefixes.iter().cloned());
+            }
+        }
+    }
+    public.into_iter().collect()
+}
+
+/// `const isApi = pathname.startsWith("/api/")`: predicate name -> literal prefixes.
+fn next_path_prefix_bindings(source: &str) -> BTreeMap<String, Vec<String>> {
+    let mut bindings = BTreeMap::new();
+    for statement in source.split(';') {
+        let Some(equal) = statement.find('=') else {
+            continue;
+        };
+        let Some(left) = statement.get(..equal) else {
+            continue;
+        };
+        let Some(name) = left
+            .split_whitespace()
+            .last()
+            .filter(|name| js_identifier(name))
+        else {
+            continue;
+        };
+        let Some(right) = statement.get(equal + 1..) else {
+            continue;
+        };
+        let mut rest = right;
+        let mut prefixes = Vec::new();
+        while let Some(at) = rest.find("pathname.startsWith") {
+            let Some(after) = rest.get(at + "pathname.startsWith".len()..) else {
+                break;
+            };
+            let Some(open) = after.find('(') else {
+                break;
+            };
+            let Some(argument) = after.get(open + 1..).map(str::trim_start) else {
+                break;
+            };
+            let Some(quote @ ('\'' | '"')) = argument.chars().next() else {
+                let Some(next) = after.get(open + 1..) else {
+                    break;
+                };
+                rest = next;
+                continue;
+            };
+            let Some(value) = argument.get(quote.len_utf8()..) else {
+                break;
+            };
+            let Some(end) = value.find(quote) else {
+                break;
+            };
+            let Some(prefix) = value.get(..end).map(|value| value.trim_start_matches('/')) else {
+                break;
+            };
+            if !prefix.is_empty()
+                && prefix
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
+            {
+                prefixes.push(prefix.to_owned());
+            }
+            let Some(next) = value.get(end + quote.len_utf8()..) else {
+                break;
+            };
+            rest = next;
+        }
+        if !prefixes.is_empty() {
+            bindings.insert(name.to_owned(), prefixes);
+        }
+    }
+    bindings
+}
+
+fn js_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+/// Conditions of `if (...)` statements whose branch redirects with `NextResponse.redirect`.
+fn next_redirect_conditions(source: &str) -> Vec<String> {
+    let lower = source.to_ascii_lowercase();
+    let mut conditions = Vec::new();
+    for (redirect, _) in lower.match_indices("nextresponse.redirect") {
+        let Some(before) = source.get(..redirect) else {
+            continue;
+        };
+        let candidates: Vec<(usize, &str)> = before.match_indices("if").collect();
+        for (at, _) in candidates.into_iter().rev() {
+            let boundary = |ch: Option<char>| ch.is_none_or(|ch| !js_identifier_char(ch));
+            if !boundary(before.get(..at).and_then(|text| text.chars().next_back()))
+                || !boundary(before.get(at + 2..).and_then(|text| text.chars().next()))
+            {
+                continue;
+            }
+            let Some(after_if) = before.get(at + 2..) else {
+                continue;
+            };
+            let Some(relative_open) = after_if.find('(') else {
+                continue;
+            };
+            let open = at + 2 + relative_open;
+            let Some(close) = matching_paren(source, open) else {
+                continue;
+            };
+            if close < redirect {
+                if let Some(condition) = source.get(open + 1..close) {
+                    conditions.push(condition.to_owned());
+                }
+                break;
+            }
+        }
+    }
+    conditions
+}
+
+fn js_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
+/// Closing parenthesis for `source[open] == '('`, skipping quoted JavaScript strings.
+fn matching_paren(source: &str, open: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let tail = bytes.get(open..)?;
+    for (offset, byte) in tail.iter().copied().enumerate() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => quote = Some(byte),
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn contains_negated_identifier(condition: &str, name: &str) -> bool {
+    let bytes = condition.as_bytes();
+    for (at, _) in condition.match_indices(name) {
+        let Some(before) = condition.get(..at).map(str::trim_end) else {
+            continue;
+        };
+        if !before.ends_with('!') || before.ends_with("!=") {
+            continue;
+        }
+        let left = at
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index))
+            .copied();
+        let right = bytes.get(at + name.len()).copied();
+        if left.is_none_or(|ch| !js_identifier_char(ch as char))
+            && right.is_none_or(|ch| !js_identifier_char(ch as char))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn public_prefix_matches(public: &str, route: &str) -> bool {
+    if public.ends_with('/') {
+        route.starts_with(public)
+    } else {
+        route == public
+            || route
+                .strip_prefix(public)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+fn next_middleware_auth(policies: &[NextMiddleware], file: &str, route: &str) -> Auth {
+    let route = route.trim_start_matches('/');
+    policies
+        .iter()
+        .filter(|policy| {
+            policy.scope.is_empty()
+                || file == policy.scope
+                || file
+                    .strip_prefix(&policy.scope)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .filter(|policy| {
+            !policy
+                .exclusions
+                .iter()
+                .any(|public| public_prefix_matches(public, route))
+        })
+        .map(|_| Auth::User)
+        .max()
+        .unwrap_or_default()
+}
+
+/// The directory basenames a repository autoloads with `@fastify/autoload`. Each autoloaded
+/// directory turns its subdirectory names into route prefixes (`dirNameRoutePrefix`, on by default),
+/// so a route plugin's deployed path carries the directory chain above it. A bounded scan reads the
+/// source files that import `@fastify/autoload` and extracts the trailing path-literal of each `dir:`
+/// option (`dir: path.join(__dirname, "routes")` -> `routes`); the basename alone is kept so the
+/// prefix can be anchored on the matching ancestor directory without resolving the app's own base
+/// path (`__dirname`, a custom `rootPath` helper). Empty when the repo does not use autoload.
+fn autoload_dir_names(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    let mut budget: u32 = 4000;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 10 {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return names;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_dir() {
+                if name == "node_modules" || name.starts_with('.') {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            } else if matches!(
+                std::path::Path::new(name.as_ref())
+                    .extension()
+                    .and_then(|e| e.to_str()),
+                Some("js" | "mjs" | "cjs" | "ts" | "mts" | "cts")
+            ) {
+                budget -= 1;
+                let Ok(source) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                if !source.contains("@fastify/autoload") {
+                    continue;
+                }
+                for line in source.lines() {
+                    if let Some(rest) = line.split_once("dir:").map(|(_, r)| r)
+                        && let Some(basename) = autoload_dir_literal(rest)
+                    {
+                        names.insert(basename);
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The directory basename named by the last quoted string literal in a `dir:` option expression:
+/// `path.join(__dirname, "./routes")` -> `routes`. `None` when the expression has no string literal
+/// (a fully computed directory the scan cannot read).
+fn autoload_dir_literal(expr: &str) -> Option<String> {
+    let mut last = None;
+    let mut chars = expr.char_indices();
+    while let Some((at, quote)) = chars.next() {
+        if matches!(quote, '"' | '\'' | '`') {
+            let start = at + quote.len_utf8();
+            let Some((end, _)) = chars.by_ref().find(|(_, candidate)| *candidate == quote) else {
+                break;
+            };
+            last = expr.get(start..end);
+        }
+    }
+    let literal = last?.trim_end_matches('/');
+    let basename = literal.rsplit('/').next()?.trim();
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || !basename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(basename.to_owned())
+}
+
+/// The route prefix `@fastify/autoload` derives from a route plugin's directory position. For a file
+/// under an autoloaded directory, the subdirectory names between that directory and the file become
+/// the prefix (`<autoload-dir>/api/utils/index.js` -> `/api/utils`); the file name itself never
+/// contributes a segment. `None` when the repo does not autoload, or the file sits at an autoloaded
+/// directory root (no enclosing subdirectory, so no prefix).
+fn autoload_prefix(dir_names: &std::collections::BTreeSet<String>, file: &str) -> Option<String> {
+    if dir_names.is_empty() {
+        return None;
+    }
+    let components: Vec<&str> = Path::new(file)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    let file_idx = components.len().checked_sub(1)?;
+    // The deepest autoloaded ancestor directory yields the most specific prefix.
+    let anchor = components
+        .get(..file_idx)?
+        .iter()
+        .rposition(|segment| dir_names.contains(*segment))?;
+    let segments = components.get(anchor + 1..file_idx)?;
+    if segments.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
+/// OS.js-style provider modules register routes through `proc.resource(path)`, which prefixes the
+/// deployed path with `/apps/<metadata.name>`. Recover that prefix from the package's metadata so
+/// findings, verification requests and exported inventories all name the real endpoint.
+fn resource_prefix(root: &Path, file: &str, line: u32) -> Option<String> {
+    let source_path = root.join(file);
+    let source = std::fs::read_to_string(&source_path).ok()?;
+    let first = line.saturating_sub(2) as usize;
+    let uses_resource = source
+        .lines()
+        .skip(first)
+        .take(5)
+        .any(|text| text.contains(".resource("));
+    if !uses_resource {
+        return None;
+    }
+    let metadata = source_path.parent()?.join("metadata.json");
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(metadata).ok()?).ok()?;
+    let name = value.get("name")?.as_str()?;
+    if name.is_empty()
+        || name
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    {
+        return None;
+    }
+    Some(format!("/apps/{name}"))
+}
+
+/// The router a local name in `file` refers to: imported (followed to the exporting file) or local.
+fn resolve_local(
+    by_file: &BTreeMap<&str, &ScanReport>,
+    file: &str,
+    local: &str,
+) -> Option<RouterId> {
+    let report = by_file.get(file)?;
+    // `api.router` with `api` an import: that module's `router` export.
+    let (head, member) = match local.split_once('.') {
+        Some((head, member)) => (head, Some(member)),
+        None => (local, None),
+    };
+    match report.module.imports.iter().find(|i| i.local == head) {
+        Some(import) => {
+            let target_file = import.resolved.as_ref()?;
+            let name = match (member, import.export.as_deref()) {
+                (Some(member), _) => member,
+                (None, export) => export.unwrap_or("default"),
+            };
+            locate_export(by_file, target_file, name, 0)
+        }
+        // A local router, or what a local factory returns (`app.use('/x', makeRouter())`).
+        None => Some((file.to_owned(), product(report, local))),
+    }
+}
+
+/// The router a module exports as `name`, followed through barrels: `export * from './users'`
+/// and `export { usersRouter as users } from './users'` (up to 8 levels).
+fn locate_export(
+    by_file: &BTreeMap<&str, &ScanReport>,
+    file: &str,
+    name: &str,
+    depth: usize,
+) -> Option<RouterId> {
+    let report = by_file.get(file)?;
+    let reexports = &report.module.reexports;
+    match report.module.exports.get(name) {
+        // `exports.users = require('./users')`: that module's router.
+        Some(local) if local.starts_with(crate::taint::NAMESPACE) && depth < 8 => {
+            let target = local.trim_start_matches(crate::taint::NAMESPACE);
+            locate_export(by_file, target, "default", depth + 1)
+        }
+        // Defined here, unless this file only re-exports it from another one.
+        Some(local) => {
+            if depth < 8 {
+                for barrel in reexports {
+                    if let Some(found) = locate_export(by_file, barrel, local, depth + 1) {
+                        return Some(found);
+                    }
+                }
+            }
+            Some((file.to_owned(), product(report, local)))
+        }
+        None if depth < 8 => reexports
+            .iter()
+            .find_map(|barrel| locate_export(by_file, barrel, name, depth + 1)),
+        None => None,
+    }
+}
+
+/// The router an export stands for: itself, what it returns when it is a factory
+/// (`module.exports = function () { ...; return router; }`), or, for a plugin that registers
+/// on its first parameter (`async function users(fastify) { fastify.get(...) }`), that
+/// parameter.
+fn product(report: &ScanReport, exported: &str) -> String {
+    let function = report.module.functions.iter().find(|f| f.name == exported);
+    if let Some(local) = function.and_then(|f| f.returns_local.clone()) {
+        return local;
+    }
+    if let Some(first) = function.and_then(|f| f.params.first())
+        && (report
+            .module
+            .entries
+            .iter()
+            .any(|e| e.receiver.as_deref() == Some(first.as_str()))
+            || report
+                .module
+                .mounts
+                .iter()
+                .any(|m| m.receiver.as_deref() == Some(first.as_str())))
+    {
+        return first.clone();
+    }
+    exported.to_owned()
+}
+
+/// Every prefix a router is reachable under (`""` for a root).
+/// Every (prefix, mount authentication) a router is reachable under (`""` for a root).
+fn prefixes(
+    parents: &BTreeMap<RouterId, Vec<(RouterId, String, Auth)>>,
+    router: &RouterId,
+    memo: &mut BTreeMap<RouterId, Vec<(String, Auth)>>,
+) -> Vec<(String, Auth)> {
+    let mut path = Vec::new();
+    prefixes_from(parents, router, &mut path, memo)
+}
+
+/// The prefixes a router is reachable under: every chain of mounts above it, each with the
+/// strongest authentication on the way. A router mounted into itself (directly or through
+/// others) is a root on the second visit, and at most `MAX_PREFIXES` prefixes are kept.
+fn prefixes_from(
+    parents: &BTreeMap<RouterId, Vec<(RouterId, String, Auth)>>,
+    router: &RouterId,
+    path: &mut Vec<RouterId>,
+    memo: &mut BTreeMap<RouterId, Vec<(String, Auth)>>,
+) -> Vec<(String, Auth)> {
+    const MAX_PREFIXES: usize = 64;
+    if let Some(known) = memo.get(router) {
+        return known.clone();
+    }
+    let root = || vec![(String::new(), Auth::NoneDetected)];
+    let Some(edges) = parents.get(router) else {
+        return root();
+    };
+    if path.contains(router) || path.len() >= 8 {
+        return root();
+    }
+    path.push(router.clone());
+    let mut found: Vec<(String, Auth)> = Vec::new();
+    for (parent, prefix, auth) in edges {
+        if parent == router {
+            // `router.use('/p', router)`: no prefix comes from mounting a router into itself.
+            continue;
+        }
+        for (above, above_auth) in prefixes_from(parents, parent, path, memo) {
+            let entry = (join(&above, prefix), above_auth.max(*auth));
+            if !found.contains(&entry) && found.len() < MAX_PREFIXES {
+                found.push(entry);
+            }
+        }
+    }
+    path.pop();
+    if found.is_empty() {
+        found = root();
+    }
+    // Only a complete result is reusable (one computed inside a cycle may miss its prefixes).
+    if path.is_empty() {
+        memo.insert(router.clone(), found.clone());
+    }
+    found
+}
+
+/// Joins URL path parts with exactly one `/` between them.
+fn join(prefix: &str, path: &str) -> String {
+    let joined = format!(
+        "{}/{}",
+        prefix.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let trimmed = if joined.len() > 1 {
+        joined.trim_end_matches('/')
+    } else {
+        &joined
+    };
+    if trimmed.starts_with('/') {
+        trimmed.to_owned()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// Express parameters as OpenAPI templates: `/users/:id` becomes `/users/{id}`.
+pub fn openapi_path(path: &str) -> String {
+    let mut out = String::new();
+    let mut chars = path.chars().peekable();
+    let identifier = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        let mut name = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                name.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        name
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            // `:id`, `:id(\\d+)` (Express 4), `:date{[0-9]+}` (Hono), `:id?`, `:path*`.
+            ':' => {
+                let name = identifier(&mut chars);
+                if let Some(&open @ ('(' | '{')) = chars.peek() {
+                    let close = if open == '(' { ')' } else { '}' };
+                    let mut depth = 0usize;
+                    for inner in chars.by_ref() {
+                        if inner == open {
+                            depth += 1;
+                        } else if inner == close {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                while chars.peek().is_some_and(|m| matches!(m, '?' | '*' | '+')) {
+                    chars.next();
+                }
+                if name.is_empty() {
+                    out.push(':');
+                } else {
+                    out.push_str(&format!("{{{name}}}"));
+                }
+            }
+            // Express 5 named wildcard `*filepath`, or a bare `*`.
+            '*' => {
+                let name = identifier(&mut chars);
+                let name = if name.is_empty() {
+                    "wildcard".to_owned()
+                } else {
+                    name
+                };
+                out.push_str(&format!("{{{name}}}"));
+            }
+            // `{id}` already a parameter; `{/:id}` or `{.:format}` an Express 5 optional group.
+            '{' => {
+                let mut look = chars.clone();
+                let name = identifier(&mut look);
+                if !name.is_empty() && look.peek() == Some(&'}') {
+                    look.next();
+                    chars = look;
+                    out.push_str(&format!("{{{name}}}"));
+                }
+            }
+            '}' => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The segment conventions shared by every file-route form: a dynamic `[param]` becomes `{param}`, a
+/// catch-all `[...rest]`/`[[...rest]]` becomes `{rest}`, and route groups `(name)` / parallel slots
+/// `@slot` contribute nothing to the URL.
+fn convert_route_parts(parts: &[&str]) -> String {
+    let mut out = Vec::new();
+    for part in parts {
+        if part.starts_with('(') && part.ends_with(')') {
+            continue; // route group
+        }
+        if part.starts_with('@') {
+            continue; // parallel route slot
+        }
+        let inner = part.trim_start_matches('[').trim_end_matches(']');
+        if part.starts_with("[[...") || part.starts_with("[...") {
+            out.push(format!(
+                "{{{}}}",
+                inner.trim_start_matches("[...").trim_start_matches("...")
+            ));
+        } else if part.starts_with('[') {
+            out.push(format!("{{{inner}}}"));
+        } else {
+            out.push((*part).to_owned());
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
+/// A file name without its final extension (`proxy.js` -> `proxy`, `[id].ts` -> `[id]`,
+/// `[...path].js` -> `[...path]`). Only the trailing extension is removed, so a catch-all segment's
+/// own dots are preserved.
+fn path_stem(s: &str) -> &str {
+    s.rsplit_once('.').map_or(s, |(stem, _)| stem)
+}
+
+/// The URL path of a file route: a named `GET`/`POST`/... export of a Next.js `app/**/route.ts`
+/// (`kind` "file-route"), the default export of a `pages/api/**` module ("default-export"), or a
+/// Vercel/Netlify filesystem function under a deployment-root `api/` directory (also "default-export").
+pub fn file_route_path(file: &str, kind: &str) -> Option<String> {
+    let segments: Vec<&str> = file.split('/').collect();
+    if kind == "file-route" {
+        if !segments
+            .last()
+            .is_some_and(|last| path_stem(last) == "route")
+        {
+            return None;
+        }
+        // The app directory: `src/app`, else the first `app` that is not a package named `app`
+        // (`packages/app/app/api/route.ts`).
+        let at = segments
+            .windows(2)
+            .position(|w| w == ["src", "app"])
+            .map(|i| i + 1)
+            .or_else(|| {
+                (0..segments.len()).find(|&i| {
+                    segments.get(i) == Some(&"app")
+                        && !matches!(segments.get(i + 1), Some(&"app" | &"src"))
+                })
+            })?;
+        let parts = segments.get(at + 1..segments.len() - 1)?;
+        return Some(convert_route_parts(parts));
+    }
+    if let Some(at) = segments.windows(2).position(|w| w == ["pages", "api"]) {
+        let mut parts: Vec<&str> = segments.get(at + 1..)?.to_vec();
+        let last = parts.pop()?;
+        let name = path_stem(last);
+        let mut path = convert_route_parts(&parts);
+        if name != "index" {
+            path = join(&path, &convert_route_parts(&[name]));
+        }
+        return Some(path);
+    }
+    vercel_api_route_path(file)
+}
+
+/// The URL path of a Vercel/Netlify filesystem function: a handler module directly under a
+/// deployment-root `api/` directory — the project root, or a single package/app directory in a
+/// monorepo — named by its endpoint (`api/proxy.js` -> `/api/proxy`, `api/users/[id].ts` ->
+/// `/api/users/{id}`, `api/items/index.js` -> `/api/items`). The `api/` directory is itself the URL
+/// prefix. Distinct from Next.js `pages/api/**` and `app/**/route.ts` (handled by [`file_route_path`]):
+/// those live under a `pages`/`app` tree, so an `api/` directory beneath one is not a standalone
+/// function root. The convention is the platform's, not any one app's.
+pub fn vercel_api_route_path(file: &str) -> Option<String> {
+    let segments: Vec<&str> = file.split('/').collect();
+    let at = segments.iter().position(|s| *s == "api")?;
+    let before = segments.get(..at)?;
+    let is_deployment_root =
+        before.is_empty() || matches!(before, ["packages", _] | ["apps", _] | ["services", _]);
+    if !is_deployment_root {
+        return None;
+    }
+    let mut parts: Vec<&str> = segments.get(at..)?.to_vec(); // keep the `api` prefix segment
+    let last = parts.pop()?;
+    let name = path_stem(last);
+    if name.is_empty() {
+        return None;
+    }
+    let mut path = convert_route_parts(&parts);
+    if name != "index" {
+        path = join(&path, &convert_route_parts(&[name]));
+    }
+    Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_join_and_convert() {
+        assert_eq!(join("/api", "/users/"), "/api/users");
+        assert_eq!(join("", "/"), "/");
+        assert_eq!(
+            openapi_path("/users/:id/posts/:post?"),
+            "/users/{id}/posts/{post}"
+        );
+    }
+
+    #[test]
+    fn nextjs_file_routes() {
+        assert_eq!(
+            file_route_path("app/api/users/[id]/route.ts", "file-route").as_deref(),
+            Some("/api/users/{id}")
+        );
+        assert_eq!(
+            file_route_path("src/app/(admin)/x/route.js", "file-route").as_deref(),
+            Some("/x")
+        );
+        assert_eq!(
+            file_route_path("pages/api/hello.ts", "default-export").as_deref(),
+            Some("/api/hello")
+        );
+        assert_eq!(
+            file_route_path("pages/api/users/index.ts", "default-export").as_deref(),
+            Some("/api/users")
+        );
+        assert_eq!(file_route_path("src/lib/util.ts", "file-route"), None);
+        assert_eq!(file_route_path("src/lib/util.ts", "default-export"), None);
+        // Each export form counts only where Next.js reads it.
+        assert_eq!(
+            file_route_path("app/api/x/route.ts", "default-export"),
+            None
+        );
+        assert_eq!(file_route_path("pages/api/x.ts", "file-route"), None);
+        assert_eq!(
+            file_route_path("packages/app/app/api/x/route.ts", "file-route").as_deref(),
+            Some("/api/x")
+        );
+        assert_eq!(
+            file_route_path("packages/app/src/app/api/x/route.ts", "file-route").as_deref(),
+            Some("/api/x")
+        );
+        assert_eq!(
+            file_route_path("app/(dashboard)/app/route.ts", "file-route").as_deref(),
+            Some("/app")
+        );
+    }
+
+    #[test]
+    fn vercel_filesystem_functions() {
+        // A deployment-root `api/` directory: the `api/` prefix is kept, `[param]` and `index` convert.
+        assert_eq!(
+            file_route_path("api/proxy.js", "default-export").as_deref(),
+            Some("/api/proxy")
+        );
+        assert_eq!(
+            vercel_api_route_path("api/users/[id].ts").as_deref(),
+            Some("/api/users/{id}")
+        );
+        assert_eq!(
+            vercel_api_route_path("api/items/index.js").as_deref(),
+            Some("/api/items")
+        );
+        assert_eq!(
+            vercel_api_route_path("api/files/[...path].js").as_deref(),
+            Some("/api/files/{path}")
+        );
+        // A monorepo package/app root counts as a deployment root.
+        assert_eq!(
+            vercel_api_route_path("apps/web/api/proxy.ts").as_deref(),
+            Some("/api/proxy")
+        );
+        // A Next.js tree is not a standalone function root: its `api/` is handled by the forms above.
+        assert_eq!(vercel_api_route_path("app/api/x/route.ts"), None);
+        assert_eq!(vercel_api_route_path("pages/api/x.ts"), None);
+        assert_eq!(vercel_api_route_path("src/api/client.ts"), None);
+        // Nothing under `api/` is not a function.
+        assert_eq!(vercel_api_route_path("src/lib/util.ts"), None);
+        // A named export form is not a Vercel default-export function path.
+        assert_eq!(file_route_path("api/proxy.js", "file-route"), None);
+    }
+
+    #[test]
+    fn nextjs_middleware_honors_public_prefix_in_guard_condition() {
+        let source = r#"
+            const token = await getToken({ req, secret });
+            const { pathname } = req.nextUrl;
+            const isAuthRoute = pathname.startsWith("/api/auth");
+            const isApiRoute = pathname.startsWith("/api/");
+            if (!token && !isAuthRoute && !isApiRoute) {
+                return NextResponse.redirect(new URL("/login", req.url));
+            }
+            export const config = { matcher: ["/((?!api/auth|_next).*)"] };
+        "#;
+        let mut exclusions = next_matcher_exclusions(source).unwrap();
+        exclusions.extend(next_middleware_public_prefixes(source));
+        let policies = [NextMiddleware {
+            scope: String::new(),
+            exclusions,
+        }];
+
+        assert_eq!(
+            next_middleware_auth(&policies, "src/app/api/facturas/route.js", "/api/facturas"),
+            Auth::NoneDetected,
+        );
+        // `startsWith("/api/")` does not exempt the exact `/api` pathname.
+        assert_eq!(
+            next_middleware_auth(&policies, "src/app/api/route.js", "/api"),
+            Auth::User,
+        );
+        assert_eq!(
+            next_middleware_auth(&policies, "src/app/dashboard/page.js", "/dashboard"),
+            Auth::User,
+        );
+    }
+
+    #[test]
+    fn nextjs_middleware_does_not_exempt_a_protected_prefix() {
+        let source = r#"
+            const token = await getToken({ req, secret });
+            const { pathname } = req.nextUrl;
+            const isApiRoute = pathname.startsWith("/api/");
+            if (!token && isApiRoute) {
+                return NextResponse.redirect(new URL("/login", req.url));
+            }
+        "#;
+        assert!(next_middleware_public_prefixes(source).is_empty());
+
+        // An OR condition does not prove the prefix suppresses the redirect and is left protected.
+        let ambiguous = r#"
+            const isApiRoute = pathname.startsWith("/api/");
+            if (!token && (!isApiRoute || maintenanceMode)) {
+                return NextResponse.redirect(new URL("/login", req.url));
+            }
+        "#;
+        assert!(next_middleware_public_prefixes(ambiguous).is_empty());
+    }
+
+    #[test]
+    fn autoload_directory_prefix() {
+        let dirs: std::collections::BTreeSet<String> = ["routes".to_owned()].into_iter().collect();
+        // Subdirectory names between the autoload dir and the route file become the prefix; the file
+        // name itself never contributes a segment.
+        assert_eq!(
+            autoload_prefix(&dirs, "server/routes/api/utils/index.js").as_deref(),
+            Some("/api/utils")
+        );
+        assert_eq!(
+            autoload_prefix(&dirs, "server/routes/api/users.js").as_deref(),
+            Some("/api")
+        );
+        // A file at the autoload root has no enclosing subdirectory, so no prefix.
+        assert_eq!(autoload_prefix(&dirs, "server/routes/index.js"), None);
+        // A repo that does not autoload gets no prefix.
+        assert_eq!(
+            autoload_prefix(
+                &std::collections::BTreeSet::new(),
+                "server/routes/api/x/index.js"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn autoload_dir_literal_takes_the_trailing_segment() {
+        assert_eq!(
+            autoload_dir_literal(r#" path.join(__dirname, "./routes"),"#).as_deref(),
+            Some("routes")
+        );
+        assert_eq!(
+            autoload_dir_literal(r#" fs.joinPath(fs.rootPath, './plugins')"#).as_deref(),
+            Some("plugins")
+        );
+        // A fully computed directory with no string literal is not recoverable.
+        assert_eq!(autoload_dir_literal(" resolveRoutesDir(),"), None);
+    }
+
+    #[test]
+    fn autoload_dir_names_reads_fastify_autoload_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("server/plugins")).unwrap();
+        std::fs::write(
+            root.join("server/plugins/config.js"),
+            "import FastifyAutoLoad from \"@fastify/autoload\";\n\
+             fastify.register(FastifyAutoLoad, { dir: fs.joinPath(fs.rootPath, \"./routes\") });\n",
+        )
+        .unwrap();
+        let names = autoload_dir_names(root);
+        assert!(names.contains("routes"), "{names:?}");
+    }
+}

@@ -1,0 +1,19 @@
+{
+  "recipe": "f0df3fa57de935e2",
+  "finding": "32ef97fc87aaa1b2",
+  "file": "app.js",
+  "original_fingerprint": "ed0e652090b17bd1",
+  "hunks": [
+    {
+      "line": 98,
+      "old": [
+        "  res.send(`<h1>Search Results for: ${searchTerm}</h1>`);"
+      ],
+      "new": [
+        "  res.send(`<h1>Search Results for: ${String(searchTerm).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;')}</h1>`);"
+      ]
+    }
+  ],
+  "poc": "open 'http://TARGET_HOST/search?q=%3Cscript%3Edocument.write%2860991%2A14217%29%3C%2Fscript%3E'",
+  "benign_status": 200
+}

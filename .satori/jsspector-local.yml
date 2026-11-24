@@ -1,0 +1,76 @@
+settings:
+  name: JSSpector dynamic verification
+
+test:
+  setShell: true
+  assertReturnCode: 0
+  assertStdoutNotContains: "panicked at"
+  assertStdoutContains: '"outcome": "verified"'
+  run:
+    - |
+      set -eu
+      export JSS_VERIFY_RUNTIME="${JSS_VERIFY_RUNTIME:-local}"
+      export JSS_VERIFY_DEBUG="${JSS_VERIFY_DEBUG:-1}"
+      echo "[verify] repository=${JSS_VERIFY_REPOSITORY:-unknown}" >&2
+      report_file=$(mktemp)
+      static_file=$(mktemp)
+      cases_file=$(mktemp)
+      resolved_file=$(mktemp)
+      trap 'rm -f "$report_file" "$static_file" "$cases_file" "$resolved_file"' EXIT
+      set --
+      expected=""
+      for fingerprint in ${JSS_VERIFY_FINGERPRINTS:-}; do
+        case "$fingerprint" in
+          *[!0-9a-fA-F]*|'') echo "invalid verify fingerprint" >&2; exit 2 ;;
+        esac
+        expected="$expected $fingerprint"
+        set -- "$@" --verify-fingerprint "$fingerprint"
+      done
+      if [ -z "$expected" ]; then
+        echo "no stable verify fingerprints were supplied" >&2
+        exit 2
+      fi
+      if [ -n "${JSS_VERIFY_CASES_B64:-}" ]; then
+        printf '%s' "$JSS_VERIFY_CASES_B64" | base64 -d > "$cases_file"
+      else
+        printf '[]\n' > "$cases_file"
+      fi
+      echo "[verify] replay selectors=$(jq 'length' "$cases_file") expected=$(printf '%s\n' $expected | grep -c .)" >&2
+      "${JSSPECTOR_BINARY:?}" scan . --min-severity high --format json --output "$static_file"
+      jq --null-input \
+        --slurpfile report "$static_file" \
+        --slurpfile cases "$cases_file" '
+          [$cases[0][] as $case |
+            ([ $report[0].findings[] | select(.fingerprint == $case.fingerprint) ] as $exact |
+              {expected: $case.fingerprint,
+               candidates: (if ($exact | length) > 0 then $exact else
+                 [ $report[0].findings[] |
+                   select(.file == $case.file and .class == $case.class and .title == $case.title) ]
+               end | map(.fingerprint))})]
+        ' > "$resolved_file"
+      set --
+      for fingerprint in $(jq --raw-output '.[].candidates[]' "$resolved_file" | sort -u); do
+        set -- "$@" --verify-fingerprint "$fingerprint"
+      done
+      "${JSSPECTOR_BINARY:?}" scan . --verify=strict --min-severity high --format json --output "$report_file" "$@"
+      failed=0
+      for expected_fingerprint in $expected; do
+        candidates=$(jq --raw-output --arg expected "$expected_fingerprint" \
+          '.[] | select(.expected == $expected) | .candidates[]' "$resolved_file")
+        verified=0
+        for fingerprint in $candidates; do
+          if jq --exit-status --arg fingerprint "$fingerprint" \
+            '.findings[] | select(.fingerprint == $fingerprint and .exploitation.outcome == "verified")' \
+            "$report_file" >/dev/null
+          then
+            verified=1
+            break
+          fi
+        done
+        if [ "$verified" -ne 1 ]; then
+          echo "expected finding $expected_fingerprint was not dynamically verified" >&2
+          failed=1
+        fi
+      done
+      cat "$report_file"
+      exit "$failed"

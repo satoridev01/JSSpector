@@ -1,0 +1,17 @@
+{
+  "id": "391282c86548a8ca",
+  "class": "path-traversal",
+  "sink": "mkdirSync",
+  "introduces": [
+    "String",
+    "basename",
+    "join",
+    "return",
+    "split"
+  ],
+  "before": "var id = req.body.id\nvar oldId = req.body.id\nvar tempId = req.body.tempId // temp music folder",
+  "after": "function safeSegment(value) {\n  var segment = path.basename(String(value).split('\\\\').join('/'))\n  return segment == '..' ? '' : segment\n}\n  var id = safeSegment(req.body.id)\n  var oldId = safeSegment(req.body.id)\n  var tempId = req.body.tempId == undefined ? undefined : safeSegment(req.body.tempId) // temp music folder",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

@@ -1,0 +1,19 @@
+{
+  "recipe": "505af8bc83cf0773",
+  "finding": "32a15f1d5eb232a6",
+  "file": "src/components/server.js",
+  "original_fingerprint": "aaef98f70c12ed2e",
+  "hunks": [
+    {
+      "line": 66,
+      "old": [
+        "  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {"
+      ],
+      "new": [
+        "  if (filePath.startsWith(__dirname + path.sep) && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request GET \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/../../../etc/passwd'",
+  "benign_status": 404
+}

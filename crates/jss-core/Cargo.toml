@@ -1,0 +1,23 @@
+[package]
+name = "jss-core"
+description = "JSSpector analysis core: IR, linking, value flow, summaries, taint, entry points, reports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Never add oxc here: everything oxc-specific lives in jss-frontend.
+[dependencies]
+ignore.workspace = true
+rayon.workspace = true
+serde.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

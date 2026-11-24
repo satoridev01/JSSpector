@@ -1,0 +1,2192 @@
+//! `scan --verify`: confirm a finding by running the scanned app in a throwaway Docker container,
+//! or directly inside an already-disposable job sandbox, and sending the request the finding
+//! implies. Opt-in; nothing here runs without `--verify`.
+//!
+//! The work splits in two: [`plan`] and [`payload`] decide what to send and how to recognize a
+//! hit, with no I/O (unit-tested directly); [`sandbox`] builds the image, starts the app with no
+//! network reach beyond a marker service, sends the requests and tears everything down. A
+//! finding the planner cannot drive is reported `skipped` with the reason, never a false
+//! "clean".
+
+mod browser;
+mod fix;
+mod mcp;
+mod payload;
+mod plan;
+mod recipes;
+mod reflected;
+mod sandbox;
+mod services;
+mod sink_binding;
+mod stdio;
+
+use jss_core::{Finding, VulnClass};
+use serde::Serialize;
+
+pub use fix::{FixOptions, FixOutcome};
+
+/// Order parsed-URL fields by how strongly they identify the value that reaches the sink.
+///
+/// SSRF usually exposes its carrier directly as a URL-shaped field in the request handler, while
+/// filesystem and execution sinks commonly receive a broad parsed-query object through a helper
+/// (`listFolders(options)` -> `options.q`). In the latter case the helper-local member is much
+/// closer to the sink than unrelated members read elsewhere in a monolithic router. Preserve
+/// source order within each group and deduplicate across them.
+fn ordered_url_query_params(
+    class: VulnClass,
+    direct: Vec<String>,
+    forwarded: Vec<String>,
+) -> Vec<String> {
+    let forwarded_first = matches!(
+        class,
+        VulnClass::PathTraversal | VulnClass::CommandInjection | VulnClass::CodeInjection
+    );
+    let (first, second) = if forwarded_first {
+        (forwarded, direct)
+    } else {
+        (direct, forwarded)
+    };
+    let mut ordered = Vec::new();
+    for param in first.into_iter().chain(second) {
+        if !ordered.contains(&param) {
+            ordered.push(param);
+        }
+    }
+    ordered
+}
+
+/// Runs verified apps in this already-disposable environment (a CI or Satori job) instead of a
+/// Docker container: `scan --local`.
+pub fn use_local_runtime() {
+    sandbox::request_local_runtime();
+}
+
+/// A negative-control request and the response it produced. Differential verifiers attach these to
+/// the reproduction so a downstream reviewer can audit the claimed contrast instead of seeing only
+/// the successful leg.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlObservation {
+    pub label: String,
+    pub method: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub response: String,
+}
+
+/// What verification concluded about one finding.
+// Successful verification carries the complete auditable PoC. Keeping it inline avoids an
+// allocation on every result and preserves the simple outcome API used throughout the verifier.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    /// The app reproduced the finding; `how` names the request that did it.
+    Verified { how: String, poc: Reproduction },
+    /// Every derived request was sent and none tripped the marker.
+    NotReproduced { tried: usize },
+    /// The finding was not driven; `reason` says why.
+    Skipped { reason: String },
+}
+
+/// The exact request that reproduced a finding plus a copyable, parameterized command and the
+/// signal the sandbox observed. Keeping this in the JSON report makes `verified` independently
+/// auditable instead of forcing callers to infer a proof from debug stderr.
+#[derive(Debug, Clone, Serialize)]
+pub struct Reproduction {
+    pub command: String,
+    /// True when `command` is a credential-redacted reproduction template rather than the literal
+    /// byte-for-byte command executed inside the isolated verifier.
+    #[serde(skip_serializing_if = "is_false")]
+    pub command_redacted: bool,
+    pub method: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub evidence: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub response: String,
+    /// The stdout of `command` when JSSpector executed that exact command as a second, independently
+    /// oracle-checked reproduction. Absent on legacy/protocol-specific reproductions whose displayed
+    /// helper command is not itself the transport JSSpector executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    /// The corresponding stderr. `Some("")` is intentionally serialized: it proves the command was
+    /// captured and produced no diagnostic, rather than that no transcript exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// `oracle-proof` only when this exact command independently reproduced the signal and traversed
+    /// the statically selected sink during the same request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_safety: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<ControlObservation>,
+}
+
+impl Reproduction {
+    /// The proof that may leave the verifier process. Raw credentials remain available to the
+    /// in-memory oracle while it drives and fixes the app, but reports and issue trackers receive
+    /// placeholders. An authenticated response can contain private application data, so retain
+    /// only its size; unauthenticated proof responses keep their useful exploit output.
+    pub fn report_safe(&self) -> Self {
+        let authenticated = self.headers.iter().any(|header| {
+            header
+                .split_once(':')
+                .is_some_and(|(name, _)| credential_header(name))
+        });
+        let response = if authenticated && !self.response.is_empty() {
+            format!(
+                "[redacted authenticated response: {} bytes]",
+                self.response.len()
+            )
+        } else {
+            redact_jwts(&self.response)
+        };
+        let bounded_oracle_filter = self.command.contains("grep -F -m 1 -o --")
+            || (self.command.contains("grep -E -m 1 -o -- 'cm9vdDo")
+                && self.command.contains("| base64 -d"));
+        let filtered_oracle_stdout = self.output_safety.as_deref() == Some("oracle-proof")
+            && bounded_oracle_filter
+            && self
+                .stdout
+                .as_ref()
+                .is_some_and(|stdout| stdout.len() <= 4_096);
+        let stdout = self.stdout.as_ref().map(|stdout| {
+            if authenticated && !stdout.is_empty() && !filtered_oracle_stdout {
+                format!("[redacted authenticated stdout: {} bytes]", stdout.len())
+            } else {
+                redact_jwts(stdout)
+            }
+        });
+        let stderr = self.stderr.as_ref().map(|stderr| {
+            if authenticated && !stderr.is_empty() {
+                format!("[redacted authenticated stderr: {} bytes]", stderr.len())
+            } else {
+                redact_jwts(stderr)
+            }
+        });
+        let controls = self
+            .controls
+            .iter()
+            .map(|control| ControlObservation {
+                label: control.label.clone(),
+                method: control.method.clone(),
+                target: redact_jwts(&control.target),
+                body: control.body.as_deref().map(redact_jwts),
+                response: if authenticated && !control.response.is_empty() {
+                    format!(
+                        "[redacted authenticated response: {} bytes]",
+                        control.response.len()
+                    )
+                } else {
+                    redact_jwts(&control.response)
+                },
+            })
+            .collect();
+        let command = redact_poc(&self.command);
+        Self {
+            command_redacted: self.command_redacted || command != self.command,
+            command,
+            method: self.method.clone(),
+            target: redact_jwts(&self.target),
+            headers: self
+                .headers
+                .iter()
+                .map(|header| redact_header(header))
+                .collect(),
+            body: self.body.as_deref().map(redact_jwts),
+            evidence: redact_jwts(&self.evidence),
+            response,
+            stdout,
+            stderr,
+            exit_code: self.exit_code,
+            output_safety: self.output_safety.clone(),
+            controls,
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Headers whose values are credentials. Kept here so report export and recipe publication use
+/// exactly the same policy.
+const CREDENTIAL_HEADERS: [&str; 9] = [
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "x-access-token",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+    "x-session-token",
+];
+const REDACTED: &str = "REDACTED";
+
+fn credential_header(name: &str) -> bool {
+    CREDENTIAL_HEADERS
+        .iter()
+        .any(|header| name.trim().eq_ignore_ascii_case(header))
+}
+
+fn redact_header(header: &str) -> String {
+    let Some((name, value)) = header.split_once(':') else {
+        return redact_jwts(header);
+    };
+    if credential_header(name) {
+        format!("{name}: {REDACTED}")
+    } else {
+        format!("{name}:{}", redact_jwts(value))
+    }
+}
+
+/// A copyable curl command without credential-header values or JWTs.
+pub(super) fn redact_poc(poc: &str) -> String {
+    poc.split_inclusive('\n')
+        .map(|line| redact_jwts(&redact_command_header(line)))
+        .collect()
+}
+
+fn redact_command_header(line: &str) -> String {
+    const FLAG: &str = "--header '";
+    let Some(start) = line.find(FLAG).map(|at| at + FLAG.len()) else {
+        return line.to_owned();
+    };
+    let (Some(head), Some(rest)) = (line.get(..start), line.get(start..)) else {
+        return line.to_owned();
+    };
+    let Some((name, _)) = rest.split_once(':') else {
+        return line.to_owned();
+    };
+    match rest.rfind('\'').and_then(|end| rest.get(end..)) {
+        Some(tail) if credential_header(name) => format!("{head}{name}: {REDACTED}{tail}"),
+        _ => line.to_owned(),
+    }
+}
+
+fn redact_jwts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("eyJ") {
+        let (before, candidate) = rest.split_at(at);
+        out.push_str(before);
+        let (kept, length) = match jwt_length(candidate) {
+            Some(length) => (REDACTED, length),
+            None => ("eyJ", 3),
+        };
+        out.push_str(kept);
+        rest = candidate.get(length..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    out
+}
+
+fn jwt_length(text: &str) -> Option<usize> {
+    let segment = |from: usize| {
+        let tail = text.get(from..).unwrap_or_default();
+        tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(tail.len())
+    };
+    let mut end = segment(0);
+    for required in [true, false] {
+        if text.get(end..=end) != Some(".") {
+            return None;
+        }
+        let length = segment(end + 1);
+        if required && length == 0 {
+            return None;
+        }
+        end += 1 + length;
+    }
+    Some(end)
+}
+
+impl Outcome {
+    /// A short, stable label for a report property: `verified`, `not-reproduced` or `skipped`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Verified { .. } => "verified",
+            Self::NotReproduced { .. } => "not-reproduced",
+            Self::Skipped { .. } => "skipped",
+        }
+    }
+}
+
+/// A finding's verdict, for the report.
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    pub fingerprint: String,
+    pub entry: Option<String>,
+    pub class: String,
+    pub outcome: Outcome,
+    /// The proven fix (or why there is none), when the finding verified and fixes are enabled.
+    pub fix: Option<FixOutcome>,
+}
+
+/// How a run should behave when the selected execution runtime is not reachable.
+pub enum Missing {
+    /// Mark every finding skipped (the default: `--verify` is best-effort).
+    Skip,
+    /// Fail the command (`--verify=strict`): the user asked to verify and means it.
+    Fail,
+}
+
+/// Verifies `findings` against the app rooted at `root`. Returns one verdict per finding, in the
+/// same order. Builds at most one HTTP image and one browser image, reused across findings.
+pub fn run(
+    root: &std::path::Path,
+    findings: &[Finding],
+    missing: Missing,
+    fix_options: &FixOptions,
+) -> Result<Vec<Verdict>, String> {
+    run_with_policy(root, findings, missing, fix_options, false)
+}
+
+/// [`run`], but once one selected finding is reproduced, return skipped verdicts for the rest.
+/// This is used by corpus/backlog verification, where one proven TP is enough to advance the
+/// repository and spending the remaining runtime budget cannot change that decision.
+pub fn run_until_first(
+    root: &std::path::Path,
+    findings: &[Finding],
+    missing: Missing,
+    fix_options: &FixOptions,
+) -> Result<Vec<Verdict>, String> {
+    run_with_policy(root, findings, missing, fix_options, true)
+}
+
+fn run_with_policy(
+    root: &std::path::Path,
+    findings: &[Finding],
+    missing: Missing,
+    fix_options: &FixOptions,
+    stop_after_verified: bool,
+) -> Result<Vec<Verdict>, String> {
+    // A custom or convention-based router may leave a handler without an inventory entry. For an
+    // HTTP finding, try a conservative route derived from a recognized controller/routes tree.
+    // A wrong guess can only fail to reproduce; it never creates a verified outcome by itself.
+    let owned: Vec<Finding> = findings
+        .iter()
+        .map(|finding| {
+            if finding.entry.is_none() && finding.source.kind == "http" {
+                // A conventional routing directory, or — failing that — a route the module registers
+                // on a host-provided web-server service (`webServer.register({ path, handler })`), for
+                // a plug-in that publishes no inventory entry. Either only creates a request
+                // candidate; a wrong guess can still only fail to reproduce.
+                let entry = plan::derive_http_entry(finding).or_else(|| {
+                    std::fs::read_to_string(root.join(&finding.file))
+                        .ok()
+                        .and_then(|source| plan::registered_route_entry(&source))
+                });
+                if let Some(entry) = entry {
+                    let mut derived = finding.clone();
+                    derived.entry = Some(entry);
+                    return derived;
+                }
+            }
+            finding.clone()
+        })
+        .collect();
+    let findings = owned.as_slice();
+    // Plan each finding, giving the planner the handler's own source so it can resolve a request
+    // input the finding only names coarsely (a `req.headers` source whose specific header the
+    // handler reads in a host/URL position).
+    let mut plans: Vec<Result<plan::Plan, plan::Skip>> = findings
+        .iter()
+        .map(|finding| {
+            let source = std::fs::read_to_string(root.join(&finding.file)).ok();
+            plan::plan_with_source(finding, source.as_deref())
+        })
+        .collect();
+    // A route the host app mounts under a prefix the module declares (`mountPath: "/auth"`).
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some(at) = &finding.entry_at
+            && let Ok(source) = std::fs::read_to_string(root.join(&at.file))
+            && let Some(prefix) = plan::declared_mount_prefix(&source)
+            && !probe.path.starts_with(&format!("{prefix}/"))
+        {
+            probe.path = if probe.path == "/" {
+                prefix
+            } else {
+                format!("{prefix}{}", probe.path)
+            };
+        }
+    }
+    // Sibling routes the same handler is also registered on (`router.put('/a', c.save).put('/b',
+    // c.save)`): a single controller method mounted on several paths often writes only on the branch
+    // its route selects, so the write-overwrite oracle tries each. Read from the route source.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some(at) = &finding.entry_at
+            && let Ok(source) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let method = finding
+                .function
+                .rsplit(['.', ' '])
+                .next()
+                .unwrap_or(finding.function.as_str());
+            let literals = plan::handler_route_literals(&source, method);
+            if literals.len() > 1 {
+                probe.alt_paths = plan::sibling_paths(&probe.path, &literals);
+            }
+        }
+    }
+    // Other request parameters the handler requires alongside the tainted one: without them it
+    // rejects the request before the sink is reached. Read from the handler source.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some((part, target)) = probe.entry_part().map(|(p, t)| (p, t.to_owned()))
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let handler = finding
+                .entry_at
+                .as_ref()
+                .filter(|at| at.file == finding.file)
+                .map(|at| plan::route_handler_source(&source, at.line, finding.source.line))
+                .unwrap_or_else(|| plan::handler_source(&source, finding.source.line));
+            let mut siblings = plan::required_siblings(handler, part, &target);
+            // A handler may reach its sink only on a guarded branch (`else if (agentKey)`,
+            // `if (mode === 'raw')`); the member that gates it must be present, or the request takes
+            // a different branch and never reaches the sink. Add any such field of the same part.
+            let guard_siblings = plan::guard_required_fields(
+                &source,
+                part,
+                &target,
+                &plan::guard_anchor_lines(finding),
+            );
+            for (name, value) in &guard_siblings {
+                if siblings.iter().all(|(k, _)| k != name) {
+                    siblings.push((name.clone(), value.clone()));
+                }
+            }
+            // A handler that dispatches on the raw request URL (`if (req.originalUrl.indexOf(
+            // "action=createdir") !== -1)`) reaches the sink only when the URL carries that fragment;
+            // add each such `key=value` gate as a query sibling so the request takes the branch the
+            // sink sits on. Empty for a handler with no raw-URL dispatch.
+            for (name, value) in
+                plan::url_substring_query_gates(&source, &plan::guard_anchor_lines(finding))
+            {
+                if siblings.iter().all(|(k, _)| *k != name) {
+                    siblings.push((name, value));
+                }
+            }
+            // Drop any sibling that selects a branch the flow does not pass through: a field whose
+            // positive `if (req.<part>.<field>) { ... }` block holds none of the flow anchors reaches
+            // the sink only when the field is ABSENT (the handler falls through to the `else`). Setting
+            // it would divert control into the wrong branch and the sink would never run
+            // (`if (req.query.openFolderOnly) {...} else { <tainted flow> }`). A field whose branch
+            // does enclose the flow is a real gate kept by `guard_required_fields` above.
+            let mut diverting =
+                plan::diverting_guard_fields(&source, part, &plan::guard_anchor_lines(finding));
+            // The same divert-away-from-sink concern, but for a field the handler copies into a local
+            // before branching on it (`var keep = req.body.keep; if (keep == 'yes') {...} else {sink}`,
+            // `if (tempId != undefined) {...}`): resolve the field through its locals so sending it does
+            // not route control into a branch that skips or crashes before the sink.
+            for name in plan::diverting_local_guard_fields(
+                &source,
+                part,
+                &plan::guard_anchor_lines(finding),
+            ) {
+                if !diverting.contains(&name) {
+                    diverting.push(name);
+                }
+            }
+            // A "create new vs. reuse existing" selector whose positive branch provisions the
+            // directory the sink's post-join flow depends on must be SENT, not diverted: the
+            // complementary branch (taken when the field is absent) reads attacker-absent filesystem
+            // state and throws before the sink. Keep the field and pin it to the value that enters the
+            // provisioning branch (`makenew == "true"`), overriding any generic placeholder.
+            let provisioning =
+                plan::provisioning_branch_fields(&source, part, &plan::guard_anchor_lines(finding));
+            diverting.retain(|name| provisioning.iter().all(|(field, _)| field != name));
+            siblings.retain(|(name, _)| !diverting.contains(name));
+            for (name, value) in &provisioning {
+                match siblings.iter_mut().find(|(existing, _)| existing == name) {
+                    Some(slot) => slot.1 = value.clone(),
+                    None => siblings.push((name.clone(), value.clone())),
+                }
+            }
+            if part == "body"
+                && finding.class == VulnClass::NosqlInjection
+                && let Some(model) = finding.sink.api.split('.').next()
+                && !model.is_empty()
+                && let Some(spec) = plan::import_source_path(&source, model)
+                && let Some(model_source) = resolve_import_source(root, &finding.file, &spec)
+            {
+                for (field, value) in plan::mongoose_schema_fillers(&model_source) {
+                    if let Some((_, current)) = siblings
+                        .iter_mut()
+                        .find(|(name, current)| *name == field && current == "jsspector")
+                    {
+                        *current = value;
+                    }
+                }
+            }
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] handler-siblings entry={:?} source={}:{} guards={guard_siblings:?} siblings={siblings:?}",
+                    probe.entry, finding.file, finding.source.line,
+                );
+            }
+            probe.siblings = siblings;
+            if part == "body" {
+                probe.multipart = plan::multipart_form(&source, &target);
+                // The tainted body field may be an array of objects the handler iterates, with the
+                // sink reading one element property (`for (const t of tasks) fetch(t.downloadUrl)`):
+                // the payload must then be a one-element array whose object carries the marker under
+                // that property and the element-level guard properties the sink branch requires.
+                if matches!(probe.entry, plan::Entry::Body(Some(_))) {
+                    probe.element_body = plan::element_body(&source, &target, finding);
+                    if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                        eprintln!(
+                            "[verify] element-body entry={:?} field={target} element_body={:?}",
+                            probe.entry, probe.element_body,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // A route often reaches the sink on only one value of a non-payload path segment
+    // (`if (platform === 'truuze')`), or rejects unknown segments outright; fill those slots with the
+    // literal a guard enclosing the sink pins them to, instead of the generic placeholder.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            probe.path_fillers = plan::path_slot_fillers(
+                &source,
+                &probe.path,
+                &probe.entry,
+                &plan::guard_anchor_lines(finding),
+            );
+        }
+    }
+    // A route whose express-validator middleware constrains a non-payload path parameter
+    // (`param("email").isEmail()`, `param("id").isMongoId()`) rejects the generic `1` slot
+    // placeholder before the sink. Resolve the route's validator middleware and use a type-valid
+    // filler for every constrained path slot except the payload-bearing one.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.path.contains('{')
+            && let Some(at) = &finding.entry_at
+            && let Ok(route_src) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let payload_slot = match &probe.entry {
+                plan::Entry::PathParam(name) => Some(name.as_str()),
+                _ => None,
+            };
+            let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
+            let mined = plan::validator_path_fillers(
+                &route_src,
+                at.line,
+                &probe.path,
+                payload_slot,
+                &resolve,
+            );
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                let roots = plan::route_middleware_roots(&route_src, at.line);
+                let resolved = roots
+                    .iter()
+                    .map(|name| (name.clone(), resolve(name).is_some()))
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[verify] validator-path at={}:{} path={} roots={resolved:?} mined={mined:?}",
+                    at.file, at.line, probe.path
+                );
+            }
+            for (slot, value) in mined {
+                if probe.path_fillers.iter().all(|(name, _)| *name != slot) {
+                    probe.path_fillers.push((slot, value));
+                }
+            }
+        }
+    }
+    // A route whose express-validator middleware marks query parameters required
+    // (`query("year").isInt()`, `query("month").isInt({ min: 0, max: 11 })`) and whose handler
+    // enforces the result (`extractErrorsFromRequest`/`validationResult`) returns a 400 before the
+    // sink unless those parameters are present and type-valid. Mine them from the route's validator
+    // chain and carry a type-valid filler for each as a sibling query parameter, so the tainted value
+    // reaches the sink instead of the validation error. The payload-bearing query field is skipped so
+    // its operator object is never overwritten by a scalar filler.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && let Some(at) = &finding.entry_at
+            && let Ok(route_src) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let payload_field = match &probe.entry {
+                plan::Entry::Query(name) => name.as_str(),
+                _ => "",
+            };
+            let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
+            let mined = plan::validator_query_fillers(&route_src, at.line, payload_field, &resolve);
+            let optional = plan::validator_optional_query_fields(&route_src, at.line, &resolve);
+            let guarded = std::fs::read_to_string(root.join(&finding.file))
+                .ok()
+                .map(|source| {
+                    plan::guard_required_fields(
+                        &source,
+                        "query",
+                        payload_field,
+                        &plan::guard_anchor_lines(finding),
+                    )
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            probe.siblings.retain(|(field, _)| {
+                field == payload_field || !optional.contains(field) || guarded.contains(field)
+            });
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] validator-query at={}:{} payload={payload_field:?} optional={optional:?} mined={mined:?}",
+                    at.file, at.line
+                );
+            }
+            for (field, value) in mined {
+                if probe.siblings.iter().all(|(name, _)| *name != field) {
+                    probe.siblings.push((field, value));
+                }
+            }
+        }
+    }
+    // A sink reached only past a guard on a body field the payload does not itself ride (the payload
+    // enters through a path segment or query parameter, but `const { id } = req.body; if (!id) throw`
+    // rejects the request first). Mine those required body fields so the request carries them and
+    // reaches the sink. Only when the payload is not already in the body (that part's siblings cover
+    // it) and the method can carry a body.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && !matches!(probe.entry, plan::Entry::Body(_))
+            && probe.method.verb(&probe.entry) != "GET"
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            probe.body_requires = plan::guard_required_fields(
+                &source,
+                "body",
+                "",
+                &plan::guard_anchor_lines(finding),
+            );
+            // A handler that forwards the whole request body into the sink path (`Service.update(
+            // req.params.map, req.body)`) where downstream code requires it to be an object rejects or
+            // crashes on a body-less request before the sink. Send a minimal JSON object body so a
+            // path/query-delivered payload passes the body-shape precondition and reaches the sink.
+            probe.body_object = plan::handler_consumes_whole_body(&source);
+        }
+    }
+    // A route guarded by express-validator middleware (`body("device_names").exists().isArray(...)`)
+    // rejects the request with a 400 before the sink unless the body carries every field the chain
+    // requires. Mine those required fields from the validator arrays the route mounts — resolving the
+    // middleware through the route's imports/requires, including `module-alias` specifiers — and carry
+    // a type-valid filler for each, so a body-delivered payload (a whole-body NoSQL operator object or
+    // a named body field) reaches the sink instead of the validation error.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && matches!(probe.entry, plan::Entry::Body(_))
+            && let Some(at) = &finding.entry_at
+            && let Ok(route_src) = std::fs::read_to_string(root.join(&at.file))
+        {
+            let payload_field = match &probe.entry {
+                plan::Entry::Body(Some(name)) => name.clone(),
+                _ => String::new(),
+            };
+            let resolve = |name: &str| resolve_middleware_source(root, &at.file, &route_src, name);
+            let mined =
+                plan::validator_required_body_fields(&route_src, at.line, &payload_field, &resolve);
+            let optional = plan::validator_optional_body_fields(&route_src, at.line, &resolve);
+            // Handler-wide mining is deliberately generous, but an attached validator is more
+            // precise about request shape. Omit fields it explicitly marks optional instead of
+            // sending a scalar that may violate `.isArray()`/`.isObject()`. Keep a field when the
+            // sink's own guarded control-flow proves it is a real precondition.
+            let guarded = std::fs::read_to_string(root.join(&finding.file))
+                .ok()
+                .map(|source| {
+                    plan::guard_required_fields(
+                        &source,
+                        "body",
+                        &payload_field,
+                        &plan::guard_anchor_lines(finding),
+                    )
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            probe.siblings.retain(|(field, _)| {
+                field == &payload_field || !optional.contains(field) || guarded.contains(field)
+            });
+            let payload_filler =
+                plan::validator_body_field_filler(&route_src, at.line, &payload_field, &resolve);
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                let idents = plan::route_middleware_idents(&route_src, at.line);
+                let resolved: Vec<(String, bool, bool)> = idents
+                    .iter()
+                    .map(|n| {
+                        let src = resolve(n);
+                        let has = src.is_some();
+                        let arr = src
+                            .as_deref()
+                            .map(|s| plan::defines_const_array(s, n))
+                            .unwrap_or(false);
+                        (n.clone(), has, arr)
+                    })
+                    .collect();
+                eprintln!(
+                    "[verify] validator-siblings entry={:?} at={}:{} payload={payload_field:?} idents={resolved:?} optional={optional:?} mined={mined:?}",
+                    probe.entry, at.file, at.line
+                );
+            }
+            apply_body_validator_fillers(
+                &mut probe.siblings,
+                &mut probe.body_query_override,
+                &payload_field,
+                payload_filler,
+                mined,
+            );
+        }
+    }
+    // A sink that reads a property of a tainted object the handler forwarded whole into a callee module
+    // (`addPrinter(req.body)` then, inside that module, `fs.writeFile(printer.logFilePath, ...)` where
+    // `logFilePath` is built from `entry.id`) is reported by the engine with the sink *property* name
+    // (`logFilePath`) as its request field — but no such field exists on the request: the attacker
+    // controls a different field (`id`) the property is derived from. Resolve that real controlling
+    // field from the sink module, and carry the sibling fields that module validates as required so the
+    // request passes the callee's own validation and reaches the sink. Only when the sink lives in a
+    // different module than the handler (the taint crosses into a callee); generic, mined by convention.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        let Ok(plan::Plan::Http(probe)) = planned else {
+            continue;
+        };
+        let plan::Entry::Body(Some(member)) = &probe.entry else {
+            continue;
+        };
+        let member = member.clone();
+        let Some(sink_file) = finding.sink.file.as_deref() else {
+            continue;
+        };
+        if sink_file == finding.file {
+            continue;
+        }
+        let Ok(sink_src) = std::fs::read_to_string(root.join(sink_file)) else {
+            continue;
+        };
+        let tainted = plan::tainted_identifiers(finding, &probe.entry);
+        let Some(real_field) = plan::derived_sink_field(&sink_src, &member, &tainted) else {
+            continue;
+        };
+        let required = plan::object_required_string_fields(&sink_src, &tainted);
+        probe.entry = plan::Entry::Body(Some(real_field.clone()));
+        for field in required {
+            if field != real_field && probe.siblings.iter().all(|(name, _)| name != &field) {
+                probe.siblings.push((field, "jsspector".to_owned()));
+            }
+        }
+    }
+    // A SQL injection whose tainted value is interpolated in a table-identifier position
+    // (`FROM ${tbl}`): mine the columns the statements interpolating that identifier reference and the
+    // body fields the handler reads, so the probe can replace the table with a sub-select that both
+    // satisfies those columns and returns a database-computed value.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && finding.class == jss_core::VulnClass::SqlInjection
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            probe.sql = plan::sql_plan_for(finding, &probe.entry, &source);
+            // A value-position injection (`WHERE email = '${x}'`) is not an identifier substitution;
+            // record how to break out of the enclosing quote so the exercise phase can drive a
+            // boolean differential. Only when no identifier plan already claimed the finding.
+            if probe.sql.is_none() {
+                probe.sql_value = plan::sql_value_plan_for(finding, &probe.entry, &source);
+            }
+        }
+    }
+    // An entry that forwards the request URL often reaches its sink only for paths the handler
+    // recognizes, and may read the tainted value from a query parameter of the parsed URL rather
+    // than from the path — the outbound host of an SSRF, or the file path of a traversal. Mine the
+    // gate paths (for an upgrade entry or a URL-sourced forward proxy/file read) and, for the
+    // URL-sourced case, the query parameters, so the request can be sent the way the handler reads it.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned {
+            let url_sourced = probe.entry == plan::Entry::Url
+                && matches!(
+                    probe.class,
+                    jss_core::VulnClass::Ssrf
+                        | jss_core::VulnClass::PathTraversal
+                        | jss_core::VulnClass::CommandInjection
+                        | jss_core::VulnClass::CodeInjection
+                );
+            if probe.method.is_upgrade() || url_sourced {
+                // A catch-all entry (`req.url` dispatched by `http.createServer`) recognizes the
+                // path and reads the tainted query parameter inside the route module that owns the
+                // sink, not the entry file. Mine the gate paths and query parameters from both the
+                // handler file and the sink's own file so the request is sent the way the dispatched
+                // handler reads it.
+                let files = [Some(finding.file.as_str()), finding.sink.file.as_deref()];
+                for file in files.into_iter().flatten() {
+                    let Ok(source) = std::fs::read_to_string(root.join(file)) else {
+                        continue;
+                    };
+                    // In a large catch-all router, lead with branches that actually read a
+                    // URL-shaped query field. The broad gate list remains as a fallback, but its
+                    // fixed cap must not hide a relevant route found later in the module.
+                    let anchors = if file == finding.file {
+                        plan::guard_anchor_lines(finding)
+                    } else {
+                        Vec::new()
+                    };
+                    let query_gates = plan::url_query_gate_paths(&source);
+                    let nearby_gates = plan::gate_paths_near(&source, &anchors);
+                    let broad_gates = plan::gate_paths(&source);
+                    let gates: Vec<String> = if probe.class == jss_core::VulnClass::Ssrf {
+                        query_gates
+                            .into_iter()
+                            .chain(nearby_gates)
+                            .chain(broad_gates)
+                            .collect()
+                    } else {
+                        nearby_gates
+                            .into_iter()
+                            .chain(query_gates)
+                            .chain(broad_gates)
+                            .collect()
+                    };
+                    for gate in gates {
+                        if !probe.gate_paths.contains(&gate) {
+                            probe.gate_paths.push(gate);
+                        }
+                    }
+                    if url_sourced {
+                        let direct = plan::url_search_params(&source);
+                        // The handler may parse the URL here but read its fields in a helper it
+                        // forwards the whole search-parameters object to (possibly in another
+                        // module). For filesystem/execution sinks those helper-local fields are
+                        // closer to the sink than unrelated members of a broad `options` object;
+                        // SSRF retains direct URL-shaped fields first.
+                        let forwarded = plan::forwarded_search_params(
+                            &source,
+                            &|fn_name| resolve_module_source(root, file, &source, fn_name),
+                            &plan::guard_anchor_lines(finding),
+                        );
+                        for param in ordered_url_query_params(probe.class, direct, forwarded) {
+                            if !probe.url_query_params.contains(&param) {
+                                probe.url_query_params.push(param);
+                            }
+                        }
+                    }
+                }
+            }
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] request plan fingerprint={} entry={:?} gates={:?} query-params={:?}",
+                    finding.fingerprint, probe.entry, probe.gate_paths, probe.url_query_params
+                );
+            }
+        }
+    }
+
+    // A coarse `req.query` SSRF whose handler is a query-selector dispatcher (`const q = req.query;
+    // switch (q.action) { case 'x': fetchHelper(q.url) }`) reaches the request sink only inside the
+    // branch the selector chooses, and picks the outbound host from another query member it reads there.
+    // The engine resolves the entry to one of those members, but with no selector the request takes no
+    // branch and never reaches the sink. Mine each dispatch branch, plus the path(s) the entry wrapper
+    // dispatches on (a module worker that routes `url.pathname === '/api'` to the handler), so the marker
+    // is driven in each candidate member under the right branch and route.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.class == jss_core::VulnClass::Ssrf
+            && matches!(probe.entry, plan::Entry::Query(_))
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let dispatch = plan::query_dispatch_cases(&source);
+            if !dispatch.is_empty() {
+                let files = [
+                    finding.entry_at.as_ref().map(|at| at.file.as_str()),
+                    Some(finding.file.as_str()),
+                    finding.sink.file.as_deref(),
+                ];
+                for file in files.into_iter().flatten() {
+                    let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+                        continue;
+                    };
+                    for gate in plan::gate_paths(&src) {
+                        if !probe.gate_paths.contains(&gate) {
+                            probe.gate_paths.push(gate);
+                        }
+                    }
+                }
+                if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                    eprintln!(
+                        "[verify] query-dispatch entry={:?} gates={:?} cases={dispatch:?}",
+                        probe.entry, probe.gate_paths,
+                    );
+                }
+                probe.query_dispatch = dispatch;
+            }
+        }
+    }
+
+    // A URL-sourced forward proxy / file sink that reads several query parameters off the parsed
+    // request URL reaches its sink only when the parameters other than the payload carrier are also
+    // present and valid (`if (!url || !type) return`; `const filter = FILTERS[type]; if (!filter)
+    // return`). Mine a valid filler for each parameter so the payload-bearing request carries its
+    // required siblings instead of being rejected before the sink.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.entry == plan::Entry::Url
+            && probe.url_query_params.len() > 1
+            && matches!(
+                probe.class,
+                jss_core::VulnClass::Ssrf
+                    | jss_core::VulnClass::PathTraversal
+                    | jss_core::VulnClass::CommandInjection
+                    | jss_core::VulnClass::CodeInjection
+            )
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let params = probe.url_query_params.clone();
+            probe.siblings = plan::url_query_fillers(&source, &params, &|name| {
+                resolve_module_source(root, &finding.file, &source, name)
+            });
+        }
+    }
+
+    // An SSRF whose tainted body field is a structured document a parse function turns into an object
+    // before the sink reads one of its members (`const parsed = parseDocument(body); fetch(
+    // `${parsed.endpoint}/...`)`) never reaches the sink with a raw URL: the input must be a document
+    // the parser accepts. Mine the document scaffold and the member->JSON-key mapping from the handler
+    // and the parse function's own source (resolving an import when the function lives in another
+    // module), so the payload can be packed the way the handler actually reads it.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.class == jss_core::VulnClass::Ssrf
+            && matches!(probe.entry, plan::Entry::Body(Some(_)))
+            && let Ok(handler) = std::fs::read_to_string(root.join(&finding.file))
+            && let Some(fn_name) = plan::parse_transform_fn(finding, &probe.entry, &handler)
+            && let Some(module_src) = resolve_module_source(root, &finding.file, &handler, &fn_name)
+        {
+            probe.doc_envelope = plan::doc_envelope(finding, &probe.entry, &handler, &module_src);
+        }
+    }
+
+    // A handler may require the tainted value itself to carry a literal delimiter before it reaches
+    // the sink (`username?.match(/#{(.*)}/) !== null`, then `username.substring(2,
+    // username.length - 1)`): a hand-rolled wrap convention distinct from the JSON-packing
+    // `envelope`/`doc_envelope` above. Mined from the finding's own file for every identifier its
+    // trace names (the sink's own argument and everything it was assigned from along the way), so
+    // it is found whichever alias the handler actually tests. Mutually exclusive with the JSON
+    // envelopes: only one wrapping convention applies to a given value.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.envelope.is_none()
+            && probe.doc_envelope.is_none()
+            && matches!(
+                probe.class,
+                jss_core::VulnClass::CodeInjection
+                    | jss_core::VulnClass::CommandInjection
+                    | jss_core::VulnClass::PathTraversal
+                    | jss_core::VulnClass::Ssrf
+            )
+            && let Ok(source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let tainted = plan::tainted_identifiers(finding, &probe.entry);
+            probe.text_wrap = plan::text_wrap(&source, &tainted);
+        }
+    }
+
+    // A sink the handler reaches only on a branch guarded by a session it looks up from a request
+    // cookie it reads itself (`const u = sessions.get(req.cookies.token); if (u) { fetch(url) }`) is
+    // not driveable by an anonymous request even though no route-level auth middleware flagged it:
+    // the in-handler check is an exploit precondition, and an authenticated user still reaches the
+    // sink. Mint a genuine session by exercising the app's own registration/login routes, mined by
+    // generic auth vocabulary from the route-registration source, and carry the returned token back
+    // under the cookie the handler reads. A session the app itself never issues cannot be forged, so
+    // this only reaches a sink a real logged-in request would, never one that is actually closed.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.auth.is_none()
+            && let Ok(handler) = std::fs::read_to_string(root.join(&finding.file))
+            && let Some(cookie) = plan::session_cookie_gate(&handler, finding.sink.line as usize)
+        {
+            // Routes are registered in the entry/app module and sometimes in the handler's own file;
+            // mine both for the login and registration endpoints.
+            let mut login = Vec::new();
+            let mut register = Vec::new();
+            let route_files = [
+                finding.entry_at.as_ref().map(|at| at.file.as_str()),
+                Some(finding.file.as_str()),
+            ];
+            for file in route_files.into_iter().flatten() {
+                let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+                    continue;
+                };
+                let (l, r) = plan::auth_endpoints(&src);
+                for p in l {
+                    if !login.contains(&p) {
+                        login.push(p);
+                    }
+                }
+                for p in r {
+                    if !register.contains(&p) {
+                        register.push(p);
+                    }
+                }
+            }
+            if !login.is_empty() {
+                probe.auth = Some(plan::AuthBootstrap {
+                    cookie,
+                    register_paths: register,
+                    login_paths: login,
+                    default_credentials: false,
+                    route_gate: false,
+                });
+            }
+        }
+    }
+
+    // A sink whose route-level authentication is a framework request-middleware (a Next.js
+    // `middleware`/matcher, a global request proxy) is reported by the engine as having no in-handler
+    // auth check, yet an anonymous probe is turned away with 401 before the sink. Such a sink is still
+    // exploitable on a realistic deployment: the app's own login route issues a session for the
+    // first-run default credential (the public default an operator is expected to change), after which
+    // the sink is reachable. Mint that session through the app's own login route and carry it back on
+    // the gated request. A session the app itself never issues cannot be forged, so this reaches only
+    // a sink an open/default-credentialed deployment already exposes. Generic: the middleware and
+    // login routes are found by framework convention and auth vocabulary, never by app-specific names.
+    for planned in plans.iter_mut() {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.auth.is_none()
+            && let Some(login_paths) = plan::framework_auth_login_paths(root, &probe.path)
+        {
+            probe.auth = Some(plan::AuthBootstrap {
+                cookie: String::new(),
+                register_paths: Vec::new(),
+                login_paths,
+                default_credentials: true,
+                route_gate: false,
+            });
+        }
+    }
+
+    // A sink behind a classic request-level auth middleware the app mounts on itself (an Express /
+    // Connect `app.use(requireAuth())`, or a path-mounted `app.use('/api', requireAuth())` covering the
+    // route) is reported by the engine as having no in-handler auth check, yet an anonymous probe is
+    // turned away with 401 before the sink. The gate is real route-level authentication a deployment
+    // configures; reproduce it like the framework-middleware case above by minting a session through
+    // the app's own login route with the deployment's configured credential. The middleware and login
+    // routes are found by convention and auth vocabulary, never by app-specific names.
+    for planned in plans.iter_mut() {
+        if let Ok(plan::Plan::Http(probe)) = planned
+            && probe.auth.is_none()
+            && let Some(login_paths) = plan::request_middleware_login_paths(root, &probe.path)
+        {
+            probe.auth = Some(plan::AuthBootstrap {
+                cookie: String::new(),
+                register_paths: Vec::new(),
+                login_paths,
+                default_credentials: true,
+                route_gate: false,
+            });
+        }
+    }
+
+    // A sink behind route-level login middleware the engine recognized (auth `user`) is reachable by
+    // any account the app lets a visitor create. Mine the app's own registration and login routes —
+    // from the entry and handler modules first, then from every route source in the project when the
+    // auth routes live elsewhere — so the sandbox can register a throwaway account, log in, and replay
+    // the request with that session. No login route means no honest way in: skip with that reason.
+    let mut project_endpoints: Option<(Vec<String>, Vec<String>)> = None;
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        let Ok(plan::Plan::Http(probe)) = planned else {
+            continue;
+        };
+        let Some(boot) = probe.auth.as_mut() else {
+            continue;
+        };
+        if !boot.route_gate || !boot.login_paths.is_empty() {
+            continue;
+        }
+        let handler = std::fs::read_to_string(root.join(&finding.file)).ok();
+        let mut login = Vec::new();
+        let mut register = Vec::new();
+        let route_files = [
+            finding.entry_at.as_ref().map(|at| at.file.as_str()),
+            Some(finding.file.as_str()),
+        ];
+        for file in route_files.into_iter().flatten() {
+            let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+                continue;
+            };
+            let (l, r) = plan::auth_endpoints(&src);
+            push_unique(&mut login, l);
+            push_unique(&mut register, r);
+        }
+        if login.is_empty() || register.is_empty() {
+            let (l, r) = project_endpoints
+                .get_or_insert_with(|| plan::project_auth_endpoints(root))
+                .clone();
+            push_unique(&mut login, l);
+            push_unique(&mut register, r);
+        }
+        // Keep the route plan even when no login endpoint exists. `Auth::User` is a static
+        // precondition and the selected runtime may deliberately disable that gate (for example a
+        // packaged server whose local/default start script selects its `NONE` auth mode). The
+        // sandbox probes the concrete route first: an actual 401/403 still requires a real session
+        // and is skipped honestly when none can be minted; an open runtime is exercised
+        // anonymously instead of being discarded before it starts.
+        boot.cookie = handler
+            .as_deref()
+            .and_then(|src| plan::session_cookie_gate(src, finding.sink.line as usize))
+            .unwrap_or_else(|| "token".to_owned());
+        boot.login_paths = login;
+        boot.register_paths = register;
+    }
+
+    // A reflected XSS runs the app (like an HTTP finding) and additionally drives a headless browser
+    // against the live response; a socket.io finding's event is emitted against the very same app
+    // session. All three need the HTTP app session.
+    let needs_http = plans.iter().any(|p| {
+        matches!(
+            p,
+            Ok(plan::Plan::Http(_))
+                | Ok(plan::Plan::ReflectedXss(_))
+                | Ok(plan::Plan::Socket(_))
+                | Ok(plan::Plan::Mcp(_))
+        )
+    });
+    let needs_browser = plans
+        .iter()
+        .any(|p| matches!(p, Ok(plan::Plan::Browser(_))));
+
+    // Nothing drivable: answer without building anything.
+    if !needs_http && !needs_browser {
+        return Ok(findings
+            .iter()
+            .zip(&plans)
+            .map(|(f, p)| {
+                let reason = match p {
+                    Err(skip) => skip.0.clone(),
+                    Ok(_) => "not attempted".to_owned(),
+                };
+                verdict(f, Outcome::Skipped { reason })
+            })
+            .collect());
+    }
+    if !sandbox::available() {
+        let runtime = if std::env::var("JSS_VERIFY_RUNTIME").as_deref() == Ok("local") {
+            "the local verifier needs Node.js on PATH"
+        } else {
+            "--verify needs a running Docker daemon; none is reachable (start Docker, set JSS_VERIFY_RUNTIME=local inside a disposable sandbox, or drop --verify)"
+        };
+        return match missing {
+            Missing::Fail => Err(runtime.to_owned()),
+            Missing::Skip => Ok(findings
+                .iter()
+                .map(|f| {
+                    verdict(
+                        f,
+                        Outcome::Skipped {
+                            reason: runtime.to_owned(),
+                        },
+                    )
+                })
+                .collect()),
+        };
+    }
+
+    // Build the sessions the plans need. A build failure for one phase skips only that phase's
+    // findings, with the failure as the reason.
+    // An HTTP finding runs against the package that serves its route: a repo can hold several
+    // apps (a web front end and a separate API or worker service). One session per launched
+    // server (see `session_key`), started on first use and reused.
+    let mut http: Vec<(std::path::PathBuf, Result<sandbox::Session, String>)> = Vec::new();
+    let mut browser = needs_browser.then(|| sandbox::BrowserSession::start(root));
+
+    let mut order: Vec<_> = findings.iter().zip(&plans).enumerate().collect();
+    if stop_after_verified {
+        // Reuse learned knowledge first. An exact replay is only a scheduling hint: the exploit and
+        // fix are both executed and proved again against this checkout before they are trusted.
+        order.sort_by_key(|(_, (finding, _))| {
+            std::cmp::Reverse(fix::has_exact_replay(root, finding, fix_options))
+        });
+    }
+
+    let mut reproduced = false;
+    let mut verdicts: Vec<(usize, Verdict)> = order
+        .into_iter()
+        .map(|(index, (finding, plan))| {
+            if stop_after_verified && reproduced {
+                return (
+                    index,
+                    verdict(
+                        finding,
+                        Outcome::Skipped {
+                            reason: "not attempted after an earlier selected finding verified"
+                                .to_owned(),
+                        },
+                    ),
+                );
+            }
+            let mut fix = None;
+            let outcome = match plan {
+                Err(skip) => Outcome::Skipped {
+                    reason: skip.0.clone(),
+                },
+                // A socket.io event is carried by the same probe machinery as an HTTP request, so the
+                // same exploit, oracles and fix proof apply to both.
+                Ok(plan::Plan::Http(probe) | plan::Plan::Socket(probe)) => {
+                    let index = acquire_http_session(&mut http, root, finding);
+                    match http.get_mut(index).map(|(_, session)| session) {
+                        Some(Ok(session)) => {
+                            let outcome = match session.activate_sink(finding) {
+                                Ok(()) => session.exercise(probe),
+                                Err(reason) => Outcome::Skipped { reason },
+                            };
+                            let outcome = session.qualify(outcome);
+                            if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                                fix = Some(fix::prove(
+                                    fix::Target::Http { session, probe },
+                                    finding,
+                                    root,
+                                    &outcome,
+                                    fix_options,
+                                ));
+                            }
+                            outcome
+                        }
+                        Some(Err(err)) => Outcome::Skipped {
+                            reason: format!("the app could not be launched: {err}"),
+                        },
+                        None => Outcome::Skipped {
+                            reason: "not attempted".to_owned(),
+                        },
+                    }
+                }
+                // An MCP tool call: resolved against the server's own tool list, so a fix is proven
+                // against the exact (tool, argument) pair that verified, not the open probe. A server
+                // that speaks only stdio is started behind the bridge when it does not listen.
+                Ok(plan::Plan::Mcp(probe)) => {
+                    let (outcome, proof) = verify_mcp(&mut http, root, finding, probe, fix_options);
+                    fix = proof;
+                    outcome
+                }
+                Ok(plan::Plan::ReflectedXss(probe)) => {
+                    let index = acquire_http_session(&mut http, root, finding);
+                    match http.get_mut(index).map(|(_, session)| session) {
+                        Some(Ok(session)) => {
+                            let outcome = match session.activate_sink(finding) {
+                                Ok(()) => session.exercise_reflected_xss(probe),
+                                Err(reason) => Outcome::Skipped { reason },
+                            };
+                            let outcome = session.qualify(outcome);
+                            if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                                fix = Some(fix::prove(
+                                    fix::Target::ReflectedXss { session, probe },
+                                    finding,
+                                    root,
+                                    &outcome,
+                                    fix_options,
+                                ));
+                            }
+                            outcome
+                        }
+                        Some(Err(err)) => Outcome::Skipped {
+                            reason: format!("the app could not be launched: {err}"),
+                        },
+                        None => Outcome::Skipped {
+                            reason: "not attempted".to_owned(),
+                        },
+                    }
+                }
+                Ok(plan::Plan::Browser(probe)) => match browser.as_mut() {
+                    Some(Ok(session)) => {
+                        let outcome = match session.activate_sink(finding) {
+                            Ok(()) => session.exercise(probe),
+                            Err(reason) => Outcome::Skipped { reason },
+                        };
+                        if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                            fix = Some(fix::prove(
+                                fix::Target::Browser { session, probe },
+                                finding,
+                                root,
+                                &outcome,
+                                fix_options,
+                            ));
+                        }
+                        outcome
+                    }
+                    Some(Err(err)) => Outcome::Skipped {
+                        reason: format!("the browser phase could not start: {err}"),
+                    },
+                    None => Outcome::Skipped {
+                        reason: "not attempted".to_owned(),
+                    },
+                },
+            };
+            let result = Verdict {
+                fix,
+                ..verdict(finding, outcome)
+            };
+            reproduced |= matches!(&result.outcome, Outcome::Verified { .. });
+            (index, result)
+        })
+        .collect();
+    // Scheduling must not perturb the scanner's stable finding/verdict order.
+    verdicts.sort_by_key(|(index, _)| *index);
+    let verdicts = verdicts.into_iter().map(|(_, verdict)| verdict).collect();
+
+    for (_, session) in &mut http {
+        if let Ok(session) = session {
+            session.teardown();
+        }
+    }
+    if let Some(Ok(session)) = browser.as_mut() {
+        session.teardown();
+    }
+    Ok(verdicts)
+}
+
+/// Appends each of `items` to `into` unless already present, keeping first-seen order (the ranking
+/// the endpoint miner produced).
+fn push_unique(into: &mut Vec<String>, items: Vec<String>) {
+    for item in items {
+        if !into.contains(&item) {
+            into.push(item);
+        }
+    }
+}
+
+/// The index into `http` of the app session that serves `finding`'s route, freshly launched for
+/// this finding alone. A second finding on the same app (same `session_key`) gets a brand new
+/// session, not the live one its predecessor already drove: one finding's write, its planted
+/// NoSQL differential record, or any other exploitation side effect must never leak into the
+/// next finding's own verdict. The teardown-and-relaunch cost is paid once per finding, matching
+/// the isolation the local runtime already keeps when switching between different apps (see
+/// below); here it additionally covers two findings that share the very same app. Shared by the
+/// HTTP and reflected-XSS dispatch, which both run the live application; the latter additionally
+/// drives a browser against its response.
+fn acquire_http_session(
+    http: &mut Vec<(std::path::PathBuf, Result<sandbox::Session, String>)>,
+    root: &std::path::Path,
+    finding: &Finding,
+) -> usize {
+    acquire_http_session_with(http, root, finding, None)
+}
+
+/// [`acquire_http_session`], launching `launch` in place of the app's own start command: how an MCP
+/// server that speaks only stdio is served, through the bridge, from its own package.
+fn acquire_http_session_with(
+    http: &mut Vec<(std::path::PathBuf, Result<sandbox::Session, String>)>,
+    root: &std::path::Path,
+    finding: &Finding,
+    launch: Option<&StdioLaunch>,
+) -> usize {
+    let declared = finding
+        .entry_at
+        .as_ref()
+        .map_or(&finding.file, |at| &at.file);
+    let declared = std::path::Path::new(declared);
+    let app = launch.map_or_else(
+        || sandbox::app_dir(root, declared),
+        |launch| launch.app.clone(),
+    );
+    let command = launch.map(|launch| launch.command.as_str());
+    let key = sandbox::session_key(root, &app, declared);
+    if let Some(index) = http.iter().position(|(existing, _)| *existing == key)
+        && let Some(slot) = http.get_mut(index)
+    {
+        if let Ok(session) = &mut slot.1 {
+            session.teardown();
+        }
+        // Drop the old session before starting its replacement: a local session holds the
+        // process-wide fixture lock until it is dropped, and the new one waits for that lock, so
+        // starting it while the old one is still in the slot would wait forever.
+        slot.1 = Err("relaunching".to_owned());
+        let gating = gating_env_sources(root, finding);
+        *slot = (
+            key,
+            sandbox::Session::start_in(root, &app, Some(declared), &gating, command),
+        );
+        return index;
+    }
+    // Local verification plants process-global fixtures such as the `/tmp/jss-canary-read` fixtures
+    // and launch shims. Unlike Docker sessions, two local app sessions cannot safely coexist: the
+    // second would either consume the first session's token or refuse to overwrite its files. Tear the
+    // previous app down before switching packages. A later finding for that package may rebuild it,
+    // which is slower but preserves isolation and makes every verdict independent of finding order.
+    if sandbox::local_runtime_requested() {
+        for (_, session) in http.iter_mut() {
+            if let Ok(session) = session {
+                session.teardown();
+            }
+        }
+        http.clear();
+    }
+    let gating = gating_env_sources(root, finding);
+    let session = sandbox::Session::start_in(root, &app, Some(declared), &gating, command);
+    http.push((key, session));
+    http.len() - 1
+}
+
+/// What a finding that could not be verified because its app never started says first.
+const LAUNCH_FAILED: &str = "the app could not be launched";
+
+/// How to start the stdio MCP server a finding is in: the package it belongs to and the exec-form
+/// command that runs the bridge over the commands that may start it.
+struct StdioLaunch {
+    /// The package directory, relative to the repository root.
+    app: std::path::PathBuf,
+    command: String,
+}
+
+/// The package a file belongs to: its nearest ancestor directory with a `package.json`. A server
+/// that speaks only stdio has no `start` script, so the package that is "launchable" for an app that
+/// listens is not what is wanted here; the server's own package is, since its `bin` and its build
+/// are what start it.
+fn enclosing_package(root: &std::path::Path, file: &std::path::Path) -> std::path::PathBuf {
+    let mut dir = file.parent();
+    while let Some(current) = dir {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+        if root.join(current).join("package.json").is_file() {
+            return current.to_path_buf();
+        }
+        dir = current.parent();
+    }
+    std::path::PathBuf::new()
+}
+
+/// The launch of the stdio MCP server of the package a finding is in, or `None` when nothing in the
+/// package suggests how to start one (see [`stdio::candidates`]).
+fn stdio_launch(root: &std::path::Path, finding: &Finding) -> Option<StdioLaunch> {
+    let declared = finding
+        .entry_at
+        .as_ref()
+        .map_or(&finding.file, |at| &at.file);
+    let declared = std::path::Path::new(declared);
+    let app = enclosing_package(root, declared);
+    let candidates = stdio::candidates(&root.join(&app), declared.strip_prefix(&app).ok());
+    (!candidates.is_empty()).then(|| StdioLaunch {
+        command: stdio::bridge_command(&candidates),
+        app,
+    })
+}
+
+/// One attempt at an MCP finding in a session started with `launch` (or the app's own start
+/// command): the exploit, and a fix proof against the exact call that verified.
+fn verify_mcp_once(
+    http: &mut Vec<(std::path::PathBuf, Result<sandbox::Session, String>)>,
+    root: &std::path::Path,
+    finding: &Finding,
+    probe: &plan::Probe,
+    fix_options: &fix::FixOptions,
+    launch: Option<&StdioLaunch>,
+) -> (Outcome, Option<fix::FixOutcome>) {
+    let index = acquire_http_session_with(http, root, finding, launch);
+    match http.get_mut(index).map(|(_, session)| session) {
+        Some(Ok(session)) => {
+            let outcome = match session.activate_sink(finding) {
+                Ok(()) => session.exercise(probe),
+                Err(reason) => Outcome::Skipped { reason },
+            };
+            let outcome = session.qualify(outcome);
+            let mut proof = None;
+            if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                let resolved = session
+                    .resolved_mcp_probe()
+                    .unwrap_or_else(|| probe.clone());
+                proof = Some(fix::prove(
+                    fix::Target::Http {
+                        session,
+                        probe: &resolved,
+                    },
+                    finding,
+                    root,
+                    &outcome,
+                    fix_options,
+                ));
+            }
+            (outcome, proof)
+        }
+        Some(Err(err)) => (
+            Outcome::Skipped {
+                reason: format!("{LAUNCH_FAILED}: {err}"),
+            },
+            None,
+        ),
+        None => (
+            Outcome::Skipped {
+                reason: "not attempted".to_owned(),
+            },
+            None,
+        ),
+    }
+}
+
+/// Verifies an MCP finding. The server is first met the way any app is: launched, and found
+/// listening over Streamable HTTP or the legacy event stream. When nothing listens — the app could
+/// not be launched as a server, or answered no MCP endpoint — it is a server that speaks only stdio,
+/// and is launched again behind the bridge, which serves it over HTTP (see [`stdio`]). Both reasons
+/// are kept when neither way worked.
+fn verify_mcp(
+    http: &mut Vec<(std::path::PathBuf, Result<sandbox::Session, String>)>,
+    root: &std::path::Path,
+    finding: &Finding,
+    probe: &plan::Probe,
+    fix_options: &fix::FixOptions,
+) -> (Outcome, Option<fix::FixOutcome>) {
+    let first = verify_mcp_once(http, root, finding, probe, fix_options, None);
+    let Outcome::Skipped { reason } = &first.0 else {
+        return first;
+    };
+    if !(reason.starts_with(LAUNCH_FAILED) || reason.contains(mcp::NO_ENDPOINT)) {
+        return first;
+    }
+    let Some(bridge) = stdio_launch(root, finding) else {
+        return first;
+    };
+    match verify_mcp_once(http, root, finding, probe, fix_options, Some(&bridge)) {
+        (Outcome::Skipped { reason: stdio }, proof) => (
+            Outcome::Skipped {
+                reason: format!("{stdio} (as an HTTP server: {reason})"),
+            },
+            proof,
+        ),
+        verified => verified,
+    }
+}
+
+/// Applies the express-validator body requirements mined for one route. The payload field's own
+/// typed filler is retained as a sibling because NoSQL verification also probes alternate common
+/// fields in the same body: the body builder removes this sibling when the primary field itself
+/// carries the operator, and keeps it for an alternate field (`token[$ne]`) so a required primary
+/// `.isEmail()` still passes. The same filler remains the scalar body half of a body/query overwrite
+/// probe when that specialized case is enabled.
+fn apply_body_validator_fillers(
+    siblings: &mut Vec<(String, String)>,
+    body_query_override: &mut Option<String>,
+    payload_field: &str,
+    payload_filler: Option<String>,
+    required: Vec<(String, String)>,
+) {
+    if body_query_override.is_some()
+        && let Some(value) = payload_filler.clone()
+    {
+        *body_query_override = Some(value);
+    }
+    if !payload_field.is_empty()
+        && let Some(value) = payload_filler
+        && siblings.iter().all(|(field, _)| field != payload_field)
+    {
+        siblings.push((payload_field.to_owned(), value));
+    }
+    for (field, value) in required {
+        if let Some((_, current)) = siblings.iter_mut().find(|(name, _)| *name == field) {
+            // Validator metadata is more precise than the handler-wide neutral filler: preserve the
+            // field but replace `jsspector` with the declared array/object/scalar shape.
+            *current = value;
+        } else {
+            siblings.push((field, value));
+        }
+    }
+}
+
+/// The source of the module that defines `fn_name`, for a parse function the handler consumes: the
+/// handler's own source when the function is local, otherwise the imported module resolved relative to
+/// the handler file (trying the common JavaScript module file names). `None` when it cannot be found.
+fn resolve_module_source(
+    root: &std::path::Path,
+    handler_file: &str,
+    handler: &str,
+    fn_name: &str,
+) -> Option<String> {
+    if plan::defines_function(handler, fn_name) {
+        return Some(handler.to_owned());
+    }
+    let spec = plan::import_source_path(handler, fn_name)?;
+    resolve_relative_source(root, handler_file, &spec)
+}
+
+/// The source text a relative module `spec` imported from `from_file` resolves to, trying the common
+/// JavaScript module file names and an `index.*`. Confined to the repository tree. `None` for a bare
+/// package specifier or a file that cannot be read.
+fn resolve_relative_source(root: &std::path::Path, from_file: &str, spec: &str) -> Option<String> {
+    // Only resolve relative specifiers; a bare package import is not part of the app tree.
+    if !spec.starts_with('.') {
+        return None;
+    }
+    let dir = std::path::Path::new(from_file).parent()?;
+    let base = dir.join(spec);
+    let base_str = base.to_string_lossy().into_owned();
+    let canonical_root = root.canonicalize().ok()?;
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // The specifier as written first (it may already name a file, extension and all).
+    candidates.push(base.clone());
+    for ext in ["js", "mjs", "cjs", "ts", "jsx", "tsx"] {
+        // Append the extension to the whole path (`./device.validators` -> `device.validators.js`)
+        // rather than replacing its last dotted segment, so a dotted module file name resolves.
+        candidates.push(std::path::PathBuf::from(format!("{base_str}.{ext}")));
+        candidates.push(base.join(format!("index.{ext}")));
+    }
+    for candidate in candidates {
+        let Ok(candidate) = canonical_root.join(candidate).canonicalize() else {
+            continue;
+        };
+        if !candidate.starts_with(&canonical_root) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(candidate) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// The source of the module that defines a route middleware `name`: the route file itself when it
+/// declares the middleware (a local `const name = [...]` validator array or function), else the
+/// module it imports/`require`s `name` from — resolved through a relative specifier or a
+/// `module-alias` `_moduleAliases` entry. Confined to the repository tree.
+fn resolve_middleware_source(
+    root: &std::path::Path,
+    route_file: &str,
+    route_src: &str,
+    name: &str,
+) -> Option<String> {
+    // Resolve an explicit import/require binding before testing for a local function. The generic
+    // function-body recognizer deliberately accepts several assignment forms and can otherwise
+    // mistake `const name = require(...)` for a function when a later object literal supplies the
+    // first `{` after that binding.
+    if let Some(spec) = plan::import_or_require_source_path(route_src, name) {
+        return resolve_import_source(root, route_file, &spec);
+    }
+    if plan::defines_const_array(route_src, name) || plan::defines_function(route_src, name) {
+        return Some(route_src.to_owned());
+    }
+    None
+}
+
+/// The source a module specifier resolves to from `from_file`: a relative specifier through
+/// [`resolve_relative_source`], or a bare specifier through a `module-alias` `_moduleAliases` entry
+/// (`@validators/device.validators`). `None` for an unresolved or non-aliased package specifier.
+fn resolve_import_source(root: &std::path::Path, from_file: &str, spec: &str) -> Option<String> {
+    if spec.starts_with('.') {
+        return resolve_relative_source(root, from_file, spec);
+    }
+    if let Some(rest) = spec.strip_prefix("@/") {
+        let mut dir = std::path::Path::new(from_file).parent();
+        while let Some(current) = dir {
+            if root.join(current).join("tsconfig.json").is_file() {
+                let rooted = current.join("src").join(rest);
+                if let Some(source) = resolve_rooted_source(root, &rooted.to_string_lossy()) {
+                    return Some(source);
+                }
+            }
+            dir = current.parent();
+        }
+    }
+    let rooted = resolve_module_alias(root, from_file, spec)?;
+    resolve_rooted_source(root, &rooted)
+}
+
+/// A bare specifier rewritten through the nearest enclosing `package.json`'s `module-alias`
+/// `_moduleAliases` map (`@validators/x` with `"@validators": "validators"` declared in
+/// `src/app/package.json` -> `src/app/validators/x`), as a repository-root-relative path without an
+/// extension. `None` when no ancestor package declares the alias.
+fn resolve_module_alias(root: &std::path::Path, from_file: &str, spec: &str) -> Option<String> {
+    let (alias, rest) = match spec.split_once('/') {
+        Some((a, r)) => (a, Some(r)),
+        None => (spec, None),
+    };
+    let mut dir = std::path::Path::new(from_file).parent();
+    while let Some(d) = dir {
+        let pkg = root.join(d).join("package.json");
+        if let Ok(text) = std::fs::read_to_string(&pkg)
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(target) = json
+                .get("_moduleAliases")
+                .and_then(|v| v.as_object())
+                .and_then(|m| m.get(alias))
+                .and_then(|v| v.as_str())
+        {
+            let target = target.trim_start_matches("./").trim_end_matches('/');
+            let mut path = d.to_path_buf();
+            if !target.is_empty() && target != "." {
+                path = path.join(target);
+            }
+            if let Some(rest) = rest {
+                path = path.join(rest);
+            }
+            return Some(path.to_string_lossy().into_owned());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The source text of a repository-root-relative module path (without extension), trying the common
+/// JavaScript file names and an `index.*`. Confined to the repository tree.
+fn resolve_rooted_source(root: &std::path::Path, rooted: &str) -> Option<String> {
+    let canonical_root = root.canonicalize().ok()?;
+    let base = std::path::Path::new(rooted);
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // Try the specifier as written first (it may already name a file, extension and all).
+    candidates.push(base.to_path_buf());
+    for ext in ["js", "mjs", "cjs", "ts", "jsx", "tsx"] {
+        // Append the extension to the whole specifier (`device.validators` -> `device.validators.js`)
+        // rather than replacing its last dotted segment, so a module whose file name itself contains a
+        // dot resolves correctly.
+        candidates.push(std::path::PathBuf::from(format!("{rooted}.{ext}")));
+        candidates.push(base.join(format!("index.{ext}")));
+    }
+    for candidate in candidates {
+        let Ok(candidate) = canonical_root.join(candidate).canonicalize() else {
+            continue;
+        };
+        if !candidate.starts_with(&canonical_root) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(candidate) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// The source texts the sandbox scans for a credential the finding's sink is gated on: the sink's own
+/// module and the modules it imports one hop out (where a `createGithubAuthEnv`-style helper reads the
+/// token). Bounded to relative imports within the repository tree. Empty when the sink file cannot be
+/// read.
+fn gating_env_sources(root: &std::path::Path, finding: &Finding) -> Vec<String> {
+    // The credential gate that must be satisfied to reach the sink may sit either in the sink's own
+    // module (the branch directly around the call) or in the entry/handler module that calls into it
+    // (an integration the route requires configured before it forwards the request). Scan both files
+    // and their relative imports so a gate read anywhere along that path is reproduced.
+    let sink_file = finding
+        .sink
+        .file
+        .as_deref()
+        .unwrap_or(finding.file.as_str());
+    // The route may be registered in a third module (`app.use('/mcp', createMcpProxy(base))` in
+    // `app.js`, whose `if (process.env.MCP_SERVER_URL)` gate must be satisfied for the handler to be
+    // mounted at all), distinct from both the sink's module and the handler's. Scan it too.
+    let entry_file = finding.entry_at.as_ref().map(|at| at.file.as_str());
+    let mut sources = Vec::new();
+    let mut seen_files = Vec::new();
+    for file in [Some(sink_file), Some(finding.file.as_str()), entry_file]
+        .into_iter()
+        .flatten()
+    {
+        if seen_files.iter().any(|f| f == file) {
+            continue;
+        }
+        seen_files.push(file.to_owned());
+        let Ok(src) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        for spec in plan::relative_import_specifiers(&src) {
+            if let Some(text) = resolve_relative_source(root, file, &spec) {
+                sources.push(text);
+            }
+        }
+        sources.push(src);
+    }
+    sources
+}
+
+fn verdict(finding: &Finding, outcome: Outcome) -> Verdict {
+    Verdict {
+        fingerprint: finding.fingerprint.clone(),
+        entry: finding.entry.clone(),
+        class: finding.class.name().to_owned(),
+        outcome,
+        fix: None,
+    }
+}
+
+/// Renders the verification section of the text report: a line per finding that was driven, then
+/// a count. Nothing when no finding was driven.
+pub fn write_text(
+    out: &mut dyn std::io::Write,
+    verdicts: &[Verdict],
+    color: bool,
+) -> std::io::Result<()> {
+    if verdicts.is_empty() {
+        return Ok(());
+    }
+    let (bold, green, red, yellow, dim, reset) = if color {
+        (
+            "\x1b[1m", "\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[2m", "\x1b[0m",
+        )
+    } else {
+        ("", "", "", "", "", "")
+    };
+    let (mut verified, mut not_reproduced, mut skipped) = (0, 0, 0);
+    writeln!(out, "\n  {bold}Verification{reset}")?;
+    for v in verdicts {
+        let entry = v.entry.as_deref().unwrap_or(&v.class);
+        match &v.outcome {
+            Outcome::Verified { how, .. } => {
+                verified += 1;
+                writeln!(
+                    out,
+                    "  {green}✔ verified{reset} {entry} {dim}{}{reset}  ({how})",
+                    v.fingerprint
+                )?;
+                match &v.fix {
+                    Some(FixOutcome::Proven {
+                        strategy,
+                        file,
+                        diff,
+                        attempts,
+                        recipes,
+                        ..
+                    }) => {
+                        let guided = if recipes.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {} recipe(s)", recipes.len())
+                        };
+                        writeln!(
+                            out,
+                            "    {green}✔ fix proven{reset} {file} {dim}({strategy}, {attempts} attempt(s){guided}){reset}"
+                        )?;
+                        for line in diff.lines() {
+                            let tint = if line.starts_with("+++") || line.starts_with("---") {
+                                dim
+                            } else if line.starts_with('+') {
+                                green
+                            } else if line.starts_with('-') {
+                                red
+                            } else if line.starts_with("@@") {
+                                dim
+                            } else {
+                                ""
+                            };
+                            writeln!(out, "      {tint}{line}{reset}")?;
+                        }
+                    }
+                    Some(FixOutcome::Unproven {
+                        reason, attempts, ..
+                    }) => writeln!(
+                        out,
+                        "    {yellow}• fix unproven{reset} {dim}after {attempts} attempt(s): {reason}{reset}"
+                    )?,
+                    Some(FixOutcome::Unsupported { reason }) => {
+                        writeln!(out, "    {dim}• no fix: {reason}{reset}")?;
+                    }
+                    None => {}
+                }
+            }
+            Outcome::NotReproduced { tried } => {
+                not_reproduced += 1;
+                writeln!(
+                    out,
+                    "  {yellow}• not reproduced{reset} {entry} {dim}{}{reset}  ({tried} request(s) sent)",
+                    v.fingerprint
+                )?;
+            }
+            Outcome::Skipped { .. } => skipped += 1,
+        }
+    }
+    writeln!(
+        out,
+        "  {dim}verified {verified}, not reproduced {not_reproduced}, skipped {skipped}{reset}"
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Reproduction, apply_body_validator_fillers, enclosing_package, ordered_url_query_params,
+        resolve_import_source, resolve_middleware_source, resolve_module_source,
+    };
+    use jss_core::VulnClass;
+
+    #[test]
+    fn report_safe_keeps_only_bounded_filtered_authenticated_oracle_stdout() {
+        let proof = Reproduction {
+            command: "curl --header 'Cookie: secret' /profile | grep -F -m 1 -o -- '77'".to_owned(),
+            command_redacted: false,
+            method: "GET".to_owned(),
+            target: "/profile".to_owned(),
+            headers: vec!["Cookie: secret".to_owned()],
+            body: None,
+            evidence: "computed 77".to_owned(),
+            response: "private profile containing 77".to_owned(),
+            stdout: Some("77\n".to_owned()),
+            stderr: Some(String::new()),
+            exit_code: Some(0),
+            output_safety: Some("oracle-proof".to_owned()),
+            controls: Vec::new(),
+        };
+        let safe = proof.report_safe();
+        assert_eq!(safe.stdout.as_deref(), Some("77\n"));
+        assert!(
+            safe.response
+                .starts_with("[redacted authenticated response:")
+        );
+        assert!(!safe.command.contains("secret"));
+        assert!(safe.command_redacted);
+
+        let mut unfiltered = proof;
+        unfiltered.command = "curl --header 'Cookie: secret' /profile".to_owned();
+        unfiltered.stdout = Some("private profile containing 77".to_owned());
+        assert!(
+            unfiltered
+                .report_safe()
+                .stdout
+                .as_deref()
+                .is_some_and(|stdout| stdout.starts_with("[redacted authenticated stdout:"))
+        );
+
+        let mut file_read = unfiltered;
+        file_read.command = "curl --header 'Cookie: secret' /profile | grep -E -m 1 -o -- 'cm9vdDo[A-Za-z0-9+/=]*' | base64 -d".to_owned();
+        file_read.stdout = Some("root:*:20000:0:99999:7:::\n".to_owned());
+        assert_eq!(
+            file_read.report_safe().stdout.as_deref(),
+            Some("root:*:20000:0:99999:7:::\n")
+        );
+    }
+
+    #[test]
+    fn sink_proximate_url_fields_lead_for_filesystem_and_execution_sinks() {
+        let direct = vec!["action".to_owned(), "format".to_owned(), "q".to_owned()];
+        let forwarded = vec!["q".to_owned(), "other".to_owned()];
+
+        assert_eq!(
+            ordered_url_query_params(VulnClass::PathTraversal, direct.clone(), forwarded.clone()),
+            vec!["q", "other", "action", "format"]
+        );
+        assert_eq!(
+            ordered_url_query_params(
+                VulnClass::CommandInjection,
+                direct.clone(),
+                forwarded.clone()
+            ),
+            vec!["q", "other", "action", "format"]
+        );
+        assert_eq!(
+            ordered_url_query_params(VulnClass::Ssrf, direct, forwarded),
+            vec!["action", "format", "q", "other"]
+        );
+    }
+
+    #[test]
+    fn a_stdio_server_runs_from_its_own_package_not_the_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |relative: &str, text: &str| {
+            let path = dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        );
+        write("packages/tasks/package.json", r#"{"name":"tasks"}"#);
+        write("packages/tasks/src/mcp/server.ts", "export {};");
+        write("tools/script.js", "");
+        let package = |file: &str| enclosing_package(dir.path(), std::path::Path::new(file));
+        assert_eq!(
+            package("packages/tasks/src/mcp/server.ts"),
+            std::path::Path::new("packages/tasks")
+        );
+        // A file outside any nested package belongs to the root.
+        assert_eq!(package("tools/script.js"), std::path::Path::new(""));
+        assert_eq!(package("index.js"), std::path::Path::new(""));
+    }
+
+    #[test]
+    fn next_src_alias_resolves_model_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("app/src/api/register")).unwrap();
+        std::fs::create_dir_all(root.join("app/src/model")).unwrap();
+        std::fs::write(root.join("app/tsconfig.json"), "{}").unwrap();
+        std::fs::write(root.join("app/src/model/user.ts"), "export default User").unwrap();
+        assert_eq!(
+            resolve_import_source(root, "app/src/api/register/route.ts", "@/model/user").as_deref(),
+            Some("export default User")
+        );
+    }
+
+    #[test]
+    fn imported_transform_modules_cannot_escape_the_scan_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("parser.js"), "export function parseDoc() {}").unwrap();
+        std::fs::write(parent.path().join("outside.js"), "outside").unwrap();
+
+        let internal = "import { parseDoc } from '../parser.js';";
+        assert_eq!(
+            resolve_module_source(&root, "src/server.js", internal, "parseDoc").as_deref(),
+            Some("export function parseDoc() {}")
+        );
+
+        let escaping = "import { parseDoc } from '../../outside.js';";
+        assert!(resolve_module_source(&root, "src/server.js", escaping, "parseDoc").is_none());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(parent.path().join("outside.js"), root.join("linked.js"))
+                .unwrap();
+            let linked = "import { parseDoc } from '../linked.js';";
+            assert!(resolve_module_source(&root, "src/server.js", linked, "parseDoc").is_none());
+        }
+    }
+
+    #[test]
+    fn module_alias_namespace_validator_resolves_for_path_fillers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let route_file = "src/routes/analytics.routes.js";
+        let route = r#"const analyticsValidations = require("@validators/analytics.validators");
+router.get(
+  "/:email/health-score",
+  analyticsValidations.healthScoreValidators.getHealthScore,
+  controller.getEngagementHealth
+);
+module.exports = { router };
+"#;
+        let validator = "const validateUserEmail = param(\"email\").isEmail();\n\
+const healthScoreValidators = { getHealthScore: [validateUserEmail] };\n\
+module.exports = { healthScoreValidators };\n";
+        std::fs::create_dir_all(root.join("src/routes")).unwrap();
+        std::fs::create_dir_all(root.join("src/validators")).unwrap();
+        std::fs::write(
+            root.join("src/package.json"),
+            r#"{"_moduleAliases":{"@validators":"validators"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(route_file), route).unwrap();
+        std::fs::write(
+            root.join("src/validators/analytics.validators.js"),
+            validator,
+        )
+        .unwrap();
+
+        let resolve = |name: &str| resolve_middleware_source(root, route_file, route, name);
+        assert_eq!(
+            super::plan::validator_path_fillers(
+                route,
+                2,
+                "/api/v2/users/analytics/{email}/health-score",
+                None,
+                &resolve,
+            ),
+            vec![("email".to_owned(), "jss@jsspector.test".to_owned())]
+        );
+    }
+
+    #[test]
+    fn required_query_validators_are_mined_through_a_spread_subchain() {
+        // A GET route whose validator chain (resolved through a member expression and assembled from
+        // a spread sub-chain) requires `query("year")`/`query("month")`: both must be carried as
+        // type-valid siblings, while an `.optional()` query field and the payload field are not.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let route_file = "src/routes/analytics.routes.js";
+        let route = r#"const analyticsValidations = require("@validators/analytics.validators");
+router.get(
+  "/:email/engagement/metrics",
+  analyticsValidations.userEngagementValidators.getMetrics,
+  controller.getEngagementMetrics
+);
+module.exports = { router };
+"#;
+        let validator = "const validateUserEmail = param(\"email\").isEmail();\n\
+const validateYearMonth = [\n\
+  query(\"year\").isInt().withMessage(\"Invalid year\"),\n\
+  query(\"month\").isInt({ min: 0, max: 11 }).withMessage(\"Invalid month\"),\n\
+];\n\
+const validateTimeframe = query(\"timeframe\").optional().isIn([\"last30days\"]);\n\
+const unrelatedValidators = { getMetrics: [query(\"wrong\").isInt()] };\n\
+const userEngagementValidators = { getMetrics: [validateUserEmail, validateTimeframe, ...validateYearMonth] };\n\
+module.exports = { unrelatedValidators, userEngagementValidators };\n";
+        std::fs::create_dir_all(root.join("src/routes")).unwrap();
+        std::fs::create_dir_all(root.join("src/validators")).unwrap();
+        std::fs::write(
+            root.join("src/package.json"),
+            r#"{"_moduleAliases":{"@validators":"validators"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(route_file), route).unwrap();
+        std::fs::write(
+            root.join("src/validators/analytics.validators.js"),
+            validator,
+        )
+        .unwrap();
+
+        let resolve = |name: &str| resolve_middleware_source(root, route_file, route, name);
+        assert_eq!(
+            super::plan::validator_query_fillers(route, 2, "email", &resolve),
+            vec![
+                ("year".to_owned(), "1".to_owned()),
+                ("month".to_owned(), "1".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_validator_filler_survives_as_a_sibling_for_an_alternate_body_probe() {
+        let route = r#"router.post(
+  "/completeEmailLogin",
+  userValidations.completeEmailLogin,
+  userController.completeEmailLogin
+);"#;
+        let validators = r#"
+const completeEmailLogin = [[
+  body("email").exists().bail().isEmail(),
+  body("token").exists().bail().notEmpty(),
+]];
+module.exports = { completeEmailLogin };
+"#;
+        let resolve = |name: &str| (name == "userValidations").then(|| validators.to_owned());
+        let required = super::plan::validator_required_body_fields(route, 1, "email", &resolve);
+        let primary = super::plan::validator_body_field_filler(route, 1, "email", &resolve);
+        let mut siblings = Vec::new();
+        let mut body_query_override = Some("generic-placeholder".to_owned());
+
+        apply_body_validator_fillers(
+            &mut siblings,
+            &mut body_query_override,
+            "email",
+            primary,
+            required,
+        );
+
+        assert_eq!(
+            siblings,
+            vec![
+                ("email".to_owned(), "jss@jsspector.test".to_owned()),
+                ("token".to_owned(), "jsspector".to_owned()),
+            ]
+        );
+        assert_eq!(body_query_override.as_deref(), Some("jss@jsspector.test"));
+    }
+
+    #[test]
+    fn required_validator_shape_replaces_a_generic_handler_sibling() {
+        let mut siblings = vec![("device_names".to_owned(), "jsspector".to_owned())];
+        let mut body_query_override = None;
+        apply_body_validator_fillers(
+            &mut siblings,
+            &mut body_query_override,
+            "batch_name",
+            None,
+            vec![("device_names".to_owned(), "[\"jsspector\"]".to_owned())],
+        );
+        assert_eq!(
+            siblings,
+            vec![("device_names".to_owned(), "[\"jsspector\"]".to_owned())]
+        );
+    }
+}

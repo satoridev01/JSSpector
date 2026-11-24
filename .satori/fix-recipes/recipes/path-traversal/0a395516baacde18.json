@@ -1,0 +1,14 @@
+{
+  "id": "0a395516baacde18",
+  "class": "path-traversal",
+  "sink": "readdirSync",
+  "introduces": [
+    "String",
+    "basename"
+  ],
+  "before": "var id = req.query.id\nif (fs.existsSync(MUSIC_DIR + '/' + id)) {",
+  "after": "var id = path.basename(String(req.query.id))\nif (id != '.' && id != '..' && fs.existsSync(MUSIC_DIR + '/' + id)) {",
+  "proven": 1,
+  "offered": 7,
+  "first_try": 3
+}

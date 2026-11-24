@@ -1,0 +1,17 @@
+{
+  "id": "75226f64a134e7b6",
+  "class": "path-traversal",
+  "sink": "readdirSync",
+  "introduces": [
+    "String",
+    "basename",
+    "return",
+    "send",
+    "status"
+  ],
+  "before": "var id = req.body.id\nvar oldId = req.body.id\nvar tempId = req.body.tempId // temp music folder",
+  "after": "var id = path.basename(String(req.body.id))\nvar oldId = id\nvar tempId = req.body.tempId == undefined ? undefined : path.basename(String(req.body.tempId)) // temp music folder\nif (id == '.' || id == '..' || tempId == '.' || tempId == '..')\n  return res.status(400).send({error: 'invalid id'})",
+  "proven": 3,
+  "offered": 3,
+  "first_try": 3
+}

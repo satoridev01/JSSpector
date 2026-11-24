@@ -1,0 +1,190 @@
+# Node.js core: module families, sinks and how strings propagate.
+name: node
+modules:
+  child_process: child_process
+  fs: fs
+  fs/promises: fs
+  fs-extra: fs
+  graceful-fs: fs
+  original-fs: fs
+  vm: vm
+  notevil: notevil
+  path: path
+  path/posix: path
+  path/win32: path
+  upath: path
+  http: http
+  https: http
+  http2: http
+  util: util
+  shelljs: shelljs
+  execa: execa
+  deepcopy: deepcopy
+  klona: klona
+  klona/full: klona
+  clone: clone
+sinks:
+  - {module: child_process, exports: [exec, execSync], class: command-injection, severity: critical, args: ["any:0"]}
+  # A tainted program name; `shell: true` makes every argument shell text (engine rule).
+  - module: child_process
+    exports: [spawn, spawnSync, execFile, execFileSync]
+    class: command-injection
+    severity: high
+    args: ["any:0"]
+    # `shell: true` makes every argument shell text.
+    escalate: {option: shell, severity: critical, args: ["any:0", "any:1"]}
+    # An element of the argument list whose start the attacker chooses: argument injection
+    # (`--upload-pack=...`).
+    also: [{args: ["start:1"], severity: medium}]
+  # `fork(modulePath)` runs a module file, no shell: a tainted path chooses which file runs.
+  - {module: child_process, exports: [fork], class: path-traversal, severity: high, args: ["any:0"],
+     also: [{args: ["start:1"], severity: medium}]}
+  - {module: shelljs, exports: [exec], class: command-injection, severity: critical, args: ["any:0"]}
+  # A module path the attacker chooses loads and runs that code (`require(x)`, `import(x)`).
+  - {global: [require, import], class: code-injection, severity: high, args: ["any:0"]}
+  - {module: execa, exports: [execaCommand, execaCommandSync, command, commandSync], class: command-injection, severity: critical, args: ["any:0"]}
+  - {module: execa, exports: ["", execa, execaSync], class: command-injection, severity: high, args: ["any:0"]}
+  - {module: vm, exports: [runInNewContext, runInThisContext, runInContext, compileFunction, Script], class: code-injection, severity: critical, args: ["any:0"]}
+  - {module: notevil, exports: [eval], class: code-injection, severity: critical, args: ["any:0"]}
+  - module: fs
+    exports: [readFile, readFileSync, writeFile, writeFileSync, appendFile, appendFileSync, createReadStream,
+      createWriteStream, unlink, unlinkSync, rm, rmSync, rmdir, rmdirSync, readdir, readdirSync, open, openSync,
+      outputFile, outputFileSync, remove, removeSync, readJson, readJsonSync, writeJson, writeJsonSync, mkdir,
+      mkdirSync, ensureDir, ensureDirSync, mkdirp, mkdirs]
+    class: path-traversal
+    severity: high
+    args: ["any:0"]
+    ignore_kinds: [dom, props]
+  - module: fs
+    exports: [rename, renameSync, copyFile, copyFileSync, cp, cpSync, copy, copySync, move, moveSync, symlink, symlinkSync]
+    class: path-traversal
+    severity: high
+    args: ["any:0", "any:1"]
+  - {module: http, exports: [get, request], class: ssrf, severity: high, args: ["url:0"]}
+  - {global: [eval, Function], class: code-injection, severity: critical, args: ["any:0", "any:1", "any:2"]}
+propagation:
+  pass_methods: [trim, trimStart, trimEnd, toLowerCase, toUpperCase, toLocaleLowerCase, toLocaleUpperCase, replace,
+    replaceAll, slice, substring, substr, split, join, concat, toString, padStart, padEnd, normalize, at, valueOf, repeat,
+    match, matchAll]
+  build_methods: [concat, join, format]
+  strip_methods: [replace, replaceAll]
+  pass_globals: [String, decodeURIComponent, decodeURI, unescape, Buffer.from, JSON.parse, JSON.stringify, util.format,
+    URL, encodeURI, encodeURL, normalizeUrl, url.parse, url.resolve, querystring.parse,
+    Object.assign, Object.values, Object.entries, Object.fromEntries, Array.from, Array.of,
+    Promise.all, Promise.allSettled, Promise.race, Promise.any, Promise.resolve, structuredClone]
+  # Of those, the ones whose result can be an object (a NoSQL operator object); the others give strings.
+  object_globals: [JSON.parse, querystring.parse, url.parse,
+    Object.assign, Object.values, Object.entries, Object.fromEntries, Array.from, Array.of,
+    Promise.all, Promise.allSettled, Promise.race, Promise.any, Promise.resolve, structuredClone]
+  # Array methods whose result is (elements of) the receiver: `items.find(...)`, `args.pop()`.
+  element_methods: [find, findLast, filter, sort, toSorted, reverse, toReversed, flat, values, pop, shift,
+    toSpliced, with]
+  # Methods that store their arguments (from the given index on) in the receiver: `args.push(x)`.
+  store_methods: {push: 0, unshift: 0, splice: 2, fill: 0, set: 1, add: 0}
+  store_globals: [Object.assign]
+  # Globals whose result holds the keys of their argument (attacker-chosen for a parsed body).
+  key_globals: [Object.keys, Object.entries, Object.getOwnPropertyNames]
+  # Callbacks of array, promise and string methods: which argument is the callback, which of its
+  # parameters get an element of the receiver, and whether the call returns what it returns.
+  callbacks:
+    map: {element: [0], returns: true}
+    flatMap: {element: [0], returns: true}
+    forEach: {element: [0]}
+    filter: {element: [0]}
+    find: {element: [0]}
+    findLast: {element: [0]}
+    findIndex: {element: [0]}
+    findLastIndex: {element: [0]}
+    some: {element: [0]}
+    every: {element: [0]}
+    sort: {element: [0, 1]}
+    toSorted: {element: [0, 1]}
+    reduce: {element: [1], accumulator: 0, returns: true}
+    reduceRight: {element: [1], accumulator: 0, returns: true}
+    then: {element: [0], returns: true}
+    finally: {keeps_receiver: true}
+    catch: {returns: true, keeps_receiver: true}
+    replace: {callback: 1, element_all: true}
+    replaceAll: {callback: 1, element_all: true}
+  # Schema validation (zod, yup, joi): the result is the input, its leaves typed by the schema.
+  validating_methods: [parse, safeParse, parseAsync, safeParseAsync, cast, attempt]
+  validation_clean_fields: [success, error, issues]
+  # `re.exec(s)` returns parts of `s`; `s.match(re)` parts of `s`.
+  regex_methods: [exec]
+  match_methods: [match, matchAll]
+  # `Object.entries(o)`: `[key, value]` tuples.
+  entry_globals: [Object.entries]
+  # The result starts with the first argument: `path.join(root, x)` (not `path.resolve`).
+  root_joins: [path.join]
+  # The result names the same file as the one argument: confining one confines the other.
+  same_file_calls: [path.resolve, path.normalize]
+  # Only strings have these: past `email.toLowerCase()`, `email` was a string.
+  string_only_methods: [toLowerCase, toUpperCase, toLocaleLowerCase, toLocaleUpperCase, trim, trimStart, trimEnd,
+    normalize, padStart, padEnd, startsWith, endsWith, charAt, charCodeAt, codePointAt, localeCompare, repeat,
+    substring, substr, split, search, replace, replaceAll]
+  # `HOSTS.has(url.hostname)` on `url = new URL(x)`: the host is one of the allowed.
+  url_classes: [URL]
+  url_host_fields: [hostname, host, origin]
+  # `f.call(that, a)`, `f.apply(that, [a])`: `f(a)`.
+  call_methods: [call]
+  apply_methods: [apply]
+  # Functions that call a function argument with the arguments after it.
+  forwarders:
+    - {functions: [setImmediate, queueMicrotask, process.nextTick], callback: 0, from: 1}
+    - {functions: [setTimeout, setInterval], callback: 0, from: 2}
+  # Module functions returning (part of) their first argument, objects included.
+  object_module_pass: [lodash.clone, lodash.cloneDeep, lodash.omit, lodash.pick, lodash.get, lodash.castArray,
+    lodash.toArray, lodash.flatten, lodash.head, lodash.last, deepcopy, klona, clone]
+sanitizers:
+  # A hash digest (hex or base64) never holds `..`, a quote or markup.
+  calls: [parseInt, parseFloat, Number, Boolean, path.basename, basename, encodeURIComponent, isNaN, digest]
+  # Used as a guard (`if (!isValid(x)) return;`), these clear their argument on the passing path.
+  validators: [isUUID, isUuid, uuidValidate, validate, isValid, isValidId, isSafe, isSafeName, isAlphanumeric,
+    isInt, isNumeric, isEmail, isURL, isMongoId, isValidObjectId, isSafeMapKey, isFinite, isInteger, includes, has,
+    test, isPathInside, isWithin, isSubPath]
+  receiver_validators: [startsWith, match]
+  # `docs.find((d) => d.name === name)` found something: `name` is one the server holds.
+  lookup_methods: [find, findLast, some]
+  # A signature check returns trusted claims: jwt.verify, verifySig, verifyToken.
+  result_cleaning_prefixes: [verify, unsign]
+  # ...trusted even when the function is in the repository: it checks a signature.
+  signed_words: [sig, signature, token, jwt, hmac, signed, cookie, session]
+  # Predicates (isX, hasX, validateX...) named like these are validators (true = safe)...
+  validator_words: [valid, safe, allowed, whitelisted, allowlisted, permitted, inside, within, contained, uuid, numeric, alphanumeric]
+  # ...or rejecters (true = bad), which clean their argument when they returned false.
+  rejecter_words: [traversal, malicious, unsafe, invalid, dangerous, forbidden, blocked, blacklisted, denylisted, private, internal, outside]
+  receiver_rejecters: [includes, match, test]
+  # `if (p.startsWith('-')) throw`: no option smuggled in as an argument.
+  leading_dash_checks: [startsWith]
+  # `if (rel.startsWith('..')) throw` with `rel = path.relative(base, file)`: `file` is inside.
+  upward_checks: [startsWith]
+  relative_calls: [path.relative]
+  # Function names that read as yes/no questions (lower case prefixes), their negations, and
+  # the prefixes of throwing assertions.
+  predicate_prefixes: [is, has, can, check, validate, verify, ensure, assert]
+  negations: [not, un, invalid]
+  assertion_prefixes: [assert, ensure]
+  rejected_markers: ["..", "\\0", "%2e"]
+  # `HOSTS.has(x)` true: `x` is one of what the server holds (on a URL's host, the URL goes
+  # there); `['a', 'b'].includes(x)` too, for a list written out (a string's is a substring).
+  set_members: [has]
+  list_members: [includes]
+  # Checks and clearing calls that are safe for some classes only (names, and words of names
+  # matched as predicates). `none`: format checks that only prove a string.
+  scoped:
+    path-traversal: [isPathInside, isWithin, isSubPath, inside, within, outside, traversal, path.basename, basename]
+    ssrf: [encodeURIComponent, private, internal, blocked, blacklisted, denylisted, forbidden]
+    none: [isURL, isEmail, url, email]
+  escapers:
+    sql-injection: [escape, escapeId, mysql.escape, mysql.format, SqlString.format, pg.escapeLiteral, escapeLiteral, escapeIdentifier]
+    xss: [escapeHtml, escape, sanitize, DOMPurify.sanitize, sanitizeHtml, encode, he.encode, xss, filterXSS]
+    command-injection: [quote, shellescape, shellEscape, escapeShellArg]
+member_sources:
+  - {object: process, property: argv, kind: cli}
+# Arguments of the user's own command line are not an attack surface on their machine.
+severity_caps:
+  cli: low
+implicit_modules: [child_process, fs, vm, path]
+module_namespaces: [promises]
+module_pass: [path.join, path.resolve, path.normalize, path.format, path.relative, util.format,
+  path.dirname, path.parse, path.extname, path.toNamespacedPath]

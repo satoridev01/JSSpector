@@ -1,0 +1,18 @@
+{
+  "id": "e24ba83c42292c48",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": [
+    "cwd",
+    "end",
+    "return",
+    "sep",
+    "startsWith",
+    "writeHead"
+  ],
+  "before": "",
+  "after": "if (!filePath.startsWith(process.cwd() + path.sep)) {\n  res.writeHead(404);\n  res.end('404');\n  return;\n}",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

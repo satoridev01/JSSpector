@@ -1,0 +1,17 @@
+{
+  "id": "b7cdc20222bc3d34",
+  "class": "path-traversal",
+  "sink": "copyFileSync",
+  "introduces": [
+    "String",
+    "basename",
+    "return",
+    "send",
+    "status"
+  ],
+  "before": "var id = req.body.id\nvar oldId = req.body.id\nvar tempId = req.body.tempId // temp music folder",
+  "after": "var id = path.basename(String(req.body.id))\nvar oldId = id\nvar tempId = req.body.tempId == undefined ? undefined : path.basename(String(req.body.tempId)) // temp music folder\nif (id == '.' || id == '..' || tempId == '.' || tempId == '..')\n  return res.status(400).send({error: 'invalid id'})",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

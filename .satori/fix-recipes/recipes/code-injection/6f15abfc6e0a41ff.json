@@ -1,0 +1,17 @@
+{
+  "id": "6f15abfc6e0a41ff",
+  "class": "code-injection",
+  "sink": "eval",
+  "introduces": [
+    "Error",
+    "new",
+    "test",
+    "throw",
+    "typeof"
+  ],
+  "before": "",
+  "after": "if (expression !== undefined && (typeof expression !== 'string' || !/^[\\d\\s+\\-*/%().]*$/.test(expression))) {\n  throw new Error('Expression is not plain arithmetic');\n}",
+  "proven": 2,
+  "offered": 1,
+  "first_try": 1
+}

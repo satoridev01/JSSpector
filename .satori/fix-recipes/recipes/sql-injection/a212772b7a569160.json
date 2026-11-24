@@ -1,0 +1,13 @@
+{
+  "id": "a212772b7a569160",
+  "class": "sql-injection",
+  "sink": "get",
+  "introduces": [
+    "String"
+  ],
+  "before": "const query = `SELECT * FROM users WHERE username = '${username}' AND password = '${password}'`;\ndb.get(query, (err, user) => {",
+  "after": "const query = `SELECT * FROM users WHERE username = ? AND password = ?`;\ndb.get(query, [String(username), String(password)], (err, user) => {",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

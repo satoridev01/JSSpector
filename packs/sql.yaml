@@ -1,0 +1,23 @@
+# SQL drivers and query builders: text built from tainted data that looks like SQL.
+name: sql
+sinks:
+  - methods: [query, execute, raw, $queryRawUnsafe, $executeRawUnsafe,
+      unsafe, exec, all, run, get, prepare, each,
+      any, one, oneOrNone, many, manyOrNone, none, result, multi, multiResult]
+    class: sql-injection
+    severity: high
+    args: ["built:0"]
+  # Query-builder fragments are SQL by contract: an identifier or ORDER BY text needs no keyword.
+  - methods: [whereRaw, orWhereRaw, andWhereRaw, orderByRaw, havingRaw, orHavingRaw, joinRaw, groupByRaw, fromRaw]
+    class: sql-injection
+    severity: high
+    args: ["fragment:0"]
+  # knex `table.specificType(name, type)`: the type text goes verbatim into CREATE/ALTER TABLE.
+  - {methods: [specificType], class: sql-injection, severity: high, args: ["fragment:1"]}
+# Literal text is SQL when its first word starts a statement or a clause (`SELECT ...`,
+# `" WHERE id = "`, `"' AND x = '"`), or when it has a pair below in order.
+sql_keywords: [select, insert, update, delete, replace, merge, with, where, and, or, not, from, join, inner, left,
+  right, outer, cross, on, values, set, order, group, having, limit, offset, union, returning, truncate, drop,
+  create, alter, call]
+sql_pairs: [[select, from], [insert, into], [update, set], [delete, from], [order, by], [group, by],
+  [inner, join], [left, join], [union, select]]

@@ -1,0 +1,101 @@
+{
+  "recipe": "e2e52736b035283a",
+  "finding": "5fcdef3fdc439ed8",
+  "file": "api/api.js",
+  "original_fingerprint": "a4f060df737f6138",
+  "hunks": [
+    {
+      "line": 6,
+      "old": [],
+      "new": [
+        "const net = require(\"net\");",
+        "const dns = require(\"dns\").promises;"
+      ]
+    },
+    {
+      "line": 13,
+      "old": [],
+      "new": [
+        "// Addresses the server must never be made to call (loopback, private, link-local, metadata, ...)",
+        "const forbiddenAddresses = new net.BlockList();",
+        "[",
+        "  [\"0.0.0.0\", 8],",
+        "  [\"10.0.0.0\", 8],",
+        "  [\"100.64.0.0\", 10],",
+        "  [\"127.0.0.0\", 8],",
+        "  [\"169.254.0.0\", 16],",
+        "  [\"172.16.0.0\", 12],",
+        "  [\"192.0.0.0\", 24],",
+        "  [\"192.168.0.0\", 16],",
+        "  [\"198.18.0.0\", 15],",
+        "  [\"224.0.0.0\", 3],",
+        "].forEach(([address, prefix]) =>",
+        "  forbiddenAddresses.addSubnet(address, prefix, \"ipv4\"),",
+        ");",
+        "[",
+        "  [\"::\", 127],",
+        "  [\"::ffff:0:0\", 96],",
+        "  [\"64:ff9b::\", 96],",
+        "  [\"fc00::\", 7],",
+        "  [\"fe80::\", 10],",
+        "  [\"ff00::\", 8],",
+        "].forEach(([address, prefix]) =>",
+        "  forbiddenAddresses.addSubnet(address, prefix, \"ipv6\"),",
+        ");",
+        "",
+        "async function assertPublicUrl(url) {",
+        "  const { protocol, hostname } = new URL(url);",
+        "  if (!/^https?:$/.test(protocol)) {",
+        "    throw new Error(\"Umami URL not allowed\");",
+        "  }",
+        "  const addresses = await dns.lookup(hostname.replace(/^\\[|\\]$/g, \"\"), {",
+        "    all: true,",
+        "  });",
+        "  if (!addresses.length) {",
+        "    throw new Error(\"Umami URL not allowed\");",
+        "  }",
+        "  for (const { address, family } of addresses) {",
+        "    if (forbiddenAddresses.check(address, family === 6 ? \"ipv6\" : \"ipv4\")) {",
+        "      throw new Error(\"Umami URL not allowed\");",
+        "    }",
+        "  }",
+        "}",
+        ""
+      ]
+    },
+    {
+      "line": 177,
+      "old": [
+        "    const url = `${baseUrl}/realtime/${websiteId}`;"
+      ],
+      "new": [
+        "    const url = `${baseUrl}/realtime/${encodeURIComponent(websiteId)}`;"
+      ]
+    },
+    {
+      "line": 184,
+      "old": [],
+      "new": [
+        "    await assertPublicUrl(url);"
+      ]
+    },
+    {
+      "line": 211,
+      "old": [
+        "  const url = `${baseUrl}/websites/${websiteId}/stats?startAt=${startTime}&endAt=${endDate}`;"
+      ],
+      "new": [
+        "  const url = `${baseUrl}/websites/${encodeURIComponent(websiteId)}/stats?startAt=${startTime}&endAt=${endDate}`;"
+      ]
+    },
+    {
+      "line": 219,
+      "old": [],
+      "new": [
+        "  await assertPublicUrl(url);"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request GET \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/api/1?umamiUrl=http%3A%2F%2FCALLBACK_HOST&style=jsspector&website=jsspector&token=jsspector'",
+  "benign_status": 302
+}

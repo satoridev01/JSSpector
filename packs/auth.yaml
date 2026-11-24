@@ -1,0 +1,24 @@
+# How authentication shows in code: route middleware and checks inside handlers.
+name: auth
+auth:
+  # Middleware names (or callee names of middleware factories) containing one of these.
+  middleware: [auth, login, logged, token, jwt, session, passport, protect, requireuser, verify, role, signedin, permission, acl, rbac]
+  admin: [admin, superuser, staff, owner, root, sysadmin]
+  # `if (!req.user) return ...`: request fields whose absence ends the request.
+  request_fields: [user, session, auth, account, isAuthenticated]
+  # NestJS-style decorators on a class or method.
+  decorators: [UseGuards, Auth, Roles, Authorized, Protected]
+  # Named like auth but only set things up: no request is refused.
+  setup: [session, cookieSession, expressSession, passport.initialize, passport.session,
+    jwtChallenges, verify.jwtChallenges, updateAuthenticatedUsers,
+    security.updateAuthenticatedUsers]
+  # `return res.status(403).send(..)` in an inline `(req, res, next)` middleware: a guard.
+  denial_methods: [status, sendStatus, writeHead]
+  # What that check must read to guard anything, as whole words (or phrases) of names and
+  # strings (`x-api-key` is `x`, `api`, `key`; `apiKey` too): a credential or an identity.
+  # `req.get('origin')`, `req.protocol` and `req.method` do not.
+  credentials: [authorization, authorized, authenticated, token, tokens, apikey, secret, secrets,
+    password, passwd, bearer, credential, credentials, signature, cookie, cookies, session,
+    sessions, user, users, account, auth, login, logged, signedin, jwt, role, roles, permission,
+    permissions, acl, principal, userid, uid, api-key, access-key]
+  not_credentials: [user-agent]

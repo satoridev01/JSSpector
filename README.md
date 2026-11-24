@@ -1,0 +1,305 @@
+# JSSpector
+
+**JSSpector** is an auto-evolving security analyzer for JavaScript and TypeScript. It combines
+deterministic static analysis with dynamic verification to find vulnerabilities that are not only
+plausible in code, but demonstrably exploitable. It chains attack paths from an entry point,
+through data flow across functions and files, to a dangerous sink, then attempts to reproduce the
+effect in a disposable runtime.
+
+JSSpector can also propose a minimal fix and validate it against the same exploit. A fix is accepted
+only when the exploit works before the change, stops working after it, becomes reproducible again
+when the vulnerable code is restored, and a benign control proves that the application still works.
+
+The system improves across consecutive runs. Proven exploit and fix strategies can be recorded and
+replayed deterministically, while `jsspector evolve` can use an AI repair agent to extend scanner
+coverage when a benchmark exposes a blind spot. AI proposes candidates; it never decides what is
+true. New scanner capabilities and fixes are promoted only after deterministic reproduction,
+regression tests and precision holdouts pass. With `--push`, validated generations are published so
+other machines and later runs start from the improved capability.
+
+> **Status: pre-alpha.** `jsspector scan` (taint findings, as text, JSON or SARIF, with baselines and a CI exit code), `jsspector routes` (entry-point inventory, OpenAPI 3.1) and `jsspector explain` work today. Framework knowledge lives in YAML packs ([`packs/`](packs/)); the engine lowers each file to an owned IR, links modules across files (relative imports, monorepo workspace packages, barrels) and follows values through function summaries.
+
+## Quick start
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/satoridev01/JSSpector/releases/latest/download/jsspector-installer.sh | sh
+jsspector scan path/to/repo
+```
+
+The installer puts the binary for your platform in `~/.cargo/bin`. Releases are built with [dist](https://github.com/axodotdev/cargo-dist) for macOS and Linux (x86_64 and arm64) when a version tag is pushed: the archives, their checksums and the installer are on [GitHub Releases](https://github.com/satoridev01/JSSpector/releases). From source: `cargo install --git https://github.com/satoridev01/JSSpector --locked jsspector`.
+
+```
+  routes/files.js
+  ❯❯❱ jsspector.path-traversal [HIGH] 5c1e0f6a2b9d4e7f
+          Data from `req.query` (http) is used as a file path without confinement.
+          in GET /invoice, auth: none-detected
+
+        15┆ fs.readFile(target, 'utf8', (err, data) => {
+          ↳ source: routes/files.js:13
+        13┆ const filename = req.query.filename;
+          ↳ through path.join(): routes/files.js:14
+        14┆ const target = path.join(INVOICE_DIR, filename);
+          ⋮┆----------------------------------------
+
+5 finding(s) in 7 file(s) scanned (0 skipped) in 0.01s
+```
+
+Each finding shows the sink, then every step from the source to it, across files, with the code line of each step. The hex string is the finding's fingerprint.
+
+| Option | Meaning |
+|---|---|
+| `--min-severity critical\|high\|medium\|low` | Lowest severity reported (default `low`: everything) |
+| `-f, --format text\|json\|sarif` | Readable list (default), the full JSON report, or SARIF 2.1.0 |
+| `-o, --output FILE` | Write the report to a file |
+| `--fail-on SEVERITY` | Exit with code 1 when a reported finding not in the baseline is at or above this |
+| `--allow-incomplete` | Permit exit 0 when selected files could not be fully analyzed; reports still say `complete: false` |
+| `--baseline FILE` / `--write-baseline FILE` | Report only findings not in FILE / record the current findings in FILE |
+| `--exclude GLOB` | Skip paths (like `.gitignore`; repeatable) |
+| `--no-inline-ignores` | Do not honor target-owned `jsspector-ignore` comments (automatic with `--repo`) |
+| `--include tests,examples,docs,generated,vendor\|all` | Also scan these file classes (source files always are) |
+| `--config FILE` / `--repo-config` | Read settings from FILE / from `.jsspector.yml` in the scanned directory (neither by default) |
+| `--threads N` | Worker threads (default: all cores) |
+
+The output is byte-identical for any thread count. A file that cannot be parsed is reported as
+skipped, never a process crash. A scan with a skipped, panicked or depth-truncated selected file is
+incomplete and exits 3 unless `--allow-incomplete` is explicit; JSON carries `complete: false` and
+SARIF sets `executionSuccessful: false`. Exit codes: 0 = complete with no finding at `--fail-on`
+(or no `--fail-on`), 1 = findings at or above it, 2 = usage or configuration error, 3 = engine,
+I/O or incomplete-analysis error.
+
+### Configuration
+
+Settings are read only when asked for: from `--config FILE`, or with `--repo-config` from
+`.jsspector.yml` in the scanned directory. A scanned repository's own file is ignored by default, so
+it cannot exclude or disable what would report it. Command-line options win:
+
+```yaml
+min_severity: high
+fail_on: high
+exclude: ["scripts/", "*.min.js"]        # globs, like .gitignore
+include: [tests]                         # extra file classes to scan
+baseline: .jsspector-baseline.json
+disable: [prototype-pollution]           # classes not to report
+packs: [security/our-orm.yaml]           # extra packs, same schema as packs/*.yaml
+auth:
+  require: [mustBeLoggedIn]              # middleware/guard names that require a login
+  admin: [mustBeAdmin]                   # ... or an admin
+```
+
+### Explaining
+
+```sh
+jsspector explain sql-injection          # the rule: CWE, what it means, how to fix, what counts as safe, sinks
+jsspector explain 5c1e0f6a path/to/repo  # one finding by fingerprint (or a unique prefix): code at every step
+```
+
+### Entry points
+
+```sh
+jsspector routes path/to/repo            # table: method, full path, auth, handler, file:line, inputs
+jsspector routes --json path/to/repo
+jsspector routes --openapi path/to/repo  # OpenAPI 3.1 of the HTTP routes
+```
+
+Routes are followed through router mounts across files (`app.use('/api', require('./routes/users'))`, factories such as `app.use('/users', users())`), route tables and registration helpers. Covered: Express/Koa/Hono/Fastify routers (array paths, `app.route('/book').get(...)` chains, verb-first `router.route('POST', path, h)`, Hono `app.route()` mounts and `basePath`, Koa router prefixes, `fastify.register(plugin, { prefix })`), `fastify.route`, NestJS controllers, Next.js `app/**/route.ts` and `pages/api` (including `export { handler as GET }` and wrapped default exports), raw `http.createServer`, socket.io events, Electron IPC, GraphQL resolver maps, tRPC procedures and queue processors. `--openapi` writes OpenAPI 3.1 paths with unique operation ids.
+
+### What `scan` covers
+
+- **Sources:** Express/Fastify/Koa/Hono/Next.js/NestJS request data (and helpers that take the request), socket.io events (including `onAny` and connection sockets), Meteor methods, Electron `ipcMain`, `postMessage` and extension messages, GraphQL `args`, tRPC `input`, job payloads, archive entry names, n8n node parameters and webhook data, MCP tool, prompt and resource arguments (medium when the server is reached only over stdio), LLM tool definitions (medium), browser URL sources (`location`, `document.referrer`, `window.name`), React props (medium), `process.argv` (low).
+- **Sinks:** command and code injection (`child_process` incl. `shell: true` and argument injection, `eval`, `Function`, `vm`, computed `require`/`import()`, `executeJavaScript`, `shell.openExternal`, simple-git, node-ssh, MCP stdio transports), SQL built from text, NoSQL operator injection (object-capable values in queries and aggregation pipelines), path traversal, SSRF (attacker-chosen URL start), XSS (`innerHTML`, jQuery, `document.write`, `dangerouslySetInnerHTML`, navigation to `javascript:`, URL attributes such as `<a href>`, `<iframe src>` and `a.href = v`), prototype pollution (`o[k1][k2] = v`, deep-set helpers).
+- **Flow:** assignments, destructuring, templates, string methods, collections (`push`, `Object.assign`, `Object.entries`, `Array.from`, `Promise.all`, clones), callbacks (`map`, `forEach`, `reduce`, `then`, `replace`, by reference too), regex captures, rest parameters, object fields (field by field, spreads included, keys apart from values, tuple positions), instance fields across methods, ES5 classes, `call`/`apply`, typed instances (`new`, annotations, fields, factories and singleton accessors, dispatched to the classes that extend or implement a base, properties every assignment types alike), return values and parameter-to-sink summaries (every contributing parameter and field, sinks inside callbacks belonging to their function), followed across files (up to 8 hops) through relative imports, workspace packages, barrels and constructor injection.
+- **Guards:** validation that exits (`if (!/^\w+$/.test(x)) return`), allowlists (also in regex captures and matches), containment (`p === base || p.startsWith(base + sep)`, never against a base the request chose), comparisons with constants, `typeof`/`check()` type checks (NoSQL), `--` before positional arguments and leading-dash checks, fields the code overwrote, schema validation results, URL checks (`sanitizeUrl`), validators and escapers listed in packs.
+- **Auth:** each finding carries `auth` (`none-detected`, `user`, `admin`) from route middleware, `router.use`, guard decorators and in-handler checks; admin-only paths are one level lower.
+- **Precision:** NoSQL query sinks apply where the project has a MongoDB driver (or is a Meteor app); browser-side sources never reach server sinks; a service worker's `request` is the page's; appending a created DOM node is no HTML injection; `location.href` starts with the page's own origin.
+- **Output:** grouped by sink file with every step from source to sink. JSON and SARIF carry the short line-independent `fingerprint` used by baselines and exact verification selection, plus a versioned SHA-256 `identity` used to deduplicate the same semantic flow across scanner runs. JSON findings start with a readable `title` and carry `resource` (sink file:line), `description` and `remediation`. With `--verify`, each selected JSON finding also carries its exact `exploitation` outcome and a structured `poc` when exploitation was verified, so issue trackers such as Satori can ingest the evidence directly; credential headers and JWTs are redacted, and authenticated response bodies leave only their byte count. A verified finding also carries a `fix` (see below). In a git checkout, the JSON report also carries `git`: the `origin` repository (without credentials), the `revision`, the scanned directory's `path` in the repository (fix diffs are relative to it) and whether tracked files were `dirty`.
+
+Dynamic verification uses effects specific to the sink rather than treating reflected input as
+proof. JavaScript execution first attempts a read-only `/etc/shadow` read inside the disposable app
+container, falls back to `/etc/passwd`, and records only the file bytes decoded by the exact PoC
+command; an interpreter-computed product remains the portable fallback when `require` is absent.
+Shell execution uses the computed product, and a tainted executable passed to `spawn`/`execFile` is
+also tried directly with the read-only `id` program. Blind execution and SSRF use an independently
+observed callback; traversal reads use a secret planted file or a controlled OS-file read, while
+create/delete/overwrite sinks use isolated filesystem state differentials. SQL, NoSQL and prototype
+pollution use agreeing negative controls and database/object-state differentials. A response that
+merely echoes the payload, static `uid=` or passwd-shaped text, or a driver request that failed is
+never a verified exploit. When a Node application using `node-config` explicitly ships an
+`unsafe` profile, verification selects that application-owned profile inside the disposable
+sandbox; no repository-specific CLI parameter is required.
+
+### Proven fixes
+
+With `--verify`, every verified finding also gets a `fix`: a minimal code change proven, in the
+same sandbox that reproduced the exploit, to stop it. A change counts as `proven` only when the
+app still starts with it and a candidate/original/candidate proof makes the exploit stop, return
+when the vulnerable source is restored, and stop again when the change is reapplied. This prevents
+persistent database or application state from passing an unrelated edit as a fix. A benign request
+to the route must still get the HTTP status it got before the change — so a change that merely
+breaks the route never passes. For an XSS (server-reflected or DOM, in Docker or the local runtime) the probe is the
+same headless-browser load, every one of which must actually load, and the page must keep its legitimate
+behavior with a benign value sent the same way — still showing a plain value in an HTML page, or for
+a DOM navigation sink still navigating to an ordinary `http` URL — so a change that merely drops the
+value, or answers it as plain text, never passes either. The scanned checkout is not left modified: Docker keeps the
+change in the container, and the local runtime writes it back once the proof is over. The report
+carries the change as a unified diff, with the original file's fingerprint so the diff can be
+re-applied and re-proved later.
+
+JSSpector applies no fix pattern by itself. Candidates come from an LLM through the `claude` CLI, which is told why each earlier candidate failed and shown the fix recipes already proven for the finding's class. The outcome is `proven` (with the diff and its strategy), `unproven` (every candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be tried here, such as a DOM XSS that imports a module from the URL, or no LLM and no recorded fix).
+
+When explicitly requested, a proven fix can be kept in a recipe store,
+[`.satori/fix-recipes`](.satori/fix-recipes) in the JSSpector checkout the binary was built from
+(its main checkout: a binary built in a linked worktree, such as a repair agent's, records
+nothing):
+
+- as a **recipe**: its class, the sink's callee, what the change introduced and a short before/after. Recipes of the same class, the same sink first, are shown to the LLM so later fixes of that pattern tend to pass on the first candidate. Each recipe counts the times it was shown and the times the first candidate was then proven. A few recipes ship with JSSpector as a starting point.
+- as an **example**: the finding's and the file's fingerprints, the file's path, the exact change, the request that reproduced the exploit (with credential headers and tokens redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the change is replayed and proved again, with no LLM. This is how a rescan of the same commit reproduces both the exploit and its fix deterministically.
+
+Ordinary verification reads store data only from the exact local `HEAD` commit after confirming
+that commit is contained by its configured upstream; dirty files, untracked recipes and local-only
+commits never enter a replay or LLM prompt. Built-in recipes remain available when that provenance
+cannot be established. `--learn-fixes` explicitly works with the local store;
+`--publish-fixes` records, commits and pushes it. A push the remote rejects is rebased once and
+retried, never forced; without push access it reports the failure and carries on. Examples name no
+repository or commit, only the file's path, but publishing what was learned from a private
+repository can still disclose its vulnerable lines and request to this repository.
+
+```sh
+jsspector scan . --verify                  # verify, then prove a fix for each verified finding
+jsspector scan . --verify --no-fix-llm     # replay recorded fixes only, no LLM
+jsspector scan . --verify --no-fix         # verification only
+jsspector scan . --verify --verify-until-first \
+  --verify-fingerprint FIRST --verify-fingerprint SECOND  # ranked backlog: stop at first proof
+jsspector scan . --verify --learn-fixes    # also record newly proven fixes locally
+jsspector scan . --verify --publish-fixes  # record, commit and push newly proven fixes
+```
+
+`--fix-attempts` (default 3) bounds the LLM candidates, `--fix-timeout` (default 600 seconds) the
+total time per finding, and `--fix-model` picks the LLM model.
+
+### Exploiting a socket.io event
+
+`--verify` also drives a finding whose source is a socket.io event payload
+(`socket.on('name', (data, cb) => ...)`): it speaks the Engine.IO long-polling wire protocol
+directly (no `socket.io-client` dependency), connects to the same app session an HTTP finding
+uses, and emits the event carrying each payload, in Docker or the local runtime alike. Restricted
+for now to path traversal, command/code injection and SSRF (NoSQL/SQL injection and prototype
+pollution need request-input or sibling enrichment not wired up for a socket source yet), the
+default namespace and Engine.IO protocol v4 (socket.io v3/v4; an older v2 server or a custom
+`path:` option is not recognized), and anonymous events (one behind a `socket.use`/handshake
+check is not driven yet). A fix is proven the way an HTTP one is: the event must stop reproducing
+and a plain payload must still be acknowledged — an event the change stops answering at all fails
+that control.
+
+### Exploiting an MCP tool call
+
+A finding whose source is the arguments of an MCP (Model Context Protocol) tool — `server.tool`,
+`registerTool`, a low-level `setRequestHandler(CallToolRequestSchema)` or FastMCP's `addTool` — is
+driven live, in Docker or the local runtime alike: over HTTP when the server listens, and through a
+bridge when it speaks only stdio. Path traversal, command/code injection and SSRF are covered.
+
+The server is found and read, not guessed. JSSpector looks for the endpoint at the paths the source
+mounts it at, then the conventional ones (`/mcp`, `/`, `/sse`, ...), speaking each of the three HTTP
+transports with a dependency-free client that runs inside the app's own session: Streamable HTTP
+stateless, Streamable HTTP with a session id, and the legacy HTTP+SSE pair. It then asks the server
+what it offers (`tools/list`). A finding rarely says which argument of the tool carries the tainted
+value — the arguments object is usually passed whole to helpers, often across files — so the tool's
+own JSON Schema decides: every free-text argument is a candidate for the payload, the likeliest
+first, and the other required arguments are filled with values the schema accepts, because a server
+validates arguments before its handler runs. Each (tool, argument) pair gets a bounded number of
+requests, so a server with a hundred tools is not hammered for the one the finding is about.
+
+The report's reproduction is a command, not a description: plain `curl` (initialize, initialized,
+then `tools/call`) for Streamable HTTP, and the official client for the legacy event stream.
+
+A call the tool's schema rejects never reached the handler, which is not the same as the handler
+resisting it: such a finding is reported as skipped, with the schema's own message, never as not
+reproduced. So is a server that asks for credentials (verification does not log in). A fix is
+proven against the concrete call that was exploited: the exploit must stop reproducing and the same
+tool must still answer a plain value as it did before the change.
+
+Most MCP servers are not HTTP servers: an editor or `npx` starts them as a child process and talks
+over its stdin and stdout, so they bind no port. When the app does not listen, or listens at no MCP
+endpoint, JSSpector launches it again behind a small bridge that runs in the app's place, starts the
+repository's own stdio server as its child and serves it as a Streamable HTTP endpoint on the
+session's port. Discovery, the call driver, the oracles and the fix proof then work on it unchanged.
+Which command starts the server is tried out, not assumed: the package's `bin` and `main`, a
+`start`-style script that is a plain `node <file>`, the sub-commands its CLI defines for serving
+(`server start`, `mcp:serve`), and the module that constructs the stdio transport, each one run until
+the first answers `initialize`. A crash a payload causes restarts the server for the attempts that
+follow, and a launch that found nothing says what every command did and what the last one wrote to
+stderr. The reproduction in the report is the official client starting the server and calling the
+tool, so anyone with the package built can replay it.
+
+### Verifying without Docker
+
+`--verify` runs each app in a disposable Docker container. In an environment that is already
+disposable and has no Docker, such as a dedicated CI or Satori job, `--local` runs the app there
+instead, with the same exploit and fix proofs:
+
+```sh
+jsspector scan . --verify --local --format json
+```
+
+Local verification installs dependencies and executes the scanned repository's build and runtime
+scripts. Use it only inside a disposable worker with an allowlisted environment and no reusable
+credentials or host filesystem access; it is not a sandbox for an untrusted repository.
+
+The backing services an app needs are provisioned on demand, only for an app that needs them and only when the host lacks them: MongoDB 7.0 (with `mongosh`) for an app with a MongoDB driver, Redis 7.2 (built from source; needs `make` and a C compiler) for an app with a Redis client. They are cached under the system temp directory, so later runs start them at once. A service that cannot be provisioned leaves the app running without it, and a finding that then does not reproduce is reported as skipped rather than not reproduced.
+
+### Scanning a GitHub repository
+
+`scan --repo` accepts either the repository HEAD or a pinned revision, clones it and performs the
+same static scan as a local path. Dynamic execution happens only with an explicit `--verify`; a
+normal repository scan never repairs JSSpector, writes recipes, commits or pushes. Because the
+remote source is not trusted policy, `--repo` does not honor its `jsspector-ignore` comments:
+
+```sh
+jsspector scan --repo owner/repository
+jsspector scan --repo owner/repository@revision --verify
+```
+
+### Auto-evolution across consecutive runs
+
+Scanner evolution is a separate, explicitly mutating command. It requires a clean, published
+JSSpector checkout and may invoke the repair agent and commit validated changes. A single-repository
+run leaves commits local for review unless `--push` is explicit. Batch workers require `--push`
+because they exchange validated generations through the upstream branch. This makes consecutive
+runs cumulative: every worker begins from the latest accepted scanner generation, and only a
+generation that passes the deterministic promotion gates can become the starting point for the
+next run:
+
+```sh
+jsspector evolve --repo owner/repository
+jsspector evolve --repo owner/repository --push
+python3 .satori/pending-repos.py --output .satori/pending-repos.txt
+jsspector evolve --repos .satori/pending-repos.txt --parallel 2 --push
+```
+
+The list contains one `owner/repository@revision` per line. Workers diagnose and prepare repairs in
+independent JSSpector clones. Integration, exact dynamic revalidation, commits and pushes are
+serialized, and the pending list is regenerated after recovered identities are merged.
+
+The repair agent works in an isolated JSSpector worktree, receives no shell or Git access, and sees
+the target checkout through a temporarily read-only tree. It may change only the static scanner, its
+integration tests and packs; the CLI, dynamic verifier and controller that judge the change are an
+immutable trust boundary. A benchmark gap that requires a new dynamic oracle therefore stops for a
+reviewed verifier change instead of letting the repair candidate redefine success. The controller
+rebuilds the candidate, reproduces the exact pinned finding with a structured PoC, integrates
+accepted changes, and reruns the full CI suite plus exact-case validation against the integrated
+`HEAD` before any push.
+Each candidate and integrated generation also scans randomized safe counterparts for command
+injection, traversal, SQL injection, SSRF, NoSQL injection and DOM data flow. Any finding in that
+controller-owned precision holdout rejects the generation before it can be promoted.
+Diagnostics and repair transcripts live in the private evolution cache. Transcript capture is
+bounded (16 MiB for the structured stream and 2 MiB for stderr), continues draining the child after
+the bound, and marks truncated artifacts. Reports, baselines, recipes and controller artifacts are
+published by atomic replacement, so an untrusted checkout cannot redirect a write through a
+pre-existing destination symlink.
+Validated generations are committed; with explicit `--push`, they are published so another
+computer starts from the new capability.
+The controller's diagnostic `--no-repair` mode never writes identities or commits, while a local
+evolution without `--push` still runs the same full promotion gates before leaving its commits for
+review.
+This standalone flow requires authenticated Satori, repair-agent and GitHub CLIs; it does not
+require a supervising agent. `SATORI_ORGANIZATION` selects a Satori organization; without it the
+Satori CLI uses its own.

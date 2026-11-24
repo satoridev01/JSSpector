@@ -1,0 +1,47 @@
+{
+  "recipe": "91762c557f5c11be",
+  "finding": "f960af5ed4938219",
+  "file": "backend/routes/media.js",
+  "original_fingerprint": "af500d8767b2bcd8",
+  "hunks": [
+    {
+      "line": 4463,
+      "old": [
+        "      if (fs.existsSync(filePath)) {"
+      ],
+      "new": [
+        "      let resolvedPath;",
+        "      try {",
+        "        resolvedPath = fs.realpathSync(path.resolve(filePath));",
+        "      } catch (_) {",
+        "        return res.status(404).send(\"Local file not found\");",
+        "      }",
+        "      const allowedBases = await getAllowedMediaBases();",
+        "      try {",
+        "        const imageCacheDir = ImageCacheManager.getImageCacheDir();",
+        "        if (imageCacheDir && typeof imageCacheDir === \"string\") {",
+        "          allowedBases.push(path.resolve(imageCacheDir));",
+        "          try {",
+        "            allowedBases.push(fs.realpathSync(imageCacheDir));",
+        "          } catch (_) {}",
+        "        }",
+        "      } catch (_) {}",
+        "      if (!isPathInsideBases(resolvedPath, allowedBases)) {",
+        "        return res.status(403).send(\"Access denied\");",
+        "      }",
+        "      if (fs.existsSync(resolvedPath)) {"
+      ]
+    },
+    {
+      "line": 4466,
+      "old": [
+        "        return res.sendFile(filePath, { dotfiles: \"allow\" });"
+      ],
+      "new": [
+        "        return res.sendFile(resolvedPath, { dotfiles: \"allow\" });"
+      ]
+    }
+  ],
+  "poc": "curl -i -sS \\\n  --request GET \\\n  --path-as-is \\\n  --url 'http://TARGET_HOST:3000/api/image?url=%2Fetc%2Fpasswd&malid=jsspector&title=jsspector&type=jsspector'",
+  "benign_status": 500
+}

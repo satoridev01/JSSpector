@@ -73,6 +73,8 @@ class ControllerTests(unittest.TestCase):
             repository="owner/repo",
             revision="abc123",
             security_advisories="disabled",
+            repository_forks=42,
+            repository_stars=99,
             report={"findings": [verified, unverified]},
             findings=(verified,),
         )
@@ -135,6 +137,13 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(report["security_advisories"], "disabled")
                 self.assertEqual(command[command.index("--repo") + 1], "owner/repo")
                 self.assertEqual(command[command.index("--visibility") + 1], "private")
+                tag_values = {
+                    command[index + 1]: command[index + 2]
+                    for index, value in enumerate(command)
+                    if value == "--tag"
+                }
+                self.assertEqual(tag_values["repository_forks"], "42")
+                self.assertEqual(tag_values["repository_stars"], "99")
                 self.assertIn("--sync", command)
                 return mock.Mock(returncode=0)
 
@@ -303,6 +312,8 @@ class ControllerTests(unittest.TestCase):
                 repository="owner/repo",
                 revision="abc123",
                 security_advisories="disabled",
+                repository_forks=42,
+                repository_stars=99,
                 candidates=({"fingerprint": "verified"},),
                 checkout=checkout,
             )
@@ -361,6 +372,8 @@ class ControllerTests(unittest.TestCase):
         self.assertLessEqual(len(cleanup_label), 64)
         self.assertNotEqual(cleanup_label, "online_test")
         self.assertEqual(result.findings, (finding,))
+        self.assertEqual(result.repository_forks, 42)
+        self.assertEqual(result.repository_stars, 99)
         self.assertTrue(result.fix_attempted)
         self.assertTrue(result.fix_proven)
 

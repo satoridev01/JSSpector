@@ -64,6 +64,8 @@ class ResearchResult:
     repository: str
     revision: str | None = None
     security_advisories: str = "unknown"
+    repository_forks: int = 0
+    repository_stars: int = 0
     report: dict[str, Any] | None = None
     findings: tuple[dict[str, Any], ...] = ()
     failed: bool = False
@@ -82,6 +84,8 @@ class StaticResult:
     repository: str
     revision: str | None = None
     security_advisories: str = "unknown"
+    repository_forks: int = 0
+    repository_stars: int = 0
     report: dict[str, Any] | None = None
     candidates: tuple[dict[str, Any], ...] = ()
     checkout: Path | None = None
@@ -762,6 +766,8 @@ def static_repository(
     started = time.monotonic()
     repository = candidate.repo
     security_advisories = candidate.security_advisories
+    repository_forks = candidate.forks
+    repository_stars = candidate.stars
     slug = repository.replace("/", "__")
     static_path = run_dir / "reports" / f"{slug}.static.json"
     static_path.parent.mkdir(parents=True, exist_ok=True)
@@ -776,6 +782,8 @@ def static_repository(
             return StaticResult(
                 repository=repository,
                 security_advisories=security_advisories,
+                repository_forks=repository_forks,
+                repository_stars=repository_stars,
                 cancelled=True,
                 elapsed_s=round(time.monotonic() - started, 1),
             )
@@ -783,6 +791,8 @@ def static_repository(
         return StaticResult(
             repository=repository,
             security_advisories=security_advisories,
+            repository_forks=repository_forks,
+            repository_stars=repository_stars,
             failed=True,
             failure_reason=clone_failure,
             elapsed_s=round(time.monotonic() - started, 1),
@@ -816,6 +826,8 @@ def static_repository(
             return StaticResult(
                 repository=repository,
                 security_advisories=security_advisories,
+                repository_forks=repository_forks,
+                repository_stars=repository_stars,
                 cancelled=True,
                 elapsed_s=round(time.monotonic() - started, 1),
             )
@@ -824,6 +836,8 @@ def static_repository(
         return StaticResult(
             repository=repository,
             security_advisories=security_advisories,
+            repository_forks=repository_forks,
+            repository_stars=repository_stars,
             failed=True,
             failure_reason=reason,
             elapsed_s=round(time.monotonic() - started, 1),
@@ -851,6 +865,8 @@ def static_repository(
             repository=repository,
             revision=revision,
             security_advisories=security_advisories,
+            repository_forks=repository_forks,
+            repository_stars=repository_stars,
             report=static,
             elapsed_s=round(time.monotonic() - started, 1),
         )
@@ -860,6 +876,8 @@ def static_repository(
         return StaticResult(
             repository=repository,
             security_advisories=security_advisories,
+            repository_forks=repository_forks,
+            repository_stars=repository_stars,
             failed=True,
             failure_reason="missing-revision",
             elapsed_s=round(time.monotonic() - started, 1),
@@ -870,6 +888,8 @@ def static_repository(
         repository=repository,
         revision=revision,
         security_advisories=security_advisories,
+        repository_forks=repository_forks,
+        repository_stars=repository_stars,
         report=static,
         candidates=tuple(candidates),
         checkout=checkout,
@@ -1061,6 +1081,8 @@ def verify_repository(
             repository=repository,
             revision=revision,
             security_advisories=static.security_advisories,
+            repository_forks=static.repository_forks,
+            repository_stars=static.repository_stars,
             elapsed_s=round(time.monotonic() - started, 1),
         )
     if static.checkout is None or not static.checkout.is_dir():
@@ -1068,6 +1090,8 @@ def verify_repository(
             repository=repository,
             revision=revision,
             security_advisories=static.security_advisories,
+            repository_forks=static.repository_forks,
+            repository_stars=static.repository_stars,
             failed=True,
             failure_reason="checkout-missing",
             elapsed_s=round(time.monotonic() - started, 1),
@@ -1159,6 +1183,8 @@ def verify_repository(
                 repository=repository,
                 revision=revision,
                 security_advisories=static.security_advisories,
+                repository_forks=static.repository_forks,
+                repository_stars=static.repository_stars,
                 docker_cleanup_failures=docker_cleanup_failures,
                 cancelled=True,
                 elapsed_s=round(time.monotonic() - started, 1),
@@ -1169,6 +1195,8 @@ def verify_repository(
             repository=repository,
             revision=revision,
             security_advisories=static.security_advisories,
+            repository_forks=static.repository_forks,
+            repository_stars=static.repository_stars,
             failed=True,
             failure_reason=reason,
             docker_cleanup_failures=docker_cleanup_failures,
@@ -1183,6 +1211,8 @@ def verify_repository(
             repository=repository,
             revision=revision,
             security_advisories=static.security_advisories,
+            repository_forks=static.repository_forks,
+            repository_stars=static.repository_stars,
             docker_cleanup_failures=docker_cleanup_failures,
             elapsed_s=round(time.monotonic() - started, 1),
         )
@@ -1199,6 +1229,8 @@ def verify_repository(
         repository=repository,
         revision=revision,
         security_advisories=static.security_advisories,
+        repository_forks=static.repository_forks,
+        repository_stars=static.repository_stars,
         report=report,
         findings=tuple(verified),
         fix_attempted=fix_attempted,
@@ -1297,6 +1329,12 @@ def synchronize(
                 "--tag",
                 "security_advisories",
                 result.security_advisories,
+                "--tag",
+                "repository_forks",
+                str(result.repository_forks),
+                "--tag",
+                "repository_stars",
+                str(result.repository_stars),
                 "--tag",
                 "sync_key",
                 key,
@@ -2182,6 +2220,8 @@ def main(argv: list[str] | None = None) -> int:
             return StaticResult(
                 repository=candidate.repo,
                 security_advisories=candidate.security_advisories,
+                repository_forks=candidate.forks,
+                repository_stars=candidate.stars,
                 cancelled=True,
             )
         try:

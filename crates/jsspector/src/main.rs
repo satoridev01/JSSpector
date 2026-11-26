@@ -11,6 +11,7 @@ mod rules;
 mod sarif;
 mod secure_io;
 mod text;
+mod update;
 mod verify;
 
 use std::ffi::OsString;
@@ -67,13 +68,15 @@ enum Command {
     /// Static workers feed deterministic and Opus-ranked queues. Only findings reproduced by
     /// strict Docker verification become private Satori issues. A proven exploit gets one
     /// best-effort Opus fix attempt by default; failure to produce a fix never hides the issue.
-    Online(OnlineArgs),
+    Online(Box<OnlineArgs>),
     /// Grow JSSpector against its pinned exploitability benchmark.
     ///
     /// This is the explicit, mutating counterpart to `scan`: it may invoke the repair agent,
     /// commit validated scanner changes and push them to the configured upstream branch. A normal
     /// scan never evolves the scanner or publishes what it learns.
     Evolve(EvolveArgs),
+    /// Upgrade a pip-installed JSSpector to the newest version available on PyPI.
+    Update,
     /// List every entry point: HTTP routes with full paths (mount prefixes followed across files),
     /// socket events, IPC channels, GraphQL fields, tRPC procedures and queue processors.
     Routes(RoutesArgs),
@@ -248,18 +251,17 @@ struct EvolveArgs {
         long,
         value_name = "FILE",
         conflicts_with = "repo",
-        required_unless_present = "repo",
-        requires = "push"
+        required_unless_present = "repo"
     )]
     repos: Option<PathBuf>,
     /// Independent repair workers used with --repos.
     #[arg(long, value_name = "N", requires = "repos", conflicts_with = "repo")]
     parallel: Option<NonZeroUsize>,
-    /// Push validated evolution commits to the configured upstream. Without this option a
-    /// single-repository evolution leaves its commits local for review. Batch evolution requires
-    /// it because independent workers exchange generations through the upstream branch.
-    #[arg(long)]
-    push: bool,
+    /// Leave a single-repository evolution local instead of publishing it. By default validated
+    /// scanner repairs are pushed, patch-versioned and released to GitHub and PyPI. Batch workers
+    /// always publish because they exchange generations through the upstream branch.
+    #[arg(long, conflicts_with = "repos")]
+    no_push: bool,
 }
 
 #[derive(Args)]
@@ -273,6 +275,9 @@ struct OnlineArgs {
     /// Analyze at most this many repositories; 0 means every match.
     #[arg(long, default_value_t = 0)]
     limit: usize,
+    /// Skip repositories larger than this GitHub-reported size in MiB.
+    #[arg(long, default_value_t = 100)]
+    max_repo_size_mb: usize,
     /// GitHub language selected by discovery.
     #[arg(long, default_value = "JavaScript")]
     language: String,
@@ -315,9 +320,21 @@ struct OnlineArgs {
     /// Maximum seconds for statically scanning an already checked-out repository.
     #[arg(long, default_value_t = 600)]
     static_timeout: usize,
-    /// Maximum seconds for strict dynamic verification of one repository.
-    #[arg(long, default_value_t = 1800)]
+    /// Maximum seconds for building and starting one candidate application.
+    #[arg(long, default_value_t = 180)]
+    verify_startup_timeout: usize,
+    /// Idle decision point for one candidate before it has made a real request.
+    #[arg(long, default_value_t = 180)]
+    verify_candidate_soft_timeout: usize,
+    /// Maximum seconds for a candidate that has made real request progress.
+    #[arg(long, default_value_t = 300)]
+    verify_candidate_hard_timeout: usize,
+    /// Normal seconds for strict dynamic verification of one repository.
+    #[arg(long, default_value_t = 900)]
     verify_timeout: usize,
+    /// Maximum repository seconds after route, sink or canary evidence appears.
+    #[arg(long, default_value_t = 1800)]
+    verify_extended_timeout: usize,
     /// Maximum seconds spent proving a fix after exploitation succeeds.
     #[arg(long, default_value_t = 600)]
     fix_timeout: usize,
@@ -327,6 +344,9 @@ struct OnlineArgs {
     /// Keep verified reports local instead of creating private Satori issues.
     #[arg(long)]
     local_only: bool,
+    /// Satori credential profile used for deduplication and synchronization.
+    #[arg(long, default_value = "satoridev05")]
+    satori_profile: String,
     /// Do not attempt or learn a proven fix after exploitation succeeds.
     #[arg(long)]
     no_evolve: bool,
@@ -795,9 +815,17 @@ fn main() -> ExitCode {
         Command::Scan(args) => scan(&args),
         Command::Online(args) => online(&args),
         Command::Evolve(args) => evolve(&args),
+        Command::Update => update_cli(),
         Command::Routes(args) => routes(&args),
         Command::Explain(args) => explain(&args),
         Command::Ir(args) => ir(&args),
+    }
+}
+
+fn update_cli() -> ExitCode {
+    match update::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(EXIT_ENGINE, format!("update: {error}")),
     }
 }
 
@@ -1052,16 +1080,29 @@ mod repository_input_tests {
                 "--repos",
                 "list.txt",
                 "--parallel",
-                "2",
-                "--push"
+                "2"
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["jsspector", "evolve", "--repos", "list.txt"]).is_err());
+        assert!(Cli::try_parse_from(["jsspector", "evolve", "--repos", "list.txt"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["jsspector", "evolve", "--repos", "list.txt", "--no-push"])
+                .is_err()
+        );
         assert!(Cli::try_parse_from(["jsspector", "evolve", "--repo", "owner/project"]).is_ok());
         assert!(
+            Cli::try_parse_from([
+                "jsspector",
+                "evolve",
+                "--repo",
+                "owner/project",
+                "--no-push"
+            ])
+            .is_ok()
+        );
+        assert!(
             Cli::try_parse_from(["jsspector", "evolve", "--repo", "owner/project", "--push"])
-                .is_ok()
+                .is_err()
         );
         assert!(Cli::try_parse_from(["jsspector", "evolve"]).is_err());
     }
@@ -1075,6 +1116,7 @@ mod repository_input_tests {
         assert_eq!(args.since, "24h");
         assert_eq!(args.min_forks, 0);
         assert_eq!(args.limit, 0);
+        assert_eq!(args.max_repo_size_mb, 100);
         assert_eq!(args.pvr, "off");
         assert_eq!(args.static_parallel, 12);
         assert_eq!(args.max_checkouts, 24);
@@ -1086,9 +1128,14 @@ mod repository_input_tests {
         assert_eq!(args.docker_gc_every, 8);
         assert_eq!(args.clone_timeout, 120);
         assert_eq!(args.static_timeout, 600);
-        assert_eq!(args.verify_timeout, 1800);
+        assert_eq!(args.verify_startup_timeout, 180);
+        assert_eq!(args.verify_candidate_soft_timeout, 180);
+        assert_eq!(args.verify_candidate_hard_timeout, 300);
+        assert_eq!(args.verify_timeout, 900);
+        assert_eq!(args.verify_extended_timeout, 1800);
         assert_eq!(args.fix_timeout, 600);
         assert_eq!(args.ai_timeout, 60);
+        assert_eq!(args.satori_profile, "satoridev05");
         assert!(!args.local_only);
         assert!(!args.no_evolve);
         assert!(!args.no_tui);
@@ -1107,6 +1154,12 @@ mod repository_input_tests {
             "--parallel-ai",
             "--parallel-docker",
             "--max-checkouts",
+            "--max-repo-size-mb",
+            "--verify-startup-timeout",
+            "--verify-candidate-soft-timeout",
+            "--verify-candidate-hard-timeout",
+            "--verify-extended-timeout",
+            "--satori-profile",
         ] {
             assert!(
                 arguments.iter().any(|value| value == expected),
@@ -1519,6 +1572,8 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
         OsString::from(args.min_forks.to_string()),
         OsString::from("--limit"),
         OsString::from(args.limit.to_string()),
+        OsString::from("--max-repo-size-mb"),
+        OsString::from(args.max_repo_size_mb.to_string()),
         OsString::from("--language"),
         OsString::from(&args.language),
         OsString::from("--pvr"),
@@ -1545,8 +1600,18 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
         OsString::from(args.clone_timeout.to_string()),
         OsString::from("--static-timeout"),
         OsString::from(args.static_timeout.to_string()),
+        OsString::from("--verify-startup-timeout"),
+        OsString::from(args.verify_startup_timeout.to_string()),
+        OsString::from("--verify-candidate-soft-timeout"),
+        OsString::from(args.verify_candidate_soft_timeout.to_string()),
+        OsString::from("--verify-candidate-hard-timeout"),
+        OsString::from(args.verify_candidate_hard_timeout.to_string()),
         OsString::from("--verify-timeout"),
         OsString::from(args.verify_timeout.to_string()),
+        OsString::from("--verify-extended-timeout"),
+        OsString::from(args.verify_extended_timeout.to_string()),
+        OsString::from("--satori-profile"),
+        OsString::from(&args.satori_profile),
         OsString::from("--ai-attempts"),
         OsString::from("1"),
         OsString::from("--ai-model"),
@@ -1719,7 +1784,7 @@ fn evolve(args: &EvolveArgs) -> ExitCode {
     if let Some(reason) = self_heal_unavailable(Some(&source_root)) {
         return fail(EXIT_ENGINE, reason);
     }
-    match evolve_repository(&source_root, repository, args.push) {
+    match evolve_repository(&source_root, repository, !args.no_push) {
         Ok(code) => code,
         Err(error) => fail(EXIT_ENGINE, error),
     }

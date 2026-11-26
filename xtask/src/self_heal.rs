@@ -245,7 +245,12 @@ pub fn run(options: &Options) -> Result<()> {
         if integrated_repair && !options.push {
             validate_integrated_head(options, &recovered)?;
         }
-        push_validated_changes(options, &recovered)?;
+        let release = if integrated_repair && options.push {
+            Some(prepare_patch_release(&options.root)?)
+        } else {
+            None
+        };
+        push_validated_changes(options, &recovered, release.as_deref())?;
     }
     eprintln!(
         "\nself-heal: verified={passed} blocked={} total={}",
@@ -1336,7 +1341,11 @@ fn commit_recovered_identities(options: &Options, recovered: &[Recovered]) -> Re
     )
 }
 
-fn push_validated_changes(options: &Options, recovered: &[Recovered]) -> Result<()> {
+fn push_validated_changes(
+    options: &Options,
+    recovered: &[Recovered],
+    release_tag: Option<&str>,
+) -> Result<()> {
     if !options.push {
         return Ok(());
     }
@@ -1344,6 +1353,24 @@ fn push_validated_changes(options: &Options, recovered: &[Recovered]) -> Result<
     let push = |ignore_environment_token: bool| {
         let mut command = Command::new("git");
         command.current_dir(&options.root).arg("push");
+        if let Some(tag) = release_tag {
+            let upstream = git_output(
+                &options.root,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            )?;
+            let (remote, branch) = upstream
+                .trim()
+                .split_once('/')
+                .context("the upstream branch does not name a remote")?;
+            let branch_ref = format!("HEAD:refs/heads/{branch}");
+            let tag_ref = format!("HEAD:refs/tags/{tag}");
+            command.args(["--atomic", remote, &branch_ref, &tag_ref]);
+        }
         if ignore_environment_token {
             command.env_remove("GITHUB_TOKEN");
         }
@@ -1365,7 +1392,11 @@ fn push_validated_changes(options: &Options, recovered: &[Recovered]) -> Result<
         Ok(push(true)?.success())
     };
     if push_with_configured_credentials()? {
-        eprintln!("self-heal: validated commits pushed");
+        if let Some(tag) = release_tag {
+            eprintln!("self-heal: validated release {tag} pushed atomically");
+        } else {
+            eprintln!("self-heal: validated commits pushed");
+        }
         return Ok(());
     }
 
@@ -1388,8 +1419,120 @@ fn push_validated_changes(options: &Options, recovered: &[Recovered]) -> Result<
     if !push_with_configured_credentials()? {
         bail!("upstream advanced again after revalidation; rerun self-heal to retry safely");
     }
-    eprintln!("self-heal: rebased, revalidated, and pushed commits");
+    if let Some(tag) = release_tag {
+        eprintln!("self-heal: rebased, revalidated, and pushed release {tag} atomically");
+    } else {
+        eprintln!("self-heal: rebased, revalidated, and pushed commits");
+    }
     Ok(())
+}
+
+/// Add the smallest immutable release commit after a scanner generation has passed its targeted
+/// proof. The full integrated-head gate runs after this, so the exact tagged commit is validated.
+fn prepare_patch_release(root: &Path) -> Result<String> {
+    command_ok(
+        Command::new("git")
+            .current_dir(root)
+            .args(["fetch", "--tags", "--quiet"]),
+        "fetch release tags".to_owned(),
+    )?;
+    let manifest_path = root.join("Cargo.toml");
+    let lock_path = root.join("Cargo.lock");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read {}", manifest_path.display()))?;
+    let lock =
+        std::fs::read(&lock_path).with_context(|| format!("read {}", lock_path.display()))?;
+    let (updated, version) = next_patch_manifest(&manifest)?;
+    let tag = format!("v{version}");
+    if !git_output(root, &["tag", "--list", &tag])?
+        .trim()
+        .is_empty()
+    {
+        bail!("release tag {tag} already exists; synchronize the workspace version first");
+    }
+    atomic_write(&manifest_path, updated.as_bytes())?;
+    let update_lock = command_ok(
+        Command::new("cargo")
+            .current_dir(root)
+            .args(["check", "--workspace", "--offline"]),
+        format!("update Cargo.lock for {tag}"),
+    );
+    if let Err(error) = update_lock {
+        atomic_write(&manifest_path, manifest.as_bytes())?;
+        atomic_write(&lock_path, &lock)?;
+        return Err(error);
+    }
+    command_ok(
+        Command::new("git")
+            .current_dir(root)
+            .args(["add", "--", "Cargo.toml", "Cargo.lock"]),
+        format!("stage {tag}"),
+    )?;
+    command_ok(
+        Command::new("git").current_dir(root).args([
+            "-c",
+            "user.name=JSSpector release",
+            "-c",
+            "user.email=release@localhost.invalid",
+            "commit",
+            "-m",
+            &format!("Release {tag}"),
+            "--",
+            "Cargo.toml",
+            "Cargo.lock",
+        ]),
+        format!("commit {tag}"),
+    )?;
+    eprintln!("self-heal: prepared patch release {tag}");
+    Ok(tag)
+}
+
+fn next_patch_manifest(manifest: &str) -> Result<(String, String)> {
+    let mut in_workspace_package = false;
+    let mut replaced = false;
+    let mut updated = String::with_capacity(manifest.len());
+    let mut release = None;
+    for line in manifest.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_workspace_package = trimmed == "[workspace.package]";
+        }
+        if in_workspace_package && !replaced {
+            let Some(version) = trimmed
+                .strip_prefix("version = \"")
+                .and_then(|value| value.strip_suffix('"'))
+            else {
+                updated.push_str(line);
+                continue;
+            };
+            let mut parts = version.split('.');
+            let major = parts.next().context("workspace version has no major")?;
+            let minor = parts.next().context("workspace version has no minor")?;
+            let patch = parts
+                .next()
+                .context("workspace version has no patch")?
+                .parse::<u64>()
+                .context("workspace patch version is not numeric")?;
+            if parts.next().is_some()
+                || major.parse::<u64>().is_err()
+                || minor.parse::<u64>().is_err()
+            {
+                bail!("workspace version `{version}` is not stable semantic versioning");
+            }
+            let patch = patch
+                .checked_add(1)
+                .context("workspace patch version overflow")?;
+            let next = format!("{major}.{minor}.{patch}");
+            let newline = if line.ends_with('\n') { "\n" } else { "" };
+            updated.push_str(&format!("version = \"{next}\"{newline}"));
+            release = Some(next);
+            replaced = true;
+        } else {
+            updated.push_str(line);
+        }
+    }
+    let release = release.context("Cargo.toml has no [workspace.package] version")?;
+    Ok((updated, release))
 }
 
 /// Rebuild and validate the exact integration commit that will be pushed. Candidate worktrees are

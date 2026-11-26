@@ -40,7 +40,16 @@ DEFAULT_SCANNER = Path(
     or ROOT.parents[1] / "target" / "release" / "jsspector"
 )
 SEVERITY_ORDER = {"critical": 0, "high": 1}
-RETRYABLE_STATUSES = {"clone-timeout", "static-timeout", "verify-timeout"}
+RETRYABLE_STATUSES = {
+    "clone-timeout",
+    "static-timeout",
+    "verify-timeout",
+    "verify-startup-timeout",
+    "verify-candidate-idle-timeout",
+    "verify-candidate-hard-timeout",
+    "verify-repository-timeout",
+    "fix-timeout",
+}
 VERIFY_RUN_LABEL_KEY = "ci.satori.jsspector.verify-run"
 GIB = 1024**3
 DOCKER_QUERY_TIMEOUT_S = 30
@@ -50,6 +59,7 @@ DOCKER_CLEANUP_LOCK = threading.Lock()
 EVENT_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
 EVENT_PREFIX = "@@JSSPECTOR_ONLINE@@"
+VERIFY_PROGRESS_PREFIX = "@@JSSPECTOR_VERIFY@@"
 LOG_PATH: Path | None = None
 SHUTDOWN = threading.Event()
 ACTIVE_PROCESSES: dict[int, subprocess.Popen[str]] = {}
@@ -93,6 +103,78 @@ class StaticResult:
     failure_reason: str | None = None
     cancelled: bool = False
     elapsed_s: float = 0.0
+
+
+@dataclass
+class VerificationBudgetState:
+    """Adaptive deadlines for one repository's dynamic verification."""
+
+    started: float
+    startup_s: int
+    candidate_soft_s: int
+    candidate_hard_s: int
+    normal_s: int
+    extended_s: int
+    fix_s: int
+    phase: str = "repository"
+    phase_started: float | None = None
+    candidate_activity: bool = False
+    candidate_positive: bool = False
+    repository_positive: bool = False
+    finishing_deadline: float | None = None
+
+    def observe(self, payload: dict[str, Any], now: float) -> None:
+        event = payload.get("event")
+        if event == "candidate_started":
+            self.phase = "startup"
+            self.phase_started = now
+            self.candidate_activity = False
+            self.candidate_positive = False
+        elif event == "app_ready":
+            self.phase = "candidate"
+            self.phase_started = now
+        elif event == "request_activity":
+            self.candidate_activity = True
+        elif event == "positive_evidence":
+            self.candidate_activity = True
+            self.candidate_positive = True
+            self.repository_positive = True
+        elif event == "fix_started":
+            self.phase = "fix"
+            self.phase_started = now
+        elif event == "fix_finished":
+            self.phase = "finishing"
+            self.phase_started = now
+            self.finishing_deadline = now + 60
+        elif event == "candidate_finished":
+            if self.phase != "finishing":
+                self.phase = "repository"
+                self.phase_started = None
+                self.candidate_activity = False
+                self.candidate_positive = False
+
+    def timed_out(self, now: float) -> str | None:
+        if self.phase == "fix" and self.phase_started is not None:
+            return "fix-timeout" if now >= self.phase_started + self.fix_s else None
+        if self.phase == "finishing":
+            return (
+                "fix-timeout"
+                if self.finishing_deadline is not None and now >= self.finishing_deadline
+                else None
+            )
+        if self.phase == "startup" and self.phase_started is not None:
+            if now >= self.phase_started + self.startup_s:
+                return "verify-startup-timeout"
+        if self.phase == "candidate" and self.phase_started is not None:
+            if not self.candidate_positive:
+                if not self.candidate_activity and now >= self.phase_started + self.candidate_soft_s:
+                    return "verify-candidate-idle-timeout"
+                if now >= self.phase_started + self.candidate_hard_s:
+                    return "verify-candidate-hard-timeout"
+        repository_budget = self.extended_s if self.repository_positive else self.normal_s
+        if now >= self.started + repository_budget:
+            return "verify-repository-timeout"
+        return None
 
 
 @dataclass(frozen=True)
@@ -265,6 +347,81 @@ def run(
     return result
 
 
+def run_verification(
+    command: list[str],
+    *,
+    log_path: Path,
+    environment: dict[str, str],
+    budgets: VerificationBudgetState,
+    repository: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run the verifier under phase-aware, evidence-sensitive deadlines."""
+    if SHUTDOWN.is_set():
+        return subprocess.CompletedProcess(command, 130, "", "interrupted")
+    log("RUN " + " ".join(command))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timeout_reason: str | None = None
+    with log_path.open("w", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=environment,
+        )
+        with ACTIVE_PROCESSES_LOCK:
+            ACTIVE_PROCESSES[process.pid] = process
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+                while process.poll() is None:
+                    while line := stream.readline():
+                        marker = line.find(VERIFY_PROGRESS_PREFIX)
+                        if marker < 0:
+                            continue
+                        try:
+                            payload = json.loads(
+                                line[marker + len(VERIFY_PROGRESS_PREFIX):]
+                            )
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(payload, dict):
+                            budgets.observe(payload, time.monotonic())
+                    if process.poll() is not None:
+                        break
+                    timeout_reason = budgets.timed_out(time.monotonic())
+                    if timeout_reason is not None:
+                        log(
+                            f"TIMEOUT reason={timeout_reason} repository={repository} "
+                            f"positive={str(budgets.repository_positive).lower()}"
+                        )
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            process.wait()
+                        break
+                    time.sleep(0.25)
+        finally:
+            with ACTIVE_PROCESSES_LOCK:
+                ACTIVE_PROCESSES.pop(process.pid, None)
+    return subprocess.CompletedProcess(
+        command,
+        124 if timeout_reason is not None else process.returncode,
+        None,
+        timeout_reason,
+    )
+
+
 def read_json(path: Path) -> dict[str, Any]:
     """Read an object report with a useful failure."""
     try:
@@ -307,6 +464,56 @@ def completed_repositories(state: dict[str, Any]) -> frozenset[str]:
             isinstance(value, dict) and value.get("status") in RETRYABLE_STATUSES
         )
     )
+
+
+def _satori_paged_items(
+    satori_cli: str, command: list[str], *, quantity: int = 200
+) -> list[dict[str, Any]]:
+    """Read every item from one account-level Satori collection."""
+    page = 1
+    collected: list[dict[str, Any]] = []
+    while True:
+        payload = _satori_json(
+            [
+                satori_cli,
+                "--json",
+                "--page",
+                str(page),
+                "--quantity",
+                str(quantity),
+                *command,
+            ]
+        )
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError(f"Satori {' '.join(command)} returned no items array")
+        page_items = [item for item in items if isinstance(item, dict)]
+        collected.extend(page_items)
+        total = payload.get("total")
+        if not page_items or (isinstance(total, int) and len(collected) >= total):
+            return collected
+        if len(page_items) < quantity:
+            return collected
+        page += 1
+
+
+def satori_repository_blacklist(satori_cli: str) -> dict[str, list[str]]:
+    """Repositories already represented by an account Issue or external report."""
+    issues = _satori_paged_items(satori_cli, ["issues"])
+    advisories = _satori_paged_items(satori_cli, ["advisories"])
+
+    def repositories(items: list[dict[str, Any]]) -> list[str]:
+        return sorted(
+            {
+                repository.strip()
+                for item in items
+                if isinstance((repository := item.get("repository")), str)
+                and repository.strip()
+            },
+            key=str.casefold,
+        )
+
+    return {"issues": repositories(issues), "advisories": repositories(advisories)}
 
 
 def acquire_run_lock(out: Path):
@@ -1097,6 +1304,10 @@ def verify_repository(
             elapsed_s=round(time.monotonic() - started, 1),
         )
     slug = repository.replace("/", "__")
+    startup_timeout = getattr(args, "verify_startup_timeout", 180)
+    candidate_soft_timeout = getattr(args, "verify_candidate_soft_timeout", 180)
+    candidate_hard_timeout = getattr(args, "verify_candidate_hard_timeout", 300)
+    extended_timeout = getattr(args, "verify_extended_timeout", 1800)
     verified_path = run_dir / "reports" / f"{slug}.{lane}.verified.json"
     emit_event(
         "verification_started",
@@ -1142,25 +1353,26 @@ def verify_repository(
         command.append("--no-fix")
     for finding in candidates:
         command.extend(("--verify-fingerprint", finding["fingerprint"]))
-    research_timeout = args.verify_timeout + (
-        args.fix_timeout if fix_attempts > 0 else 0
-    )
     docker_label = verification_run_label(run_label, repository, revision, lane)
     cleanup_artifact = run_dir / "logs" / f"{slug}.{lane}.docker-cleanup.json"
     log(
         f"VERIFY lane={lane} {pinned} candidates={len(candidates)} "
-        f"exploit_budget={args.verify_timeout}s fix_budget="
+        f"startup_budget={startup_timeout}s "
+        f"candidate_soft_budget={candidate_soft_timeout}s "
+        f"candidate_hard_budget={candidate_hard_timeout}s "
+        f"exploit_budget={args.verify_timeout}s "
+        f"extended_budget={extended_timeout}s fix_budget="
         f"{args.fix_timeout if fix_attempts > 0 else 0}s"
     )
     with docker_slots:
         try:
-            result = run(
+            result = run_verification(
                 command,
-                timeout=research_timeout,
                 log_path=run_dir / "logs" / f"{slug}.{lane}.verify.log",
                 environment={
                     **os.environ,
                     "JSS_VERIFY_RUN_LABEL": docker_label,
+                    "JSS_VERIFY_PROGRESS": "1",
                     # Research reports keep the exact verifier streams while this campaign is
                     # being calibrated. Command/header credential redaction remains enabled in
                     # JSSpector; operators can restore output redaction with
@@ -1169,7 +1381,16 @@ def verify_repository(
                         "JSS_REPORT_RAW_OUTPUT", "1"
                     ),
                 },
-                timeout_label=f"research:{repository}",
+                budgets=VerificationBudgetState(
+                    started=time.monotonic(),
+                    startup_s=startup_timeout,
+                    candidate_soft_s=candidate_soft_timeout,
+                    candidate_hard_s=candidate_hard_timeout,
+                    normal_s=args.verify_timeout,
+                    extended_s=extended_timeout,
+                    fix_s=args.fix_timeout,
+                ),
+                repository=repository,
             )
         finally:
             docker_cleanup = cleanup_owned_docker_resources(
@@ -1190,7 +1411,11 @@ def verify_repository(
                 elapsed_s=round(time.monotonic() - started, 1),
             )
         log(f"VERIFY_FAILED {pinned} exit={result.returncode}")
-        reason = "verify-timeout" if result.returncode == 124 else "verify-failed"
+        reason = (
+            result.stderr
+            if result.returncode == 124 and isinstance(result.stderr, str)
+            else "verify-failed"
+        )
         return ResearchResult(
             repository=repository,
             revision=revision,
@@ -1605,6 +1830,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--limit", type=int, default=0, help="0 scans every discovered repo"
     )
+    parser.add_argument(
+        "--max-repo-size-mb",
+        type=positive,
+        default=100,
+        help="skip repositories larger than this GitHub size (default: 100 MiB)",
+    )
     parser.add_argument("--language", default="JavaScript")
     parser.add_argument("--pvr", choices=discover.PVR_MODES, default="off")
     parser.add_argument(
@@ -1665,10 +1896,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--static-timeout", type=positive, default=600)
     parser.add_argument(
+        "--verify-startup-timeout",
+        type=positive,
+        default=180,
+        help="build/start ceiling for one selected candidate (default: 180s)",
+    )
+    parser.add_argument(
+        "--verify-candidate-soft-timeout",
+        type=positive,
+        default=180,
+        help="idle candidate decision point (default: 180s)",
+    )
+    parser.add_argument(
+        "--verify-candidate-hard-timeout",
+        type=positive,
+        default=300,
+        help="candidate ceiling after real request activity (default: 300s)",
+    )
+    parser.add_argument(
         "--verify-timeout",
         type=positive,
+        default=900,
+        help="normal wall-clock exploitation budget per repository (default: 900s)",
+    )
+    parser.add_argument(
+        "--verify-extended-timeout",
+        type=positive,
         default=1800,
-        help="wall-clock budget for dynamic exploitation per repository (default: 1800s)",
+        help="repository budget after positive evidence (default: 1800s)",
     )
     parser.add_argument("--max-candidates", type=positive, default=5)
     parser.add_argument("--ai-candidates", type=positive, default=20)
@@ -1701,6 +1956,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--scanner", type=Path, default=DEFAULT_SCANNER)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--satori-cli", default="satori-v2")
+    parser.add_argument("--satori-profile", default="satoridev05")
     parser.add_argument(
         "--satori-sync",
         action="store_true",
@@ -1711,6 +1967,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--min-forks must be non-negative")
     if args.limit < 0:
         parser.error("--limit must be non-negative")
+    if args.verify_candidate_hard_timeout < args.verify_candidate_soft_timeout:
+        parser.error("--verify-candidate-hard-timeout must be at least the soft timeout")
+    if args.verify_extended_timeout < args.verify_timeout:
+        parser.error("--verify-extended-timeout must be at least --verify-timeout")
     return args
 
 
@@ -1719,6 +1979,7 @@ def candidates_from_file(
     *,
     args: argparse.Namespace,
     state: dict[str, Any],
+    remote_blacklist: frozenset[str],
     run_dir: Path,
     on_found: Callable[[discover.Candidate], None] | None = None,
 ) -> tuple[list[discover.Candidate], dict[str, Any]]:
@@ -1728,40 +1989,47 @@ def candidates_from_file(
         raise SystemExit(f"repository inventory not found: {inventory}")
     repositories = []
     seen = set()
-    completed = completed_repositories(state)
+    completed = {
+        repository.casefold()
+        for repository in completed_repositories(state) | remote_blacklist
+    }
     for line in inventory.read_text(encoding="utf-8").splitlines():
         repository = line.strip()
         if not repository or repository.startswith("#") or repository in seen:
             continue
         seen.add(repository)
-        if repository not in completed:
+        if repository.casefold() not in completed:
             repositories.append(repository)
-    pool = github_pool() if args.pvr != "any" else None
+    pool = github_pool()
     wanted: list[discover.Candidate] = []
     rejected = []
     pvr_errors = []
-    pvr_workers = (
-        min(args.pvr_parallel, pool.recommended_parallelism)
-        if pool is not None
-        else 0
-    )
+    pvr_workers = min(args.pvr_parallel, pool.recommended_parallelism)
     batch_size = max(64, pvr_workers * 8)
-    pvr_executor = (
-        ThreadPoolExecutor(max_workers=pvr_workers) if pool is not None else None
-    )
+    pvr_executor = ThreadPoolExecutor(max_workers=pvr_workers)
+    oversized = []
     try:
         for offset in range(0, len(repositories), batch_size):
             if args.limit and len(wanted) >= args.limit:
                 break
             batch = repositories[offset:offset + batch_size]
-            if pvr_executor is None:
-                statuses = [None] * len(batch)
-            else:
-                statuses = list(pvr_executor.map(pool.has_pvr, batch))
-            for repository, enabled in zip(batch, statuses, strict=True):
+            metadata = list(pvr_executor.map(pool.repository, batch))
+            statuses = (
+                [None] * len(batch)
+                if args.pvr == "any"
+                else list(pvr_executor.map(pool.has_pvr, batch))
+            )
+            for repository, info, enabled in zip(batch, metadata, statuses, strict=True):
                 if args.limit and len(wanted) >= args.limit:
                     break
-                if pool is None:
+                if info is None:
+                    pvr_errors.append(repository)
+                    continue
+                size_kb = int(info.get("size") or 0)
+                if size_kb > args.max_repo_size_mb * 1024:
+                    oversized.append(repository)
+                    continue
+                if args.pvr == "any":
                     keep = True
                     advisory_state = "unknown"
                 elif enabled is None:
@@ -1773,6 +2041,9 @@ def candidates_from_file(
                 if keep:
                     candidate = discover.Candidate(
                         repo=repository,
+                        stars=int(info.get("stargazers_count") or 0),
+                        forks=int(info.get("forks_count") or 0),
+                        size_kb=size_kb,
                         security_advisories=advisory_state,
                     )
                     wanted.append(candidate)
@@ -1787,8 +2058,7 @@ def candidates_from_file(
                     checked=len(wanted) + len(rejected) + len(pvr_errors),
                 )
     finally:
-        if pvr_executor is not None:
-            pvr_executor.shutdown()
+        pvr_executor.shutdown()
     (run_dir / "repos.txt").write_text(
         "".join(f"{candidate.repo}\n" for candidate in wanted), encoding="utf-8"
     )
@@ -1797,6 +2067,9 @@ def candidates_from_file(
     )
     (run_dir / "pvr-errors.txt").write_text(
         "".join(f"{repository}\n" for repository in pvr_errors), encoding="utf-8"
+    )
+    (run_dir / "oversized.txt").write_text(
+        "".join(f"{repository}\n" for repository in oversized), encoding="utf-8"
     )
     return (
         wanted,
@@ -1807,6 +2080,7 @@ def candidates_from_file(
             "found": len(wanted),
             "pvr_filtered": len(rejected),
             "pvr_errors": len(pvr_errors),
+            "oversized": len(oversized),
         },
     )
 
@@ -1815,6 +2089,7 @@ def discover_candidates(
     *,
     args: argparse.Namespace,
     state: dict[str, Any],
+    remote_blacklist: frozenset[str],
     run_dir: Path,
     on_found: Callable[[discover.Candidate], None] | None = None,
 ) -> tuple[list[discover.Candidate], dict[str, Any]]:
@@ -1828,12 +2103,13 @@ def discover_candidates(
         language=args.language,
         limit=args.limit,
         min_forks=args.min_forks,
+        max_repo_size_kb=args.max_repo_size_mb * 1024,
         since_seconds=args.since,
         all_candidates=args.all_candidates,
         pvr_mode=args.pvr,
         pvr_parallel=args.pvr_parallel,
         out=run_dir,
-        exclude=completed_repositories(state),
+        exclude=completed_repositories(state) | remote_blacklist,
         should_stop=SHUTDOWN.is_set,
         on_progress=progress,
     )
@@ -1868,6 +2144,7 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGINT, request_shutdown)
         signal.signal(signal.SIGTERM, request_shutdown)
     args = parse_args(argv)
+    os.environ["SATORI_PROFILE"] = args.satori_profile
     scanner = args.scanner.expanduser().resolve()
     if not scanner.is_file():
         raise SystemExit(
@@ -1898,6 +2175,35 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = out / "runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=False)
     LOG_PATH = run_dir / "online.log"
+    remote_blacklist: frozenset[str] = frozenset()
+    if args.satori_sync:
+        try:
+            inventory = satori_repository_blacklist(satori_cli)
+        except RuntimeError as error:
+            _run_lock.close()
+            LOG_PATH = None
+            raise SystemExit(
+                f"cannot build the mandatory Satori repository blacklist: {error}"
+            ) from error
+        remote_blacklist = frozenset(
+            repository
+            for repositories in inventory.values()
+            for repository in repositories
+        )
+        write_json(
+            run_dir / "satori-repository-blacklist.json",
+            {
+                **inventory,
+                "repositories": sorted(remote_blacklist, key=str.casefold),
+                "profile": args.satori_profile,
+            },
+        )
+        log(
+            f"SATORI_BLACKLIST profile={args.satori_profile} "
+            f"issues={len(inventory['issues'])} "
+            f"advisories={len(inventory['advisories'])} "
+            f"unique={len(remote_blacklist)}"
+        )
     started = time.monotonic()
     docker_baseline = capture_docker_inventory()
     initial_gc = cleanup_online_docker_storage(
@@ -2125,7 +2431,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             with state_lock:
                 counters["verification_failed"] += 1
-                if result.failure_reason == "verify-timeout":
+                if result.failure_reason in RETRYABLE_STATUSES and result.failure_reason not in {
+                    "clone-timeout",
+                    "static-timeout",
+                }:
                     counters["verification_timeout"] += 1
                     timeout_repositories.add(result.repository)
                 state["processed"][result.repository] = {
@@ -2368,15 +2677,20 @@ def main(argv: list[str] | None = None) -> int:
 
     log(
         f"ONLINE_START since={args.since}s min_forks={args.min_forks} pvr={args.pvr} "
+        f"max_repo_size_mb={args.max_repo_size_mb} "
         f"static_parallel={args.static_parallel} "
         f"max_checkouts={args.max_checkouts} "
         f"parallel_no_ai={args.parallel_no_ai} parallel_ai={args.parallel_ai} "
         f"parallel_docker={args.parallel_docker} ai_attempts={args.ai_attempts} "
         f"min_free_gb={args.min_free_gb} docker_cache_gb={args.docker_cache_gb} "
         f"docker_gc_every={args.docker_gc_every} "
+        f"verify_startup={args.verify_startup_timeout}s "
+        f"verify_candidate={args.verify_candidate_soft_timeout}/"
+        f"{args.verify_candidate_hard_timeout}s "
+        f"verify_repository={args.verify_timeout}/{args.verify_extended_timeout}s "
         f"ai_model={args.ai_model} fix_attempts={args.fix_attempts} "
         f"learn_fixes={args.learn_fixes} "
-        f"satori_sync={args.satori_sync}"
+        f"satori_sync={args.satori_sync} satori_blacklist={len(remote_blacklist)}"
     )
     static_executor = ThreadPoolExecutor(max_workers=args.static_parallel)
     no_ai_executor = ThreadPoolExecutor(max_workers=args.parallel_no_ai)
@@ -2424,6 +2738,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.repos_file,
                 args=args,
                 state=state,
+                remote_blacklist=remote_blacklist,
                 run_dir=run_dir,
                 on_found=schedule,
             )
@@ -2431,6 +2746,7 @@ def main(argv: list[str] | None = None) -> int:
             candidates, discovery_metrics = discover_candidates(
                 args=args,
                 state=state,
+                remote_blacklist=remote_blacklist,
                 run_dir=run_dir,
                 on_found=schedule,
             )
@@ -2508,6 +2824,9 @@ def main(argv: list[str] | None = None) -> int:
         "elapsed_s": round(time.monotonic() - started, 1),
         "configuration": {
             "pvr_parallel": args.pvr_parallel,
+            "max_repo_size_mb": args.max_repo_size_mb,
+            "satori_profile": args.satori_profile,
+            "satori_blacklist": len(remote_blacklist),
             "static_parallel": args.static_parallel,
             "max_checkouts": args.max_checkouts,
             "parallel_no_ai": args.parallel_no_ai,
@@ -2531,6 +2850,10 @@ def main(argv: list[str] | None = None) -> int:
             "clone_timeout": args.clone_timeout,
             "static_timeout": args.static_timeout,
             "verify_timeout": args.verify_timeout,
+            "verify_extended_timeout": args.verify_extended_timeout,
+            "verify_startup_timeout": args.verify_startup_timeout,
+            "verify_candidate_soft_timeout": args.verify_candidate_soft_timeout,
+            "verify_candidate_hard_timeout": args.verify_candidate_hard_timeout,
         },
     }
     write_json(run_dir / "online.json", run_metrics)

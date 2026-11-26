@@ -319,7 +319,11 @@ class ControllerTests(unittest.TestCase):
             )
             args = Namespace(
                 verify_threads=2,
-                verify_timeout=1800,
+                verify_startup_timeout=180,
+                verify_candidate_soft_timeout=180,
+                verify_candidate_hard_timeout=300,
+                verify_timeout=900,
+                verify_extended_timeout=1800,
                 fix_attempts=1,
                 fix_timeout=600,
                 fix_model="claude-opus-5-5",
@@ -333,7 +337,10 @@ class ControllerTests(unittest.TestCase):
                 self.assertNotIn("--no-fix", command)
                 self.assertIn("--fix-attempts", command)
                 self.assertIn("--learn-fixes", command)
-                self.assertEqual(kwargs["timeout"], 2400)
+                budgets = kwargs["budgets"]
+                self.assertEqual(budgets.normal_s, 900)
+                self.assertEqual(budgets.extended_s, 1800)
+                self.assertEqual(budgets.fix_s, 600)
                 output = Path(command[command.index("--output") + 1])
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(
@@ -348,7 +355,9 @@ class ControllerTests(unittest.TestCase):
                 "failures": [],
             }
             with (
-                mock.patch.object(controller, "run", side_effect=verified_once) as run,
+                mock.patch.object(
+                    controller, "run_verification", side_effect=verified_once
+                ) as run,
                 mock.patch.object(
                     controller,
                     "cleanup_owned_docker_resources",
@@ -433,10 +442,56 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(controller.DISK_WATCHDOG_INTERVAL_S, 60)
         self.assertEqual(args.clone_timeout, 120)
         self.assertEqual(args.static_timeout, 600)
-        self.assertEqual(args.verify_timeout, 1800)
+        self.assertEqual(args.max_repo_size_mb, 100)
+        self.assertEqual(args.verify_startup_timeout, 180)
+        self.assertEqual(args.verify_candidate_soft_timeout, 180)
+        self.assertEqual(args.verify_candidate_hard_timeout, 300)
+        self.assertEqual(args.verify_timeout, 900)
+        self.assertEqual(args.verify_extended_timeout, 1800)
         self.assertEqual(args.ai_attempts, 1)
         self.assertEqual(args.ai_timeout, 60)
         self.assertEqual(args.fix_timeout, 600)
+        self.assertEqual(args.satori_profile, "satoridev05")
+
+    def test_adaptive_budget_only_extends_on_positive_evidence(self) -> None:
+        budget = controller.VerificationBudgetState(
+            started=0,
+            startup_s=180,
+            candidate_soft_s=180,
+            candidate_hard_s=300,
+            normal_s=900,
+            extended_s=1800,
+            fix_s=600,
+        )
+        budget.observe({"event": "candidate_started"}, 10)
+        self.assertEqual(budget.timed_out(191), "verify-startup-timeout")
+
+        budget.observe({"event": "app_ready"}, 200)
+        budget.observe({"event": "request_activity"}, 210)
+        self.assertIsNone(budget.timed_out(499))
+        self.assertEqual(budget.timed_out(500), "verify-candidate-hard-timeout")
+
+        budget.observe({"event": "positive_evidence"}, 220)
+        self.assertIsNone(budget.timed_out(1000))
+        self.assertEqual(budget.timed_out(1800), "verify-repository-timeout")
+        budget.observe({"event": "fix_started"}, 1800)
+        self.assertIsNone(budget.timed_out(2399))
+        self.assertEqual(budget.timed_out(2400), "fix-timeout")
+
+    def test_satori_blacklist_unions_account_issues_and_advisories(self) -> None:
+        with mock.patch.object(
+            controller,
+            "_satori_paged_items",
+            side_effect=[
+                [{"repository": "Owner/Issue"}, {"repository": "shared/repo"}],
+                [{"repository": "Owner/Advisory"}, {"repository": "shared/repo"}],
+            ],
+        ):
+            inventory = controller.satori_repository_blacklist("satori-v2")
+        self.assertEqual(inventory["issues"], ["Owner/Issue", "shared/repo"])
+        self.assertEqual(
+            inventory["advisories"], ["Owner/Advisory", "shared/repo"]
+        )
 
     def test_online_refuses_to_start_below_the_disk_reserve(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -517,6 +572,24 @@ class ControllerTests(unittest.TestCase):
         )
         self.assertNotIn("forks:", query)
         self.assertIn("stars:0", query)
+
+    def test_discovery_filters_oversized_repositories_before_pvr(self) -> None:
+        searcher = discover.Searcher(
+            mock.Mock(), discover.Config(max_repo_size_kb=100 * 1024)
+        )
+        items = [
+            {
+                "full_name": "owner/too-large",
+                "size": 100 * 1024 + 1,
+                "owner": {},
+            },
+            {"full_name": "owner/kept", "size": 100 * 1024, "owner": {}},
+        ]
+        self.assertEqual(
+            [candidate.repo for candidate in searcher._new(items, "stars:0")],
+            ["owner/kept"],
+        )
+        self.assertEqual(searcher.metrics.oversized, 1)
 
     def test_unfiltered_discovery_batches_are_also_prioritized_by_forks(self) -> None:
         candidates = [

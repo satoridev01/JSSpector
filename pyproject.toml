@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "jsspector"
+dynamic = ["version"]
+description = "Static and dynamic security analyzer for JavaScript and TypeScript"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["javascript", "typescript", "security", "sast", "vulnerability-scanner"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Rust",
+  "Topic :: Security",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/satoridev01/JSSpector"
+Repository = "https://github.com/satoridev01/JSSpector"
+Releases = "https://github.com/satoridev01/JSSpector/releases"
+Issues = "https://github.com/satoridev01/JSSpector/issues"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/jsspector/Cargo.toml"
+locked = true
+strip = true

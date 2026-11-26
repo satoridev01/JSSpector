@@ -3717,9 +3717,15 @@ impl Session {
         })();
         self.finish_sink_observation(marker_before);
         match &result {
-            Ok(_) => self
-                .driver_successes
-                .set(self.driver_successes.get().saturating_add(1)),
+            Ok(output) => {
+                self.driver_successes
+                    .set(self.driver_successes.get().saturating_add(1));
+                super::emit_verify_progress("request_activity", None, None);
+                let (status, _) = parse_driver_meta(&String::from_utf8_lossy(&output.stderr));
+                if status.is_some_and(|status| (200..400).contains(&status)) {
+                    super::emit_verify_progress("positive_evidence", None, Some("route_reachable"));
+                }
+            }
             Err(error) => {
                 let mut errors = self.driver_errors.borrow_mut();
                 if errors.len() < 5 {
@@ -3778,6 +3784,7 @@ impl Session {
             let callback_hit = self.binding_marker_count(binding) > marker_before;
             if file_hit || callback_hit {
                 self.last_sink_hit.set(true);
+                super::emit_verify_progress("positive_evidence", None, Some("sink_hit"));
                 return;
             }
             if wait < 5 {
@@ -4109,6 +4116,11 @@ impl Session {
             Err(_) => return None,
         };
         let body = String::from_utf8_lossy(&output.stdout);
+        if !body.contains(&self.canary.token)
+            && payload::response_contains_canary(&body, &self.canary.token)
+        {
+            super::emit_verify_progress("positive_evidence", None, Some("canary_partial"));
+        }
         let mut captured_command_output = None;
         let reproduced = match &attempt.signal {
             Signal::InResponse

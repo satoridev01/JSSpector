@@ -14,8 +14,8 @@ The system improves across consecutive runs. Proven exploit and fix strategies c
 replayed deterministically, while `jsspector evolve` can use an AI repair agent to extend scanner
 coverage when a benchmark exposes a blind spot. AI proposes candidates; it never decides what is
 true. New scanner capabilities and fixes are promoted only after deterministic reproduction,
-regression tests and precision holdouts pass. With `--push`, validated generations are published so
-other machines and later runs start from the improved capability.
+regression tests and precision holdouts pass. Validated generations are published by default so
+other machines and later runs start from the improved capability; `--no-push` keeps one local.
 
 > **Status: pre-alpha.** `jsspector scan` (taint findings, as text, JSON or SARIF, with baselines and a CI exit code), `jsspector routes` (entry-point inventory, OpenAPI 3.1) and `jsspector explain` work today. Framework knowledge lives in YAML packs ([`packs/`](packs/)); the engine lowers each file to an owned IR, links modules across files (relative imports, monorepo workspace packages, barrels) and follows values through function summaries.
 
@@ -81,11 +81,23 @@ no runtime dependency on `jsspector-monitor` or on a JSSpector source checkout. 
 ## Quick start
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/satoridev01/JSSpector/releases/latest/download/jsspector-installer.sh | sh
+python3 -m pip install jsspector
 jsspector scan path/to/repo
 ```
 
-The installer puts the binary for your platform in `~/.cargo/bin`. Releases are built with [dist](https://github.com/axodotdev/cargo-dist) for macOS and Linux (x86_64 and arm64) when a version tag is pushed: the archives, their checksums and the installer are on [GitHub Releases](https://github.com/satoridev01/JSSpector/releases). From source: `cargo install --git https://github.com/satoridev01/JSSpector --locked jsspector`.
+PyPI installs the native binary for macOS or Linux (x86_64 or arm64) into the active Python
+environment. Run `jsspector update` to upgrade that same environment to the newest PyPI release.
+For an isolated global CLI, `pipx install jsspector` works as well (use `pipx upgrade jsspector`
+to update that installation). Releases are built with
+[dist](https://github.com/axodotdev/cargo-dist) when a version tag is pushed: archives, checksums
+and the shell installer remain available on
+[GitHub Releases](https://github.com/satoridev01/JSSpector/releases). The shell installer is:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/satoridev01/JSSpector/releases/latest/download/jsspector-installer.sh | sh
+```
+
+From source: `cargo install --git https://github.com/satoridev01/JSSpector --locked jsspector`.
 
 ```
   routes/files.js
@@ -319,18 +331,18 @@ jsspector scan --repo owner/repository@revision --verify
 ### Auto-evolution across consecutive runs
 
 Scanner evolution is a separate, explicitly mutating command. It requires a clean, published
-JSSpector checkout and may invoke the repair agent and commit validated changes. A single-repository
-run leaves commits local for review unless `--push` is explicit. Batch workers require `--push`
-because they exchange validated generations through the upstream branch. This makes consecutive
-runs cumulative: every worker begins from the latest accepted scanner generation, and only a
-generation that passes the deterministic promotion gates can become the starting point for the
-next run:
+JSSpector checkout and may invoke the repair agent and commit validated changes. Validated repairs
+push by default; `--no-push` keeps a single-repository evolution local for review. Batch workers
+always publish because they exchange validated generations through the upstream branch. This makes
+consecutive runs cumulative: every worker begins from the latest accepted scanner generation, and
+only a generation that passes the deterministic promotion gates can become the starting point for
+the next run:
 
 ```sh
 jsspector evolve --repo owner/repository
-jsspector evolve --repo owner/repository --push
+jsspector evolve --repo owner/repository --no-push
 python3 .satori/pending-repos.py --output .satori/pending-repos.txt
-jsspector evolve --repos .satori/pending-repos.txt --parallel 2 --push
+jsspector evolve --repos .satori/pending-repos.txt --parallel 2
 ```
 
 The list contains one `owner/repository@revision` per line. Workers diagnose and prepare repairs in
@@ -353,10 +365,11 @@ bounded (16 MiB for the structured stream and 2 MiB for stderr), continues drain
 the bound, and marks truncated artifacts. Reports, baselines, recipes and controller artifacts are
 published by atomic replacement, so an untrusted checkout cannot redirect a write through a
 pre-existing destination symlink.
-Validated generations are committed; with explicit `--push`, they are published so another
-computer starts from the new capability.
+Validated scanner generations are patch-versioned and pushed atomically with their Git tag. The
+tag builds the GitHub Release, which publishes the four native wheels to PyPI; another installation
+can then receive the capability with `jsspector update`.
 The controller's diagnostic `--no-repair` mode never writes identities or commits, while a local
-evolution without `--push` still runs the same full promotion gates before leaving its commits for
+evolution with `--no-push` still runs the same full promotion gates before leaving its commits for
 review.
 This standalone flow requires authenticated Satori, repair-agent and GitHub CLIs; it does not
 require a supervising agent. `SATORI_ORGANIZATION` selects a Satori organization; without it the

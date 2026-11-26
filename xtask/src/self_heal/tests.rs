@@ -1,5 +1,21 @@
 use super::*;
 
+#[test]
+fn patch_release_updates_only_the_workspace_version() -> Result<()> {
+    let manifest = "[workspace]\nmembers = []\n\n[workspace.package]\nversion = \"1.2.9\"\nedition = \"2024\"\n\n[profile.release]\ndebug = true\n";
+    let (updated, version) = next_patch_manifest(manifest)?;
+    assert_eq!(version, "1.2.10");
+    assert!(updated.contains("[workspace.package]\nversion = \"1.2.10\"\n"));
+    assert!(updated.contains("[profile.release]\ndebug = true\n"));
+    Ok(())
+}
+
+#[test]
+fn patch_release_rejects_prerelease_or_missing_versions() {
+    assert!(next_patch_manifest("[workspace.package]\nversion = \"1.2.3-alpha.1\"\n").is_err());
+    assert!(next_patch_manifest("[package]\nversion = \"1.2.3\"\n").is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn timeout_stops_descendant_processes() -> Result<()> {

@@ -814,6 +814,15 @@ impl BrowserSession {
                 let logs = self.browser_marker_logs();
                 self.last_sink_hit
                     .set(self.browser_binding_count_in(&logs) > binding_before);
+                super::super::emit_verify_progress("request_activity", None, None);
+                super::super::emit_verify_progress(
+                    "positive_evidence",
+                    None,
+                    Some("route_reachable"),
+                );
+                if self.last_sink_hit.get() {
+                    super::super::emit_verify_progress("positive_evidence", None, Some("sink_hit"));
+                }
                 Some(marker_hit(&logs, hit).is_some())
             }
             BrowserRuntime::Local {
@@ -831,6 +840,17 @@ impl BrowserSession {
                 let logs = std::fs::read_to_string(marker_log).unwrap_or_default();
                 self.last_sink_hit
                     .set(self.browser_binding_count_in(&logs) > binding_before);
+                if browser_result.is_ok() {
+                    super::super::emit_verify_progress("request_activity", None, None);
+                    super::super::emit_verify_progress(
+                        "positive_evidence",
+                        None,
+                        Some("route_reachable"),
+                    );
+                }
+                if self.last_sink_hit.get() {
+                    super::super::emit_verify_progress("positive_evidence", None, Some("sink_hit"));
+                }
                 let reached = marker_hit(&logs, hit).is_some();
                 if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
                     eprintln!(

@@ -23,6 +23,51 @@ mod stdio;
 use jss_core::{Finding, VulnClass};
 use serde::Serialize;
 
+const VERIFY_PROGRESS_PREFIX: &str = "@@JSSPECTOR_VERIFY@@";
+
+fn emit_verify_progress(event: &str, finding: Option<&Finding>, evidence: Option<&str>) {
+    if std::env::var_os("JSS_VERIFY_PROGRESS").is_none() {
+        return;
+    }
+    let mut payload = serde_json::json!({"schema": 1, "event": event});
+    if let serde_json::Value::Object(fields) = &mut payload {
+        if let Some(finding) = finding {
+            fields.insert(
+                "fingerprint".to_owned(),
+                serde_json::Value::String(finding.fingerprint.clone()),
+            );
+        }
+        if let Some(evidence) = evidence {
+            fields.insert(
+                "evidence".to_owned(),
+                serde_json::Value::String(evidence.to_owned()),
+            );
+        }
+    }
+    eprintln!("{VERIFY_PROGRESS_PREFIX}{payload}");
+}
+
+fn outcome_name(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Verified { .. } => "verified",
+        Outcome::NotReproduced { .. } => "not-reproduced",
+        Outcome::Skipped { .. } => "skipped",
+    }
+}
+
+fn prove_fix_with_progress(
+    target: fix::Target<'_>,
+    finding: &Finding,
+    root: &std::path::Path,
+    outcome: &Outcome,
+    options: &FixOptions,
+) -> FixOutcome {
+    emit_verify_progress("fix_started", Some(finding), None);
+    let result = fix::prove(target, finding, root, outcome, options);
+    emit_verify_progress("fix_finished", Some(finding), None);
+    result
+}
+
 pub use fix::{FixOptions, FixOutcome};
 
 /// Order parsed-URL fields by how strongly they identify the value that reaches the sink.
@@ -1245,7 +1290,7 @@ fn run_with_policy(
     // apps (a web front end and a separate API or worker service). One session per launched
     // server (see `session_key`), started on first use and reused.
     let mut http: Vec<(std::path::PathBuf, Result<sandbox::Session, String>)> = Vec::new();
-    let mut browser = needs_browser.then(|| sandbox::BrowserSession::start(root));
+    let mut browser: Option<Result<sandbox::BrowserSession, String>> = None;
 
     let mut order: Vec<_> = findings.iter().zip(&plans).enumerate().collect();
     if stop_after_verified {
@@ -1272,6 +1317,7 @@ fn run_with_policy(
                     ),
                 );
             }
+            emit_verify_progress("candidate_started", Some(finding), None);
             let mut fix = None;
             let outcome = match plan {
                 Err(skip) => Outcome::Skipped {
@@ -1283,13 +1329,14 @@ fn run_with_policy(
                     let index = acquire_http_session(&mut http, root, finding);
                     match http.get_mut(index).map(|(_, session)| session) {
                         Some(Ok(session)) => {
+                            emit_verify_progress("app_ready", Some(finding), None);
                             let outcome = match session.activate_sink(finding) {
                                 Ok(()) => session.exercise(probe),
                                 Err(reason) => Outcome::Skipped { reason },
                             };
                             let outcome = session.qualify(outcome);
                             if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
-                                fix = Some(fix::prove(
+                                fix = Some(prove_fix_with_progress(
                                     fix::Target::Http { session, probe },
                                     finding,
                                     root,
@@ -1319,13 +1366,14 @@ fn run_with_policy(
                     let index = acquire_http_session(&mut http, root, finding);
                     match http.get_mut(index).map(|(_, session)| session) {
                         Some(Ok(session)) => {
+                            emit_verify_progress("app_ready", Some(finding), None);
                             let outcome = match session.activate_sink(finding) {
                                 Ok(()) => session.exercise_reflected_xss(probe),
                                 Err(reason) => Outcome::Skipped { reason },
                             };
                             let outcome = session.qualify(outcome);
                             if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
-                                fix = Some(fix::prove(
+                                fix = Some(prove_fix_with_progress(
                                     fix::Target::ReflectedXss { session, probe },
                                     finding,
                                     root,
@@ -1343,35 +1391,40 @@ fn run_with_policy(
                         },
                     }
                 }
-                Ok(plan::Plan::Browser(probe)) => match browser.as_mut() {
-                    Some(Ok(session)) => {
-                        let outcome = match session.activate_sink(finding) {
-                            Ok(()) => session.exercise(probe),
-                            Err(reason) => Outcome::Skipped { reason },
-                        };
-                        if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
-                            fix = Some(fix::prove(
-                                fix::Target::Browser { session, probe },
-                                finding,
-                                root,
-                                &outcome,
-                                fix_options,
-                            ));
+                Ok(plan::Plan::Browser(probe)) => {
+                    match browser.get_or_insert_with(|| sandbox::BrowserSession::start(root)) {
+                        Ok(session) => {
+                            emit_verify_progress("app_ready", Some(finding), None);
+                            let outcome = match session.activate_sink(finding) {
+                                Ok(()) => session.exercise(probe),
+                                Err(reason) => Outcome::Skipped { reason },
+                            };
+                            if fix_options.enabled && matches!(outcome, Outcome::Verified { .. }) {
+                                fix = Some(prove_fix_with_progress(
+                                    fix::Target::Browser { session, probe },
+                                    finding,
+                                    root,
+                                    &outcome,
+                                    fix_options,
+                                ));
+                            }
+                            outcome
                         }
-                        outcome
+                        Err(err) => Outcome::Skipped {
+                            reason: format!("the browser phase could not start: {err}"),
+                        },
                     }
-                    Some(Err(err)) => Outcome::Skipped {
-                        reason: format!("the browser phase could not start: {err}"),
-                    },
-                    None => Outcome::Skipped {
-                        reason: "not attempted".to_owned(),
-                    },
-                },
+                }
             };
             let result = Verdict {
                 fix,
                 ..verdict(finding, outcome)
             };
+            emit_verify_progress(
+                "candidate_finished",
+                Some(finding),
+                Some(outcome_name(&result.outcome)),
+            );
             reproduced |= matches!(&result.outcome, Outcome::Verified { .. });
             (index, result)
         })
@@ -1531,6 +1584,7 @@ fn verify_mcp_once(
     let index = acquire_http_session_with(http, root, finding, launch);
     match http.get_mut(index).map(|(_, session)| session) {
         Some(Ok(session)) => {
+            emit_verify_progress("app_ready", Some(finding), None);
             let outcome = match session.activate_sink(finding) {
                 Ok(()) => session.exercise(probe),
                 Err(reason) => Outcome::Skipped { reason },
@@ -1541,7 +1595,7 @@ fn verify_mcp_once(
                 let resolved = session
                     .resolved_mcp_probe()
                     .unwrap_or_else(|| probe.clone());
-                proof = Some(fix::prove(
+                proof = Some(prove_fix_with_progress(
                     fix::Target::Http {
                         session,
                         probe: &resolved,

@@ -35,6 +35,7 @@ import github
 
 LOOKBACK_SECONDS = 365 * 24 * 3600  # default push-time window when none is given
 DEFAULT_MIN_FORKS = 0
+DEFAULT_MAX_REPO_SIZE_KB = 100 * 1024
 PVR_MODES = ("on", "off", "any")
 TIERS = ("stars:>=100", "stars:10..99", "stars:1..9")  # highest PVR rate first
 ZERO_STAR_TIER = "stars:0"  # included by default; includes user and organization owners
@@ -59,6 +60,7 @@ class Config:
     language: str = "JavaScript"
     limit: int = 0
     min_forks: int = DEFAULT_MIN_FORKS
+    max_repo_size_kb: int = DEFAULT_MAX_REPO_SIZE_KB
     since_seconds: int = LOOKBACK_SECONDS
     all_candidates: bool = True
     pvr_mode: str = "on"
@@ -71,6 +73,8 @@ class Config:
     def __post_init__(self):
         if self.min_forks < 0:
             raise ValueError("min_forks must be non-negative")
+        if self.max_repo_size_kb < 1:
+            raise ValueError("max_repo_size_kb must be positive")
         if self.pvr_mode not in PVR_MODES:
             raise ValueError(f"pvr_mode must be one of {PVR_MODES}, got {self.pvr_mode!r}")
         if self.pvr_parallel < 1:
@@ -84,6 +88,9 @@ class Config:
             language=os.environ.get("LANGUAGE") or "JavaScript",
             limit=int(os.environ.get("LIMIT") or 0),
             min_forks=int(os.environ.get("MIN_FORKS") or DEFAULT_MIN_FORKS),
+            max_repo_size_kb=(
+                int(os.environ.get("MAX_REPO_SIZE_MB") or 100) * 1024
+            ),
             since_seconds=int(os.environ.get("SINCE_SECONDS") or LOOKBACK_SECONDS),
             all_candidates=os.environ.get("ALL_CANDIDATES", "1") != "0",
             pvr_mode=os.environ.get("PVR_MODE") or "on",
@@ -113,6 +120,7 @@ class Metrics:
 
     searches: int = 0
     candidates: int = 0
+    oversized: int = 0
     pvr_checks: int = 0
     positives: int = 0
     found: int = 0
@@ -197,7 +205,7 @@ class Searcher:
         self.pool = pool
         self.cfg = cfg
         self.metrics = Metrics()
-        self.seen = set(cfg.exclude)
+        self.seen = {repository.casefold() for repository in cfg.exclude}
 
     def windows(self, tier, start, end):
         """(start, end, total) push-time windows of one tier, newest first, each with no
@@ -232,9 +240,13 @@ class Searcher:
         """Not-yet-seen, worth-checking candidates among search results."""
         for item in items:
             candidate = candidate_of(item)
-            if candidate.repo in self.seen:
+            identity = candidate.repo.casefold()
+            if identity in self.seen:
                 continue
-            self.seen.add(candidate.repo)
+            self.seen.add(identity)
+            if candidate.size_kb > self.cfg.max_repo_size_kb:
+                self.metrics.oversized += 1
+                continue
             if candidate.forks >= self.cfg.min_forks:
                 yield candidate
 

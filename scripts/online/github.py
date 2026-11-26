@@ -211,6 +211,12 @@ class TokenPool:
             return bool((payload or {}).get("enabled"))
         return False if status in (403, 404, 451) else None
 
+    def repository(self, repo):
+        """Repository metadata, or None when GitHub cannot provide it."""
+        session = self._next()
+        status, payload = session.call(f"{API}/repos/{repo}", session.core)
+        return payload if status == 200 and isinstance(payload, dict) else None
+
     def search(self, query, page=1):
         """One page of a repository search -> (items, total_count); (None, 0) on failure."""
         url = (f"{API}/search/repositories?q={urllib.parse.quote(query)}"

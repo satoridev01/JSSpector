@@ -68,6 +68,11 @@ pub struct Probe {
     /// planted as `<traversed-dir>/<suffix>` rather than as the leaf itself. `None` for the common
     /// case where the tainted value is (or ends) the read path. Mined from the handler source only.
     pub read_suffix: Option<String>,
+    /// A literal filename suffix appended to the tainted value itself (`${userId}.json` or
+    /// `userId + '.json'`). Unlike [`Self::read_suffix`], the input still names the file stem rather
+    /// than a directory. Verification therefore plants `<stem><suffix>` and reports that effective
+    /// crafted filename. `None` when the handler does not transform the filename this way.
+    pub read_filename_suffix: Option<String>,
     /// When set, the tainted request input is not the raw payload but a base64-encoded JSON envelope
     /// the handler decodes (`JSON.parse(Buffer.from(id, 'base64url'))`), and the sink consumes one
     /// member of the decoded object. The payload value is therefore wrapped — placed under the
@@ -318,6 +323,7 @@ impl Probe {
             gate_paths: Vec::new(),
             url_query_params: Vec::new(),
             read_suffix: None,
+            read_filename_suffix: None,
             envelope: None,
             doc_envelope: None,
             lists_dir: false,
@@ -367,6 +373,9 @@ impl Probe {
         self.read_suffix = path_class
             .then(|| source.and_then(|src| appended_path_suffix(src, &tainted)))
             .flatten();
+        self.read_filename_suffix = path_class
+            .then(|| source.and_then(|src| appended_filename_suffix(src, &tainted)))
+            .flatten();
         self.removes = path_class && sink_removes(&finding.sink.api);
         self.removes_dir = path_class && sink_removes_dir(&finding.sink.api);
         self.creates = path_class && sink_creates(&finding.sink.api);
@@ -383,7 +392,7 @@ impl Probe {
             })
             .flatten();
         if finding.class == VulnClass::CommandInjection {
-            self.cmd_quote = shell_quote_context(&finding.sink.arg);
+            self.cmd_quote = command_quote_context(finding);
             self.cmd_dir_segment = finding
                 .trace
                 .iter()
@@ -697,6 +706,8 @@ pub enum UrlVector {
     Href,
     /// `document.referrer` (the referring page's URL).
     Referrer,
+    /// A cross-origin window sends the attacker value with `postMessage`.
+    Message,
 }
 
 /// What the browser sink does with the value.
@@ -711,6 +722,8 @@ pub enum BrowserSink {
     /// so the payload is a module URL pointing at the marker, not an HTML/JS snippet. The page
     /// fetching the module from the marker origin is the reproduction.
     Import,
+    /// Evaluated as JavaScript (`eval`/`Function`) after arriving in a message event.
+    Eval,
 }
 
 /// The sandbox's decision for a finding: drive it, or skip it with a reason. The source-free
@@ -743,6 +756,11 @@ pub fn plan_with_source(finding: &Finding, source: Option<&str>) -> Result<Plan,
     if finding.source.kind == "mcp" {
         return Probe::mcp_probe(finding, source).map(|probe| Plan::Mcp(Box::new(probe)));
     }
+    // `postMessage` is a browser transport rather than an HTTP request. Drive it from a distinct
+    // attacker origin so an origin check (or its absence) is part of the proof.
+    if finding.source.kind == "postmessage" {
+        return postmessage_probe(finding).map(Plan::Browser);
+    }
     // Server-side HTTP findings first.
     match Probe::from_finding_with_source(finding, source) {
         Ok(probe) => return Ok(Plan::Http(Box::new(probe))),
@@ -755,6 +773,39 @@ pub fn plan_with_source(finding: &Finding, source: Option<&str>) -> Result<Plan,
         }
     }
     browser_probe(finding, source).map(Plan::Browser)
+}
+
+fn postmessage_probe(finding: &Finding) -> Result<BrowserProbe, Skip> {
+    if finding.class != VulnClass::CodeInjection {
+        return Err(Skip(format!(
+            "{} from postMessage is not driven by verify v1",
+            finding.class.name()
+        )));
+    }
+    let last = finding
+        .sink
+        .api
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or(&finding.sink.api)
+        .trim();
+    if !matches!(last, "eval" | "Function") {
+        return Err(Skip(format!(
+            "the postMessage sink `{}` is not a string-evaluating browser sink",
+            finding.sink.api
+        )));
+    }
+    Ok(BrowserProbe {
+        file: finding
+            .sink
+            .file
+            .clone()
+            .unwrap_or_else(|| finding.file.clone()),
+        vector: UrlVector::Message,
+        sink: BrowserSink::Eval,
+        params: Vec::new(),
+    })
 }
 
 /// A server-reflected XSS the sandbox can drive, or why not. The payload must enter through a
@@ -962,9 +1013,17 @@ fn manual_split_param_reads(source: &str) -> Vec<String> {
     while let Some((at, len)) = find_first_of(source, from, &[".split('&')", ".split(\"&\")"]) {
         from = at + len;
         let window_end = (from + 400).min(source.len());
-        let Some((eq_at, eq_len)) = find_first_of(source, from, &[".split('=')", ".split(\"=\")"])
-            .filter(|(eq_at, _)| *eq_at < window_end)
-        else {
+        let Some((eq_at, eq_len)) = find_first_of(
+            source,
+            from,
+            &[
+                ".split('=')",
+                ".split(\"=\")",
+                ".indexOf('=')",
+                ".indexOf(\"=\")",
+            ],
+        )
+        .filter(|(eq_at, _)| *eq_at < window_end) else {
             continue;
         };
         let after_eq = eq_at + eq_len;
@@ -979,6 +1038,63 @@ fn manual_split_param_reads(source: &str) -> Vec<String> {
                 }
             }
         }
+        // A hand-written parser may dispatch each pair directly instead of first filling an object:
+        // `const [k, v] = pair.split('='); if (k === 'name') selected = v`. The comparison literal
+        // is the query parameter name. Keep the search close to the `=` split so unrelated string
+        // comparisons elsewhere in a monolithic server do not become candidates.
+        let compare_end = (after_eq + 1600).min(source.len());
+        for name in compared_parameter_literals(&source[after_eq..compare_end]) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+            if out.len() >= 8 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Identifier-like string literals used in an equality comparison. Within a hand-written query
+/// parser these are the recognized key names (`k === 'name'`), while numeric values such as the
+/// accompanying `secrets === '1'` are intentionally excluded.
+fn compared_parameter_literals(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(i) else {
+            i += 1;
+            continue;
+        };
+        let mut end = i + 1;
+        while let Some(&current) = bytes.get(end) {
+            if current == quote {
+                break;
+            }
+            end += if current == b'\\' { 2 } else { 1 };
+        }
+        if end >= bytes.len() {
+            break;
+        }
+        let value = &source[i + 1..end];
+        let before = source[..i].trim_end();
+        let after = source[end + 1..].trim_start();
+        let compared = before.ends_with("===")
+            || before.ends_with("==")
+            || after.starts_with("===")
+            || (after.starts_with("==") && !after.starts_with("=>"));
+        let identifier_like = value
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || matches!(b, b'_' | b'$'))
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'$'));
+        if compared && identifier_like && value.len() <= 64 && !out.iter().any(|v| v == value) {
+            out.push(value.to_owned());
+        }
+        i = end + 1;
     }
     out
 }
@@ -1259,6 +1375,7 @@ impl Probe {
                 gate_paths: Vec::new(),
                 url_query_params: Vec::new(),
                 read_suffix: None,
+                read_filename_suffix: None,
                 envelope: None,
                 doc_envelope: None,
                 lists_dir: false,
@@ -1341,6 +1458,13 @@ impl Probe {
                     let handler = handler_source(src, finding.source.line);
                     appended_path_suffix(handler, &tainted)
                         .or_else(|| appended_listing_suffix(handler, &finding.sink.arg, &tainted))
+                })
+            })
+            .flatten();
+        let read_filename_suffix = (finding.class == VulnClass::PathTraversal)
+            .then(|| {
+                source.and_then(|src| {
+                    appended_filename_suffix(handler_source(src, finding.source.line), &tainted)
                 })
             })
             .flatten();
@@ -1436,7 +1560,7 @@ impl Probe {
         // are read off the finding itself so the payload lands as a live command separator.
         let (cmd_quote, cmd_dir_segment) = if finding.class == VulnClass::CommandInjection {
             (
-                shell_quote_context(&finding.sink.arg),
+                command_quote_context(finding),
                 finding
                     .trace
                     .iter()
@@ -1488,6 +1612,7 @@ impl Probe {
             gate_paths: Vec::new(),
             url_query_params: Vec::new(),
             read_suffix,
+            read_filename_suffix,
             envelope,
             doc_envelope: None,
             lists_dir,
@@ -1638,6 +1763,7 @@ impl Probe {
             gate_paths: Vec::new(),
             url_query_params: Vec::new(),
             read_suffix: None,
+            read_filename_suffix: None,
             envelope: None,
             doc_envelope: None,
             lists_dir: false,
@@ -1727,6 +1853,7 @@ impl Probe {
             gate_paths: Vec::new(),
             url_query_params: Vec::new(),
             read_suffix: None,
+            read_filename_suffix: None,
             envelope: None,
             doc_envelope: None,
             lists_dir: false,
@@ -2560,6 +2687,87 @@ fn appended_path_suffix(source: &str, names: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// A literal suffix the handler attaches to the tainted filename itself. This differs from
+/// [`appended_path_suffix`]: `` `${userId}.json` `` reads `<attacker-value>.json`, while
+/// `path.join(base, userId, 'record.json')` reads below an attacker-selected directory. Keep the
+/// suffix narrow and filesystem-local so it can only describe a filename constraint, never supply
+/// an extra traversal segment.
+fn appended_filename_suffix(source: &str, names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+
+    // Template interpolation: `${userId}.json` (allow whitespace around the identifier).
+    let mut from = 0usize;
+    while let Some(rel) = source[from..].find("${") {
+        let open = from + rel;
+        let Some(close_rel) = source[open + 2..].find('}') else {
+            break;
+        };
+        let close = open + 2 + close_rel;
+        let ident = source[open + 2..close].trim();
+        if names.iter().any(|name| name == ident) {
+            let rest = &source[close + 1..];
+            let end = rest.find('`').unwrap_or(rest.len());
+            let suffix = &rest[..end];
+            if is_safe_filename_suffix(suffix) {
+                return Some(suffix.to_owned());
+            }
+        }
+        from = close + 1;
+    }
+
+    // String concatenation: `userId + '.json'`. Restrict the search to the remainder of the same
+    // line and require the right operand to be one complete string literal.
+    for name in names {
+        let mut from = 0usize;
+        while let Some(rel) = source[from..].find(name) {
+            let at = from + rel;
+            from = at + name.len();
+            let before_ok = at == 0
+                || source
+                    .as_bytes()
+                    .get(at - 1)
+                    .is_none_or(|byte| !is_ident(*byte));
+            let after_ok = source
+                .as_bytes()
+                .get(from)
+                .is_none_or(|byte| !is_ident(*byte));
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let line = source[from..].split('\n').next().unwrap_or_default();
+            let Some(rhs) = line.trim_start().strip_prefix('+').map(str::trim_start) else {
+                continue;
+            };
+            let Some(quote) = rhs
+                .as_bytes()
+                .first()
+                .copied()
+                .filter(|q| matches!(q, b'\'' | b'"'))
+            else {
+                continue;
+            };
+            let Some(end) = rhs[1..].find(quote as char).map(|end| end + 1) else {
+                continue;
+            };
+            let suffix = &rhs[1..end];
+            if is_safe_filename_suffix(suffix) {
+                return Some(suffix.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn is_safe_filename_suffix(value: &str) -> bool {
+    value.starts_with('.')
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// A read sink built by `+`-concatenation that places a *server-selected* directory segment between
@@ -6091,8 +6299,10 @@ fn push_dispatch(out: &mut Vec<QueryDispatch>, selector: &str, value: &str, para
 }
 
 /// The prefix a plug-in-style app mounts a module's routes under, when the module declares it as
-/// a literal: `mountPath: "/auth"` or `mountPath = '/auth'`. The routes are registered on a
-/// router the host mounts at that path at startup, which no call in the module shows.
+/// a literal: `mountPath: "/auth"`, `mountPath = '/auth'`, or a module header saying its REST
+/// surface is "mounted at /api/cells". The routes are registered on a router the host mounts at
+/// that path at startup, which no call in the module shows. A prose-derived prefix is only a request
+/// candidate: an inaccurate comment can make verification miss, but cannot produce a verified hit.
 pub fn declared_mount_prefix(source: &str) -> Option<String> {
     const KEYS: [&str; 2] = ["mountPath", "mountpath"];
     for key in KEYS {
@@ -6122,6 +6332,30 @@ pub fn declared_mount_prefix(source: &str) -> Option<String> {
                 && !value.contains(['$', ' ', '{', '*', ':'])
             {
                 return Some(value.trim_end_matches('/').to_owned());
+            }
+        }
+    }
+
+    // Small router modules often document the host-owned mount in their header instead of exposing
+    // it as executable metadata. Keep this deliberately narrow: only a literal absolute path
+    // immediately following "mounted at/under" qualifies, and never accept route syntax or prose.
+    for line in source.lines().take(40) {
+        let lower = line.to_ascii_lowercase();
+        for marker in ["mounted at", "mounted under"] {
+            let Some(at) = lower.find(marker) else {
+                continue;
+            };
+            let rest = line[at + marker.len()..].trim_start();
+            let value: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, '`' | '"' | '\'' | ',' | ';'))
+                .collect();
+            let value = value.trim_end_matches(['.', ')', ']', '}', ':', '/']);
+            if value.starts_with('/')
+                && value.len() > 1
+                && !value.contains(['$', ' ', '{', '*', ':', '?', '#'])
+            {
+                return Some(value.to_owned());
             }
         }
     }
@@ -6324,6 +6558,9 @@ pub fn url_search_params(source: &str) -> Vec<String> {
             push_param(&mut out, &member, DISCOVERY_MAX);
         }
     }
+    for name in manual_split_param_reads(source) {
+        push_param(&mut out, &name, DISCOVERY_MAX);
+    }
     // A member read inline off the object form of the search parameters, with no intermediate
     // variable (`Object.fromEntries(url.searchParams).url` -> `url`, or the bracket form
     // `Object.fromEntries(url.searchParams)["url"]`). The variable-binding shape above misses this
@@ -6500,6 +6737,168 @@ fn nth_param(source: &str, name: &str, pos: usize) -> Option<String> {
         return None;
     }
     Some(base.to_owned())
+}
+
+/// Resolve a coarse whole-query source through one local helper and into the parameter that the
+/// sink actually consumes. A common shape is `helper(req.query)`, followed by a destructure inside
+/// the helper and a call into the sink's module. Static analysis can conservatively report
+/// `req.query`, but driving the first query member it sees may exercise a branch selector rather
+/// than the dangerous argument. This returns the sink-bound request field plus the sibling values
+/// needed by enclosing equality/presence guards.
+///
+/// The resolution is source-derived: the sink function and parameter come from the sink line and
+/// argument, the call argument is mapped through an object destructure, and guard literals are read
+/// from the two function bodies. Nothing is tied to a route or application name.
+pub fn forwarded_query_context(
+    route_source: &str,
+    sink_source: &str,
+    sink_line: u32,
+    sink_argument: &str,
+) -> Option<(String, Vec<(String, String)>)> {
+    let sink_name = enclosing_function_name(sink_source, sink_line)?;
+    let sink_params = split_top_level_commas(&function_param_list(sink_source, &sink_name)?)
+        .into_iter()
+        .map(|param| param.split('=').next().unwrap_or(&param).trim().to_owned())
+        .collect::<Vec<_>>();
+    let target_pos = sink_params.iter().position(|param| {
+        !param.is_empty() && param.bytes().all(is_ident) && mentions(sink_argument, param)
+    })?;
+
+    let (call_at, call_args) = named_call_arguments(route_source, &sink_name, target_pos + 1)?;
+    let target_local = call_args.get(target_pos)?.trim();
+    if target_local.is_empty() || !target_local.bytes().all(is_ident) {
+        return None;
+    }
+    let (caller_open, caller_close) = enclosing_function_block(route_source, call_at)?;
+    let caller_line = route_source[..call_at]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32
+        + 1;
+    let caller_name = enclosing_function_name(route_source, caller_line)?;
+    let caller_body = &route_source[caller_open + 1..caller_close];
+    let caller_params = split_top_level_commas(&function_param_list(route_source, &caller_name)?)
+        .into_iter()
+        .map(|param| param.split('=').next().unwrap_or(&param).trim().to_owned())
+        .filter(|param| !param.is_empty() && param.bytes().all(is_ident))
+        .collect::<Vec<_>>();
+
+    let mut bindings: Vec<(String, String)> = Vec::new(); // (field, local)
+    for object in &caller_params {
+        for pair in destructured_fields_of(caller_body, object) {
+            if !bindings.contains(&pair) {
+                bindings.push(pair);
+            }
+        }
+    }
+    // Also map locals assigned directly from req.query.<field>, including the caller's branch
+    // selector (`const provider = req.query.provider`).
+    for field in member_params(route_source, "query") {
+        for local in aliases(route_source, "query", &field) {
+            let pair = (field.clone(), local);
+            if !bindings.contains(&pair) {
+                bindings.push(pair);
+            }
+        }
+    }
+    let target_field = bindings
+        .iter()
+        .find_map(|(field, local)| (local == target_local).then(|| field.clone()))?;
+
+    let mut siblings: Vec<(String, String)> = Vec::new();
+    let mut add = |field: String, value: String| {
+        if field != target_field && siblings.iter().all(|(seen, _)| seen != &field) {
+            siblings.push((field, value));
+        }
+    };
+
+    // Guards in the helper that calls the sink: branch selectors and required companion fields.
+    for (local, literal) in enclosing_guards(route_source, caller_line) {
+        if let Some((field, _)) = bindings.iter().find(|(_, bound)| bound == &local) {
+            add(
+                field.clone(),
+                literal.unwrap_or_else(|| validator_filler(field, "")),
+            );
+        }
+    }
+    for local in presence_guard_fields(route_source, &[caller_line]) {
+        if let Some((field, _)) = bindings.iter().find(|(_, bound)| bound == &local) {
+            add(field.clone(), validator_filler(field, ""));
+        }
+    }
+
+    // A guard inside the sink function can constrain a sibling argument (`store ===
+    // 'gcp-secret'`). Map its formal position back through this call and then through the helper's
+    // destructure to the original request field.
+    for (pos, param) in sink_params.iter().enumerate() {
+        if pos == target_pos || param.is_empty() || !param.bytes().all(is_ident) {
+            continue;
+        }
+        let Some(value) = equality_literal(sink_source, param) else {
+            continue;
+        };
+        let Some(local) = call_args.get(pos).map(|arg| arg.trim()) else {
+            continue;
+        };
+        if let Some((field, _)) = bindings.iter().find(|(_, bound)| bound == local) {
+            add(field.clone(), value);
+        }
+    }
+
+    Some((target_field, siblings))
+}
+
+fn enclosing_function_name(source: &str, line: u32) -> Option<String> {
+    let offset = line_offset(source, line as usize)?;
+    let (open, _) = enclosing_function_block(source, offset)?;
+    let before = source[..open].trim_end();
+    let close = before.rfind(')')?;
+    let paren = matching_open_paren(source, close)?;
+    let head = source[..paren].trim_end();
+    let name: String = head
+        .bytes()
+        .rev()
+        .take_while(|byte| is_ident(*byte))
+        .map(|byte| byte as char)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn named_call_arguments(source: &str, name: &str, minimum: usize) -> Option<(usize, Vec<String>)> {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        if at > 0 && bytes.get(at - 1).is_some_and(|byte| is_ident(*byte)) {
+            continue;
+        }
+        if bytes
+            .get(at + name.len())
+            .is_some_and(|byte| is_ident(*byte))
+        {
+            continue;
+        }
+        let rest = &source[at + name.len()..];
+        let ws = rest.len() - rest.trim_start().len();
+        let open = at + name.len() + ws;
+        if bytes.get(open) != Some(&b'(') {
+            continue;
+        }
+        let prefix = source[..at].trim_end();
+        if prefix.ends_with("function") || prefix.ends_with("function*") {
+            continue;
+        }
+        let close = matching_close_paren(source, open)?;
+        let args = split_top_level_commas(&source[open + 1..close]);
+        if args.len() >= minimum {
+            return Some((at, args));
+        }
+    }
+    None
 }
 
 /// For a URL-sourced forward proxy / file sink that reads several query parameters off the parsed
@@ -7657,6 +8056,22 @@ fn shell_quote_context(arg: &str) -> Option<char> {
         (_, true) => Some('"'),
         _ => None,
     }
+}
+
+/// The shell quoting a tainted command value reaches after simple string transforms in the trace.
+///
+/// `JSON.stringify(userValue)` always emits a double-quoted JavaScript string. That does not make
+/// the value shell-safe: POSIX shells still perform command substitution inside double quotes. By
+/// recording this as a double-quoted command context, the payload generator can add `$()` probes
+/// instead of trying only separators, which stay inert inside the generated quotes.
+fn command_quote_context(finding: &Finding) -> Option<char> {
+    shell_quote_context(&finding.sink.arg).or_else(|| {
+        finding
+            .trace
+            .iter()
+            .any(|step| step.note.contains("JSON.stringify"))
+            .then_some('"')
+    })
 }
 
 /// The runtime shell text a command-injection sink argument emits *before* the tainted interpolation.

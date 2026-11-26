@@ -1,5 +1,13 @@
 use super::*;
 
+#[test]
+fn indexed_json_report_command_prints_the_reconstructed_file_contents() {
+    let command = decode_indexed_json_response("curl -sS http://TARGET/file");
+    assert!(command.starts_with("curl -sS http://TARGET/file | node -e '"));
+    assert!(command.contains("Object.keys(v).sort"));
+    assert!(command.contains("process.stdout.write(Buffer.from"));
+}
+
 /// Tests that start servers or browsers on this machine, or read every port listening on it,
 /// run one at a time: a listener one opens would otherwise be taken for the app another one
 /// probes, and their load skews the others' process timings.
@@ -16,8 +24,13 @@ fn interrupted_local_fixtures_are_recognized_without_claiming_arbitrary_files() 
     let path = std::path::Path::new("/tmp/jss-canary-read.json");
     assert!(is_recognizable_local_fixture(
         path,
-        br#""new-token""#,
+        br#""CANARY new-token""#,
         br#""18e885c6937a34481e587""#,
+    ));
+    assert!(is_recognizable_local_fixture(
+        path,
+        br#""CANARY new-token""#,
+        br#""CANARY 18e885c6937a34481e587""#,
     ));
     assert!(!is_recognizable_local_fixture(
         path,
@@ -1399,6 +1412,36 @@ fn marker_hit_ignores_unstructured_and_wrong_token_lines() {
 }
 
 #[test]
+fn marker_hit_count_distinguishes_a_fresh_callback_from_a_stale_one() {
+    let once = "MARKER {\"method\":\"GET\",\"path\":\"/run-token-2\",\"userAgent\":null}\n";
+    let twice = format!("{once}{once}");
+    assert_eq!(marker_hit_count(once, "run-token-2"), 1);
+    assert_eq!(marker_hit_count(&twice, "run-token-2"), 2);
+    assert_eq!(marker_hit_count(&twice, "another-token"), 0);
+}
+
+#[test]
+fn blind_command_output_requires_a_valid_url_encoded_id_result() {
+    let logs = concat!(
+        "MARKER {\"method\":\"GET\",\"path\":\"/run-token-2\",\"userAgent\":null}\n",
+        "MARKER {\"method\":\"GET\",\"path\":\"/run-token-2/id/not-id\",\"userAgent\":null}\n",
+        "MARKER {\"method\":\"GET\",\"path\":\"/run-token-2/id/uid%3D1000%28node%29%20gid%3D1000%28node%29%20groups%3D1000%28node%29\",\"userAgent\":null}\n",
+    );
+    assert_eq!(
+        captured_id_output(logs, "run-token-2").as_deref(),
+        Some("uid=1000(node) gid=1000(node) groups=1000(node)")
+    );
+    assert!(captured_id_output(logs, "wrong-token").is_none());
+    assert!(
+        captured_id_output(
+            "MARKER {\"method\":\"GET\",\"path\":\"/run-token-2/id/%ZZ\",\"userAgent\":null}\n",
+            "run-token-2"
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn public_callback_evidence_requires_an_exact_token_path() {
     let body = br#"{"interactions":[
             {"protocol":"dns","path":null},
@@ -2347,6 +2390,10 @@ fn a_yarn_project_installs_with_corepack_and_runs_its_build() {
     assert!(file.contains("RUN corepack enable"), "{file}");
     assert!(file.contains("yarn run build"), "{file}");
     assert!(
+        file.contains("curl ca-certificates git"),
+        "verification images need git for reachable application code that shells out to it: {file}"
+    );
+    assert!(
         file.contains("node_modules/.bin/next build --webpack"),
         "a failed Next build is retried with the compatible webpack backend: {file}"
     );
@@ -3115,6 +3162,59 @@ fn the_router_finding_launches_the_server_that_mounts_it_not_the_manifest_main()
 }
 
 #[test]
+fn a_router_test_server_never_overrides_the_real_start_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "package.json",
+        r#"{"scripts":{"start":"node supervise.js"}}"#,
+    );
+    write(
+        root,
+        "supervise.js",
+        "import { fork } from 'node:child_process';\n\
+         fork(new URL('./src/worker-supervisor.js', import.meta.url));\n",
+    );
+    write(
+        root,
+        "src/worker-supervisor.js",
+        "import { fork } from 'node:child_process';\n\
+         fork(new URL('./server.js', import.meta.url));\n",
+    );
+    write(
+        root,
+        "src/server.js",
+        "import express from 'express';\n\
+         import router from './router.js';\n\
+         const app = express();\n\
+         app.use('/api', router);\n\
+         app.listen(8080);\n",
+    );
+    write(
+        root,
+        "src/router.js",
+        "import express from 'express';\n\
+         const router = express.Router();\n\
+         router.post('/query', (_req, res) => res.send('ok'));\n\
+         export default router;\n",
+    );
+    write(
+        root,
+        "test/router.test.js",
+        "import express from 'express';\n\
+         import router from '../src/router.js';\n\
+         const app = express();\n\
+         app.use('/api', router);\n\
+         app.listen(0);\n",
+    );
+    assert_eq!(
+        start_command(root, Some(std::path::Path::new("src/router.js"))).as_deref(),
+        Some(r#"["node","supervise.js"]"#)
+    );
+}
+
+#[test]
 fn a_filesystem_route_handler_module_is_hosted_when_no_manifest_can_be() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -3539,7 +3639,10 @@ fn the_canary_is_staged_as_valid_json_without_entering_the_cached_image() {
     );
     assert!(!file.contains("cafed00d"), "{file}");
     let staging = canary_staging_command(&canary);
-    assert!(staging.contains(r#"printf '"%s"' 'cafed00d'"#), "{staging}");
+    assert!(
+        staging.contains(r#"printf '"CANARY %s"' 'cafed00d'"#),
+        "{staging}"
+    );
 }
 
 #[test]
@@ -4016,6 +4119,7 @@ fn end_to_end_verifies_traversal_and_clears_confinement() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -4059,6 +4163,7 @@ fn end_to_end_verifies_traversal_and_clears_confinement() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -4102,6 +4207,7 @@ fn end_to_end_verifies_traversal_and_clears_confinement() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -4172,6 +4278,7 @@ fn end_to_end_verifies_traversal_and_clears_confinement() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -4228,20 +4335,13 @@ fn end_to_end_verifies_traversal_and_clears_confinement() {
     );
     match &visible_injected {
         Outcome::Verified { poc, .. } => {
-            // The request carries only the two factors; the response carries their product.
-            assert!(poc.command.contains("%2A"), "{}", poc.command);
+            assert!(poc.command.contains("id"), "{}", poc.command);
             assert!(
-                poc.evidence
-                    .contains("injected shell arithmetic expression"),
+                poc.evidence.contains("read-only `id` command"),
                 "{}",
                 poc.evidence
             );
-            let product = poc.response.lines().last().unwrap_or_default().trim();
-            assert!(!product.is_empty(), "{poc:?}");
-            assert!(
-                !poc.target.contains(product),
-                "the derived product must be absent from the HTTP request target: {poc:?}"
-            );
+            assert!(poc.response.contains("uid="), "{poc:?}");
             assert_eq!(poc.controls.len(), 1, "{poc:?}");
         }
         other => panic!("command injection should verify, got {other:?}"),
@@ -4288,16 +4388,15 @@ fn end_to_end_verifies_traversal_and_clears_confinement() {
         matches!(false_traversal, Outcome::NotReproduced { .. }),
         "static passwd-shaped text is not a file read: {false_traversal:?}"
     );
-    // A blind command injection (the handler discards the child's output) is proved out of band:
-    // the injected command makes an HTTP callback to the isolated marker carrying this probe's
-    // unique token. That is an unmistakable observable consequence with an implicit negative
-    // control (a benign request never carries the token) — never a filesystem side effect.
+    // A blind command injection (the handler discards the child's output) is proved by piping the
+    // real stdout of `id` to the isolated marker under this probe's unique token.
     match &injected {
         Outcome::Verified { poc, .. } => {
             assert!(
-                poc.evidence
-                    .contains("marker service received callback token"),
-                "blind command injection must verify via the out-of-band callback, got {}",
+                poc.evidence.contains("OS command `id` executed")
+                    && poc.evidence.contains("uid=")
+                    && poc.evidence.contains(" gid="),
+                "blind command injection must expose the captured id output, got {}",
                 poc.evidence
             );
             assert!(
@@ -4308,10 +4407,19 @@ fn end_to_end_verifies_traversal_and_clears_confinement() {
         }
         other => panic!("blind command injection should verify out of band, got {other:?}"),
     }
-    assert!(
-        matches!(forged, Outcome::Verified { .. }),
-        "the SSRF should verify, got {forged:?}"
-    );
+    match &forged {
+        Outcome::Verified { poc, .. } => {
+            assert!(poc.command.contains("--include"), "{}", poc.command);
+            let output = poc.stdout.as_deref().unwrap_or_default();
+            assert!(
+                output.contains("HTTP/1.1 200"),
+                "curl --include should retain the target response headers: {poc:?}"
+            );
+            assert!(output.ends_with("ok"), "{poc:?}");
+            assert!(poc.evidence.contains("CANARY"), "{poc:?}");
+        }
+        other => panic!("the SSRF should verify, got {other:?}"),
+    }
 }
 
 /// An app whose file read sits behind login middleware: accounts are created on `/api/users`,
@@ -4448,6 +4556,7 @@ fn end_to_end_verifies_a_login_gated_route_with_a_registered_session() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -4815,6 +4924,7 @@ socket.on('error', (e) => { console.error('database unreachable: ' + e.message);
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -5035,6 +5145,7 @@ fn a_fix_is_proven_only_when_it_closes_the_exploit_and_keeps_the_route() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -5228,6 +5339,7 @@ fn a_socket_io_event_is_exploited_by_direct_member_access_and_through_a_built_lo
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -5376,6 +5488,7 @@ fn a_socket_io_fix_is_proven_only_when_the_event_keeps_acking() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,

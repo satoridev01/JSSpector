@@ -8,11 +8,13 @@
 //! An **example** is one proven fix as a deterministic reproduction case: the finding's and the
 //! original file's fingerprints, the file's path, the exact change, the request that reproduced
 //! the exploit (credentials redacted) and the status a benign request kept. It names no repository
-//! or commit: the fingerprints are what a replay matches, and the store may be published. When the same finding shows up again on the same file content, the
+//! or commit: the fingerprints are what a replay matches. Even so, exact code, paths and PoCs can
+//! be correlated back to a public repository, so examples must remain in the private user-data
+//! store and must not be published. When the same finding shows up again on the same file content, the
 //! example's change is replayed — and proved again by the same three controls — without an LLM.
 //!
-//! Proven recipes and examples are embedded in every binary. A trusted published checkout may
-//! supply the same data; recording and publication remain separate, explicit caller choices.
+//! Only generic curated seeds are embedded in the binary. Proven recipes and exact examples live
+//! in the private user-data store; recording is explicit and publication is disabled.
 //!
 //! The store is a directory: `recipes/<class>/<id>.json` and `examples/<finding>-<file>.json`.
 //! Reads take no lock (every write is a rename); each write takes `.lock` once, for one
@@ -1274,29 +1276,17 @@ router.post('/login', async (req, res) => {\n\
     }
 
     #[test]
-    fn installed_binary_falls_back_to_embedded_proven_recipes() {
+    fn installed_binary_does_not_embed_exact_proven_examples() {
         let absent_checkout = tempfile::tempdir().unwrap();
         let book = Book::published(absent_checkout.path());
-        let recipe: Recipe = book
-            .read(
-                &book
-                    .dir
-                    .join("recipes/code-injection/1ee9bc4053e329b0.json"),
+        assert!(book.recipe_paths("code-injection").is_empty());
+        assert!(
+            book.replay(
+                &finding(VulnClass::CodeInjection, "eval", "aaaa"),
+                "app.js",
+                "eval(input)",
             )
-            .unwrap();
-        let example: Example = book
-            .read(
-                &book
-                    .dir
-                    .join("examples/324f1a9a515c8189-40f4daf76567b905.json"),
-            )
-            .unwrap();
-
-        assert_eq!(
-            (recipe.class.as_str(), recipe.sink.as_str()),
-            ("code-injection", "eval")
+            .is_none()
         );
-        assert_eq!(example.recipe, recipe.id);
-        assert_eq!(example.benign_status, 200);
     }
 }

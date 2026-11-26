@@ -1,12 +1,11 @@
 use super::*;
 
 impl Session {
-    /// Confirms a path-traversal read whose content is not reflected, by a differential oracle: a
-    /// canary planted only outside the base directory makes the handler take its file-found branch,
-    /// while two equivalent unplanted out-of-base paths take its not-found branch. URL reflection
-    /// (a not-found page echoing the requested id) is neutralized before comparing, and the two
-    /// unplanted responses must agree, so a handler that confines the path — reaching none of the
-    /// three — yields no signal.
+    /// Confirms a path-traversal read whose content is not reflected, by a differential oracle. A
+    /// real sensitive OS file is preferred; a crafted out-of-root fixture is used only when the
+    /// handler's filename constraints prevent naming that file. Two equivalent missing paths must
+    /// agree, while the positive path must take a distinct file-found branch. URL reflection is
+    /// neutralized before comparing, so a handler that confines all three paths yields no signal.
     pub(super) fn verify_read_oracle(
         &self,
         probe: &Probe,
@@ -52,6 +51,73 @@ impl Session {
         if !self.accept_bound_effect_with_hit(differential, sink_hit) {
             return None;
         }
+        // The read oracle runs before the broad reflected-content matrix, so it must preserve the
+        // stronger result when its positive leg actually returns the planted bytes. JavaScript
+        // commonly serializes a string/Buffer spread as numeric JSON keys; that is content
+        // disclosure, even though the literal token is not contiguous in the raw response. Export
+        // the same decoder used by the normal response path so the copyable PoC prints the bytes a
+        // reviewer needs to see instead of an opaque object.
+        if payload::response_contains_canary(&present, &self.canary.token) {
+            let mut command = self.poc_command(&present_attempt);
+            if !present.contains(&self.canary.token) {
+                command = decode_indexed_json_response(&command);
+            }
+            let transcript = self.exact_http_transcript(&present_attempt, &command);
+            return Some(Reproduction {
+                command,
+                command_redacted: false,
+                method: present_attempt.verb.to_owned(),
+                target: present_attempt.target.clone(),
+                headers: present_attempt
+                    .headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect(),
+                body: present_attempt.body.clone(),
+                evidence: observed_evidence(
+                    &Signal::InResponse,
+                    self.canary.callback_host(),
+                    &present,
+                    &self.canary.token,
+                    None,
+                ),
+                response: response_excerpt(&present),
+                stdout: transcript
+                    .as_ref()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned()),
+                stderr: transcript
+                    .as_ref()
+                    .map(|output| String::from_utf8_lossy(&output.stderr).into_owned()),
+                exit_code: transcript.as_ref().and_then(|output| output.status.code()),
+                output_safety: transcript.map(|_| "oracle-proof".to_owned()),
+                controls: Vec::new(),
+            });
+        }
+        let evidence = match &oracle.proof {
+            payload::ReadOracleProof::SensitiveFile { path } => format!(
+                "the traversal reached the real operating-system file `{path}`: the handler took its \
+                file-found path for `{path}` but its not-found path for two equivalent nonexistent \
+                siblings under `/etc`, proving path traversal and disclosure of the target file's \
+                existence outside the application base directory; the response did not return the \
+                file bytes, so this is an existence oracle, not local file content disclosure"
+            ),
+            payload::ReadOracleProof::CraftedFixture {
+                effective_path,
+                constraint,
+            } => {
+                let why = constraint
+                    .as_deref()
+                    .unwrap_or("the handler requires a crafted verifier fixture");
+                format!(
+                    "{why}, so an exact `/etc/shadow` or `/etc/passwd` target is not representable; \
+                    a verifier-created file outside the application base directory was placed at \
+                    `{effective_path}`, and the traversal took its file-found path only for that file \
+                    while two equivalent unplanted controls took its not-found path; the response \
+                    did not return the file bytes, so this proves an existence oracle rather than \
+                    local file content disclosure"
+                )
+            }
+        };
         Some(Reproduction {
             command: self.poc_command(&present_attempt),
             command_redacted: false,
@@ -63,11 +129,7 @@ impl Session {
                 .map(|(name, value)| format!("{name}: {value}"))
                 .collect(),
             body: present_attempt.body.clone(),
-            evidence: "a canary file planted only outside the application's base directory was \
-                reached by traversal: the handler took its file-found path for the planted path but \
-                its not-found path for an equivalent unplanted path, proving the read opened the \
-                attacker-controlled path outside the base directory"
-                .to_owned(),
+            evidence,
             response: response_excerpt(&present),
             stdout: None,
             stderr: None,

@@ -14,6 +14,8 @@ pub struct BrowserAttempt {
     pub url: String,
     /// The marker service is reached carrying this token when the canary runs.
     pub token: String,
+    /// JSON-encoded message data sent from a distinct attacker origin after the page loads.
+    pub message: Option<String>,
 }
 
 /// Param names a URL-sourced DOM sink commonly reads, tried when the exact one is unknown.
@@ -40,6 +42,7 @@ pub fn browser_attempts(
         out.push(BrowserAttempt {
             url,
             token: token.clone(),
+            message: None,
         })
     };
     let params = param_names(probe);
@@ -67,8 +70,45 @@ pub fn browser_attempts(
             // The sandbox sets the referrer separately; the page itself carries no payload.
             push(page.to_owned());
         }
+        UrlVector::Message => {
+            // Common browser message protocols either consume the string directly or parse a JSON
+            // envelope before evaluating its `data` field. Keep the payload inert in the driver:
+            // only the target page receives it, and verification still requires its exact sink and
+            // the marker callback to execute.
+            drop(push);
+            out.clear();
+            let direct = serde_json::to_string(&payload).unwrap_or_default();
+            let envelope =
+                serde_json::to_string(&serde_json::json!({"type": "plugin_init", "data": payload}))
+                    .unwrap_or_default();
+            let string_envelope = serde_json::to_string(&envelope).unwrap_or_default();
+            for message in [string_envelope, envelope, direct] {
+                out.push(BrowserAttempt {
+                    url: page.to_owned(),
+                    token: token.clone(),
+                    message: Some(message),
+                });
+            }
+        }
     }
     out
+}
+
+/// Harmless messages shaped like the exploit attempts. They exercise the same application
+/// protocol from the target's own origin, so a postMessage fix must keep the trusted initialization
+/// path working while rejecting the cross-origin exploit.
+pub fn benign_messages(value: &str) -> Vec<String> {
+    let code = format!("void({})", serde_json::to_string(value).unwrap_or_default());
+    let envelope = serde_json::to_string(&serde_json::json!({
+        "type": "plugin_init",
+        "data": code,
+    }))
+    .unwrap_or_default();
+    vec![
+        serde_json::to_string(&envelope).unwrap_or_default(),
+        envelope,
+        serde_json::to_string(&code).unwrap_or_default(),
+    ]
 }
 
 /// The page loads that carry a plain `value` where [`browser_attempts`] places the payload: the
@@ -101,7 +141,7 @@ pub fn benign_urls(probe: &BrowserProbe, page: &str, value: &str) -> Vec<String>
             }
             out.push(format!("{page}#{encoded}"));
         }
-        UrlVector::Referrer => {}
+        UrlVector::Referrer | UrlVector::Message => {}
     }
     out
 }
@@ -162,6 +202,7 @@ pub fn bookmarklet_attempts(
         out.push(BrowserAttempt {
             url,
             token: token.clone(),
+            message: None,
         })
     };
     for payload in &payloads {
@@ -265,6 +306,7 @@ fn canary_payload(sink: BrowserSink, canary: &Canary, token: &str) -> String {
         BrowserSink::Html => format!("<img src=x onerror=\"fetch('{service}')\">"),
         BrowserSink::Navigation => format!("javascript:fetch('{service}')"),
         BrowserSink::Import => service,
+        BrowserSink::Eval => format!("fetch('{service}')"),
     }
 }
 
@@ -320,6 +362,40 @@ mod tests {
         let canary = Canary::new("t".to_owned());
         let attempts = browser_attempts(&search, "/index.html", &canary, 1);
         assert_eq!(attempts.len(), urls.len());
+    }
+
+    #[test]
+    fn a_postmessage_eval_tries_the_common_plugin_init_envelope_first() {
+        let canary = Canary::new("message-token".to_owned());
+        let attempts = browser_attempts(
+            &probe(UrlVector::Message, BrowserSink::Eval),
+            "/plugin.html",
+            &canary,
+            7,
+        );
+        assert_eq!(attempts.len(), 3);
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| { attempt.url == "/plugin.html" && attempt.message.is_some() })
+        );
+        let outer: String = serde_json::from_str(attempts[0].message.as_ref().unwrap()).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&outer).unwrap();
+        assert_eq!(envelope["type"], "plugin_init");
+        assert!(envelope["data"].as_str().unwrap().contains("fetch("));
+    }
+
+    #[test]
+    fn benign_postmessage_values_use_the_same_envelopes_without_a_callback() {
+        let messages = benign_messages("jsspectorbenign");
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].contains("plugin_init"));
+        assert!(messages.iter().all(|message| message.contains("void")));
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.contains("jss-marker"))
+        );
     }
 
     #[test]

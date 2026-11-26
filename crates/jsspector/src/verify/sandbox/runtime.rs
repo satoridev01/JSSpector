@@ -1017,7 +1017,8 @@ pub(super) fn is_recognizable_local_fixture(
     if !name.starts_with("jss-canary-read") {
         return false;
     }
-    serde_json::from_slice::<String>(existing).is_ok_and(|token| {
+    serde_json::from_slice::<String>(existing).is_ok_and(|contents| {
+        let token = contents.strip_prefix("CANARY ").unwrap_or(&contents);
         (16..=128).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
 }
@@ -1029,7 +1030,7 @@ pub(super) fn plant_local_files(canary: &Canary) -> Result<Vec<std::path::PathBu
         .map(|path| {
             (
                 std::path::PathBuf::from(path),
-                format!("\"{}\"", canary.token).into_bytes(),
+                canary.planted_json_string().into_bytes(),
             )
         })
         .collect();
@@ -1198,7 +1199,7 @@ pub(super) fn restore_local_read_canaries(canary: &Canary) -> Result<(), String>
         if path.exists() {
             continue;
         }
-        std::fs::write(&path, format!("\"{}\"", canary.token)).map_err(|error| {
+        std::fs::write(&path, canary.planted_json_string()).map_err(|error| {
             format!(
                 "restoring local verifier fixture {}: {error}",
                 path.display()
@@ -2703,9 +2704,9 @@ pub(super) fn dockerfile(
          ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0\n\
          ENV TS_NODE_TRANSPILE_ONLY=true\n\
          {build_env_lines}\
-         RUN command -v curl >/dev/null 2>&1 || \
-         (apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*) || \
-         apk add --no-cache curl ca-certificates\n\
+         RUN (command -v curl >/dev/null 2>&1 && command -v git >/dev/null 2>&1) || \
+         (apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates git && rm -rf /var/lib/apt/lists/*) || \
+         apk add --no-cache curl ca-certificates git\n\
          WORKDIR /app\n\
          COPY . /app\n\
          WORKDIR {install_workdir}\n\
@@ -4010,14 +4011,15 @@ pub(super) fn start_command(
         let default_file = manifest_start_command(root)
             .as_deref()
             .and_then(node_command_file);
-        let default_mounts = default_file.as_deref().is_some_and(|file| {
-            file == module
-                || module_reachable_from(
-                    root,
-                    std::path::Path::new(file),
-                    std::path::Path::new(&module),
-                )
-        });
+        let default_mounts =
+            default_file.as_deref().is_some_and(|file| {
+                file == module
+                    || module_reachable_from(
+                        root,
+                        std::path::Path::new(file),
+                        std::path::Path::new(&module),
+                    )
+            }) || manifest_start_reaches_module(root, std::path::Path::new(&module));
         if !default_mounts
             && let Some(server) = server_mounting_module(root, &module)
             && Some(&server) != default_file.as_ref()
@@ -4093,6 +4095,96 @@ pub(super) fn start_command(
         return Some(node_red_host_command(&file));
     }
     is_route_handler_module(&root.join(&file)).then(|| route_host_command(&file))
+}
+
+/// Whether the manifest's Node launcher reaches `module`, including the common supervisor shape
+/// where `npm start` runs a small file that `fork()`s the real server named by a local `.js` literal.
+/// This prevents a directly runnable child worker or short-lived test from replacing the deployment
+/// launcher that supplies its arguments and environment.
+fn manifest_start_reaches_module(root: &std::path::Path, module: &std::path::Path) -> bool {
+    let Ok(manifest) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&manifest) else {
+        return false;
+    };
+    let Some(script) = json
+        .get("scripts")
+        .and_then(|scripts| scripts.get("start"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(launcher) = node_launcher_file(script, root) else {
+        return false;
+    };
+    supervisor_reaches_module(root, std::path::Path::new(&launcher), module, 3)
+}
+
+fn supervisor_reaches_module(
+    root: &std::path::Path,
+    launcher: &std::path::Path,
+    module: &std::path::Path,
+    depth: usize,
+) -> bool {
+    if module_reachable_from(root, launcher, module) {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let Ok(source) = std::fs::read_to_string(root.join(launcher)) else {
+        return false;
+    };
+    if !(source.contains("fork(") || source.contains("spawn(")) {
+        return false;
+    }
+    let parent = launcher
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    javascript_string_literals(&source)
+        .into_iter()
+        .any(|literal| {
+            if ![".js", ".mjs", ".cjs"]
+                .iter()
+                .any(|extension| literal.ends_with(extension))
+                || literal.contains(['$', '{'])
+            {
+                return false;
+            }
+            let child = parent.join(literal.trim_start_matches("./"));
+            root.join(&child).is_file()
+                && supervisor_reaches_module(root, &child, module, depth.saturating_sub(1))
+        })
+}
+
+/// Plain JavaScript string literal bodies. Escaped/template strings are deliberately ignored: this
+/// helper is only a conservative source of checked-in child entry filenames for a supervisor.
+fn javascript_string_literals(source: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    for (at, byte) in bytes.iter().enumerate() {
+        if !matches!(byte, b'\'' | b'"' | b'`') || at < 4 {
+            continue;
+        }
+        let before = &source[..at];
+        if ![".js", ".mjs", ".cjs"]
+            .iter()
+            .any(|extension| before.ends_with(extension))
+        {
+            continue;
+        }
+        let line_start = before.rfind(['\n', '\r']).map_or(0, |index| index + 1);
+        let Some(open) = source[line_start..at].rfind(*byte as char) else {
+            continue;
+        };
+        let start = line_start + open + 1;
+        let literal = &source[start..at];
+        if !literal.contains('\\') {
+            out.push(literal);
+        }
+    }
+    out
 }
 
 /// Whether the package manifest's only selectable launch is a CLI dispatcher `main` file. Mirrors
@@ -5051,6 +5143,9 @@ pub(super) fn server_mounting_module(root: &std::path::Path, module_rel: &str) -
         if rel == module_rel {
             continue;
         }
+        if nonproduction_server_candidate(&candidate) {
+            continue;
+        }
         if !is_standalone_server(&root.join(&candidate)) {
             continue;
         }
@@ -5070,6 +5165,28 @@ pub(super) fn server_mounting_module(root: &std::path::Path, module_rel: &str) -
         }
     }
     best
+}
+
+/// Tests and fixtures may briefly bind a real HTTP listener while exercising a router, but they are
+/// not application launchers: their runner exits as soon as assertions finish. Selecting one makes
+/// the verifier race a short-lived test server and then misclassify subsequent connection failures.
+fn nonproduction_server_candidate(path: &std::path::Path) -> bool {
+    let in_nonproduction_dir = path.components().any(|component| {
+        matches!(
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .as_str(),
+            "test" | "tests" | "__tests__" | "fixture" | "fixtures" | "example" | "examples"
+        )
+    });
+    let name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    in_nonproduction_dir || name.ends_with(".test") || name.ends_with(".spec")
 }
 
 /// Every JavaScript source file in the repo (relative to `root`), by a bounded walk that skips
@@ -7742,7 +7859,13 @@ const record = (req) => console.log('MARKER ' + JSON.stringify({
   path: req.url,
   userAgent: req.headers['user-agent'] || null,
 }));
-const log = (req, res) => { record(req); res.end('ok'); };
+const log = (req, res) => {
+  record(req);
+  let token = '';
+  try { token = new URL(req.url, 'http://jss-marker').pathname.replace(/^\/+/, ''); } catch (_) {}
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.end(token ? `CANARY ${token}\n` : 'CANARY\n');
+};
 // An outbound request whose host is attacker-controlled may be forwarded with upgrade headers
 // (a proxied WebSocket/upgrade request). Record those too, so a reached-service signal is seen
 // however the request arrives, then drop the raw socket.

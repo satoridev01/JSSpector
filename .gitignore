@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.profraw
 
+# Bundled online controller bytecode
+__pycache__/
+*.py[cod]
+
 # Fuzzing artifacts
 /fuzz/artifacts/
 /fuzz/corpus/
@@ -21,6 +25,16 @@
 /.satori/exploitability-regressions.json
 # The fix recipe store's lock and temporary files
 /.satori/fix-recipes/**/.*
+# Exact learned examples now live under the user's private data directory, never in this public
+# checkout. Ignore the legacy on-tree store so a future research run cannot stage a disclosure.
+/.satori/fix-recipes/examples/
+/.satori/fix-recipes/recipes/
+
+# Online research artifacts can contain undisclosed repositories, PoCs and callback tokens.
+/runs/
+
+# Local presentation exports are not project sources.
+/JSSpector-narration.*
 
 # OS / editor
 .DS_Store

@@ -6,7 +6,7 @@
 
 use super::mcp::{self, McpDiscovery};
 use super::payload::{self, Attempt, Canary, Signal};
-use super::plan::{Method, Probe};
+use super::plan::{Entry, Method, Probe};
 use super::{ControlObservation, Outcome, Reproduction};
 use fs2::FileExt;
 use serde::Deserialize;
@@ -322,6 +322,15 @@ pub struct Session {
     last_sink_hit: std::cell::Cell<bool>,
     proof_sink_hit: std::cell::Cell<bool>,
     unbound_effect: std::cell::Cell<bool>,
+    /// The concrete request that most recently verified this finding. Fix proof replays this exact
+    /// request after each relaunch instead of searching the complete payload/route matrix again.
+    /// Complex differential oracles that do not verify through [`Self::send`] leave this empty and
+    /// retain the exhaustive fallback.
+    last_verified_attempt: RefCell<Option<Attempt>>,
+    /// A harmless resource-creation request needed before a query/evaluator route can run (for
+    /// example, create one model cell before `/query` can evaluate an expression). Kept so fix
+    /// relaunches and the displayed PoC repeat the same prerequisite deterministically.
+    probe_setup: RefCell<Vec<Attempt>>,
     /// Transport/driver failures observed while exercising the current finding. A negative verdict
     /// is conclusive only when every request the verifier relied on was actually driven.
     driver_errors: RefCell<Vec<String>>,
@@ -836,6 +845,8 @@ impl Session {
             last_sink_hit: std::cell::Cell::new(false),
             proof_sink_hit: std::cell::Cell::new(false),
             unbound_effect: std::cell::Cell::new(false),
+            last_verified_attempt: RefCell::new(None),
+            probe_setup: RefCell::new(Vec::new()),
             driver_errors: RefCell::new(Vec::new()),
             driver_successes: std::cell::Cell::new(0),
             mcp_calls: RefCell::new(McpCalls::default()),
@@ -1135,6 +1146,8 @@ impl Session {
             last_sink_hit: std::cell::Cell::new(false),
             proof_sink_hit: std::cell::Cell::new(false),
             unbound_effect: std::cell::Cell::new(false),
+            last_verified_attempt: RefCell::new(None),
+            probe_setup: RefCell::new(Vec::new()),
             driver_errors: RefCell::new(Vec::new()),
             driver_successes: std::cell::Cell::new(0),
             mcp_calls: RefCell::new(McpCalls::default()),
@@ -2059,6 +2072,8 @@ impl Session {
             &self.network,
             "--memory",
             "512m",
+            "--tmpfs",
+            "/data/db",
         ];
         // A name a SQL database answers to is not also MongoDB's (`db` may be Postgres).
         let taken: Vec<&str> = self
@@ -2137,6 +2152,17 @@ impl Session {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
+            // Official database images declare persistent VOLUME paths. Verification data is
+            // disposable, so mount those paths as tmpfs instead of leaking anonymous Docker
+            // volumes when a process is interrupted between `run` and teardown.
+            args.push("--tmpfs".to_owned());
+            args.push(
+                match sidecar.kind {
+                    super::services::SqlKind::Postgres => "/var/lib/postgresql/data",
+                    super::services::SqlKind::Mysql => "/var/lib/mysql",
+                }
+                .to_owned(),
+            );
             for alias in &sidecar.aliases {
                 args.push("--network-alias".to_owned());
                 args.push(alias.clone());
@@ -2867,6 +2893,9 @@ impl Session {
         self.driver_successes.set(0);
         self.proof_sink_hit.set(false);
         self.unbound_effect.set(false);
+        *self.last_verified_attempt.borrow_mut() = None;
+        self.probe_setup.borrow_mut().clear();
+        self.prepare_probe_resources(probe);
         // An MCP probe is aimed at the endpoint found for its own hints and resolved against the
         // server's own tool list: the tool and argument the source did not settle, and the other
         // arguments the tool requires, come from its schema, one concrete pair at a time.
@@ -2885,6 +2914,182 @@ impl Session {
         );
         let outcome = self.qualify_sink_binding(outcome);
         self.attach_exact_command_transcript(outcome)
+    }
+
+    /// Replays the single request that established the current finding. A fixed candidate should
+    /// usually be disproved in one request; rerunning hundreds of alternate routes and payloads is
+    /// both slower and semantically weaker than checking the exact exploit. If the original proof
+    /// used a multi-request differential oracle, no single attempt is recorded and the caller falls
+    /// back to the full probe.
+    pub fn replay_verified_attempt(&mut self, probe: &Probe) -> Outcome {
+        let Some(attempt) = self.last_verified_attempt.borrow().clone() else {
+            return self.exercise(probe);
+        };
+        self.driver_errors.borrow_mut().clear();
+        self.driver_successes.set(0);
+        self.proof_sink_hit.set(false);
+        self.unbound_effect.set(false);
+        self.probe_setup.borrow_mut().clear();
+        self.prepare_probe_resources(probe);
+        let outcome = match self.send(&attempt) {
+            Some(poc) => Outcome::Verified {
+                how: format!("{} {}", poc.method, poc.target),
+                poc,
+            },
+            None => Outcome::NotReproduced { tried: 1 },
+        };
+        let outcome = qualify_driver_health(
+            outcome,
+            self.driver_errors.borrow().as_slice(),
+            self.driver_successes.get(),
+        );
+        self.qualify_sink_binding(outcome)
+    }
+
+    /// Some evaluator routes operate on an existing resource and honestly reject an empty store.
+    /// When the route and request field explicitly identify a query/expression evaluator, create one
+    /// harmless code-backed resource at the parent collection first. This is performed only inside
+    /// the disposable verifier sandbox and is included in the reported reproduction command.
+    fn prepare_probe_resources(&self, probe: &Probe) {
+        // A conventional worker registration route is the honest public prerequisite for endpoints
+        // keyed by a worker id. Register a disposable manager (no project row required) so `{id}=1`
+        // exists in a fresh SQL sidecar before the selected worker route is exercised.
+        if probe.path.contains("/workers/{id}/") {
+            let setup = Attempt {
+                verb: "POST",
+                target: "/worker/register".to_owned(),
+                body: Some(
+                    serde_json::json!({
+                        "hostname": "jsspector",
+                        "pid": 1,
+                        "mode": "verification",
+                        "type": "manager"
+                    })
+                    .to_string(),
+                ),
+                // Verification fills token-like environment variables with this same neutral
+                // secret when an app expects them. Some local collectors consequently protect
+                // their otherwise-public registration route with that token. Authenticate the
+                // disposable registration with the verifier-owned value so the prerequisite is
+                // created instead of silently recording a 401 response as setup.
+                headers: vec![
+                    (
+                        "Authorization".to_owned(),
+                        format!("Bearer {STRONG_FILLER_SECRET}"),
+                    ),
+                    ("Content-Type".to_owned(), "application/json".to_owned()),
+                ],
+                signal: Signal::InResponse,
+            };
+            let registered = self.fetch_meta(&setup);
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                let summary = registered
+                    .as_ref()
+                    .map(|(body, status, _)| (status, response_excerpt(body)));
+                eprintln!("[verify] worker prerequisite response={summary:?}");
+            }
+            if registered
+                .is_some_and(|(_, status, _)| status.is_some_and(|code| (200..300).contains(&code)))
+            {
+                self.probe_setup.borrow_mut().push(setup);
+            } else if self.seed_worker_row() && std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!("[verify] worker prerequisite seeded in disposable SQL sidecar");
+            }
+        }
+
+        if probe.class != jss_core::VulnClass::CodeInjection {
+            return;
+        }
+        let Entry::Body(Some(field)) = &probe.entry else {
+            return;
+        };
+        if !matches!(field.as_str(), "expression" | "query") {
+            return;
+        }
+        let Some(parent) = probe.path.strip_suffix("/query") else {
+            return;
+        };
+        if parent.is_empty() {
+            return;
+        }
+        let body = serde_json::json!({
+            "id": "jsspector_probe",
+            "name": "jsspector_probe",
+            "prompt": "verification prerequisite",
+            "code": "export default ({ brep }) => brep.box(1, 1, 1);"
+        })
+        .to_string();
+        let setup = Attempt {
+            verb: "POST",
+            target: parent.to_owned(),
+            body: Some(body),
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            signal: Signal::InResponse,
+        };
+        let created = self.fetch_meta(&setup);
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            let summary = created
+                .as_ref()
+                .map(|(body, status, _)| (status, response_excerpt(body)));
+            eprintln!("[verify] evaluator prerequisite target={parent} response={summary:?}");
+        }
+        if created
+            .is_some_and(|(_, status, _)| status.is_some_and(|code| (200..300).contains(&code)))
+        {
+            self.probe_setup.borrow_mut().push(setup);
+        }
+    }
+
+    /// Seed the minimum conventional worker row when the application's own registration endpoint
+    /// cannot run against its checked-in schema (for example, the route expects a migration that
+    /// the repository's bootstrap omitted). The route under test only requires an existing id; this
+    /// disposable row supplies that ordinary state without changing application code or bypassing
+    /// its request authentication.
+    fn seed_worker_row(&self) -> bool {
+        for (container, sidecar) in &self.sql {
+            let output = match sidecar.kind {
+                super::services::SqlKind::Postgres => self.exec(
+                    container,
+                    &[
+                        "env",
+                        &format!("PGPASSWORD={}", sidecar.password),
+                        "psql",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-U",
+                        &sidecar.user,
+                        "-d",
+                        &sidecar.database,
+                        "-c",
+                        "INSERT INTO workers (id, hostname, pid, status) VALUES (1, 'jsspector', 1, 'idle') ON CONFLICT (id) DO NOTHING;",
+                    ],
+                ),
+                super::services::SqlKind::Mysql => {
+                    let mut args = vec![
+                        "mysql".to_owned(),
+                        "--protocol=tcp".to_owned(),
+                        "-h".to_owned(),
+                        "127.0.0.1".to_owned(),
+                        "-u".to_owned(),
+                        sidecar.user.clone(),
+                    ];
+                    if !sidecar.password.is_empty() {
+                        args.push(format!("-p{}", sidecar.password));
+                    }
+                    args.extend([
+                        sidecar.database.clone(),
+                        "-e".to_owned(),
+                        "INSERT IGNORE INTO workers (id, hostname, pid, status) VALUES (1, 'jsspector', 1, 'idle');".to_owned(),
+                    ]);
+                    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+                    self.exec(container, &refs)
+                }
+            };
+            if output.is_ok_and(|result| result.status.success()) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Differential oracles (SQL/NoSQL, traversal branch comparisons, and similar proofs) build
@@ -3763,7 +3968,7 @@ impl Session {
     /// so it gets a bounded second to reach the marker before the driver returns.
     fn socket_ack_wait(&self, attempt: &Attempt) -> u64 {
         if self.socket_unacked.borrow().contains(&attempt.target) {
-            if matches!(attempt.signal, Signal::ServiceReached(_)) {
+            if attempt.signal.service_token().is_some() {
                 1000
             } else {
                 150
@@ -3889,11 +4094,22 @@ impl Session {
 
     /// Sends one request from inside the app container and checks its signal.
     fn send(&self, attempt: &Attempt) -> Option<Reproduction> {
+        // Effect oracles are stateful. A fix replay must prove that *this* request produced a new
+        // effect, not reuse the file/marker record left by the original exploit.
+        let marker_before = attempt
+            .signal
+            .service_token()
+            .map(|token| marker_hit_count(&self.tail_logs(&self.marker), token))
+            .unwrap_or_default();
+        if let Signal::FileWritten(path) = &attempt.signal {
+            let _ = self.exec(&self.app, &["rm", "-f", path]);
+        }
         let output = match self.drive(attempt) {
             Ok(output) => output,
             Err(_) => return None,
         };
         let body = String::from_utf8_lossy(&output.stdout);
+        let mut captured_command_output = None;
         let reproduced = match &attempt.signal {
             Signal::InResponse
             | Signal::ResponseContains(_)
@@ -3909,7 +4125,8 @@ impl Session {
                 payload::reproduced(attempt, &self.canary, &body, exists, false)
             }
             Signal::ServiceReached(token) => {
-                let local_reached = marker_hit(&self.tail_logs(&self.marker), token).is_some();
+                let marker_after = self.tail_logs(&self.marker);
+                let local_reached = marker_hit_count(&marker_after, token) > marker_before;
                 if local_reached {
                     // The isolated marker hit is the exploitation proof. Mirroring that hit to
                     // the public callback only records metadata; a transient callback/API failure
@@ -3924,6 +4141,23 @@ impl Session {
                     && self.public_callback_reached(token);
                 let reached = local_reached || public_reached;
                 payload::reproduced(attempt, &self.canary, &body, false, reached)
+            }
+            Signal::CommandOutputReached(token) => {
+                let marker_after = self.tail_logs(&self.marker);
+                let fresh_hit = marker_hit_count(&marker_after, token) > marker_before;
+                captured_command_output = fresh_hit
+                    .then(|| captured_id_output(&marker_after, token))
+                    .flatten();
+                if captured_command_output.is_some() {
+                    self.relay_public_callback(token);
+                }
+                payload::reproduced(
+                    attempt,
+                    &self.canary,
+                    &body,
+                    false,
+                    captured_command_output.is_some(),
+                )
             }
         };
         let reproduced = self.accept_bound_effect(reproduced);
@@ -3953,6 +4187,7 @@ impl Session {
                 Signal::ComputedResponse { .. } => "interpreter-computed-response",
                 Signal::FileWritten(_) => "canary-file-written",
                 Signal::ServiceReached(_) => "callback-reached",
+                Signal::CommandOutputReached(_) => "command-output-callback-reached",
             };
             eprintln!(
                 "[verify] {} {} request-body={:?} -> status {:?} stderr[{}] body[{}] signal={} matched={} canary-exists={}",
@@ -3968,9 +4203,40 @@ impl Session {
             );
         }
         reproduced.then(|| {
+            *self.last_verified_attempt.borrow_mut() = Some(attempt.clone());
             let display = normalized_callback_attempt(attempt, self.canary.callback_host());
-            let command = self.poc_command(&display);
-            let transcript = self.exact_http_transcript(attempt, &command);
+            let mut exploit_command = self.poc_command(&display);
+            if matches!(&attempt.signal, Signal::InResponse)
+                && !body.contains(&self.canary.token)
+                && payload::response_contains_canary(&body, &self.canary.token)
+            {
+                exploit_command = decode_indexed_json_response(&exploit_command);
+            }
+            let command = self
+                .probe_setup
+                .borrow()
+                .iter()
+                .map(|setup| self.poc_command(setup))
+                .chain(std::iter::once(exploit_command))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            // The report command replaces the private marker with CALLBACK_HOST. Re-run the same
+            // request against the literal isolated marker so callback-based proofs can retain the
+            // exact curl transcript without making the disposable app reach the public Internet.
+            let executed_command = self
+                .probe_setup
+                .borrow()
+                .iter()
+                .map(|setup| literal_reproduction_command(setup, self.port))
+                .chain(std::iter::once(literal_reproduction_command(
+                    attempt, self.port,
+                )))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            let transcript = self.exact_http_transcript(attempt, &executed_command);
+            let stdout = transcript
+                .as_ref()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
             Reproduction {
                 command,
                 command_redacted: false,
@@ -3982,11 +4248,15 @@ impl Session {
                     .map(|(name, value)| format!("{name}: {value}"))
                     .collect(),
                 body: display.body.clone(),
-                evidence: observed_evidence(&attempt.signal, self.canary.callback_host()),
+                evidence: observed_evidence(
+                    &attempt.signal,
+                    self.canary.callback_host(),
+                    &body,
+                    &self.canary.token,
+                    captured_command_output.as_deref(),
+                ),
                 response: body.trim().to_owned(),
-                stdout: transcript
-                    .as_ref()
-                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned()),
+                stdout,
                 stderr: transcript
                     .as_ref()
                     .map(|output| String::from_utf8_lossy(&output.stderr).into_owned()),
@@ -4009,18 +4279,36 @@ impl Session {
                     | Signal::ResponseContains(_)
                     | Signal::Base64FileRead { .. }
                     | Signal::ComputedResponse { .. }
+                    | Signal::ServiceReached(_)
+                    | Signal::CommandOutputReached(_)
             )
         {
             return None;
         }
-        let marker_before = self.begin_sink_observation();
+        let service_marker_before = attempt
+            .signal
+            .service_token()
+            .map(|token| marker_hit_count(&self.tail_logs(&self.marker), token))
+            .unwrap_or_default();
+        let sink_marker_before = self.begin_sink_observation();
         let output = self.exec(&self.app, &["sh", "-c", command]).ok()?;
-        self.finish_sink_observation(marker_before);
+        self.finish_sink_observation(sink_marker_before);
         if !output.status.success() {
             return None;
         }
         let body = String::from_utf8_lossy(&output.stdout);
-        let oracle = payload::reproduced(attempt, &self.canary, &body, false, false);
+        let service_reached = match &attempt.signal {
+            Signal::ServiceReached(token) => {
+                marker_hit_count(&self.tail_logs(&self.marker), token) > service_marker_before
+            }
+            Signal::CommandOutputReached(token) => {
+                let logs = self.tail_logs(&self.marker);
+                marker_hit_count(&logs, token) > service_marker_before
+                    && captured_id_output(&logs, token).is_some()
+            }
+            _ => false,
+        };
+        let oracle = payload::reproduced(attempt, &self.canary, &body, false, service_reached);
         let bound = self.sink_binding.is_none() || self.last_sink_hit.get();
         (oracle && bound).then_some(output)
     }
@@ -4087,7 +4375,7 @@ impl Session {
         let registered_token = host.split('.').next().unwrap_or_default();
         let confirmed = output.status.success()
             && String::from_utf8_lossy(&output.stdout)
-                .contains(&format!("SATORI_CANARY_{registered_token}"));
+                .contains(&format!("CANARY {registered_token}"));
         if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
             eprintln!(
                 "[verify] callback relay {} -> status {:?} confirmed={confirmed}",
@@ -4163,7 +4451,7 @@ pub(super) fn original_file_content(
 fn canary_staging_command(canary: &Canary) -> String {
     let marker_files = canary.planted_files().join(" ");
     format!(
-        "for f in {marker_files}; do printf '\"%s\"' '{}' > \"$f\"; done && cp /jss-canary-img-fixture {} && ",
+        "for f in {marker_files}; do printf '\"CANARY %s\"' '{}' > \"$f\"; done && cp /jss-canary-img-fixture {} && ",
         canary.token,
         canary.planted_image_file()
     )
@@ -4228,6 +4516,71 @@ fn marker_hit(logs: &str, token: &str) -> Option<MarkerHit> {
     })
 }
 
+/// Number of structured marker records for this token. Fix replays compare this value before and
+/// after the request so an earlier callback can never prove a changed candidate exploitable.
+fn marker_hit_count(logs: &str, token: &str) -> usize {
+    logs.lines()
+        .filter_map(|line| {
+            let payload = line.split_once("MARKER ")?.1.trim();
+            serde_json::from_str::<MarkerHit>(payload).ok()
+        })
+        .filter(|hit| hit.path.contains(token))
+        .count()
+}
+
+/// Returns the real stdout transported by a blind command-injection probe. The payload places the
+/// URL-encoded output of the read-only Linux `id` command after `/<token>/id/`. Requiring both the
+/// per-run token and the shape of `id` output prevents a generic callback from being promoted into
+/// command-execution evidence.
+fn captured_id_output(logs: &str, token: &str) -> Option<String> {
+    let prefix = format!("/{token}/id/");
+    logs.lines().rev().find_map(|line| {
+        let payload = line.split_once("MARKER ")?.1.trim();
+        let hit: MarkerHit = serde_json::from_str(payload).ok()?;
+        let encoded = hit.path.split(['?', '#']).next()?.strip_prefix(&prefix)?;
+        if encoded.len() > 4_096 {
+            return None;
+        }
+        let decoded = percent_decode_component(encoded)?;
+        let output = decoded.trim();
+        (output.starts_with("uid=")
+            && output.contains(" gid=")
+            && output.len() <= 2_048
+            && output
+                .chars()
+                .all(|ch| ch == ' ' || ch == '\t' || !ch.is_control()))
+        .then(|| output.to_owned())
+    })
+}
+
+fn percent_decode_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = *bytes.get(index)?;
+        if byte == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn callback_relay_args(url: &str, hit: &MarkerHit) -> Vec<String> {
     let args = vec![
         "--fail".to_owned(),
@@ -4266,9 +4619,20 @@ fn safe_method(value: &str) -> Option<&str> {
     .then_some(value)
 }
 
-fn observed_evidence(signal: &Signal, callback_host: Option<&str>) -> String {
+fn observed_evidence(
+    signal: &Signal,
+    callback_host: Option<&str>,
+    response: &str,
+    canary_token: &str,
+    captured_command_output: Option<&str>,
+) -> String {
     match signal {
-        Signal::InResponse => "the canary token appeared in the application response".to_owned(),
+        Signal::InResponse if response.contains(canary_token) => {
+            "the planted out-of-root file's exact canary contents appeared in the application response, proving local file content disclosure".to_owned()
+        }
+        Signal::InResponse => {
+            "the application serialized the planted out-of-root file's exact canary contents as ordered numeric JSON entries; reconstructing those entries produced the per-run token, proving local file content disclosure".to_owned()
+        }
         Signal::ResponseContains(expected) => {
             if expected == "uid=" {
                 "the application response contained the output of the read-only `id` command (`uid=`)"
@@ -4294,13 +4658,26 @@ fn observed_evidence(signal: &Signal, callback_host: Option<&str>) -> String {
         Signal::ServiceReached(token) => {
             if callback_host.is_some() {
                 format!(
-                    "the isolated request carrying `{token}` was confirmed by the registered Satori callback"
+                    "the isolated request carrying CANARY `{token}` was confirmed by the registered Satori callback"
                 )
             } else {
-                format!("the isolated marker service received callback token `{token}`")
+                format!("the isolated marker service received CANARY `{token}`")
             }
         }
+        Signal::CommandOutputReached(token) => format!(
+            "the injected read-only OS command `id` executed; the isolated marker captured its exact stdout `{}` under the per-run token `{token}`",
+            captured_command_output.unwrap_or("[missing command output]")
+        ),
     }
+}
+
+/// Make an indexed JSON content disclosure human-readable in the exact reported transcript. The
+/// target is a JavaScript application, so `node` is already present in the verifier container. The
+/// decoder is static and reads only curl's stdout; no repository-controlled text enters the script.
+fn decode_indexed_json_response(command: &str) -> String {
+    format!(
+        "{command} | node -e 'const fs=require(\"fs\");const v=JSON.parse(fs.readFileSync(0,\"utf8\"));const a=Array.isArray(v)?v:(v&&v.type===\"Buffer\"&&Array.isArray(v.data)?v.data:Object.keys(v).sort((a,b)=>Number(a)-Number(b)).map(k=>v[k]));process.stdout.write(Buffer.from(a.map(x=>typeof x===\"number\"?x:String(x).charCodeAt(0))))'"
+    )
 }
 
 fn normalized_callback_attempt(attempt: &Attempt, callback_host: Option<&str>) -> Attempt {
@@ -4348,16 +4725,27 @@ fn configured_callback_host() -> Result<Option<String>, String> {
 fn marker_normalized(attempt: &Attempt) -> (String, Option<String>) {
     let mut target = attempt.target.clone();
     let mut body = attempt.body.clone();
-    if let Signal::ServiceReached(token) = &attempt.signal {
+    if let Some(token) = attempt.signal.service_token() {
         let private = format!("http://jss-marker/{token}");
         let callback = "http://CALLBACK_HOST";
         target = target.replace(&private, callback).replace(
             &format!("http%3A%2F%2Fjss-marker%2F{token}"),
             "http%3A%2F%2FCALLBACK_HOST",
         );
+        // Blind command-injection probes address the marker through Node's `{ hostname, path }`
+        // options object rather than a literal URL. Normalize that hostname too, including after
+        // the surrounding request has percent-encoded the payload. The verifier's literal replay
+        // bypasses this function and continues to use the private `jss-marker` DNS alias.
+        target = target.replace("jss-marker", "CALLBACK_HOST");
         target = replace_local_marker_url(&target, token, callback);
         body = body.map(|value| {
-            replace_local_marker_url(&value.replace(&private, callback), token, callback)
+            replace_local_marker_url(
+                &value
+                    .replace(&private, callback)
+                    .replace("jss-marker", "CALLBACK_HOST"),
+                token,
+                callback,
+            )
         });
     }
     (target, body)
@@ -4388,6 +4776,12 @@ fn reproduction_command(attempt: &Attempt, mcp: Option<&McpEndpoint>, port: u16)
     curl_command(attempt, port)
 }
 
+/// The command the verifier itself can execute. Unlike the report-facing command, this keeps the
+/// disposable marker address intact; it never leaves the private verification network.
+fn literal_reproduction_command(attempt: &Attempt, port: u16) -> String {
+    append_oracle_filter(raw_curl_command_with_marker(attempt, port, false), attempt)
+}
+
 fn curl_command(attempt: &Attempt, port: u16) -> String {
     let command = raw_curl_command(attempt, port);
     append_oracle_filter(command, attempt)
@@ -4398,7 +4792,15 @@ fn curl_command(attempt: &Attempt, port: u16) -> String {
 /// the cookie-capture options on the write and the replay cookie on the read must belong to curl,
 /// not to the proof filter following it.
 fn raw_curl_command(attempt: &Attempt, port: u16) -> String {
-    let (target, body) = marker_normalized(attempt);
+    raw_curl_command_with_marker(attempt, port, true)
+}
+
+fn raw_curl_command_with_marker(attempt: &Attempt, port: u16, normalize_marker: bool) -> String {
+    let (target, body) = if normalize_marker {
+        marker_normalized(attempt)
+    } else {
+        (attempt.target.clone(), attempt.body.clone())
+    };
     if attempt.verb == "SOCKET" {
         return socket_command(&target, body.as_deref(), port);
     }
@@ -4407,6 +4809,11 @@ fn raw_curl_command(attempt: &Attempt, port: u16) -> String {
         "curl -sS --max-time 15".to_owned(),
         format!("--request {}", attempt.verb),
     ];
+    if attempt.signal.service_token().is_some() {
+        // Callback proofs are often blind. Preserve the target application's HTTP status and
+        // headers alongside its response body so a reviewer can see exactly what the PoC returned.
+        parts.push("--include".to_owned());
+    }
     if target.starts_with('/') {
         // The verifier sends the request target verbatim. curl otherwise normalizes dot
         // segments before sending them, which makes a copyable traversal PoC differ from the
@@ -4497,7 +4904,12 @@ fn shell_double_quote_contents(value: &str) -> String {
 /// placeholder emitted for Docker's `jss-marker` hostname. The port is intentionally discovered
 /// from the generated value: it is reserved per run and must never leak into a reusable PoC.
 fn replace_local_marker_url(value: &str, token: &str, replacement: &str) -> String {
-    let mut out = value.to_owned();
+    let mut out = value
+        .replace(&format!("http://jss-marker/{token}"), replacement)
+        .replace(
+            &format!("http%3A%2F%2Fjss-marker%2F{token}"),
+            "http%3A%2F%2FCALLBACK_HOST",
+        );
     for (prefix, separator) in [
         ("http://0x7f000001:", "/"),
         ("http%3A%2F%2F0x7f000001%3A", "%2F"),

@@ -154,15 +154,21 @@ impl Reproduction {
                 .stdout
                 .as_ref()
                 .is_some_and(|stdout| stdout.len() <= 4_096);
+        let raw_output =
+            std::env::var_os("JSS_REPORT_RAW_OUTPUT").is_some_and(|value| value == "1");
         let stdout = self.stdout.as_ref().map(|stdout| {
-            if authenticated && !stdout.is_empty() && !filtered_oracle_stdout {
+            if raw_output {
+                stdout.clone()
+            } else if authenticated && !stdout.is_empty() && !filtered_oracle_stdout {
                 format!("[redacted authenticated stdout: {} bytes]", stdout.len())
             } else {
                 redact_jwts(stdout)
             }
         });
         let stderr = self.stderr.as_ref().map(|stderr| {
-            if authenticated && !stderr.is_empty() {
+            if raw_output {
+                stderr.clone()
+            } else if authenticated && !stderr.is_empty() {
                 format!("[redacted authenticated stderr: {} bytes]", stderr.len())
             } else {
                 redact_jwts(stderr)
@@ -402,6 +408,35 @@ fn run_with_policy(
             plan::plan_with_source(finding, source.as_deref())
         })
         .collect();
+    // A coarse whole-query source can be forwarded into a helper and destructured there before one
+    // member reaches a sink function. Retarget the request to that member and retain the source-
+    // derived branch/shape siblings; otherwise the verifier may inject a selector such as
+    // `provider` while the dangerous `token_secret_name` remains untouched.
+    for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
+        if finding.source.kind == "http"
+            && finding.source.expr.trim_end().ends_with(".query")
+            && let Ok(plan::Plan::Http(probe)) = planned
+            && matches!(probe.entry, plan::Entry::Query(_))
+            && let Ok(route_source) = std::fs::read_to_string(root.join(&finding.file))
+        {
+            let sink_file = finding.sink.file.as_deref().unwrap_or(&finding.file);
+            if let Ok(sink_source) = std::fs::read_to_string(root.join(sink_file))
+                && let Some((field, siblings)) = plan::forwarded_query_context(
+                    &route_source,
+                    &sink_source,
+                    finding.sink.line,
+                    &finding.sink.arg,
+                )
+            {
+                probe.entry = plan::Entry::Query(field);
+                for sibling in siblings {
+                    if probe.siblings.iter().all(|(name, _)| name != &sibling.0) {
+                        probe.siblings.push(sibling);
+                    }
+                }
+            }
+        }
+    }
     // A route the host app mounts under a prefix the module declares (`mountPath: "/auth"`).
     for (finding, planned) in findings.iter().zip(plans.iter_mut()) {
         if let Ok(plan::Plan::Http(probe)) = planned
@@ -532,6 +567,11 @@ fn run_with_policy(
                     "[verify] handler-siblings entry={:?} source={}:{} guards={guard_siblings:?} siblings={siblings:?}",
                     probe.entry, finding.file, finding.source.line,
                 );
+            }
+            for (name, value) in std::mem::take(&mut probe.siblings) {
+                if siblings.iter().all(|(seen, _)| seen != &name) {
+                    siblings.push((name, value));
+                }
             }
             probe.siblings = siblings;
             if part == "body" {

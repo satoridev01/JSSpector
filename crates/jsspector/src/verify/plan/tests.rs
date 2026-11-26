@@ -829,6 +829,16 @@ fn declared_mount_prefix_reads_a_literal_default() {
     assert_eq!(p("this.mountPath = '/files/'").as_deref(), Some("/files"));
     assert_eq!(p("this.mountPath = this.options.mountPath;"), None);
     assert_eq!(p("mountPath: \"/\""), None);
+    assert_eq!(
+        p("// REST surface for cells, mounted at /api/cells.\nimport express from 'express';")
+            .as_deref(),
+        Some("/api/cells")
+    );
+    assert_eq!(
+        p("/** Router mounted under `/internal/files` by the host. */"),
+        None,
+        "quoted prose is intentionally not treated as an executable path hint"
+    );
 }
 
 #[test]
@@ -882,6 +892,7 @@ fn a_header_entry_takes_its_other_forwarded_headers_as_siblings() {
         gate_paths: Vec::new(),
         url_query_params: Vec::new(),
         read_suffix: None,
+        read_filename_suffix: None,
         envelope: None,
         doc_envelope: None,
         lists_dir: false,
@@ -1244,6 +1255,25 @@ fn shell_quote_context_reads_the_interpolated_quote() {
 }
 
 #[test]
+fn json_stringify_trace_is_a_double_quoted_shell_context() {
+    let mut f = finding(
+        VulnClass::CommandInjection,
+        Auth::NoneDetected,
+        Some("GET /run"),
+        "req.url",
+    );
+    f.sink.api = "child_process.exec".to_owned();
+    f.sink.arg = "cmd".to_owned();
+    f.trace.push(TraceStep {
+        file: None,
+        line: 12,
+        col: 8,
+        note: "through JSON.stringify()".to_owned(),
+    });
+    assert_eq!(command_quote_context(&f), Some('"'));
+}
+
+#[test]
 fn diverting_guard_fields_drops_an_alternative_branch_selector() {
     // `openFolderOnly` selects a branch that does not contain the tainted flow (the sink is reached
     // only when it is absent); it must be dropped. `file` is read on the flow path, and `id` is a
@@ -1536,6 +1566,45 @@ fn a_multiline_destructure_anchor_still_finds_the_handlers_presence_guards() {
 }
 
 use super::*;
+
+#[test]
+fn a_forwarded_whole_query_targets_the_sink_bound_destructured_field() {
+    let route = r#"
+async function checkCredentialProvider(provider, query) {
+  if (provider === 'jira') {
+    const { domain, email, project_key: projectKey,
+      token_store_type: tokenStoreType, token_secret_name: tokenSecretName } = query;
+    if (!domain || !email || !projectKey) return { status: 'missing' };
+    return resolveJiraToken(null, null, tokenSecretName, tokenStoreType);
+  }
+}
+async function handle(req) {
+  const provider = req.query.provider;
+  return checkCredentialProvider(provider, req.query);
+}
+"#;
+    let sink = r#"
+export function resolveJiraToken(tokenEnv, token, tokenSecret, tokenStore) {
+  if (tokenStore === 'gcp-secret' && tokenSecret) {
+    return execSync(`gcloud --secret="${tokenSecret}"`);
+  }
+}
+"#;
+    let line = sink[..sink.find("execSync").unwrap()]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32
+        + 1;
+    let (field, siblings) =
+        forwarded_query_context(route, sink, line, "`gcloud --secret=\"${tokenSecret}\"`")
+            .expect("the forwarded field should resolve");
+    assert_eq!(field, "token_secret_name");
+    assert!(siblings.contains(&("provider".to_owned(), "jira".to_owned())));
+    assert!(siblings.contains(&("token_store_type".to_owned(), "gcp-secret".to_owned())));
+    assert!(siblings.contains(&("domain".to_owned(), "jsspector".to_owned())));
+    assert!(siblings.contains(&("email".to_owned(), "jsspector".to_owned())));
+    assert!(siblings.contains(&("project_key".to_owned(), "jsspector".to_owned())));
+}
 use jss_core::{SinkLoc, SourceLoc, TraceStep};
 
 #[test]
@@ -1722,6 +1791,23 @@ app.delete('/api/save/:saveName', (req, res) => {\n\
     // Scoped to the delete handler (its source line), no suffix is appended to the sink path.
     let delete_handler = handler_source(source, 8);
     assert_eq!(appended_path_suffix(delete_handler, &tainted), None);
+}
+
+#[test]
+fn a_literal_filename_suffix_is_mined_from_templates_and_concatenation() {
+    let tainted = ["userId".to_owned()];
+    assert_eq!(
+        appended_filename_suffix("const file = path.join(root, `${userId}.json`);", &tainted,),
+        Some(".json".to_owned())
+    );
+    assert_eq!(
+        appended_filename_suffix("const file = root + '/' + userId + '.yaml';", &tainted),
+        Some(".yaml".to_owned())
+    );
+    assert_eq!(
+        appended_filename_suffix("const file = path.join(root, userId);", &tainted),
+        None
+    );
 }
 
 #[test]
@@ -2400,6 +2486,29 @@ fn manual_split_param_reads_mines_a_hand_rolled_key_value_hash_parser() {
 }
 
 #[test]
+fn manual_split_param_reads_mines_direct_key_dispatch() {
+    let source = r#"
+        const query = req.url.split('?')[1] || '';
+        const pairs = query.split('&');
+        for (const pair of pairs) {
+          const eq = pair.indexOf('=');
+          const k = pair.substring(0, eq);
+          const v = pair.substring(eq + 1);
+          if (k === 'name') selected = decodeURIComponent(v);
+          if (k === "secrets" && v === '1') includeSecrets = true;
+        }
+    "#;
+    assert_eq!(
+        manual_split_param_reads(source),
+        vec!["name".to_owned(), "secrets".to_owned()]
+    );
+    assert_eq!(
+        url_search_params(source),
+        vec!["name".to_owned(), "secrets".to_owned()]
+    );
+}
+
+#[test]
 fn manual_split_param_reads_ignores_an_unrelated_split_on_ampersand() {
     // No `=`-split and no bracket-assigned object nearby: not the idiom, no false candidates.
     assert!(
@@ -2465,6 +2574,20 @@ fn a_non_url_dom_source_is_skipped_with_a_reason() {
     f.source.kind = "dom";
     let err = plan(&f).unwrap_err();
     assert!(err.0.contains("not a URL input"), "{}", err.0);
+}
+
+#[test]
+fn a_postmessage_eval_is_driven_from_a_cross_origin_browser_page() {
+    let mut f = dom_finding("event.data", "eval", "plugins.js");
+    f.class = VulnClass::CodeInjection;
+    f.source.kind = "postmessage";
+    let plan = plan_with_source(&f, None).expect("postMessage eval should be browser-driven");
+    let Plan::Browser(probe) = plan else {
+        panic!("expected a browser probe, got {plan:?}");
+    };
+    assert_eq!(probe.vector, UrlVector::Message);
+    assert_eq!(probe.sink, BrowserSink::Eval);
+    assert_eq!(probe.file, "plugins.js");
 }
 
 #[test]

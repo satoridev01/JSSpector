@@ -109,6 +109,16 @@ impl Binding {
             if let Some(range) = select_candidate(source, &local, &self.arg) {
                 return Ok(range);
             }
+            // A fix often introduces a validated variable and feeds that to the same call. The
+            // scanner's recorded argument then no longer textually matches, even though the sink
+            // stayed in place. When an argument was recorded, bind the uniquely nearest compatible
+            // call in the tight line window; ties still fail closed, and an argument-less/stale
+            // finding never gains this fallback.
+            if !normalized_argument(&self.arg).is_empty()
+                && let Some(range) = uniquely_nearest(source, &local, self.line)
+            {
+                return Ok(range);
+            }
 
             // Generated/cross-file summaries can retain a stale line after a build rewrites the
             // module. A whole-file fallback is safe only when the argument identifies one call or
@@ -134,6 +144,24 @@ impl Binding {
             self.file, self.line, self.col, self.api
         )
     }
+}
+
+fn uniquely_nearest(
+    source: &str,
+    candidates: &[(usize, usize)],
+    expected_line: u32,
+) -> Option<(usize, usize)> {
+    let mut ranked: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter_map(|range| {
+            let line = offset_line_col(source, range.0)?.0;
+            Some((line.abs_diff(expected_line), range))
+        })
+        .collect();
+    ranked.sort_by_key(|(distance, range)| (*distance, range.0));
+    let (distance, best) = *ranked.first()?;
+    (ranked.get(1).is_none_or(|(next, _)| *next != distance)).then_some(best)
 }
 
 fn marker_expression(token: &str, callback_url: &str) -> String {
@@ -614,5 +642,17 @@ mod tests {
             .instrument(source)
             .unwrap_err();
         assert!(error.contains("exact sink expression could not be located"));
+    }
+
+    #[test]
+    fn a_fix_can_feed_the_same_nearby_sink_through_a_validated_variable() {
+        let source = "const safeRevision = validateRevision(revision);\nconst output = execSync(`git ls-tree ${safeRevision}`);\nconst later = true;\n";
+        let mut binding = binding("child_process.execSync", 2, 16);
+        binding.arg = "`git ls-tree ${revision}`".to_owned();
+        let out = binding.instrument(source).unwrap();
+        assert!(
+            out.contains(",execSync(`git ls-tree ${safeRevision}`))"),
+            "{out}"
+        );
     }
 }

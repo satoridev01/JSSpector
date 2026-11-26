@@ -1,0 +1,1 @@
+# Empty deterministic inventory used by the online TUI smoke test.

@@ -4,6 +4,7 @@ mod baseline;
 mod config;
 mod excerpt;
 mod explain;
+mod online_ui;
 mod openapi;
 mod report;
 mod rules;
@@ -12,6 +13,7 @@ mod secure_io;
 mod text;
 mod verify;
 
+use std::ffi::OsString;
 use std::fmt::Display;
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::num::NonZeroUsize;
@@ -60,6 +62,12 @@ enum Command {
     /// (command-line options win). Output is deterministic: the same tree gives the same report for
     /// any number of threads.
     Scan(Box<ScanArgs>),
+    /// Research one resumable pass of recently pushed public JavaScript repositories.
+    ///
+    /// Static workers feed deterministic and Opus-ranked queues. Only findings reproduced by
+    /// strict Docker verification become private Satori issues. A proven exploit gets one
+    /// best-effort Opus fix attempt by default; failure to produce a fix never hides the issue.
+    Online(OnlineArgs),
     /// Grow JSSpector against its pinned exploitability benchmark.
     ///
     /// This is the explicit, mutating counterpart to `scan`: it may invoke the repair agent,
@@ -213,12 +221,12 @@ struct ScanArgs {
     /// Model for the LLM fix fallback [default: the `claude` CLI's own].
     #[arg(long, value_name = "MODEL", requires = "verify")]
     fix_model: Option<String>,
-    /// Record what a proven LLM fix taught JSSpector in its local recipe store. Off by default:
-    /// verification and fix generation otherwise leave the JSSpector checkout unchanged.
+    /// Record what a proven LLM fix taught JSSpector in its private user-data recipe store. Off by
+    /// default; the store is never written inside the public JSSpector checkout.
     #[arg(long, requires = "verify")]
     learn_fixes: bool,
-    /// Record, commit and push what a proven LLM fix taught JSSpector. This is an explicit
-    /// cross-run publication action; without it no recipe commit or push is attempted.
+    /// Deprecated: publishing exact exploit/fix examples is disabled because it can disclose an
+    /// unreported vulnerability. Use --learn-fixes to keep them in the private local store.
     #[arg(long, requires = "verify")]
     publish_fixes: bool,
     #[command(flatten)]
@@ -252,6 +260,82 @@ struct EvolveArgs {
     /// it because independent workers exchange generations through the upstream branch.
     #[arg(long)]
     push: bool,
+}
+
+#[derive(Args)]
+struct OnlineArgs {
+    /// How far back GitHub discovery looks.
+    #[arg(long, default_value = "24h")]
+    since: String,
+    /// Minimum repository fork count; 0 includes repositories with no forks.
+    #[arg(long, default_value_t = 0)]
+    min_forks: usize,
+    /// Analyze at most this many repositories; 0 means every match.
+    #[arg(long, default_value_t = 0)]
+    limit: usize,
+    /// GitHub language selected by discovery.
+    #[arg(long, default_value = "JavaScript")]
+    language: String,
+    /// Private-vulnerability-reporting policy.
+    #[arg(long, default_value = "off", value_parser = ["on", "off", "any"])]
+    pvr: String,
+    /// Replay this deterministic owner/repository inventory instead of searching GitHub.
+    #[arg(long, value_name = "FILE")]
+    repos_file: Option<PathBuf>,
+    /// Directory holding durable state and private run artifacts.
+    #[arg(long, value_name = "DIR", default_value = "runs/jsspector-online")]
+    out: PathBuf,
+    /// Concurrent one-thread static scans, tuned for this 10-core host.
+    #[arg(long, default_value_t = 12)]
+    static_parallel: usize,
+    /// Maximum run-owned repository checkouts retained across static analysis and verification.
+    #[arg(long, default_value_t = 24)]
+    max_checkouts: usize,
+    /// Deterministically ordered dynamic-verification workers.
+    #[arg(long, default_value_t = 2)]
+    parallel_no_ai: usize,
+    /// Opus-ranked dynamic-verification workers.
+    #[arg(long, default_value_t = 2)]
+    parallel_ai: usize,
+    /// Shared Docker verification cap.
+    #[arg(long, default_value_t = 4)]
+    parallel_docker: usize,
+    /// Stop safely if Docker GC cannot preserve this much host disk; 0 disables the guard.
+    #[arg(long, default_value_t = 100)]
+    min_free_gb: usize,
+    /// Maximum BuildKit cache retained by online GC.
+    #[arg(long, default_value_t = 20)]
+    docker_cache_gb: usize,
+    /// Run Docker storage GC after this many completed verifications.
+    #[arg(long, default_value_t = 8)]
+    docker_gc_every: usize,
+    /// Maximum seconds for the one reusable shallow checkout of a repository.
+    #[arg(long, default_value_t = 120)]
+    clone_timeout: usize,
+    /// Maximum seconds for statically scanning an already checked-out repository.
+    #[arg(long, default_value_t = 600)]
+    static_timeout: usize,
+    /// Maximum seconds for strict dynamic verification of one repository.
+    #[arg(long, default_value_t = 1800)]
+    verify_timeout: usize,
+    /// Maximum seconds spent proving a fix after exploitation succeeds.
+    #[arg(long, default_value_t = 600)]
+    fix_timeout: usize,
+    /// Maximum seconds for one optional Opus candidate-ranking call.
+    #[arg(long, default_value_t = 60)]
+    ai_timeout: usize,
+    /// Keep verified reports local instead of creating private Satori issues.
+    #[arg(long)]
+    local_only: bool,
+    /// Do not attempt or learn a proven fix after exploitation succeeds.
+    #[arg(long)]
+    no_evolve: bool,
+    /// Print append-only logs instead of the interactive terminal interface.
+    #[arg(long)]
+    no_tui: bool,
+    /// Override the Python online controller embedded in the JSSpector binary.
+    #[arg(long, value_name = "FILE", hide = true)]
+    runner: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -369,16 +453,31 @@ impl<'a> ReportedFinding<'a> {
 #[derive(Serialize)]
 #[serde(tag = "outcome", rename_all = "kebab-case")]
 enum Exploitation<'a> {
-    Verified { how: &'a str },
-    NotReproduced { tried: usize },
-    Skipped { reason: &'a str },
+    Verified {
+        how: &'a str,
+        /// The demonstrated CIA impact, distinct from merely reaching a dangerous primitive.
+        impact: &'static str,
+    },
+    NotReproduced {
+        tried: usize,
+    },
+    Skipped {
+        reason: &'a str,
+    },
 }
 
 impl<'a> Exploitation<'a> {
     fn from_verdict(verdict: &'a verify::Verdict) -> (Self, Option<verify::Reproduction>) {
         match &verdict.outcome {
             verify::Outcome::Verified { how, poc } => {
-                (Self::Verified { how }, Some(poc.report_safe()))
+                let impact = if poc.evidence.contains("existence oracle")
+                    && poc.evidence.contains("local file content disclosure")
+                {
+                    "file-existence-only"
+                } else {
+                    "demonstrated"
+                };
+                (Self::Verified { how, impact }, Some(poc.report_safe()))
             }
             verify::Outcome::NotReproduced { tried } => {
                 (Self::NotReproduced { tried: *tried }, None)
@@ -476,11 +575,35 @@ mod exploitation_output_tests {
 
         assert_eq!(
             serde_json::to_value(exploitation).unwrap(),
-            json!({"outcome": "verified", "how": "GET /items?id=proof"})
+            json!({
+                "outcome": "verified",
+                "how": "GET /items?id=proof",
+                "impact": "demonstrated"
+            })
         );
         let poc = serde_json::to_value(poc.unwrap()).unwrap();
         assert_eq!(poc["command"], "curl http://TARGET/items?id=proof");
         assert_eq!(poc["evidence"], "the response contained proof");
+    }
+
+    #[test]
+    fn existence_only_traversal_is_machine_readable_as_non_material_impact() {
+        let mut poc = reproduction();
+        poc.evidence =
+            "the target produced an existence oracle, not local file content disclosure".to_owned();
+        let verdict = verdict(
+            "0123456789abcdef",
+            verify::Outcome::Verified {
+                how: "GET /../../etc/shadow".to_owned(),
+                poc,
+            },
+        );
+        let (exploitation, _) = Exploitation::from_verdict(&verdict);
+
+        assert_eq!(
+            serde_json::to_value(exploitation).unwrap()["impact"],
+            "file-existence-only"
+        );
     }
 
     #[test]
@@ -670,6 +793,7 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Parse(args) => parse(&args),
         Command::Scan(args) => scan(&args),
+        Command::Online(args) => online(&args),
         Command::Evolve(args) => evolve(&args),
         Command::Routes(args) => routes(&args),
         Command::Explain(args) => explain(&args),
@@ -820,7 +944,7 @@ fn repository_spec(value: &str) -> Result<(&str, Option<&str>), String> {
 
 #[cfg(test)]
 mod repository_input_tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
 
@@ -866,22 +990,25 @@ mod repository_input_tests {
     }
 
     #[test]
-    fn only_a_main_checkout_keeps_a_recipe_store() {
-        let main = tempfile::tempdir().unwrap();
-        std::fs::create_dir(main.path().join(".git")).unwrap();
+    fn recipe_store_defaults_to_private_user_data() {
         assert_eq!(
-            recipe_store_of(main.path()),
-            Some(main.path().join(".satori").join("fix-recipes"))
+            recipe_store_path(
+                None,
+                Some(Path::new("/tmp/xdg")),
+                Some(Path::new("/tmp/home")),
+            ),
+            Some(PathBuf::from("/tmp/xdg/jsspector/fix-recipes"))
         );
-        // A linked worktree's `.git` is a file pointing at the main repository.
-        let linked = tempfile::tempdir().unwrap();
-        std::fs::write(
-            linked.path().join(".git"),
-            "gitdir: /elsewhere/.git/worktrees/x\n",
-        )
-        .unwrap();
-        assert_eq!(recipe_store_of(linked.path()), None);
-        assert_eq!(recipe_store_of(tempfile::tempdir().unwrap().path()), None);
+        assert_eq!(
+            recipe_store_path(None, None, Some(Path::new("/tmp/home"))),
+            Some(PathBuf::from(
+                "/tmp/home/.local/share/jsspector/fix-recipes",
+            ))
+        );
+        assert_eq!(
+            recipe_store_path(Some(Path::new("/private/store")), None, None),
+            Some(PathBuf::from("/private/store"))
+        );
     }
 
     #[test]
@@ -937,6 +1064,93 @@ mod repository_input_tests {
                 .is_ok()
         );
         assert!(Cli::try_parse_from(["jsspector", "evolve"]).is_err());
+    }
+
+    #[test]
+    fn online_defaults_are_the_tuned_verified_only_pipeline() {
+        let cli = Cli::try_parse_from(["jsspector", "online"]).unwrap();
+        let Command::Online(args) = cli.command else {
+            panic!("online did not parse as the online command");
+        };
+        assert_eq!(args.since, "24h");
+        assert_eq!(args.min_forks, 0);
+        assert_eq!(args.limit, 0);
+        assert_eq!(args.pvr, "off");
+        assert_eq!(args.static_parallel, 12);
+        assert_eq!(args.max_checkouts, 24);
+        assert_eq!(args.parallel_no_ai, 2);
+        assert_eq!(args.parallel_ai, 2);
+        assert_eq!(args.parallel_docker, 4);
+        assert_eq!(args.min_free_gb, 100);
+        assert_eq!(args.docker_cache_gb, 20);
+        assert_eq!(args.docker_gc_every, 8);
+        assert_eq!(args.clone_timeout, 120);
+        assert_eq!(args.static_timeout, 600);
+        assert_eq!(args.verify_timeout, 1800);
+        assert_eq!(args.fix_timeout, 600);
+        assert_eq!(args.ai_timeout, 60);
+        assert!(!args.local_only);
+        assert!(!args.no_evolve);
+        assert!(!args.no_tui);
+
+        let arguments = online_arguments(&args, Path::new("/tmp/jsspector"))
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for expected in [
+            "--satori-sync",
+            "--learn-fixes",
+            "--ai-model",
+            "claude-opus-5-5",
+            "--fix-model",
+            "--parallel-no-ai",
+            "--parallel-ai",
+            "--parallel-docker",
+            "--max-checkouts",
+        ] {
+            assert!(
+                arguments.iter().any(|value| value == expected),
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn online_local_non_evolving_mode_has_no_mutating_flags() {
+        let cli = Cli::try_parse_from([
+            "jsspector",
+            "online",
+            "--local-only",
+            "--no-evolve",
+            "--no-tui",
+        ])
+        .unwrap();
+        let Command::Online(args) = cli.command else {
+            panic!("online did not parse as the online command");
+        };
+        let arguments = online_arguments(&args, Path::new("/tmp/jsspector"));
+        assert!(!arguments.iter().any(|value| value == "--satori-sync"));
+        assert!(!arguments.iter().any(|value| value == "--learn-fixes"));
+        assert!(!arguments.iter().any(|value| value == "--fix-attempts"));
+    }
+
+    #[test]
+    fn online_controller_is_bundled_without_the_monitor_checkout() {
+        let controller = materialize_online_controller().unwrap();
+        let runner = controller.runner;
+        assert!(runner.is_file());
+        let directory = runner.parent().unwrap();
+        for module in [
+            "controller.py",
+            "discover.py",
+            "github.py",
+            "claude_limits.py",
+        ] {
+            assert!(directory.join(module).is_file(), "missing {module}");
+        }
+        let github = std::fs::read_to_string(directory.join("github.py")).unwrap();
+        assert!(github.contains("jsspector-online"));
+        assert!(!github.contains("jsspector-monitor"));
     }
 
     #[test]
@@ -1232,6 +1446,189 @@ fn self_heal_unavailable(source_root: Option<&Path>) -> Option<String> {
     }
 }
 
+struct OnlineController {
+    runner: PathBuf,
+    _temporary: Option<tempfile::TempDir>,
+}
+
+fn online_runner(explicit: Option<&Path>) -> Result<OnlineController, String> {
+    if let Some(path) = explicit {
+        return path
+            .is_file()
+            .then(|| OnlineController {
+                runner: path.to_path_buf(),
+                _temporary: None,
+            })
+            .ok_or_else(|| format!("online controller not found: {}", path.display()));
+    }
+    if let Some(path) = std::env::var_os("JSSPECTOR_ONLINE_RUNNER").map(PathBuf::from) {
+        return path
+            .is_file()
+            .then_some(OnlineController {
+                runner: path.clone(),
+                _temporary: None,
+            })
+            .ok_or_else(|| format!("JSSPECTOR_ONLINE_RUNNER is not a file: {}", path.display()));
+    }
+    materialize_online_controller()
+}
+
+const ONLINE_CONTROLLER: &[(&str, &str)] = &[
+    (
+        "controller.py",
+        include_str!("../../../scripts/online/controller.py"),
+    ),
+    (
+        "discover.py",
+        include_str!("../../../scripts/online/discover.py"),
+    ),
+    (
+        "github.py",
+        include_str!("../../../scripts/online/github.py"),
+    ),
+    (
+        "claude_limits.py",
+        include_str!("../../../scripts/online/claude_limits.py"),
+    ),
+];
+
+fn materialize_online_controller() -> Result<OnlineController, String> {
+    let temporary = tempfile::Builder::new()
+        .prefix("jsspector-online-controller-")
+        .tempdir()
+        .map_err(|error| format!("create private online controller directory: {error}"))?;
+    let directory = temporary.path();
+    for (name, contents) in ONLINE_CONTROLLER {
+        let path = directory.join(name);
+        std::fs::write(&path, contents)
+            .map_err(|error| format!("write bundled online controller: {error}"))?;
+    }
+    Ok(OnlineController {
+        runner: directory.join("controller.py"),
+        _temporary: Some(temporary),
+    })
+}
+
+fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
+    let mut command = vec![
+        OsString::from("--scanner"),
+        scanner.as_os_str().to_owned(),
+        OsString::from("--since"),
+        OsString::from(&args.since),
+        OsString::from("--min-forks"),
+        OsString::from(args.min_forks.to_string()),
+        OsString::from("--limit"),
+        OsString::from(args.limit.to_string()),
+        OsString::from("--language"),
+        OsString::from(&args.language),
+        OsString::from("--pvr"),
+        OsString::from(&args.pvr),
+        OsString::from("--out"),
+        args.out.as_os_str().to_owned(),
+        OsString::from("--static-parallel"),
+        OsString::from(args.static_parallel.to_string()),
+        OsString::from("--max-checkouts"),
+        OsString::from(args.max_checkouts.to_string()),
+        OsString::from("--parallel-no-ai"),
+        OsString::from(args.parallel_no_ai.to_string()),
+        OsString::from("--parallel-ai"),
+        OsString::from(args.parallel_ai.to_string()),
+        OsString::from("--parallel-docker"),
+        OsString::from(args.parallel_docker.to_string()),
+        OsString::from("--min-free-gb"),
+        OsString::from(args.min_free_gb.to_string()),
+        OsString::from("--docker-cache-gb"),
+        OsString::from(args.docker_cache_gb.to_string()),
+        OsString::from("--docker-gc-every"),
+        OsString::from(args.docker_gc_every.to_string()),
+        OsString::from("--clone-timeout"),
+        OsString::from(args.clone_timeout.to_string()),
+        OsString::from("--static-timeout"),
+        OsString::from(args.static_timeout.to_string()),
+        OsString::from("--verify-timeout"),
+        OsString::from(args.verify_timeout.to_string()),
+        OsString::from("--ai-attempts"),
+        OsString::from("1"),
+        OsString::from("--ai-model"),
+        OsString::from("claude-opus-5-5"),
+        OsString::from("--ai-timeout"),
+        OsString::from(args.ai_timeout.to_string()),
+    ];
+    if let Some(repositories) = &args.repos_file {
+        command.push(OsString::from("--repos-file"));
+        command.push(repositories.as_os_str().to_owned());
+    }
+    if !args.local_only {
+        command.push(OsString::from("--satori-sync"));
+    }
+    if !args.no_evolve {
+        command.extend([
+            OsString::from("--fix-attempts"),
+            OsString::from("1"),
+            OsString::from("--fix-timeout"),
+            OsString::from(args.fix_timeout.to_string()),
+            OsString::from("--fix-model"),
+            OsString::from("claude-opus-5-5"),
+            OsString::from("--learn-fixes"),
+        ]);
+    }
+    command
+}
+
+fn online(args: &OnlineArgs) -> ExitCode {
+    if [
+        args.static_parallel,
+        args.max_checkouts,
+        args.parallel_no_ai,
+        args.parallel_ai,
+        args.parallel_docker,
+        args.docker_cache_gb,
+        args.docker_gc_every,
+    ]
+    .contains(&0)
+    {
+        return fail(EXIT_USAGE, "online worker counts must be positive");
+    }
+    let controller = match online_runner(args.runner.as_deref()) {
+        Ok(controller) => controller,
+        Err(error) => return fail(EXIT_ENGINE, error),
+    };
+    let scanner = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return fail(EXIT_ENGINE, format!("locate jsspector binary: {error}")),
+    };
+    let mut command = ProcessCommand::new("python3");
+    command
+        .arg(&controller.runner)
+        .args(online_arguments(args, &scanner));
+    let use_tui = !args.no_tui && io::stdout().is_terminal() && io::stderr().is_terminal();
+    if !use_tui {
+        eprintln!(
+            "jsspector: online research since={} deterministic={} ai={} docker={} satori={} evolve={}",
+            args.since,
+            args.parallel_no_ai,
+            args.parallel_ai,
+            args.parallel_docker,
+            !args.local_only,
+            !args.no_evolve,
+        );
+    }
+    let status = if use_tui {
+        online_ui::run(command)
+    } else {
+        online_ui::run_plain(command)
+    };
+    match status {
+        Ok(status) => ExitCode::from(
+            status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(EXIT_ENGINE),
+        ),
+        Err(error) => fail(EXIT_ENGINE, format!("start online controller: {error}")),
+    }
+}
+
 fn evolve_repository(source_root: &Path, repository: &str, push: bool) -> Result<ExitCode, String> {
     let workflow = source_root.join(".satori/self-heal.sh");
     eprintln!("jsspector: validating and repairing scanner support for {repository}");
@@ -1462,6 +1859,12 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 verify::use_local_runtime();
             }
             let defaults = verify::FixOptions::default();
+            if args.publish_fixes {
+                return fail(
+                    EXIT_USAGE,
+                    "--publish-fixes is disabled: exact exploit/fix examples stay in the private local recipe store",
+                );
+            }
             let fix_options = verify::FixOptions {
                 enabled: !args.no_fix,
                 llm: !args.no_fix_llm,
@@ -1470,14 +1873,10 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 timeout: args
                     .fix_timeout
                     .map_or(defaults.timeout, std::time::Duration::from_secs),
-                recipes: if args.learn_fixes || args.publish_fixes {
-                    mutable_fix_recipes()
-                } else {
-                    Some(compiled_fix_recipes())
-                },
-                learn: args.learn_fixes || args.publish_fixes,
-                publish: args.publish_fixes,
-                allow_unpublished_recipes: false,
+                recipes: private_fix_recipes(),
+                learn: args.learn_fixes,
+                publish: false,
+                allow_unpublished_recipes: true,
             };
             let result = if args.verify_until_first {
                 verify::run_until_first(&analysis.root, &selected, missing, &fix_options)
@@ -1947,31 +2346,28 @@ fn without_credentials(url: &str) -> String {
     }
 }
 
-/// The logical recipe-store path compiled into this binary. Read-only verification can always use
-/// it because [`verify::recipes::Book`] falls back to its embedded copy when no trusted checkout is
-/// available.
-fn compiled_fix_recipes() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(".satori")
-        .join("fix-recipes")
+/// Exact exploit/fix examples are sensitive until disclosure. Keep them outside the public source
+/// checkout, with an explicit override for isolated automation accounts.
+fn private_fix_recipes() -> Option<PathBuf> {
+    recipe_store_path(
+        std::env::var_os("JSSPECTOR_FIX_RECIPES")
+            .as_deref()
+            .map(Path::new),
+        std::env::var_os("XDG_DATA_HOME").as_deref().map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
 }
 
-/// A store may be mutated only from JSSpector's main checkout. Linked repair worktrees must not
-/// write outside their allowed branch, while installed binaries still retain read-only recipes.
-fn mutable_fix_recipes() -> Option<PathBuf> {
-    recipe_store_of(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
-}
-
-/// The recipe store of `checkout`, only when it is a repository's main checkout (its `.git` is a
-/// directory). A linked worktree — where a repair agent builds and checks a candidate scanner —
-/// has no store: a fix it proved would be an edit outside the repair's allowed paths, and its
-/// branch is no place to learn or publish from.
-fn recipe_store_of(checkout: &Path) -> Option<PathBuf> {
-    checkout
-        .join(".git")
-        .is_dir()
-        .then(|| checkout.join(".satori").join("fix-recipes"))
+fn recipe_store_path(
+    explicit: Option<&Path>,
+    data_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    explicit
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| data_home.map(|path| path.join("jsspector/fix-recipes")))
+        .or_else(|| home.map(|path| path.join(".local/share/jsspector/fix-recipes")))
 }
 
 fn fail(code: u8, message: impl Display) -> ExitCode {

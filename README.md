@@ -19,6 +19,65 @@ other machines and later runs start from the improved capability.
 
 > **Status: pre-alpha.** `jsspector scan` (taint findings, as text, JSON or SARIF, with baselines and a CI exit code), `jsspector routes` (entry-point inventory, OpenAPI 3.1) and `jsspector explain` work today. Framework knowledge lives in YAML packs ([`packs/`](packs/)); the engine lowers each file to an owned IR, links modules across files (relative imports, monorepo workspace packages, barrels) and follows values through function summaries.
 
+## Autonomous online research
+
+```sh
+jsspector online
+```
+
+`online` opens a TUI and performs one resumable pass over public JavaScript repositories pushed in
+the last 24 hours, with no minimum forks or stars and GitHub private vulnerability reporting
+disabled. GitHub search is exhaustively partitioned by star count only to avoid its 1,000-result
+ceiling; those partitions exclude no star count. Inside every resolved discovery batch,
+repositories are sent to analysis from most-forked to least-forked, using forks as the proxy for
+downstream usage. Its
+defaults are tuned for a 10-core, 32-GB Mac with 16 GB assigned to Docker: 12 one-thread static
+workers feed two deterministic verification workers and two Opus 5.5-ranked workers, with at most
+four Docker verifications running at once. At most 24 run-owned repository checkouts are retained,
+so a slow verification queue cannot consume the disk without bound. Discovery streams each
+resolved batch directly into static analysis, so scanning and verification begin while GitHub
+continues building the inventory.
+Each repository gets one reusable shallow checkout (120-second default clone deadline), rather
+than being cloned again for static analysis, exploitation, and fixing. Static analysis has a
+ten-minute deadline. Strict exploitation may use up to 30 minutes; when it succeeds, the same
+process and sandbox get a separate ten-minute fix budget. Timeouts remain explicitly retryable
+rather than being classified as clean. Every verification has its own Docker ownership label and is
+garbage-collected before its worker slot is released. Database state uses tmpfs rather than
+anonymous persistent volumes. Every eight completed verifications, the controller also removes
+images and volumes created since this run began and bounds BuildKit cache to 20 GB. It preserves
+images and volumes that existed before the run. A watchdog checks a 100-GiB host-disk reserve before
+the pass and once per minute; if GC cannot restore that headroom, active work is stopped safely with
+resumable state instead of filling the disk. These defaults can be tuned with
+`--docker-gc-every`, `--docker-cache-gb`, and
+`--min-free-gb` (`--min-free-gb 0` disables only the disk guard).
+The TUI shows discovery, static progress, both queues,
+verified exploits, proven fixes and Satori synchronization. Press `q` or Ctrl-C for a bounded stop;
+finished work remains in `runs/jsspector-online` and the next run skips it.
+
+AI only orders candidates and proposes a best-effort fix. It cannot declare a vulnerability real.
+Only a finding with `exploitation.outcome == "verified"` after strict dynamic reproduction becomes
+a private Satori issue, and a path-traversal proof that demonstrates only file existence is kept
+local rather than treated as material CIA impact. File-content disclosure, modification, or a
+demonstrated availability effect still crosses the gate. A verified exploit gets one Opus fix
+attempt in that same proof pass; only
+a dynamically proven fix is learned, and failure to find a fix never hides the issue. Satori sync
+promotes the materialized finding to a confirmed `TP` before counting it as visible in `/issues`.
+Reports carry
+`security_advisories: enabled|disabled|unknown` and the same Satori tag, so clients can enable the
+Advisory action only when GitHub exposes that private channel. Nothing is filed or published on
+GitHub by this command.
+
+Each AI-lane repository receives at most one Opus 5.5 ranking call. It has a 60-second deadline;
+timeout uses the original deterministic order instead of retrying or blocking a worker for minutes.
+
+Use `--local-only` to disable Satori synchronization, `--no-evolve` to disable the post-proof fix
+attempt, `--repos-file FILE` to replay a frozen inventory, and `--no-tui` for append-only logs in an
+automation. Worker counts, stage deadlines and the discovery window remain individually
+overrideable. The bundled
+controller requires Python 3, authenticated `gh`, `claude` and `satori-v2` CLIs, and Docker; it has
+no runtime dependency on `jsspector-monitor` or on a JSSpector source checkout. See
+[`docs/ONLINE.md`](docs/ONLINE.md) for the pipeline invariants and artifact layout.
+
 ## Quick start
 
 ```sh
@@ -146,19 +205,18 @@ re-applied and re-proved later.
 
 JSSpector applies no fix pattern by itself. Candidates come from an LLM through the `claude` CLI, which is told why each earlier candidate failed and shown the fix recipes already proven for the finding's class. The outcome is `proven` (with the diff and its strategy), `unproven` (every candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be tried here, such as a DOM XSS that imports a module from the URL, or no LLM and no recorded fix).
 
-When explicitly requested, a proven fix can be kept in a recipe store,
-[`.satori/fix-recipes`](.satori/fix-recipes) in the JSSpector checkout the binary was built from
-(its main checkout: a binary built in a linked worktree, such as a repair agent's, records
-nothing):
+When explicitly requested, a proven fix can be kept in a private recipe store under
+`$JSSPECTOR_FIX_RECIPES`, `$XDG_DATA_HOME/jsspector/fix-recipes`, or
+`~/.local/share/jsspector/fix-recipes` (in that order). Exact examples never belong in the public
+JSSpector checkout: even without an owner/repository field, their code, paths and PoCs can disclose
+an unreported vulnerability by correlation.
 
 - as a **recipe**: its class, the sink's callee, what the change introduced and a short before/after. Recipes of the same class, the same sink first, are shown to the LLM so later fixes of that pattern tend to pass on the first candidate. Each recipe counts the times it was shown and the times the first candidate was then proven. A few recipes ship with JSSpector as a starting point.
 - as an **example**: the finding's and the file's fingerprints, the file's path, the exact change, the request that reproduced the exploit (with credential headers and tokens redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the change is replayed and proved again, with no LLM. This is how a rescan of the same commit reproduces both the exploit and its fix deterministically.
 
-Ordinary verification reads store data only from the exact local `HEAD` commit after confirming
-that commit is contained by its configured upstream; dirty files, untracked recipes and local-only
-commits never enter a replay or LLM prompt. Built-in recipes remain available when that provenance
-cannot be established. `--learn-fixes` explicitly works with the local store;
-`--publish-fixes` records, commits and pushes it. A push the remote rejects is rebased once and
+Ordinary verification reads the private user-data store. Generic curated seeds remain built in.
+`--learn-fixes` explicitly records in the private store; `--publish-fixes` is disabled because
+publishing exact examples would cross the disclosure boundary.
 retried, never forced; without push access it reports the failure and carries on. Examples name no
 repository or commit, only the file's path, but publishing what was learned from a private
 repository can still disclose its vulnerable lines and request to this repository.

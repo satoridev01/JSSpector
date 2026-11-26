@@ -230,12 +230,43 @@ pub fn plan(root: &Path, app_root: &Path, mongo: bool) -> ServicePlan {
     if plan.sql.is_empty() {
         plan.sql = sidecars_from_dependencies(app_root, mongo, &repo);
     }
+    // A driver-derived Postgres sidecar otherwise starts as an empty database. If the repository
+    // ships a canonical full schema, initialize from it before the application runs its incremental
+    // migrations; this is the same first-run prerequisite the project expects in development.
+    if let Some(schema) = postgres_schema(root, app_root) {
+        for sidecar in plan
+            .sql
+            .iter_mut()
+            .filter(|sidecar| sidecar.kind == SqlKind::Postgres && sidecar.mounts.is_empty())
+        {
+            sidecar.mounts.push((
+                schema.clone(),
+                "/docker-entrypoint-initdb.d/00-jss-schema.sql".to_owned(),
+            ));
+        }
+    }
     if mongo && plan.mongo_image.is_none() {
         plan.mongo_image = repo.mongo.clone().or_else(|| legacy_mongo_image(app_root));
     }
     let sources = env_reads(app_root);
     complete_env(&mut plan, &sources, mongo);
     plan
+}
+
+fn postgres_schema(root: &Path, app_root: &Path) -> Option<PathBuf> {
+    let candidates = [
+        app_root.join("prisma/schema.sql"),
+        app_root.join("schema.sql"),
+        root.join("prisma/schema.sql"),
+        root.join("schema.sql"),
+        root.join("cloud/schema.sql"),
+    ];
+    candidates.into_iter().find(|path| {
+        inside(root, path)
+            && std::fs::read_to_string(path)
+                .ok()
+                .is_some_and(|sql| sql.to_ascii_lowercase().contains("create table"))
+    })
 }
 
 /// Compose files from `app_root` up to `root`, nearest directory first: in each, the main file
@@ -578,7 +609,11 @@ fn sidecars_from_dependencies(app_root: &Path, mongo: bool, repo: &RepoImages) -
         return Vec::new();
     };
     let declares = |names: &[&str]| {
-        ["dependencies", "optionalDependencies"]
+        // Verification installs dev dependencies as well, and many monorepos keep the database
+        // driver there even though their checked-in server imports it at runtime (the package is
+        // not published independently). Ignoring that section starts the app without the SQL
+        // sidecar and makes every database-backed route fail before its real sink.
+        ["dependencies", "devDependencies", "optionalDependencies"]
             .iter()
             .filter_map(|section| json.get(section).and_then(serde_json::Value::as_object))
             .any(|deps| names.iter().any(|name| deps.contains_key(*name)))
@@ -1099,6 +1134,34 @@ mod tests {
             r#"{"dependencies":{"express":"4"}}"#,
         );
         assert!(plan_for(other.path()).sql.is_empty());
+
+        let dev_only = tempfile::tempdir().unwrap();
+        write(
+            dev_only.path(),
+            "package.json",
+            r#"{"dependencies":{"express":"4"},"devDependencies":{"pg":"8"}}"#,
+        );
+        assert_eq!(plan_for(dev_only.path()).sql.len(), 1);
+    }
+
+    #[test]
+    fn a_driver_derived_postgres_sidecar_initializes_the_repository_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "package.json", r#"{"dependencies":{"pg":"8"}}"#);
+        write(
+            root,
+            "prisma/schema.sql",
+            "CREATE TABLE workers (id serial primary key);",
+        );
+        let plan = plan(root, root, false);
+        assert_eq!(plan.sql.len(), 1);
+        assert_eq!(plan.sql[0].mounts.len(), 1);
+        assert!(plan.sql[0].mounts[0].0.ends_with("prisma/schema.sql"));
+        assert_eq!(
+            plan.sql[0].mounts[0].1,
+            "/docker-entrypoint-initdb.d/00-jss-schema.sql"
+        );
     }
 
     #[test]

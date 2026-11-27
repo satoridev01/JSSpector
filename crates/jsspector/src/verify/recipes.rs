@@ -1213,6 +1213,18 @@ router.post('/login', async (req, res) => {\n\
     }
 
     #[test]
+    fn shipped_ssrf_recipes_do_not_poison_ipv4_blocklist_checks() {
+        for recipe in seeds().into_iter().filter(|recipe| recipe.class == "ssrf") {
+            assert!(
+                !recipe.after.contains("['::ffff:0:0', 96]")
+                    && !recipe.after.contains("[\"::ffff:0:0\", 96]"),
+                "{} adds the IPv4-mapped range directly to Node's BlockList",
+                recipe.id
+            );
+        }
+    }
+
+    #[test]
     fn installed_binary_embeds_recipes_but_not_exact_proven_examples() {
         let absent_checkout = tempfile::tempdir().unwrap();
         let book = Book::published(absent_checkout.path());

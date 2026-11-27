@@ -1,0 +1,20 @@
+{
+  "id": "f56ed42e43ada35c",
+  "class": "path-traversal",
+  "sink": "writeFile",
+  "introduces": [
+    "String",
+    "body",
+    "id",
+    "includes",
+    "json",
+    "name",
+    "return",
+    "status"
+  ],
+  "before": "",
+  "after": "        if (unsafePathValue(req.body?.id) || unsafePathValue(req.body?.name)) {\n            return res.status(400).json({ ok: false, error: \"Invalid serial number or name\" });\n        }\n}\nfunction unsafePathValue(value) {\n    if (value === undefined || value === null) return false;\n    const text = String(value);\n    return /[\\/\\\\\\0]/.test(text) || text.includes(\"..\");",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

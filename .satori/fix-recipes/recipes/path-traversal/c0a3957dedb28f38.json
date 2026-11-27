@@ -1,0 +1,20 @@
+{
+  "id": "c0a3957dedb28f38",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": [
+    "end",
+    "indexOf",
+    "resolve",
+    "return",
+    "sep",
+    "serverLogger",
+    "startsWith",
+    "writeHead"
+  ],
+  "before": "",
+  "after": "let rootResolved = path.resolve(rootDirectory);\nlet fileResolved = path.resolve(filePath);\nif (filePath.indexOf('\\0') !== -1 || (fileResolved !== rootResolved && !fileResolved.startsWith(rootResolved + path.sep))) {\n    statusCode = 404;\n    response.writeHead(statusCode);\n    response.end();\n    serverLogger(clientAddress, statusCode, originPathname);\n    return;\n}",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

@@ -10,6 +10,6 @@
   "before": "fs.readFile(__dirname + '/files/' + req.params.file, function (err) {\nres.sendFile(__dirname + '/files/' + req.params.file);",
   "after": "var path = require('path');\n    fs.readFile(__dirname + '/files/' + path.basename(String(req.params.file)), function (err) {\n    res.sendFile(__dirname + '/files/' + path.basename(String(req.params.file)));",
   "proven": 1,
-  "offered": 1,
-  "first_try": 1
+  "offered": 2,
+  "first_try": 2
 }

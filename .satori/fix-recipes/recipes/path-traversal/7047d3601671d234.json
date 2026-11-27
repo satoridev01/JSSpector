@@ -1,0 +1,16 @@
+{
+  "id": "7047d3601671d234",
+  "class": "path-traversal",
+  "sink": "sendFile",
+  "introduces": [
+    "String",
+    "normalize",
+    "posix"
+  ],
+  "note": "Normalize an untrusted URL path as a rooted POSIX path, convert backslashes before normalization, and strip the synthetic leading slash before joining it beneath the application's fixed base directory.",
+  "before": "const relativePath = requestPath.replace(routePrefix, '');",
+  "after": "const relativePath = path.posix.normalize('/' + String(requestPath).replace(routePrefix, '').replace(/\\\\/g, '/')).replace(/^\\/+/, '');",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

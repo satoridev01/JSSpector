@@ -529,7 +529,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args.verify_extended_timeout, 1800)
         self.assertEqual(args.ai_attempts, 1)
         self.assertEqual(args.ai_timeout, 60)
-        self.assertEqual(args.fix_timeout, 600)
+        self.assertEqual(args.fix_timeout, 1200)
         self.assertEqual(args.satori_profile, "satoridev05")
 
     def test_adaptive_budget_only_extends_on_positive_evidence(self) -> None:

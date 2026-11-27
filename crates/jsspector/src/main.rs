@@ -219,7 +219,7 @@ struct ScanArgs {
     /// LLM fix candidates per verified finding [default: 3].
     #[arg(long, value_name = "N", requires = "verify")]
     fix_attempts: Option<usize>,
-    /// Time budget in seconds to prove a fix for one finding [default: 600].
+    /// Time budget in seconds to prove a fix for one finding [default: 1200].
     #[arg(long, value_name = "SECONDS", requires = "verify")]
     fix_timeout: Option<u64>,
     /// Model for the LLM fix fallback [default: the `claude` CLI's own].
@@ -366,7 +366,7 @@ struct OnlineArgs {
     #[arg(long, default_value_t = 1800)]
     verify_extended_timeout: usize,
     /// Maximum seconds spent proving a fix after exploitation succeeds.
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 1200)]
     fix_timeout: usize,
     /// Maximum seconds for one optional Opus candidate-ranking call.
     #[arg(long, default_value_t = 60)]
@@ -1167,7 +1167,7 @@ mod repository_input_tests {
         assert_eq!(args.verify_candidate_hard_timeout, 180);
         assert_eq!(args.verify_timeout, 900);
         assert_eq!(args.verify_extended_timeout, 1800);
-        assert_eq!(args.fix_timeout, 600);
+        assert_eq!(args.fix_timeout, 1200);
         assert_eq!(args.ai_timeout, 60);
         assert_eq!(args.satori_profile, "satoridev05");
         assert!(!args.local_only);

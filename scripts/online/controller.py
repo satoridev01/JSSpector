@@ -2236,8 +2236,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--fix-timeout",
         type=positive,
-        default=600,
-        help="LLM fix budget after verified exploitation (default: 600s)",
+        default=1200,
+        help="LLM fix budget after verified exploitation (default: 1200s)",
     )
     parser.add_argument("--fix-model", default="claude-opus-5-5")
     parser.add_argument(

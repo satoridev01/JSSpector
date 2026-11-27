@@ -75,7 +75,7 @@ Each repository gets one reusable shallow checkout (120-second default clone dea
 than being cloned again for static analysis, exploitation, and fixing. Static analysis has a
 ten-minute deadline. Strict exploitation gets 15 minutes, extended to 30 once the sink is reached or
 part of the canary appears (a route that merely answers is not evidence); when it succeeds, the same
-process and sandbox get a separate ten-minute fix budget. Timeouts remain explicitly retryable
+process and sandbox get a separate twenty-minute fix budget. Timeouts remain explicitly retryable
 rather than being classified as clean. Every verification has its own Docker ownership label and is
 garbage-collected before its worker slot is released. Database state uses tmpfs rather than
 anonymous persistent volumes. Every eight completed verifications, the controller also removes
@@ -302,7 +302,7 @@ jsspector scan . --verify --learn-fixes    # also record newly proven fixes loca
 jsspector scan . --verify --publish-fixes  # evolve, release and embed an anonymous proven recipe
 ```
 
-`--fix-attempts` (default 3) bounds the LLM candidates, `--fix-timeout` (default 600 seconds) the
+`--fix-attempts` (default 3) bounds the LLM candidates, `--fix-timeout` (default 1200 seconds) the
 total time per finding, and `--fix-model` picks the LLM model.
 
 ### Exploiting a socket.io event

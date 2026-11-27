@@ -76,7 +76,7 @@ impl Default for FixOptions {
             llm: true,
             model: None,
             attempts: 3,
-            timeout: Duration::from_secs(600),
+            timeout: Duration::from_secs(1200),
             recipes: None,
             learn: false,
             publish: false,
@@ -1381,6 +1381,11 @@ pub fn unified_diff(file: &str, old: &str, new: &str) -> String {
 mod tests {
     use super::*;
     use jss_core::{Auth, Severity, SinkLoc, SourceLoc, TraceStep, VulnClass};
+
+    #[test]
+    fn default_fix_budget_is_twenty_minutes() {
+        assert_eq!(FixOptions::default().timeout, Duration::from_secs(1200));
+    }
 
     fn finding(
         class: VulnClass,

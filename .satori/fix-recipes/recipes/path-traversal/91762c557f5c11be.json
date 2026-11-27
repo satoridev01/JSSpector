@@ -15,6 +15,6 @@
   "before": "if (fs.existsSync(filePath)) {\n  return res.sendFile(filePath, { dotfiles: \"allow\" });",
   "after": "let resolvedPath;\ntry {\n  resolvedPath = fs.realpathSync(path.resolve(filePath));\n} catch (_) {\n  return res.status(404).send(\"Local file not found\");\n}\nconst allowedBases = await getAllowedMediaBases();\ntry {\n  const imageCacheDir = ImageCacheManager.getImageCacheDir();\n  if (imageCacheDir && typeof imageCacheDir === \"string\") {\n    allowedBases.push(path.resolve(imageCacheDir));\n    try {",
   "proven": 1,
-  "offered": 0,
-  "first_try": 0
+  "offered": 1,
+  "first_try": 1
 }

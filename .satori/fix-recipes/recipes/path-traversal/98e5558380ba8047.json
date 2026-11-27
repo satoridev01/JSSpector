@@ -1,0 +1,17 @@
+{
+  "id": "98e5558380ba8047",
+  "class": "path-traversal",
+  "sink": "sendFile",
+  "introduces": [
+    "next",
+    "resolve",
+    "return",
+    "sep",
+    "startsWith"
+  ],
+  "before": "",
+  "after": "const apiDir = path.resolve(DIST_DIR, 'api');\nif (!path.resolve(jsonFilePath).startsWith(apiDir + path.sep) || !path.resolve(indexJsonPath).startsWith(apiDir + path.sep)) {\n  return next();\n}",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

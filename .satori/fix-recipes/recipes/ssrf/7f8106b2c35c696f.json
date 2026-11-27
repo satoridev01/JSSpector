@@ -1,0 +1,20 @@
+{
+  "id": "7f8106b2c35c696f",
+  "class": "ssrf",
+  "sink": "request",
+  "introduces": [
+    "Error",
+    "address",
+    "end",
+    "family",
+    "href",
+    "isArray",
+    "isIP",
+    "isSafeTargetUrl"
+  ],
+  "before": "? { host: up.host, port: up.port, method: req.method, path: req.url, headers }\n: { host: target.hostname, port: target.port || 80, method: req.method, path: target.pathname + target.search, headers };",
+  "after": "import dns from 'node:dns';\nconst isSafeAddr = (a, f) => isSafeTargetUrl('http://' + ((f === 6 || net.isIP(a) === 6) ? '[' + a + ']' : a) + '/');\nfunction safeLookup(hostname, options, cb) {\n  if (typeof options === 'function') { cb = options; options = {}; }\n  dns.lookup(hostname, options, (err, address, family) => {\n    if (err) return cb(err);\n    const list = Array.isArray(address) ? address : [{ address, family }];\n    for (const a of list) if (!isSafeAddr(a.address, a.family)) return cb(new Error('blocked address'));\n    cb(null, address, family);\n  });\n}\n  if (!isSafeTargetUrl(target.href)) { res.writeHead(403); return res.end('target not allowed'); }",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

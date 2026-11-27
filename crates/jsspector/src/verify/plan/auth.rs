@@ -424,7 +424,7 @@ fn matcher_literals(src: &str) -> Vec<String> {
         .find(']')
         .or_else(|| after.find('}'))
         .map(|e| e + 1)
-        .unwrap_or_else(|| after.len().min(400));
+        .unwrap_or_else(|| super::capped_end(after, after.len(), 400));
     let region = &after[..end.min(after.len())];
     let mut out = Vec::new();
     for quote in ['"', '\'', '`'] {

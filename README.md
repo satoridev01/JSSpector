@@ -30,11 +30,43 @@ the last 24 hours, with no minimum forks or stars and GitHub private vulnerabili
 disabled. GitHub search is exhaustively partitioned by star count only to avoid its 1,000-result
 ceiling; those partitions exclude no star count. Inside every resolved discovery batch,
 repositories are sent to analysis from most-forked to least-forked, using forks as the proxy for
-downstream usage. Its
-defaults are tuned for a 10-core, 32-GB Mac with 16 GB assigned to Docker: 12 one-thread static
-workers feed two deterministic verification workers and two Opus 5.5-ranked workers, with at most
-four Docker verifications running at once. At most 24 run-owned repository checkouts are retained,
-so a slow verification queue cannot consume the disk without bound. Discovery streams each
+downstream usage.
+Worker counts are sized for the machine `online` runs on. At startup it measures the CPUs, memory
+and disk that are free right now (on macOS, those of the Docker VM) and plans for about 80% of the
+whole host (`--target-utilization`): one concurrent Docker verification costs about one CPU and
+1.5 GiB on average, while a one-thread static worker mostly waits on its `git clone`. On the 10-core,
+32-GB Mac with 16 GB assigned to Docker that the former fixed defaults were tuned for, this
+reproduces them: 12 static workers feed two deterministic verification workers and two Opus
+5.5-ranked workers, with at most four Docker verifications at once and 24 retained checkouts. A
+20-core Arm host with 120 GB gets about twelve Docker verifications, ten of them deterministic: the
+Opus lane keeps its two workers and the deterministic lane takes the remaining slots. While the pass
+runs, a governor samples the host every five seconds and moves the Docker slot limit to stay near
+the target (memory first, by a quarter; CPU by one slot) without interrupting running
+verifications, so a model server or build started mid-pass shrinks it. Explicit
+`--parallel-docker`, `--parallel-no-ai`, `--static-parallel` and `--max-checkouts` are kept as
+given; explicit lane counts or `--no-governor` keep the slots fixed. The retained-checkout budget
+still bounds disk use, so a slow verification queue cannot consume the disk without bound.
+
+```sh
+jsspector online --estimate     # what this host supports and why; runs nothing
+jsspector online --calibrate    # measure this host (about 35 minutes) and save its profile
+```
+
+`--calibrate` runs a real pass that never publishes, fixes or calls Opus. Every slot goes to the
+deterministic lane, first at half the estimate and then at the estimate, for `--calibrate-minutes`
+(30 by default, counted from the first verification). Fitting the sampled whole-host CPU and memory
+against the number of running verifications yields this host's per-verification cost, which is
+saved to `~/.config/jsspector/online-profile.json`; later passes on the same hardware size
+themselves from it. The same improvement metrics judge whether running that many pays: if
+verifications per hour did not grow with the slots, or the downloads that every clone, npm install
+and image pull share stayed at the link's ceiling, the profile caps the slots at the lower level; a
+static-bound pass raises static workers, unless the clones share a saturated link; and timeouts that
+are significantly more frequent at the higher level (a one-sided Fisher exact test, since repositories
+differ widely) cap the slots there. A smaller rise is reported, not acted on. Every sample also
+records the bytes received on physical network interfaces. A calibration keeps its own state in its run directory, so the repositories it
+touched remain eligible for real passes.
+
+Discovery streams each
 resolved batch directly into static analysis, so scanning and verification begin while GitHub
 continues building the inventory.
 Each repository gets one reusable shallow checkout (120-second default clone deadline), rather
@@ -51,7 +83,13 @@ resumable state instead of filling the disk. These defaults can be tuned with
 `--docker-gc-every`, `--docker-cache-gb`, and
 `--min-free-gb` (`--min-free-gb 0` disables only the disk guard).
 The TUI shows discovery, static progress, both queues,
-verified exploits, proven fixes and Satori synchronization. Press `q` or Ctrl-C for a bounded stop;
+verified exploits with their average per hour, proven fixes, Satori synchronization, and the live
+Docker slot limit with whole-host CPU and memory use. Its "Where to improve" panel keeps only
+measurements that point at a change: where Docker slot time goes (verified, not reproduced, skipped
+because the app never launched, timeout; and build/start versus probing), which stage limits the
+pass (verification, checkouts, static/clone or discovery), and issues per slot-hour for each lane.
+The same summary is saved as `performance` in each pass's `online.json`, so passes can be compared
+before and after a change. Press `q` or Ctrl-C for a bounded stop;
 finished work remains in `runs/jsspector-online` and the next run skips it.
 
 AI only orders candidates and proposes a best-effort fix. It cannot declare a vulnerability real.

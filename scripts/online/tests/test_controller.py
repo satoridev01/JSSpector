@@ -24,9 +24,40 @@ import claude_limits  # noqa: E402
 import controller  # noqa: E402
 import discover  # noqa: E402
 import github  # noqa: E402
+import resources  # noqa: E402
+
+
+# The hardware the hand-tuned defaults were chosen on (a 10-core laptop whose Docker VM had 16 GiB).
+# Auto-sizing on it must reproduce those defaults, and tests must never probe the machine they run
+# on or read the operator's calibration profile.
+REFERENCE_HOST = resources.Host(
+    platform="linux",
+    cpu_model="reference 10-core",
+    logical_cpus=10,
+    capacity_cpus=8.7,
+    busy_cpus=1.0,
+    mem_total_gib=16.0,
+    mem_available_gib=15.0,
+    docker="native",
+    docker_cpus=10,
+    disk_free_gib=600.0,
+)
 
 
 class ControllerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        probe = mock.patch.object(
+            controller.resources, "probe_host", return_value=REFERENCE_HOST
+        )
+        probe.start()
+        self.addCleanup(probe.stop)
+        profile = mock.patch.dict(
+            os.environ,
+            {"JSSPECTOR_ONLINE_PROFILE": str(Path(tempfile.gettempdir()) / "jss-no-profile.json")},
+        )
+        profile.start()
+        self.addCleanup(profile.stop)
+
     def test_only_structurally_verified_findings_cross_the_gate(self) -> None:
         verified = {
             "fingerprint": "verified",
@@ -433,17 +464,53 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(payload["type"], "verification_finished")
         self.assertEqual(payload["findings"], 2)
 
+    def test_buildkit_prune_uses_only_flags_this_buildx_accepts(self) -> None:
+        def help_text(text: str) -> mock.Mock:
+            return mock.Mock(stdout=text, stderr="", returncode=0)
+
+        recent = "--filter --max-used-space --min-free-space --reserved-space --timeout --force"
+        older = "--filter --max-used-space --min-free-space --reserved-space --force"
+        oldest = "--filter --keep-storage --force"
+        for text, expected in (
+            (
+                recent,
+                ["--max-used-space", "20GB", "--timeout", "2m", "--min-free-space", "100GB"],
+            ),
+            (older, ["--max-used-space", "20GB", "--min-free-space", "100GB"]),
+            (oldest, ["--keep-storage", "20GB"]),
+        ):
+            controller.buildx_prune_flags.cache_clear()
+            with mock.patch.object(controller.subprocess, "run", return_value=help_text(text)):
+                command = controller.buildx_prune_command(20, 100)
+            self.assertEqual(command[:4], ["docker", "buildx", "prune", "--force"])
+            self.assertEqual(command[4:], expected)
+        controller.buildx_prune_flags.cache_clear()
+
     def test_online_defaults_match_the_public_command(self) -> None:
         args = controller.parse_args([])
         self.assertEqual(args.since, 24 * 60 * 60)
         self.assertEqual(args.min_forks, 0)
         self.assertTrue(args.all_candidates)
         self.assertEqual(args.pvr, "off")
+        # Worker counts are sized from the host unless given explicitly.
+        self.assertIsNone(args.static_parallel)
+        self.assertIsNone(args.max_checkouts)
+        self.assertIsNone(args.parallel_no_ai)
+        self.assertEqual(args.parallel_ai, 2)
+        self.assertIsNone(args.parallel_docker)
+        self.assertEqual(args.target_utilization, 0.8)
+        self.assertFalse(args.no_governor)
+        self.assertFalse(args.estimate)
+        self.assertFalse(args.calibrate)
+        self.assertEqual(args.calibrate_minutes, 30)
+        self.assertTrue(args.ai_lane)
+        # On the reference hardware the automatic plan is the former hand-tuned default.
+        capacity = controller.plan_capacity(args, Path(tempfile.gettempdir()))
         self.assertEqual(args.static_parallel, 12)
         self.assertEqual(args.max_checkouts, 24)
         self.assertEqual(args.parallel_no_ai, 2)
-        self.assertEqual(args.parallel_ai, 2)
         self.assertEqual(args.parallel_docker, 4)
+        self.assertTrue(capacity.governed)
         self.assertEqual(args.min_free_gb, 100)
         self.assertEqual(args.docker_cache_gb, 20)
         self.assertEqual(args.docker_gc_every, 8)
@@ -870,8 +937,10 @@ class ControllerTests(unittest.TestCase):
             images=frozenset({"existing-image", "run-image"}),
             volumes=frozenset({"existing-volume", "run-volume"}),
         )
+        flags = frozenset({"--max-used-space", "--min-free-space", "--timeout"})
         with (
             mock.patch.object(controller, "capture_docker_inventory", return_value=current),
+            mock.patch.object(controller, "buildx_prune_flags", return_value=flags),
             mock.patch.object(
                 controller, "_docker_cleanup_command", return_value=None
             ) as cleanup,
@@ -891,6 +960,46 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("--min-free-space", commands[-1])
         self.assertEqual(result["images"], 1)
         self.assertEqual(result["volumes"], 1)
+
+    def test_periodic_storage_gc_keeps_reusable_base_images(self) -> None:
+        baseline = controller.DockerInventory(images=frozenset({"old"}), volumes=frozenset())
+        current = controller.DockerInventory(
+            images=frozenset({"old", "node-id", "session-id", "dangling-id", "xss-id"}),
+            volumes=frozenset(),
+        )
+        listing = mock.Mock(
+            returncode=0,
+            stdout=(
+                "node-id\tnode\n"
+                "session-id\tjsspector-verify\n"
+                "dangling-id\t<none>\n"
+                "xss-id\tjsspector-verify-xss-browser\n"
+                "old\tvllm-node\n"
+            ),
+        )
+        flags = frozenset({"--max-used-space"})
+        for keep, expected in ((True, ["dangling-id", "session-id"]), (False, None)):
+            with (
+                mock.patch.object(controller, "capture_docker_inventory", return_value=current),
+                mock.patch.object(controller, "buildx_prune_flags", return_value=flags),
+                mock.patch.object(controller.subprocess, "run", return_value=listing),
+                mock.patch.object(
+                    controller, "_docker_cleanup_command", return_value=None
+                ) as cleanup,
+            ):
+                result = controller.cleanup_online_docker_storage(
+                    baseline, cache_gb=20, min_free_gb=100, keep_reusable_images=keep
+                )
+            removed = [
+                call.args[0][3:] for call in cleanup.call_args_list
+                if call.args[0][:3] == ["docker", "image", "rm"]
+            ]
+            if keep:
+                self.assertEqual(removed, [expected])
+                self.assertEqual(result["kept_images"], 2)
+            else:
+                self.assertEqual(removed, [["dangling-id", "node-id", "session-id", "xss-id"]])
+                self.assertEqual(result["kept_images"], 0)
 
     def test_docker_inventory_failure_disables_run_delta_deletion(self) -> None:
         with mock.patch.object(

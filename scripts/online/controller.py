@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import shutil
@@ -22,13 +24,14 @@ import tempfile
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
 import discover
 import github
+import resources
 from claude_limits import UsageGate, usage_limit_message
 
 
@@ -85,6 +88,12 @@ class ResearchResult:
     docker_cleanup_failures: int = 0
     cancelled: bool = False
     elapsed_s: float = 0.0
+    # Improvement metrics: Docker slot time, its split by verifier phase, and whether a candidate
+    # was actually driven ("not-reproduced") or none could be ("skipped", with the first reason).
+    slot_s: float = 0.0
+    phases: dict[str, float] = field(default_factory=dict)
+    driven: str = ""
+    skip_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -122,9 +131,32 @@ class VerificationBudgetState:
     candidate_positive: bool = False
     repository_positive: bool = False
     finishing_deadline: float | None = None
+    phase_clock: float | None = None
+    phase_totals: dict[str, float] = field(default_factory=dict)
+
+    def _account(self, now: float) -> None:
+        """Charge the time since the last phase change to the phase that just ended."""
+        clock = self.started if self.phase_clock is None else self.phase_clock
+        self.phase_totals[self.phase] = self.phase_totals.get(self.phase, 0.0) + max(
+            0.0, now - clock
+        )
+        self.phase_clock = now
+
+    def close(self, now: float) -> dict[str, float]:
+        """Seconds spent per phase once the verifier has exited."""
+        self._account(now)
+        return {phase: round(value, 1) for phase, value in self.phase_totals.items()}
 
     def observe(self, payload: dict[str, Any], now: float) -> None:
         event = payload.get("event")
+        if event in {
+            "candidate_started",
+            "app_ready",
+            "fix_started",
+            "fix_finished",
+            "candidate_finished",
+        }:
+            self._account(now)
         if event == "candidate_started":
             self.phase = "startup"
             self.phase_started = now
@@ -258,12 +290,17 @@ def terminate_process_tree(process: subprocess.Popen[str]) -> None:
             pass
 
 
-def request_shutdown(_signum: int | None = None, _frame: Any = None) -> None:
+def request_shutdown(
+    _signum: int | None = None,
+    _frame: Any = None,
+    *,
+    message: str = "operator requested a safe stop",
+) -> None:
     """Make TUI cancellation bounded and leave no scanner or Claude children behind."""
     if SHUTDOWN.is_set():
         return
     SHUTDOWN.set()
-    emit_event("run_stopping", message="operator requested a safe stop")
+    emit_event("run_stopping", message=message)
     with ACTIVE_PROCESSES_LOCK:
         processes = list(ACTIVE_PROCESSES.values())
     for process in processes:
@@ -534,6 +571,59 @@ def acquire_run_lock(out: Path):
     return handle
 
 
+# Sources the verifier drives without an HTTP route (browser, socket, MCP, archive and queue
+# planners); an `http` or `stored` source needs the entry point the static inventory resolved.
+ROUTED_SOURCES = frozenset({"http", "stored"})
+
+
+def drivable(finding: dict[str, Any]) -> bool:
+    """Whether strict verification can plausibly send this candidate anything.
+
+    The verifier skips an HTTP-sourced candidate without an entry point ("no entry point maps to
+    this sink") after spending a Docker slot on it, so such candidates go last: with several
+    candidates in a repository, they must not crowd out ones that can actually be driven.
+    """
+    if finding.get("entry"):
+        return True
+    source = finding.get("source")
+    kind = source.get("kind") if isinstance(source, dict) else None
+    if kind == "stored":
+        stored_by = finding.get("stored_by")
+        return isinstance(stored_by, dict) and bool(stored_by.get("entry"))
+    return kind not in ROUTED_SOURCES
+
+
+def unverified_kind(
+    report: dict[str, Any], candidates: tuple[dict[str, Any], ...]
+) -> tuple[str, str | None]:
+    """("not-reproduced" | "skipped", first skip reason) for the selected candidates.
+
+    A candidate that was driven and did not reproduce costs probing time; one that was skipped
+    (the app never launched, no route matched) points at launch or routing support to improve.
+    """
+    selected = {
+        candidate.get("fingerprint")
+        for candidate in candidates
+        if isinstance(candidate, dict)
+    }
+    outcomes: list[tuple[str, str | None]] = []
+    for finding in report.get("findings", []):
+        if not isinstance(finding, dict) or finding.get("fingerprint") not in selected:
+            continue
+        exploitation = finding.get("exploitation")
+        if isinstance(exploitation, dict) and isinstance(exploitation.get("outcome"), str):
+            reason = exploitation.get("reason")
+            outcomes.append(
+                (exploitation["outcome"], reason if isinstance(reason, str) else None)
+            )
+    if any(outcome == "not-reproduced" for outcome, _reason in outcomes):
+        return "not-reproduced", None
+    skipped = [reason for outcome, reason in outcomes if outcome == "skipped"]
+    if skipped:
+        return "skipped", next((reason for reason in skipped if reason), None)
+    return "not-reproduced", None
+
+
 def verified_findings(report: dict[str, Any]) -> list[dict[str, Any]]:
     """The only findings allowed through the Satori boundary.
 
@@ -657,6 +747,75 @@ def capture_docker_inventory() -> DockerInventory | None:
     return DockerInventory(images=captured["images"], volumes=captured["volumes"])
 
 
+@functools.lru_cache(maxsize=1)
+def buildx_prune_flags() -> frozenset[str]:
+    """Long options this host's `docker buildx prune` accepts.
+
+    The flags moved between buildx releases (`--timeout` is recent; `--max-used-space` replaced
+    `--keep-storage`), and one unknown flag fails the whole prune.
+    """
+    try:
+        completed = subprocess.run(
+            ["docker", "buildx", "prune", "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return frozenset()
+    return frozenset(re.findall(r"--[a-z][a-z-]+", completed.stdout + completed.stderr))
+
+
+def buildx_prune_command(cache_gb: int, min_free_gb: int) -> list[str]:
+    """Bound BuildKit's cache with the options this buildx supports."""
+    flags = buildx_prune_flags()
+    prune = ["docker", "buildx", "prune", "--force"]
+    if "--max-used-space" in flags or "--keep-storage" not in flags:
+        prune.extend(("--max-used-space", f"{cache_gb}GB"))
+    else:
+        prune.extend(("--keep-storage", f"{cache_gb}GB"))
+    # Without buildx's own deadline the subprocess timeout still bounds the call.
+    if "--timeout" in flags:
+        prune.extend(("--timeout", "2m"))
+    if min_free_gb and "--min-free-space" in flags:
+        prune.extend(("--min-free-space", f"{min_free_gb}GB"))
+    return prune
+
+
+# Per-verification images, removed with their verification's label; anything else named (node,
+# mongo, postgres, the content-addressed XSS browser) is reusable by the next verification.
+SESSION_IMAGE_REPOSITORIES = frozenset({"jsspector-verify", "jsspector-verify-browser"})
+
+
+def reusable_images() -> frozenset[str]:
+    """Short IDs of named images a later verification will build on or run again.
+
+    Deleting a pulled base image every few verifications forces the next build to download it
+    again, on the same link every clone and npm install shares.
+    """
+    try:
+        completed = subprocess.run(
+            ["docker", "image", "ls", "-a", "--format", "{{.ID}}\t{{.Repository}}"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return frozenset()
+    if completed.returncode:
+        return frozenset()
+    keep = set()
+    for line in completed.stdout.splitlines():
+        image, _, repository = line.partition("\t")
+        repository = repository.strip()
+        if repository and repository != "<none>" and repository not in SESSION_IMAGE_REPOSITORIES:
+            keep.add(image.strip())
+    return frozenset(keep)
+
+
 def _docker_cleanup_command(command: list[str]) -> dict[str, Any] | None:
     """Run one bounded GC command and return a compact failure, if any."""
     try:
@@ -681,15 +840,18 @@ def cleanup_online_docker_storage(
     cache_gb: int,
     min_free_gb: int,
     artifact: Path | None = None,
+    keep_reusable_images: bool = False,
 ) -> dict[str, Any]:
     """Bound BuildKit and remove only images/volumes created after this run began.
 
     Base images and anonymous volumes cannot inherit the verifier label. Taking a baseline lets the
     controller reclaim those objects without touching Docker data that belonged to the operator
     before `jsspector online` started. Objects still used by an active worker are left for the next
-    GC cycle.
+    GC cycle. A periodic cycle with disk to spare keeps named, reusable images (pulled base images,
+    the XSS browser) so later builds do not download them again; disk pressure and the final
+    cleanup remove them too.
     """
-    removed_candidates = {"images": 0, "volumes": 0}
+    removed_candidates = {"images": 0, "volumes": 0, "kept_images": 0}
     failures: list[dict[str, Any]] = []
     with DOCKER_CLEANUP_LOCK:
         if baseline is not None:
@@ -701,9 +863,14 @@ def cleanup_online_docker_storage(
             else:
                 new_images = sorted(current.images - baseline.images)
                 new_volumes = sorted(current.volumes - baseline.volumes)
+                kept = frozenset()
+                if keep_reusable_images:
+                    kept = reusable_images() & frozenset(new_images)
+                    new_images = [image for image in new_images if image not in kept]
                 removed_candidates = {
                     "images": len(new_images),
                     "volumes": len(new_volumes),
+                    "kept_images": len(kept),
                 }
                 # No --force: Docker keeps anything an active verification still references.
                 for resource, identifiers in (
@@ -720,18 +887,7 @@ def cleanup_online_docker_storage(
                                 f"DOCKER_GC_DEFERRED resource={resource} "
                                 f"count={len(identifiers[start : start + 100])}"
                             )
-        prune = [
-            "docker",
-            "buildx",
-            "prune",
-            "--force",
-            "--max-used-space",
-            f"{cache_gb}GB",
-            "--timeout",
-            "2m",
-        ]
-        if min_free_gb:
-            prune.extend(("--min-free-space", f"{min_free_gb}GB"))
+        prune = buildx_prune_command(cache_gb, min_free_gb)
         failure = _docker_cleanup_command(prune)
         if failure is not None:
             failures.append(failure)
@@ -740,6 +896,7 @@ def cleanup_online_docker_storage(
         write_json(artifact, result)
     log(
         f"DOCKER_STORAGE_GC images={removed_candidates['images']} "
+        f"kept_images={removed_candidates['kept_images']} "
         f"volumes={removed_candidates['volumes']} cache_limit_gb={cache_gb} "
         f"failures={len(failures)}"
     )
@@ -1061,6 +1218,7 @@ def static_repository(
     ]
     candidates.sort(
         key=lambda finding: (
+            not drivable(finding),
             SEVERITY_ORDER[finding["severity"]],
             finding["fingerprint"],
         )
@@ -1285,7 +1443,7 @@ def verify_repository(
     scanner: Path,
     run_dir: Path,
     lane: str,
-    docker_slots: threading.Semaphore,
+    docker_slots: resources.AdjustableSlots | threading.Semaphore,
     run_label: str,
 ) -> ResearchResult:
     """Require strict Docker proof for the selected candidate ordering."""
@@ -1373,7 +1531,18 @@ def verify_repository(
         f"extended_budget={extended_timeout}s fix_budget="
         f"{args.fix_timeout if fix_attempts > 0 else 0}s"
     )
+    budgets = VerificationBudgetState(
+        started=time.monotonic(),
+        startup_s=startup_timeout,
+        candidate_soft_s=candidate_soft_timeout,
+        candidate_hard_s=candidate_hard_timeout,
+        normal_s=args.verify_timeout,
+        extended_s=extended_timeout,
+        fix_s=args.fix_timeout,
+    )
     with docker_slots:
+        slot_started = time.monotonic()
+        budgets.started = slot_started
         try:
             result = run_verification(
                 command,
@@ -1390,22 +1559,16 @@ def verify_repository(
                         "JSS_REPORT_RAW_OUTPUT", "1"
                     ),
                 },
-                budgets=VerificationBudgetState(
-                    started=time.monotonic(),
-                    startup_s=startup_timeout,
-                    candidate_soft_s=candidate_soft_timeout,
-                    candidate_hard_s=candidate_hard_timeout,
-                    normal_s=args.verify_timeout,
-                    extended_s=extended_timeout,
-                    fix_s=args.fix_timeout,
-                ),
+                budgets=budgets,
                 repository=repository,
             )
         finally:
+            phases = budgets.close(time.monotonic())
             docker_cleanup = cleanup_owned_docker_resources(
                 docker_label,
                 artifact=cleanup_artifact,
             )
+    slot_s = round(time.monotonic() - slot_started, 1)
     docker_cleanup_failures = len(docker_cleanup["failures"])
     if result.returncode:
         if result.returncode == 130 or SHUTDOWN.is_set():
@@ -1418,6 +1581,8 @@ def verify_repository(
                 docker_cleanup_failures=docker_cleanup_failures,
                 cancelled=True,
                 elapsed_s=round(time.monotonic() - started, 1),
+                slot_s=slot_s,
+                phases=phases,
             )
         log(f"VERIFY_FAILED {pinned} exit={result.returncode}")
         reason = (
@@ -1435,12 +1600,15 @@ def verify_repository(
             failure_reason=reason,
             docker_cleanup_failures=docker_cleanup_failures,
             elapsed_s=round(time.monotonic() - started, 1),
+            slot_s=slot_s,
+            phases=phases,
         )
 
     report = read_json(verified_path)
     verified = verified_findings(report)
     if not verified:
-        log(f"NO_VERIFIED_EXPLOIT {pinned}")
+        driven, skip_reason = unverified_kind(report, candidates)
+        log(f"NO_VERIFIED_EXPLOIT {pinned} driven={driven}")
         return ResearchResult(
             repository=repository,
             revision=revision,
@@ -1449,6 +1617,10 @@ def verify_repository(
             repository_stars=static.repository_stars,
             docker_cleanup_failures=docker_cleanup_failures,
             elapsed_s=round(time.monotonic() - started, 1),
+            slot_s=slot_s,
+            phases=phases,
+            driven=driven,
+            skip_reason=skip_reason,
         )
     log(f"VERIFIED_EXPLOIT {pinned} count={len(verified)}")
     fix_attempted = fix_attempts > 0
@@ -1471,6 +1643,8 @@ def verify_repository(
         fix_proven=fix_proven,
         docker_cleanup_failures=docker_cleanup_failures,
         elapsed_s=round(time.monotonic() - started, 1),
+        slot_s=slot_s,
+        phases=phases,
     )
 
 
@@ -1815,6 +1989,17 @@ def positive(value: str) -> int:
     return number
 
 
+def utilization(value: str) -> float:
+    """Argparse type for a whole-host utilization target."""
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a fraction such as 0.8") from error
+    if not 0.1 <= number <= 0.95:
+        raise argparse.ArgumentTypeError("expected a fraction between 0.1 and 0.95")
+    return number
+
+
 def non_negative(value: str) -> int:
     """Argparse type for optional attempts where zero disables the step."""
     try:
@@ -1859,23 +2044,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="use this deterministic owner/repo inventory instead of GitHub Search",
     )
     parser.add_argument("--pvr-parallel", type=positive, default=8)
-    parser.add_argument("--static-parallel", type=positive, default=12)
+    parser.add_argument(
+        "--static-parallel",
+        type=positive,
+        default=None,
+        help="concurrent one-thread static scans (default: auto, at least 12)",
+    )
     parser.add_argument(
         "--max-checkouts",
         type=positive,
-        default=24,
+        default=None,
         help=(
             "maximum run-owned repository checkouts retained across static analysis "
-            "and verification (default: 24)"
+            "and verification (default: auto, at least 24)"
         ),
     )
-    parser.add_argument("--parallel-no-ai", type=positive, default=2)
+    parser.add_argument(
+        "--parallel-no-ai",
+        type=positive,
+        default=None,
+        help="deterministic verification workers (default: auto, Docker slots minus the AI lane)",
+    )
     parser.add_argument("--parallel-ai", type=positive, default=2)
     parser.add_argument(
         "--parallel-docker",
         type=positive,
-        default=4,
-        help="global Docker verification cap shared by both lanes",
+        default=None,
+        help=(
+            "global Docker verification cap shared by both lanes (default: auto, sized "
+            "from this host's free CPU and memory)"
+        ),
+    )
+    parser.add_argument(
+        "--target-utilization",
+        type=utilization,
+        default=resources.DEFAULT_TARGET,
+        help="whole-host CPU and memory share auto-sizing aims for (default: 0.8)",
+    )
+    parser.add_argument(
+        "--no-governor",
+        action="store_true",
+        help="keep auto-sized worker counts fixed instead of adjusting them to the target",
+    )
+    parser.add_argument(
+        "--estimate",
+        action="store_true",
+        help="print the concurrency this host supports and exit without running a pass",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help=(
+            "measure verification cost on this host with a local, fix-free, deterministic "
+            "pass and save the host profile"
+        ),
+    )
+    parser.add_argument(
+        "--calibrate-minutes",
+        type=positive,
+        default=30,
+        help="measured calibration window after the first verification starts (default: 30)",
+    )
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        default=None,
+        help="host profile written by --calibrate (default: ~/.config/jsspector/online-profile.json)",
     )
     parser.add_argument(
         "--min-free-gb",
@@ -1980,6 +2214,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--verify-candidate-hard-timeout must be at least the soft timeout")
     if args.verify_extended_timeout < args.verify_timeout:
         parser.error("--verify-extended-timeout must be at least --verify-timeout")
+    if args.estimate and args.calibrate:
+        parser.error("--estimate and --calibrate are mutually exclusive")
+    # A calibration measures hardware: it never publishes, fixes or spends Opus usage.
+    args.ai_lane = not args.calibrate
+    if args.calibrate:
+        args.satori_sync = False
+        args.fix_attempts = 0
+        args.learn_fixes = False
     return args
 
 
@@ -2141,8 +2383,87 @@ def discover_candidates(
 
 def choose_lane(index: int, args: argparse.Namespace) -> str:
     """Stable weighted assignment independent of completion timing."""
+    if not getattr(args, "ai_lane", True):
+        return "no-ai"
     workers = args.parallel_no_ai + args.parallel_ai
     return "no-ai" if index % workers < args.parallel_no_ai else "ai"
+
+
+@dataclass(frozen=True)
+class Capacity:
+    """How this pass was sized, and how it adapts while it runs."""
+
+    host: resources.Host
+    costs: resources.Costs
+    plan: resources.Plan
+    governed: bool
+    calibration: resources.Calibration | None
+    profile_path: Path
+    notes: tuple[str, ...]
+
+
+def plan_capacity(args: argparse.Namespace, out: Path) -> Capacity:
+    """Resolve every auto-sized worker count in place from the resources free right now.
+
+    Costs come from this host's calibration profile when one matches the hardware, else from the
+    built-in model. Explicit counts are kept; the governor only runs when the Docker and
+    deterministic counts are both automatic, so an operator's fixed numbers stay fixed.
+    """
+    host = resources.probe_host(out)
+    profile_path = (args.profile or resources.default_profile_path()).expanduser()
+    costs, note = resources.load_profile(profile_path, host)
+    notes = (note,) if note else ()
+    costs = costs or resources.Costs()
+    plan = resources.estimate(
+        host,
+        costs,
+        target=args.target_utilization,
+        parallel_ai=args.parallel_ai,
+        ai_lane=args.ai_lane,
+        static_parallel=args.static_parallel,
+        max_checkouts=args.max_checkouts,
+        parallel_no_ai=args.parallel_no_ai,
+        parallel_docker=args.parallel_docker,
+        max_repo_size_mb=args.max_repo_size_mb,
+    )
+    calibration = None
+    if args.calibrate:
+        high = plan.parallel_docker
+        low = max(1, round(high / 2))
+        high = max(high, low + resources.MIN_FIT_SPREAD)
+        calibration = resources.Calibration(
+            low=low, high=high, window_s=args.calibrate_minutes * 60.0
+        )
+        # Size the pools for the high level; the monitor starts the slots at the low one.
+        plan = replace(
+            plan,
+            parallel_docker=high,
+            parallel_no_ai=high,
+            docker_ceiling=max(plan.docker_ceiling, high),
+            max_checkouts=max(
+                plan.max_checkouts,
+                plan.static_parallel + resources.QUEUE_PER_SLOT * high,
+            ),
+        )
+    governed = bool(
+        not args.no_governor
+        and calibration is None
+        and args.parallel_docker is None
+        and args.parallel_no_ai is None
+    )
+    args.static_parallel = plan.static_parallel
+    args.max_checkouts = plan.max_checkouts
+    args.parallel_no_ai = plan.parallel_no_ai
+    args.parallel_docker = plan.parallel_docker
+    return Capacity(
+        host=host,
+        costs=costs,
+        plan=plan,
+        governed=governed,
+        calibration=calibration,
+        profile_path=profile_path,
+        notes=notes,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2159,6 +2480,22 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"scanner not found: {scanner}; build JSSpector or set JSSPECTOR_BINARY"
         )
+    capacity = plan_capacity(args, args.out.expanduser().resolve())
+    if args.estimate:
+        for note in capacity.notes:
+            print(f"jsspector: {note}", file=sys.stderr)
+        print(
+            resources.render_plan(
+                capacity.host,
+                capacity.costs,
+                capacity.plan,
+                target=args.target_utilization,
+                governed=capacity.governed,
+                ai_lane=args.ai_lane,
+            ),
+            flush=True,
+        )
+        return 0
     if args.satori_sync:
         satori_cli = shutil.which(args.satori_cli)
         if satori_cli is None:
@@ -2183,7 +2520,42 @@ def main(argv: list[str] | None = None) -> int:
     run_label = f"online_{stamp}_{os.getpid()}"
     run_dir = out / "runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=False)
+    if args.calibrate:
+        state_path = run_dir / "state.json"
+        state = read_state(state_path)
     LOG_PATH = run_dir / "online.log"
+    for note in capacity.notes:
+        log(f"CAPACITY_NOTE {note}")
+    plan = capacity.plan
+    log(
+        f"CAPACITY host={capacity.host.cpu_model!r} cpus={capacity.host.logical_cpus} "
+        f"capacity={capacity.host.capacity_cpus:g} busy={capacity.host.busy_cpus:g} "
+        f"memory_gib={capacity.host.mem_total_gib:g} "
+        f"available_gib={capacity.host.mem_available_gib:g} docker={capacity.host.docker} "
+        f"costs={capacity.costs.source!r} target={args.target_utilization:g} "
+        f"docker_slots={plan.parallel_docker} floor={plan.docker_floor} "
+        f"ceiling={plan.docker_ceiling} limited_by={plan.limited_by} "
+        f"governed={capacity.governed} calibrate={args.calibrate}"
+    )
+    write_json(
+        run_dir / "capacity.json",
+        {
+            "host": asdict(capacity.host),
+            "costs": asdict(capacity.costs),
+            "plan": asdict(plan),
+            "target": args.target_utilization,
+            "governed": capacity.governed,
+            "calibration": (
+                {
+                    "low": capacity.calibration.low,
+                    "high": capacity.calibration.high,
+                    "minutes": args.calibrate_minutes,
+                }
+                if capacity.calibration
+                else None
+            ),
+        },
+    )
     remote_blacklist: frozenset[str] = frozenset()
     if args.satori_sync:
         try:
@@ -2261,8 +2633,41 @@ def main(argv: list[str] | None = None) -> int:
         "docker_storage_gc_failed": len(initial_gc["failures"]),
         "docker_storage_gc_cycles": 1,
     }
-    docker_slots = threading.BoundedSemaphore(args.parallel_docker)
-    checkout_slots = threading.BoundedSemaphore(args.max_checkouts)
+    docker_slots = resources.AdjustableSlots(args.parallel_docker, wake=SHUTDOWN)
+    no_ai_gate = resources.AdjustableSlots(args.parallel_no_ai, wake=SHUTDOWN)
+    if capacity.calibration is not None:
+        docker_slots.set_limit(capacity.calibration.low)
+        no_ai_gate.set_limit(capacity.calibration.low)
+    ai_workers = args.parallel_ai if args.ai_lane else 0
+    static_running = 0
+    static_running_lock = threading.Lock()
+    # Verifications submitted to a lane's pool but not yet picked up by one of its threads: the
+    # backlog a pool's own queue hides from the slot gates.
+    verification_backlog = 0
+    backlog_lock = threading.Lock()
+
+    def backlog_started() -> None:
+        nonlocal verification_backlog
+        with backlog_lock:
+            verification_backlog -= 1
+    monitor = resources.Monitor(
+        host=capacity.host,
+        plan=plan,
+        target=args.target_utilization,
+        docker_slots=docker_slots,
+        no_ai_gate=no_ai_gate,
+        ai_workers=ai_workers,
+        governed=capacity.governed,
+        calibration=capacity.calibration,
+        static_active=lambda: static_running,
+        emit=emit_event,
+        log=log,
+        on_calibrated=lambda message: request_shutdown(message=message),
+        record_path=run_dir / "resources.jsonl",
+        checkouts=lambda: (checkout_slots.held, checkout_slots.capacity),
+        backlog=lambda: verification_backlog,
+    )
+    checkout_slots = resources.CountedSemaphore(args.max_checkouts)
     state_lock = threading.Lock()
     failures_lock = threading.Lock()
     storage_gc_lock = threading.Lock()
@@ -2290,6 +2695,7 @@ def main(argv: list[str] | None = None) -> int:
                 docker_baseline,
                 cache_gb=args.docker_cache_gb,
                 min_free_gb=args.min_free_gb,
+                keep_reusable_images=not (force or under_budget),
             )
             free_after = free_disk_gb(out)
             with state_lock:
@@ -2347,19 +2753,27 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(failure)
 
     def no_ai_job(static: StaticResult) -> ResearchResult:
+        backlog_started()
         selected = tuple(static.candidates[: args.max_candidates])
-        return verify_repository(
-            static,
-            candidates=selected,
-            args=args,
-            scanner=scanner,
-            run_dir=run_dir,
-            lane="no-ai",
-            docker_slots=docker_slots,
-            run_label=run_label,
-        )
+        # The gate is what the governor widens and narrows; with fixed counts the pool size
+        # equals the gate and it never blocks.
+        no_ai_gate.acquire()
+        try:
+            return verify_repository(
+                static,
+                candidates=selected,
+                args=args,
+                scanner=scanner,
+                run_dir=run_dir,
+                lane="no-ai",
+                docker_slots=docker_slots,
+                run_label=run_label,
+            )
+        finally:
+            no_ai_gate.release()
 
     def ai_job(static: StaticResult) -> ResearchResult:
+        backlog_started()
         selected = claude_rank(static, args=args, run_dir=run_dir)
         return verify_repository(
             static,
@@ -2383,6 +2797,16 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:
             if SHUTDOWN.is_set():
                 return
+            finished_at = monitor.now()
+            monitor.record(
+                resources.VerificationRecord(
+                    lane=lane,
+                    outcome="error",
+                    started=finished_at,
+                    finished=finished_at,
+                    slot_s=0.0,
+                )
+            )
             record_failure(
                 stage="verification",
                 repository=repository,
@@ -2425,6 +2849,27 @@ def main(argv: list[str] | None = None) -> int:
                 "operational_failure",
                 repository=result.repository,
                 message="Docker garbage collection failed",
+            )
+        outcome = resources.outcome_kind(
+            cancelled=result.cancelled,
+            failed=result.failed,
+            failure_reason=result.failure_reason,
+            findings=len(result.findings),
+            driven=result.driven,
+        )
+        if outcome is not None:
+            finished_at = monitor.now()
+            monitor.record(
+                resources.VerificationRecord(
+                    lane=lane,
+                    outcome=outcome,
+                    started=finished_at - result.slot_s,
+                    finished=finished_at,
+                    slot_s=result.slot_s,
+                    phases=dict(result.phases),
+                    findings=len(result.findings),
+                    skip_reason=result.skip_reason,
+                )
             )
         if result.cancelled:
             return
@@ -2542,6 +2987,9 @@ def main(argv: list[str] | None = None) -> int:
                 repository_stars=candidate.stars,
                 cancelled=True,
             )
+        nonlocal static_running
+        with static_running_lock:
+            static_running += 1
         try:
             result = static_repository(
                 candidate,
@@ -2552,6 +3000,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             checkout_slots.release()
             raise
+        finally:
+            with static_running_lock:
+                static_running -= 1
         if result.checkout is None:
             checkout_slots.release()
         return result
@@ -2657,6 +3108,9 @@ def main(argv: list[str] | None = None) -> int:
         emit_event(
             "verification_queued", repository=static.repository, lane=lane
         )
+        nonlocal verification_backlog
+        with backlog_lock:
+            verification_backlog += 1
         try:
             if lane == "ai":
                 submitted = ai_executor.submit(ai_job, static)
@@ -2667,6 +3121,8 @@ def main(argv: list[str] | None = None) -> int:
                 with state_lock:
                     counters["no_ai_submitted"] += 1
         except RuntimeError:
+            with backlog_lock:
+                verification_backlog -= 1
             if static.checkout is not None and static.checkout.exists():
                 remove_checkout(static.checkout, run_dir)
             checkout_slots.release()
@@ -2691,6 +3147,8 @@ def main(argv: list[str] | None = None) -> int:
         f"max_checkouts={args.max_checkouts} "
         f"parallel_no_ai={args.parallel_no_ai} parallel_ai={args.parallel_ai} "
         f"parallel_docker={args.parallel_docker} ai_attempts={args.ai_attempts} "
+        f"ai_lane={args.ai_lane} governor={capacity.governed} "
+        f"target={args.target_utilization:g} "
         f"min_free_gb={args.min_free_gb} docker_cache_gb={args.docker_cache_gb} "
         f"docker_gc_every={args.docker_gc_every} "
         f"verify_startup={args.verify_startup_timeout}s "
@@ -2702,7 +3160,14 @@ def main(argv: list[str] | None = None) -> int:
         f"satori_sync={args.satori_sync} satori_blacklist={len(remote_blacklist)}"
     )
     static_executor = ThreadPoolExecutor(max_workers=args.static_parallel)
-    no_ai_executor = ThreadPoolExecutor(max_workers=args.parallel_no_ai)
+    # A governed pass may widen the deterministic gate up to the ceiling, so its pool is sized for
+    # that; idle pool threads cost nothing and queued repositories wait at the gate in order.
+    no_ai_workers = (
+        max(args.parallel_no_ai, plan.docker_ceiling - ai_workers)
+        if capacity.governed or capacity.calibration is not None
+        else args.parallel_no_ai
+    )
+    no_ai_executor = ThreadPoolExecutor(max_workers=no_ai_workers)
     ai_executor = ThreadPoolExecutor(max_workers=args.parallel_ai)
     storage_monitor_stop = threading.Event()
 
@@ -2720,6 +3185,27 @@ def main(argv: list[str] | None = None) -> int:
         daemon=True,
     )
     storage_monitor.start()
+    monitor.start()
+    emit_event(
+        "resources",
+        slots=docker_slots.limit,
+        active=0,
+        waiting=0,
+        message=(
+            f"capacity: docker {docker_slots.limit} of {plan.docker_ceiling} max, "
+            f"static {args.static_parallel}, checkouts {args.max_checkouts}"
+            + (
+                f", governor holds {args.target_utilization:.0%}"
+                if capacity.governed
+                else ""
+            )
+            + (
+                f", calibrating {capacity.calibration.low}→{capacity.calibration.high} slots"
+                if capacity.calibration
+                else ""
+            )
+        ),
+    )
     scheduled = 0
 
     def schedule(candidate: discover.Candidate) -> None:
@@ -2772,6 +3258,8 @@ def main(argv: list[str] | None = None) -> int:
         ai_executor.shutdown(wait=True, cancel_futures=SHUTDOWN.is_set())
         storage_monitor_stop.set()
         storage_monitor.join(timeout=10)
+        monitor.stop()
+        monitor.join(timeout=10)
 
     checkouts_root = run_dir / "checkouts"
     if checkouts_root.exists():
@@ -2827,9 +3315,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     write_json(run_dir / "failures.json", {"failures": ordered_failures})
 
+    performance = resources.performance_summary(
+        monitor.performance.snapshot(),
+        list(monitor.samples),
+        static_parallel=args.static_parallel,
+    )
+    for line in resources.performance_lines(performance, performance, window="whole pass"):
+        log(f"PERFORMANCE {line}")
     run_metrics = {
         "discovery": discovery_metrics,
         **counters,
+        "performance": performance,
         "elapsed_s": round(time.monotonic() - started, 1),
         "configuration": {
             "pvr_parallel": args.pvr_parallel,
@@ -2841,6 +3337,13 @@ def main(argv: list[str] | None = None) -> int:
             "parallel_no_ai": args.parallel_no_ai,
             "parallel_ai": args.parallel_ai,
             "parallel_docker": args.parallel_docker,
+            "docker_slots_final": docker_slots.limit,
+            "docker_ceiling": plan.docker_ceiling,
+            "target_utilization": args.target_utilization,
+            "governed": capacity.governed,
+            "capacity_limited_by": plan.limited_by,
+            "costs": capacity.costs.source,
+            "calibrate": args.calibrate,
             "min_free_gb": args.min_free_gb,
             "docker_cache_gb": args.docker_cache_gb,
             "docker_gc_every": args.docker_gc_every,
@@ -2878,6 +3381,45 @@ def main(argv: list[str] | None = None) -> int:
         f"verified_repositories={counters['verified_repositories']} "
         f"repository_failures={repository_failures} fatal_failures={fatal_failures}"
     )
+    if capacity.calibration is not None:
+        calibration = capacity.calibration
+        result = resources.analyze_calibration(
+            monitor.samples,
+            calibration,
+            records=monitor.performance.snapshot(),
+            host=capacity.host,
+            target=args.target_utilization,
+            parallel_ai=args.parallel_ai,
+            static_parallel=args.static_parallel,
+            max_repo_size_mb=args.max_repo_size_mb,
+        )
+        saved: Path | None = None
+        if "error" not in result:
+            resources.save_profile(
+                capacity.profile_path,
+                resources.calibration_profile(
+                    result, host=capacity.host, target=args.target_utilization
+                ),
+            )
+            saved = capacity.profile_path
+        write_json(run_dir / "calibration.json", result)
+        report = resources.render_calibration(
+            result, target=args.target_utilization, profile=saved
+        )
+        log(f"CALIBRATION_RESULT saved={saved is not None} artifact=calibration.json")
+        print(report, flush=True)
+        emit_event(
+            "calibration_finished",
+            output=str(run_dir),
+            success=saved is not None,
+            report=report,
+        )
+        completed_window = calibration.phase == "done"
+        _run_lock.close()
+        LOG_PATH = None
+        if saved is not None:
+            return 0
+        return 130 if SHUTDOWN.is_set() and not completed_window else 1
     if SHUTDOWN.is_set():
         emit_event("run_interrupted", output=str(run_dir))
         _run_lock.close()

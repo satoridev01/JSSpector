@@ -16,6 +16,6 @@
   "before": "const originalUrlObj = new URL(targetUrl);",
   "after": "import net from 'net';\nimport dns from 'dns';\nconst forbiddenAddresses = new net.BlockList();\n[[\"0.0.0.0\", 8], [\"10.0.0.0\", 8], [\"100.64.0.0\", 10], [\"127.0.0.0\", 8], [\"169.254.0.0\", 16], [\"172.16.0.0\", 12], [\"192.0.0.0\", 24], [\"192.168.0.0\", 16], [\"198.18.0.0\", 15], [\"224.0.0.0\", 3]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv4\"));\n[[\"::\", 127], [\"64:ff9b::\", 96], [\"fc00::\", 7], [\"fe80::\", 10], [\"ff00::\", 8]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv6\"));\nasync function resolvePublicAddress(urlObj) {\n  if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') {\n    throw new Error('URL scheme not allowed');\n  }\n  const host = urlObj.hostname.replace(/^\\[|\\]$/g, '');",
   "proven": 1,
-  "offered": 0,
+  "offered": 1,
   "first_try": 0
 }

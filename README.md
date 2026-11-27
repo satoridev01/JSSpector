@@ -73,7 +73,8 @@ resolved batch directly into static analysis, so scanning and verification begin
 continues building the inventory.
 Each repository gets one reusable shallow checkout (120-second default clone deadline), rather
 than being cloned again for static analysis, exploitation, and fixing. Static analysis has a
-ten-minute deadline. Strict exploitation may use up to 30 minutes; when it succeeds, the same
+ten-minute deadline. Strict exploitation gets 15 minutes, extended to 30 once the sink is reached or
+part of the canary appears (a route that merely answers is not evidence); when it succeeds, the same
 process and sandbox get a separate ten-minute fix budget. Timeouts remain explicitly retryable
 rather than being classified as clean. Every verification has its own Docker ownership label and is
 garbage-collected before its worker slot is released. Database state uses tmpfs rather than

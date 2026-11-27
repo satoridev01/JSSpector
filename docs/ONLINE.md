@@ -20,7 +20,9 @@ It does not import or execute `jsspector-monitor`.
    exact checkout is reused by static analysis, proof, and fixing. Static scans produce
    high/critical candidates at immutable revisions.
 4. Stable inventory indexes assign repositories to the deterministic workers or the two Opus-ranked
-   workers, in proportion to their counts. Opus receives bounded finding summaries and may only reorder fingerprints.
+   workers, in proportion to their counts. When the Opus lane already has two repositories per worker
+   waiting, new ones go to the deterministic lane (`AI_OVERFLOW`), so a lagging lane cannot hold the
+   whole checkout budget. Opus receives bounded finding summaries and may only reorder fingerprints.
 5. Both lanes share the Docker verification slots (four on the reference laptop). Strict verification must return a structured
    `exploitation.outcome` of `verified`; an exit code, static finding, model judgment or reflected
    payload is insufficient. A path-traversal file-existence oracle is recorded with
@@ -64,8 +66,9 @@ It does not import or execute `jsspector-monitor`.
 - Only timeouts from the current run are retained in its `retry-timeouts.txt`; they are not silently
   classified as clean and remain eligible for the next pass.
 - Static scans have a ten-minute default deadline, overrideable with `--static-timeout SECONDS`.
-- Cloning has an independent two-minute default deadline. Dynamic exploitation has a 30-minute
-  budget; a verified result gets a separate ten-minute fixing budget in the same process.
+- Cloning has an independent two-minute default deadline. Dynamic exploitation has a 15-minute
+  budget, extended to 30 minutes only by sink or canary evidence (an answering route is activity);
+  a verified result gets a separate ten-minute fixing budget in the same process.
 - Operator cancellation is neither an operational failure nor a terminal repository result.
   Pending work remains eligible for the next resumable pass.
 - Repository revisions and finding fingerprints are pinned before dynamic work.

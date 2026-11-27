@@ -553,6 +553,59 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(budget.timed_out(2399))
         self.assertEqual(budget.timed_out(2400), "fix-timeout")
 
+    def test_an_answering_route_is_activity_not_evidence(self) -> None:
+        budget = controller.VerificationBudgetState(
+            started=0,
+            startup_s=180,
+            candidate_soft_s=180,
+            candidate_hard_s=300,
+            normal_s=900,
+            extended_s=1800,
+            fix_s=600,
+        )
+        budget.observe({"event": "candidate_started"}, 10)
+        budget.observe({"event": "app_ready"}, 20)
+        for at in range(30, 300, 10):
+            budget.observe({"event": "positive_evidence", "evidence": "route_reachable"}, at)
+        self.assertFalse(budget.repository_positive)
+        self.assertIsNone(budget.timed_out(250))  # activity: no idle timeout
+        self.assertEqual(budget.timed_out(320), "verify-candidate-hard-timeout")
+        budget.observe({"event": "positive_evidence", "evidence": "sink_hit"}, 310)
+        self.assertTrue(budget.repository_positive)
+        self.assertIsNone(budget.timed_out(1000))
+        self.assertEqual(budget.timed_out(1800), "verify-repository-timeout")
+
+    def test_a_lagging_opus_lane_overflows_into_the_deterministic_lane(self) -> None:
+        args = controller.parse_args(["--parallel-no-ai", "7", "--parallel-ai", "2"])
+        ai_indexes = [index for index in range(18) if controller.choose_lane(index, args) == "ai"]
+        self.assertTrue(ai_indexes)
+        index = ai_indexes[0]
+        self.assertEqual(controller.lane_with_overflow(index, args, 3), ("ai", False))
+        self.assertEqual(controller.lane_with_overflow(index, args, 4), ("no-ai", True))
+        no_ai = next(i for i in range(18) if controller.choose_lane(i, args) == "no-ai")
+        self.assertEqual(controller.lane_with_overflow(no_ai, args, 99), ("no-ai", False))
+
+    def test_a_claude_timeout_is_reported_as_a_timeout(self) -> None:
+        args = Namespace(ai_timeout=60, ai_candidates=20, max_candidates=5, ai_model="m", ai_attempts=1)
+        static = controller.StaticResult(
+            repository="owner/repo",
+            revision="abc",
+            candidates=tuple(
+                {"fingerprint": f"f{i}", "severity": "high", "title": "t", "file": "a.js"}
+                for i in range(3)
+            ),
+        )
+        timed_out = subprocess.CompletedProcess(["claude"], 124, "", "")
+        logs: list[str] = []
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(controller, "run", return_value=timed_out),
+            mock.patch.object(controller, "log", side_effect=logs.append),
+        ):
+            ranked = controller.claude_rank(static, args=args, run_dir=Path(temporary))
+        self.assertEqual(len(ranked), 3)  # deterministic fallback
+        self.assertTrue(any("did not answer within 60s" in line for line in logs), logs)
+
     def test_satori_blacklist_unions_account_issues_and_advisories(self) -> None:
         with mock.patch.object(
             controller,

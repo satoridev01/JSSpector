@@ -360,7 +360,8 @@ struct OnlineArgs {
     /// Normal seconds for strict dynamic verification of one repository.
     #[arg(long, default_value_t = 900)]
     verify_timeout: usize,
-    /// Maximum repository seconds after route, sink or canary evidence appears.
+    /// Maximum repository seconds after sink or canary evidence appears (a route that merely
+    /// answers does not extend the normal budget).
     #[arg(long, default_value_t = 1800)]
     verify_extended_timeout: usize,
     /// Maximum seconds spent proving a fix after exploitation succeeds.

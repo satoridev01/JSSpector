@@ -169,8 +169,12 @@ class VerificationBudgetState:
             self.candidate_activity = True
         elif event == "positive_evidence":
             self.candidate_activity = True
-            self.candidate_positive = True
-            self.repository_positive = True
+            # `route_reachable` only says the app answered (any 2xx/3xx): activity that keeps the
+            # candidate's idle deadline away, not evidence. Reaching the sink or seeing part of
+            # the canary earns the extended budget; every verified exploit showed one first.
+            if payload.get("evidence") != "route_reachable":
+                self.candidate_positive = True
+                self.repository_positive = True
         elif event == "fix_started":
             self.phase = "fix"
             self.phase_started = now
@@ -1375,6 +1379,8 @@ def claude_rank(
                 break
             limited = usage_limit_message(completed.stdout, completed.stderr)
             if not limited:
+                if completed.returncode == 124:
+                    raise RuntimeError(f"Claude did not answer within {args.ai_timeout}s")
                 raise RuntimeError(
                     completed.stderr.strip() or "Claude exited unsuccessfully"
                 )
@@ -2381,6 +2387,22 @@ def discover_candidates(
     return candidates, metrics
 
 
+# The Opus lane ranks each repository before verifying it and has few workers. When this many
+# repositories per worker already wait for it, new ones go to the deterministic lane instead: a
+# lane that falls behind would otherwise hold the whole checkout budget and starve the rest.
+AI_OVERFLOW_PER_WORKER = 2
+
+
+def lane_with_overflow(
+    index: int, args: argparse.Namespace, ai_queued: int
+) -> tuple[str, bool]:
+    """(lane, overflowed): the stable assignment, unless the Opus lane is behind."""
+    lane = choose_lane(index, args)
+    if lane == "ai" and ai_queued >= AI_OVERFLOW_PER_WORKER * args.parallel_ai:
+        return "no-ai", True
+    return lane, False
+
+
 def choose_lane(index: int, args: argparse.Namespace) -> str:
     """Stable weighted assignment independent of completion timing."""
     if not getattr(args, "ai_lane", True):
@@ -2644,12 +2666,15 @@ def main(argv: list[str] | None = None) -> int:
     # Verifications submitted to a lane's pool but not yet picked up by one of its threads: the
     # backlog a pool's own queue hides from the slot gates.
     verification_backlog = 0
+    ai_backlog = 0
     backlog_lock = threading.Lock()
 
-    def backlog_started() -> None:
-        nonlocal verification_backlog
+    def backlog_started(lane: str = "no-ai") -> None:
+        nonlocal verification_backlog, ai_backlog
         with backlog_lock:
             verification_backlog -= 1
+            if lane == "ai":
+                ai_backlog -= 1
     monitor = resources.Monitor(
         host=capacity.host,
         plan=plan,
@@ -2778,7 +2803,7 @@ def main(argv: list[str] | None = None) -> int:
             no_ai_gate.release()
 
     def ai_job(static: StaticResult) -> ResearchResult:
-        backlog_started()
+        backlog_started("ai")
         selected = claude_rank(static, args=args, run_dir=run_dir)
         return verify_repository(
             static,
@@ -3107,15 +3132,25 @@ def main(argv: list[str] | None = None) -> int:
                 remove_checkout(static.checkout, run_dir)
             checkout_slots.release()
             return
-        lane = choose_lane(index, args)
+        nonlocal verification_backlog, ai_backlog
+        with backlog_lock:
+            lane, overflowed = lane_with_overflow(index, args, ai_backlog)
+        if overflowed:
+            with state_lock:
+                counters["ai_overflow"] = counters.get("ai_overflow", 0) + 1
+            log(
+                f"AI_OVERFLOW {static.repository} -> deterministic (Opus lane has "
+                f"{ai_backlog} waiting)"
+            )
         # Publish queueing before submit: a fast deterministic worker can otherwise emit
         # verification_started first and leave the TUI with a phantom queued item.
         emit_event(
             "verification_queued", repository=static.repository, lane=lane
         )
-        nonlocal verification_backlog
         with backlog_lock:
             verification_backlog += 1
+            if lane == "ai":
+                ai_backlog += 1
         try:
             if lane == "ai":
                 submitted = ai_executor.submit(ai_job, static)
@@ -3128,6 +3163,8 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError:
             with backlog_lock:
                 verification_backlog -= 1
+                if lane == "ai":
+                    ai_backlog -= 1
             if static.checkout is not None and static.checkout.exists():
                 remove_checkout(static.checkout, run_dir)
             checkout_slots.release()

@@ -157,15 +157,15 @@ impl Canary {
     /// The JSON document planted at `<planted_dir>/<suffix>`: the token under common field names a
     /// handler might reflect, so it surfaces whether the sink echoes the bytes raw or parses the
     /// file and renders one of its fields. The content is always valid JSON (survives a `JSON.parse`)
-    /// and always contains the token as a substring; the token alone remains the proof.
+    /// and every value uses the human-readable `CANARY <token>` form shown in the exported PoC.
     pub fn planted_dir_document(&self) -> String {
-        let t = &self.token;
+        let marker = self.planted_text();
         let fields = [
             "id", "name", "title", "value", "data", "content", "message", "text",
         ];
         let body = fields
             .iter()
-            .map(|field| format!("\"{field}\":\"{t}\""))
+            .map(|field| format!("\"{field}\":\"{marker}\""))
             .collect::<Vec<_>>()
             .join(",");
         format!("{{{body}}}")
@@ -3284,6 +3284,18 @@ mod tests {
         AppendedParam, Entry, Method, MultipartForm, Probe, SqlColumn, SqlDelete, SqlPlan,
     };
     use super::*;
+
+    #[test]
+    fn an_appended_file_canary_is_human_readable_in_every_json_field() {
+        let canary = Canary::new("18eb-example".to_owned());
+        let document: serde_json::Value =
+            serde_json::from_str(&canary.planted_dir_document()).unwrap();
+        for field in [
+            "id", "name", "title", "value", "data", "content", "message", "text",
+        ] {
+            assert_eq!(document[field], "CANARY 18eb-example");
+        }
+    }
 
     #[test]
     fn a_registration_post_carries_the_mined_account_fields() {

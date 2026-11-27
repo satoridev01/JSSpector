@@ -2906,7 +2906,7 @@ fn numeric_assignment(source: &str, name: &str) -> bool {
         }) else {
             continue;
         };
-        let end = binding_rhs_end(rhs).min(300);
+        let end = capped_end(rhs, binding_rhs_end(rhs), 300);
         let stmt = &rhs[..end];
         if [
             "Number(",
@@ -3149,7 +3149,7 @@ fn bound_from_directory_listing(source: &str, child: &str, tainted: &[String]) -
             let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
                 continue;
             };
-            let end = binding_rhs_end(rhs).min(300);
+            let end = capped_end(rhs, binding_rhs_end(rhs), 300);
             let stmt = &rhs[..end];
             if (stmt.contains("readdir") || stmt.contains("opendir"))
                 && tainted.iter().any(|name| mentions(stmt, name))
@@ -5662,7 +5662,7 @@ fn derived_locals(source: &str, name: &str) -> Vec<String> {
             let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
                 continue;
             };
-            let end = rhs.find(';').unwrap_or(rhs.len()).min(300);
+            let end = capped_end(rhs, rhs.find(';').unwrap_or(rhs.len()), 300);
             if mentions(&rhs[..end], name) {
                 out.push(ident);
             }
@@ -5758,6 +5758,13 @@ fn is_continuation_after(byte: u8) -> bool {
 
 /// Local variables bound directly from `<receiver>.<part>.<name>`
 /// (`const responseType = request.query.response_type ?? ...` -> `responseType`).
+/// `end` capped at `cap` bytes and moved back to a character boundary. A byte cap on source text can
+/// land inside a multi-byte character (CJK comments, box-drawing art in a banner), and slicing there
+/// panics, which aborted the verification of the whole repository.
+fn capped_end(text: &str, end: usize, cap: usize) -> usize {
+    text.floor_char_boundary(end.min(cap))
+}
+
 fn aliases(source: &str, part: &str, name: &str) -> Vec<String> {
     let access = format!(".{part}.{name}");
     let mut out = Vec::new();
@@ -5781,7 +5788,7 @@ fn aliases(source: &str, part: &str, name: &str) -> Vec<String> {
             // handling a `var a = req.body.a` with no trailing `;` would swallow the following
             // statements and borrow their literals (`var b = req.body.b == "true" ? ...`),
             // pinning `a` to `"true"`. Capped so a runaway scan cannot read the whole file.
-            let end = binding_rhs_end(rhs).min(300);
+            let end = capped_end(rhs, binding_rhs_end(rhs), 300);
             let stmt = &rhs[..end];
             if let Some(pos) = stmt.find(&access)
                 && receiver_before(&stmt[..pos])
@@ -9060,7 +9067,7 @@ fn local_ternary_selector(source: &str, part: &str, local: &str) -> Option<(Stri
             let Some(rhs) = tail.strip_prefix('=').filter(|r| !r.starts_with('=')) else {
                 continue;
             };
-            let end = binding_rhs_end(rhs).min(300);
+            let end = capped_end(rhs, binding_rhs_end(rhs), 300);
             let stmt = &rhs[..end];
             let Some(q) = top_level_index(stmt, '?') else {
                 continue;

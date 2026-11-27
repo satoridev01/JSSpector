@@ -3923,3 +3923,18 @@ const userSchema = new mongoose.Schema({
         ]
     );
 }
+
+#[test]
+fn byte_capped_statements_never_split_a_character() {
+    // A binding whose 300-byte cap lands inside a three-byte character (WeWorker/WeWorker panicked
+    // here with "end byte index 300 is not a char boundary; it is inside '鈹'").
+    let prefix = " req.body.a + \"";
+    let pad = "x".repeat(299 - prefix.len());
+    let source = format!("var a ={prefix}{pad}鈹\";\n");
+    let rhs = &source["var a =".len()..];
+    assert_eq!(rhs.find('鈹'), Some(299));
+    assert_eq!(super::capped_end(rhs, rhs.len(), 300), 299);
+    assert_eq!(super::capped_end(rhs, 10, 300), 10);
+    assert_eq!(super::capped_end("ascii only", 400, 300), 10.min(400));
+    assert_eq!(super::aliases(&source, "body", "a"), ["a"]);
+}

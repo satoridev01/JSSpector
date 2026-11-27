@@ -1504,15 +1504,19 @@ fn marker_certificate_validates_private_and_callback_hostnames_only() {
     assert!(key_public.status.success());
     assert_eq!(cert_public.stdout, key_public.stdout);
 
+    // `openssl x509 -checkhost` reports its verdict on stdout ("does match" / "does NOT match");
+    // OpenSSL 3.0 exits 0 either way, so the exit status alone cannot tell them apart.
     let validates = |hostname: &str| {
-        std::process::Command::new("openssl")
+        let output = std::process::Command::new("openssl")
             .args(["x509", "-in"])
             .arg(&cert)
             .args(["-noout", "-checkhost", hostname])
             .output()
-            .expect("OpenSSL is required to validate the marker certificate")
-            .status
-            .success()
+            .expect("OpenSSL is required to validate the marker certificate");
+        let verdict = String::from_utf8_lossy(&output.stdout);
+        output.status.success()
+            && verdict.contains("does match")
+            && !verdict.contains("does NOT match")
     };
 
     assert!(validates("jss-marker"));
@@ -1861,6 +1865,89 @@ fn a_typescript_start_target_is_missing_until_its_compiler_emits_it() {
     assert!(missing_node_start_target(dir.path()));
     write(dir.path(), "build/app.js", "console.log('ready')");
     assert!(!missing_node_start_target(dir.path()));
+}
+
+#[test]
+fn a_finding_file_that_only_exports_its_server_falls_back_to_the_start_script() {
+    // `server/app.mjs` constructs and listens inside an exported helper; the project starts it
+    // through `server/cli.mjs`. Launched in place it exits silently, so the root script is retried.
+    let module = "import express from 'express';\nconst app = express();\n\
+                  const relay = { start(port) { return app.listen(port); } };\n\
+                  export const SLOW = new Set();\nexport { relay };\n";
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "server/app.mjs", module);
+    write(
+        dir.path(),
+        "server/cli.mjs",
+        "import { relay } from './app.mjs';\nrelay.start(3000);\n",
+    );
+    write(
+        dir.path(),
+        "package.json",
+        r#"{"type":"module","scripts":{"start":"node server/cli.mjs"}}"#,
+    );
+    let app = app_dir(dir.path(), std::path::Path::new("server/app.mjs"));
+    assert_eq!(app, std::path::Path::new("server"));
+    assert_eq!(
+        start_script_retry(
+            dir.path(),
+            &app,
+            Some(std::path::Path::new("server/app.mjs"))
+        ),
+        Some(std::path::PathBuf::new())
+    );
+
+    // The app's own package start script when it has one that differs from the in-place launch.
+    let own = tempfile::tempdir().unwrap();
+    write(own.path(), "legacy/src/libraryServer.js", module);
+    write(
+        own.path(),
+        "legacy/package.json",
+        r#"{"scripts":{"start":"node src/app.js"}}"#,
+    );
+    write(
+        own.path(),
+        "legacy/src/app.js",
+        "require('./libraryServer.js');\n",
+    );
+    assert_eq!(
+        start_script_retry(
+            own.path(),
+            std::path::Path::new("legacy"),
+            Some(std::path::Path::new("legacy/src/libraryServer.js"))
+        ),
+        Some(std::path::PathBuf::from("legacy"))
+    );
+
+    // A front-end dev server would answer on an unrelated port: no retry.
+    let frontend = tempfile::tempdir().unwrap();
+    write(frontend.path(), "server/app.mjs", module);
+    write(
+        frontend.path(),
+        "package.json",
+        r#"{"scripts":{"start":"vite"}}"#,
+    );
+    assert_eq!(
+        start_script_retry(
+            frontend.path(),
+            std::path::Path::new("server"),
+            Some(std::path::Path::new("server/app.mjs"))
+        ),
+        None
+    );
+
+    // Without a start script there is nothing to retry.
+    let bare = tempfile::tempdir().unwrap();
+    write(bare.path(), "server/app.mjs", module);
+    write(bare.path(), "package.json", r#"{"name":"x"}"#);
+    assert_eq!(
+        start_script_retry(
+            bare.path(),
+            std::path::Path::new("server"),
+            Some(std::path::Path::new("server/app.mjs"))
+        ),
+        None
+    );
 }
 
 #[test]
@@ -3869,8 +3956,11 @@ fn the_listening_probe_never_accepts_an_excluded_wanted_port() {
         .args(["-e", &listening_probe_excluding(port, &[port])])
         .output()
         .unwrap();
+    // The probe normally runs in the app container's own network namespace, where nothing else
+    // listens. A developer host may run other HTTP services on loopback (CUPS on 631, for one),
+    // which the probe may legitimately report; the excluded listener itself never may be.
     assert!(
-        !out.status.success(),
+        !out.status.success() || String::from_utf8_lossy(&out.stdout).trim() != port.to_string(),
         "a pre-existing listener on {port} was selected as the new app"
     );
 }

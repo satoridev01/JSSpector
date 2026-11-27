@@ -41,6 +41,34 @@ impl SqlKind {
             Self::Mysql => "mysql",
         }
     }
+
+    /// The data directory the engine's official image declares as its `VOLUME`, which the sandbox
+    /// replaces with a tmpfs so a disposable database never leaves an anonymous volume behind.
+    ///
+    /// Postgres moved it in 18: the image now declares `/var/lib/postgresql` (with a
+    /// major-versioned `PGDATA` below it) and refuses to start when anything is mounted at the old
+    /// `/var/lib/postgresql/data`. Through 17 that old path is the declared volume itself, so
+    /// mounting its parent would leave the volume anonymous. A tag without a leading version
+    /// (`latest`, `alpine`, a digest) is the current major.
+    pub(crate) fn data_dir(self, image: &str) -> &'static str {
+        match self {
+            Self::Mysql => "/var/lib/mysql",
+            Self::Postgres => match postgres_major(image) {
+                Some(major) if major < 18 => "/var/lib/postgresql/data",
+                _ => "/var/lib/postgresql",
+            },
+        }
+    }
+}
+
+/// The Postgres major version an image tag names (`16-alpine`, `17.2`, pgvector's `pg17`).
+fn postgres_major(image: &str) -> Option<u32> {
+    let image = image.split('@').next().unwrap_or(image);
+    let name = image.rsplit('/').next().unwrap_or(image);
+    let (_, tag) = name.split_once(':')?;
+    let tag = tag.strip_prefix("pg").unwrap_or(tag);
+    let digits: String = tag.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// One SQL database container to start before the app.
@@ -985,6 +1013,31 @@ fn set_default(env: &mut Vec<(String, String)>, key: &str, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_data_dir_follows_the_image_major() {
+        for (image, dir) in [
+            ("postgres:16-alpine", "/var/lib/postgresql/data"),
+            ("postgres:17", "/var/lib/postgresql/data"),
+            ("postgres:9.6", "/var/lib/postgresql/data"),
+            ("postgis/postgis:16-3.4", "/var/lib/postgresql/data"),
+            ("pgvector/pgvector:pg17", "/var/lib/postgresql/data"),
+            (
+                "registry.local:5000/postgres:15",
+                "/var/lib/postgresql/data",
+            ),
+            ("postgres:18", "/var/lib/postgresql"),
+            ("postgres:18-alpine", "/var/lib/postgresql"),
+            ("pgvector/pgvector:pg18", "/var/lib/postgresql"),
+            ("postgres", "/var/lib/postgresql"),
+            ("postgres:latest", "/var/lib/postgresql"),
+            ("postgres:alpine3.20", "/var/lib/postgresql"),
+            ("postgres@sha256:0123abcd", "/var/lib/postgresql"),
+        ] {
+            assert_eq!(SqlKind::Postgres.data_dir(image), dir, "{image}");
+        }
+        assert_eq!(SqlKind::Mysql.data_dir("mysql:8"), "/var/lib/mysql");
+    }
 
     fn write(root: &Path, rel: &str, text: &str) {
         let path = root.join(rel);

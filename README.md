@@ -198,6 +198,14 @@ never a verified exploit. When a Node application using `node-config` explicitly
 `unsafe` profile, verification selects that application-owned profile inside the disposable
 sandbox; no repository-specific CLI parameter is required.
 
+The app is started the way its project runs it: the package's start script, or the finding's own
+file run with `node` when that file constructs a server and listens. Such a file often only exports
+its server (the project's CLI is what calls `listen`), so when the in-place launch exits without
+listening, the package's start script (the repository root's when the file's directory has no
+package) is tried before the finding is skipped; the image rebuild reuses its cached install layer.
+Database sidecars keep their data on tmpfs at the path their official image declares:
+`/var/lib/postgresql` from Postgres 18, `/var/lib/postgresql/data` before.
+
 ### Proven fixes
 
 With `--verify`, every verified finding also gets a `fix`: a minimal code change proven, in the

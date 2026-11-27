@@ -605,6 +605,18 @@ impl Session {
         let Err(err) = first else {
             return first;
         };
+        let err = match Self::retry_with_start_script(
+            root,
+            app_path,
+            entry_file,
+            gating_sources,
+            launch,
+            &err,
+        ) {
+            Some(Ok(session)) => return Ok(session),
+            Some(Err(message)) => message,
+            None => err,
+        };
         // An app written for an older Node (a native addon with no build for the current ABI, an API
         // since removed) installs or boots only on the runtime its repository pins. The default
         // runtime is tried first, so an app that already launches keeps launching exactly as before;
@@ -634,6 +646,49 @@ impl Session {
                 format!("{err}\n(on the repository's own {image} as well: {retry})")
             }
         })
+    }
+
+    /// After a failed launch of the finding's own file run in place (`node server/app.mjs`, chosen
+    /// because the file constructs a listener and calls `.listen`), the project's own start script:
+    /// the app package's, or the repository root's when the file's directory has no package. Such a
+    /// file often only exports its server (the `listen` sits in a function the project's CLI calls,
+    /// or it initializes state and returns), so it exits without listening while
+    /// `"start": "node server/cli.mjs"` would serve it. `None` when no retry applies: a host shim
+    /// launch (chosen because the manifest cannot serve the route), a manifest that would run the
+    /// same command, or a front-end manifest (its dev server would answer on an unrelated port).
+    /// The dependencies install in the same place, so the rebuild reuses the cached install layer.
+    fn retry_with_start_script(
+        root: &std::path::Path,
+        app_path: &std::path::Path,
+        entry_file: Option<&std::path::Path>,
+        gating_sources: &[String],
+        launch: Option<&str>,
+        err: &str,
+    ) -> Option<Result<Self, String>> {
+        if launch.is_some() {
+            return None;
+        }
+        let retry_path = start_script_retry(root, app_path, entry_file)?;
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] launch of the finding's file failed; retrying with the start script of \
+                 `{}`",
+                if retry_path.as_os_str().is_empty() {
+                    ".".to_owned()
+                } else {
+                    retry_path.display().to_string()
+                }
+            );
+        }
+        Some(
+            Self::start_on(root, &retry_path, None, gating_sources, None, None).map_err(|retry| {
+                if retry == err {
+                    err.to_owned()
+                } else {
+                    format!("{err}\n(with the project's start script as well: {retry})")
+                }
+            }),
+        )
     }
 
     /// One Docker launch of the app, on `node_image` when given (the repository's pinned runtime,
@@ -2156,13 +2211,7 @@ impl Session {
             // disposable, so mount those paths as tmpfs instead of leaking anonymous Docker
             // volumes when a process is interrupted between `run` and teardown.
             args.push("--tmpfs".to_owned());
-            args.push(
-                match sidecar.kind {
-                    super::services::SqlKind::Postgres => "/var/lib/postgresql/data",
-                    super::services::SqlKind::Mysql => "/var/lib/mysql",
-                }
-                .to_owned(),
-            );
+            args.push(sidecar.kind.data_dir(&sidecar.image).to_owned());
             for alias in &sidecar.aliases {
                 args.push("--network-alias".to_owned());
                 args.push(alias.clone());

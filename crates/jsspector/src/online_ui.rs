@@ -38,6 +38,7 @@ const HELP: &[&str] = &[
     "            its memory guard may still lower them)",
     "  a         hand the slots back to the governor",
     "  h / ?     show or hide this help        q / Esc   stop safely (work stays resumable)",
+    "            when the run ends the dashboard stays, showing how it ended; q closes it",
     "",
     "Verification   docker active/limit (+queued) · whole-host CPU and memory",
     "Where to improve",
@@ -128,6 +129,10 @@ struct State {
     /// Docker slots the operator asked for that the controller has not confirmed yet.
     requested_slots: Option<u64>,
     show_help: bool,
+    /// How the controller process ended (`exit 0`, `killed by signal 9`), once it has.
+    exit: Option<String>,
+    /// Run time frozen at the controller's exit, so the final rate and elapsed stay readable.
+    ended_after: Option<Duration>,
 }
 
 impl State {
@@ -344,6 +349,32 @@ impl State {
             .then(|| self.verified_findings as f64 * 3600.0 / elapsed.as_secs_f64())
     }
 
+    /// Time since the run started, frozen once the controller has exited.
+    fn elapsed(&self, started: Instant) -> Duration {
+        self.ended_after.unwrap_or_else(|| started.elapsed())
+    }
+
+    /// Records the controller's exit. A non-zero exit is a failure even after `run_finished`
+    /// (a Satori sync or Docker cleanup failed), unless the pass was interrupted.
+    fn controller_exited(&mut self, status: ExitStatus, elapsed: Duration) {
+        let exit = exit_description(status);
+        self.finished = true;
+        self.stopping = false;
+        self.ended_after = Some(elapsed);
+        if self.phase != "Interrupted" {
+            self.phase = if status.success() {
+                "Finished".to_owned()
+            } else {
+                "Failed".to_owned()
+            };
+        }
+        self.activity(format!(
+            "controller ended ({exit}) after {}; q closes the dashboard",
+            duration_label(elapsed)
+        ));
+        self.exit = Some(exit);
+    }
+
     fn issue_rate(&self, elapsed: Duration) -> String {
         self.issues_per_hour(elapsed)
             .map_or_else(|| "–".to_owned(), |rate| format!("{rate:.1}"))
@@ -354,6 +385,9 @@ impl State {
         match code {
             KeyCode::Esc if self.show_help => self.show_help = false,
             KeyCode::Char('q') | KeyCode::Esc => return KeyAction::Stop,
+            KeyCode::Char('+' | '=' | '-' | '_' | 'a') if self.ended_after.is_some() => {
+                self.activity("the run has ended; q closes the dashboard");
+            }
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 return KeyAction::Stop;
             }
@@ -434,7 +468,10 @@ impl State {
 
     fn summary(&self, elapsed: Duration) -> String {
         format!(
-            "jsspector online: {} static, {} verified findings ({}/h), {} Satori issues, artifacts {}",
+            "jsspector online {} ({}) after {}: {} static, {} verified findings ({}/h), {} Satori issues, artifacts {}",
+            self.phase.to_lowercase(),
+            self.exit.as_deref().unwrap_or("still running"),
+            duration_label(elapsed),
             self.static_done,
             self.verified_findings,
             self.issue_rate(elapsed),
@@ -572,17 +609,19 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "  {}  ·  discovered {}  ·  ",
-            state.phase, state.discovered
-        )),
+        Span::raw("  "),
+        Span::styled(state.phase.clone(), phase_style(&state.phase)),
+        Span::raw(format!("  ·  discovered {}  ·  ", state.discovered)),
         Span::styled(
-            format!("issues {}/h", state.issue_rate(started.elapsed())),
+            format!("issues {}/h", state.issue_rate(state.elapsed(started))),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  ·  elapsed {}s", started.elapsed().as_secs())),
+        Span::raw(format!(
+            "  ·  elapsed {}s",
+            state.elapsed(started).as_secs()
+        )),
     ]);
     frame.render_widget(
         Paragraph::new(title).block(Block::default().borders(Borders::ALL)),
@@ -703,15 +742,33 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
         *activity_area,
     );
 
-    let footer = if state.stopping {
-        "Stopping safely… completed work will be resumable"
+    let dim = Style::default().fg(Color::DarkGray);
+    let footer = if let Some(exit) = &state.exit {
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", state.phase.to_uppercase()),
+                phase_badge(&state.phase),
+            ),
+            Span::raw(format!(
+                "  {exit}  ·  ran {}  ·  artifacts {}  ·  ",
+                duration_label(state.elapsed(started)),
+                if state.output.is_empty() {
+                    "unavailable"
+                } else {
+                    &state.output
+                }
+            )),
+            Span::styled("q closes", Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    } else if state.stopping {
+        Line::styled("Stopping safely… completed work will be resumable", dim)
     } else {
-        "q stop  ·  +/- docker slots  ·  a auto  ·  h help  ·  static findings never sync without verified exploitation"
+        Line::styled(
+            "q stop  ·  +/- docker slots  ·  a auto  ·  h help  ·  static findings never sync without verified exploitation",
+            dim,
+        )
     };
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-        *footer_area,
-    );
+    frame.render_widget(Paragraph::new(footer), *footer_area);
     if state.show_help {
         let area = centered(frame.area(), 90, HELP.len() as u16 + 2);
         frame.render_widget(Clear, area);
@@ -724,6 +781,56 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
             area,
         );
     }
+}
+
+/// Header color for the run phase: green finished, red failed, yellow interrupted.
+fn phase_style(phase: &str) -> Style {
+    match phase {
+        "Finished" => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        "Failed" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "Interrupted" | "Stopping" => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default(),
+    }
+}
+
+/// Footer badge once the controller has exited.
+fn phase_badge(phase: &str) -> Style {
+    let background = match phase {
+        "Finished" => Color::Green,
+        "Failed" => Color::Red,
+        _ => Color::Yellow,
+    };
+    Style::default()
+        .fg(Color::Black)
+        .bg(background)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn duration_label(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match (seconds / 3600, seconds % 3600 / 60, seconds % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    }
+}
+
+fn exit_description(status: ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("killed by signal {signal}");
+        }
+    }
+    "exit unknown".to_owned()
 }
 
 #[cfg(unix)]
@@ -823,7 +930,10 @@ pub(crate) fn run(mut command: Command) -> io::Result<ExitStatus> {
         let _session = TerminalSession::enter()?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
-        let mut finished_at = None;
+        // The dashboard stays up after the controller exits, showing how it ended, until the
+        // operator closes it; only a stop the operator asked for closes it on its own.
+        let mut exited = None;
+        let mut stop_requested = false;
         loop {
             consume(&receiver, &mut state);
             terminal.draw(|frame| draw(frame, &state, started))?;
@@ -833,6 +943,10 @@ pub(crate) fn run(mut command: Command) -> io::Result<ExitStatus> {
                 && key.kind == KeyEventKind::Press
                 && state.on_key(key.code, key.modifiers) == KeyAction::Stop
             {
+                if let Some(status) = exited {
+                    break status;
+                }
+                stop_requested = true;
                 if state.stopping {
                     state.activity("forcing the unresponsive controller to exit");
                     force_stop(&mut child)?;
@@ -844,28 +958,26 @@ pub(crate) fn run(mut command: Command) -> io::Result<ExitStatus> {
                 }
             }
 
-            if let Some(status) = child.try_wait()? {
+            if exited.is_none()
+                && let Some(status) = child.try_wait()?
+            {
+                // Late events are still in the channel; drain them before freezing the view.
+                thread::sleep(Duration::from_millis(200));
                 consume(&receiver, &mut state);
-                state.finished = true;
-                if state.phase != "Interrupted" && state.phase != "Finished" {
-                    state.phase = if status.success() {
-                        "Finished".to_owned()
-                    } else {
-                        "Failed".to_owned()
-                    };
-                }
-                let completed = *finished_at.get_or_insert_with(Instant::now);
+                state.controller_exited(status, started.elapsed());
                 terminal.draw(|frame| draw(frame, &state, started))?;
-                if completed.elapsed() >= Duration::from_millis(900) {
+                if stop_requested {
+                    thread::sleep(Duration::from_millis(900));
                     break status;
                 }
+                exited = Some(status);
             }
         }
     };
     if let Some(report) = &state.report {
         println!("{report}");
     }
-    eprintln!("{}", state.summary(started.elapsed()));
+    eprintln!("{}", state.summary(state.elapsed(started)));
     Ok(status)
 }
 
@@ -992,6 +1104,54 @@ mod tests {
         state.docker_slots = 1;
         state.on_key(KeyCode::Char('-'), KeyModifiers::NONE);
         assert_eq!(read(), r#"{"docker_slots":1}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ended_run_stays_visible_with_its_exit() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let render = |state: &State| {
+            let mut terminal = Terminal::new(TestBackend::new(140, 34)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, state, Instant::now()))
+                .unwrap();
+            terminal.backend().to_string()
+        };
+        let mut state = State::new();
+        state.apply(serde_json::from_str(r#"{"type":"run_finished","output":"/tmp/r1"}"#).unwrap());
+        // A Satori sync failure: the pass finished but the controller exits 1.
+        state.controller_exited(ExitStatus::from_raw(1 << 8), Duration::from_secs(3725));
+        let rendered = render(&state);
+        for expected in [" FAILED ", "exit 1", "ran 1h 02m", "q closes"] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        assert_eq!(state.elapsed(Instant::now()), Duration::from_secs(3725));
+        assert!(
+            state
+                .summary(Duration::from_secs(3725))
+                .starts_with("jsspector online failed (exit 1) after 1h 02m")
+        );
+
+        let mut clean = State::new();
+        clean.controller_exited(ExitStatus::from_raw(0), Duration::from_secs(65));
+        assert!(render(&clean).contains(" FINISHED "));
+
+        let mut killed = State::new();
+        killed.controller_exited(ExitStatus::from_raw(9), Duration::from_secs(5));
+        assert_eq!(killed.phase, "Failed");
+        assert!(render(&killed).contains("killed by signal 9"));
+
+        // The controller is gone: slot keys explain instead of writing a control file.
+        assert_eq!(
+            killed.on_key(KeyCode::Char('+'), KeyModifiers::NONE),
+            KeyAction::Handled
+        );
+        assert_eq!(killed.requested_slots, None);
+        assert_eq!(
+            killed.on_key(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyAction::Stop
+        );
     }
 
     #[test]

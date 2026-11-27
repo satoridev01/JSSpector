@@ -193,9 +193,10 @@ struct ScanArgs {
     /// fails instead of skipping when the selected runtime is unavailable.
     #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "best-effort")]
     verify: Option<VerifyMode>,
-    /// Run each verified app in this environment instead of a Docker container: for an
-    /// already-disposable sandbox such as a CI or Satori job, where Docker is not available. The
-    /// services an app needs (MongoDB, Redis) are provisioned on demand.
+    /// Run each verified app in this environment instead of a Docker container: only for an
+    /// already-disposable sandbox such as a containerized CI or Satori job, where Docker is not
+    /// available. Refused on an ordinary host. Other disposable workers must set
+    /// JSS_VERIFY_DISPOSABLE=1. The services an app needs are provisioned on demand.
     #[arg(long, requires = "verify")]
     local: bool,
     /// Dynamically verify only this exact finding fingerprint. Repeatable; the report still

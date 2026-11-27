@@ -2,7 +2,9 @@
 //! requests and tear everything down. The default Docker runtime keeps traffic on a private
 //! network. `JSS_VERIFY_RUNTIME=local` is for an already-disposable CI sandbox such as a Satori job:
 //! it reads the repository Dockerfile's package setup and exposed port, then runs the app as a child
-//! process in that same sandbox without requiring nested Docker.
+//! process in that same sandbox without requiring nested Docker. Local execution is refused on an
+//! ordinary host because a verified command injection would otherwise run with the developer's own
+//! operating-system permissions.
 
 use super::mcp::{self, McpDiscovery};
 use super::payload::{self, Attempt, Canary, Signal};
@@ -265,12 +267,34 @@ pub(super) fn request_local_runtime() {
     LOCAL_RUNTIME.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+const LOCAL_RUNTIME_REFUSAL: &str = "--local executes untrusted repository code as the current OS user and is refused outside a disposable container; start Docker, or set JSS_VERIFY_DISPOSABLE=1 only inside a disposable VM/container";
+
+fn local_runtime_is_disposable(acknowledgement: Option<&str>, in_container: bool) -> bool {
+    acknowledgement.is_some_and(|value| value == "1") || in_container
+}
+
+fn local_runtime_selected() -> bool {
+    LOCAL_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
+}
+
+/// Why a requested local runtime may not start. A Docker container is already a disposable OS
+/// boundary; other disposable workers must acknowledge that property explicitly.
+pub(super) fn local_runtime_refusal() -> Option<&'static str> {
+    let acknowledgement = std::env::var("JSS_VERIFY_DISPOSABLE").ok();
+    (local_runtime_selected()
+        && !local_runtime_is_disposable(
+            acknowledgement.as_deref(),
+            std::path::Path::new("/.dockerenv").is_file(),
+        ))
+    .then_some(LOCAL_RUNTIME_REFUSAL)
+}
+
 /// Whether apps run in this environment rather than in Docker: `scan --local`, or
 /// `JSS_VERIFY_RUNTIME=local` (kept for existing scripts and for the self-heal controller's
 /// re-invocation).
 pub(super) fn local_runtime_requested() -> bool {
-    LOCAL_RUNTIME.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("JSS_VERIFY_RUNTIME").is_ok_and(|value| value == "local")
+    local_runtime_selected() && local_runtime_refusal().is_none()
 }
 
 /// Where the MCP server of a session answers.

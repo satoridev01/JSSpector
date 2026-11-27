@@ -1074,8 +1074,14 @@ fn scan(
         ])
         .arg(output)
         .current_dir(target)
-        .env("JSS_VERIFY_RUNTIME", "local")
         .env("JSS_VERIFY_DEBUG", "1");
+    if std::env::var("JSS_VERIFY_DISPOSABLE").as_deref() == Ok("1")
+        || std::path::Path::new("/.dockerenv").is_file()
+    {
+        command
+            .env("JSS_VERIFY_RUNTIME", "local")
+            .env("JSS_VERIFY_DISPOSABLE", "1");
+    }
     if !fingerprints.is_empty() {
         command.arg("--verify=strict");
         for fingerprint in fingerprints {

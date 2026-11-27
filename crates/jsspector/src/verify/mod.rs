@@ -417,6 +417,9 @@ fn run_with_policy(
     fix_options: &FixOptions,
     stop_after_verified: bool,
 ) -> Result<Vec<Verdict>, String> {
+    if let Some(reason) = sandbox::local_runtime_refusal() {
+        return Err(reason.to_owned());
+    }
     // A custom or convention-based router may leave a handler without an inventory entry. For an
     // HTTP finding, try a conservative route derived from a recognized controller/routes tree.
     // A wrong guess can only fail to reproduce; it never creates a verified outcome by itself.

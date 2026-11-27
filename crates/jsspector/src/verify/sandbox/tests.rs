@@ -30,6 +30,14 @@ fn local_listeners() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+fn local_runtime_requires_a_disposable_boundary() {
+    assert!(!local_runtime_is_disposable(None, false));
+    assert!(!local_runtime_is_disposable(Some("0"), false));
+    assert!(local_runtime_is_disposable(Some("1"), false));
+    assert!(local_runtime_is_disposable(None, true));
+}
+
+#[test]
 fn interrupted_local_fixtures_are_recognized_without_claiming_arbitrary_files() {
     let path = std::path::Path::new("/tmp/jss-canary-read.json");
     assert!(is_recognizable_local_fixture(

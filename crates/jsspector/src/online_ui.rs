@@ -27,6 +27,9 @@ use serde::Deserialize;
 
 const EVENT_PREFIX: &str = "@@JSSPECTOR_ONLINE@@";
 const MAX_ACTIVITY: usize = 10;
+/// The issue rate is shown only after this long: one early finding would otherwise read as an
+/// absurd hourly average.
+const RATE_WARMUP: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Deserialize)]
 struct WireEvent {
@@ -44,6 +47,13 @@ struct WireEvent {
     fix_proven: Option<bool>,
     success: Option<bool>,
     message: Option<String>,
+    cpu: Option<f64>,
+    memory: Option<f64>,
+    active: Option<u64>,
+    waiting: Option<u64>,
+    slots: Option<u64>,
+    report: Option<String>,
+    lines: Option<Vec<String>>,
 }
 
 enum ControllerLine {
@@ -78,6 +88,17 @@ struct State {
     stopping: bool,
     finished: bool,
     activity: VecDeque<String>,
+    /// Whole-host CPU and memory use and the live Docker slot limit, from `resources` events.
+    cpu: Option<f64>,
+    memory: Option<f64>,
+    docker_active: u64,
+    docker_waiting: u64,
+    docker_slots: u64,
+    /// The calibration report, printed after the dashboard closes.
+    report: Option<String>,
+    /// Improvement metrics from the controller: where Docker time goes, the limiting stage and
+    /// each lane's yield.
+    performance: Vec<String>,
 }
 
 impl State {
@@ -246,6 +267,37 @@ impl State {
                 self.finished = true;
                 self.activity("run stopped; completed work remains resumable");
             }
+            "resources" => {
+                if event.cpu.is_some() {
+                    self.cpu = event.cpu;
+                }
+                if event.memory.is_some() {
+                    self.memory = event.memory;
+                }
+                if let Some(active) = event.active {
+                    self.docker_active = active;
+                }
+                if let Some(slots) = event.slots {
+                    self.docker_slots = slots;
+                }
+                if let Some(waiting) = event.waiting {
+                    self.docker_waiting = waiting;
+                }
+            }
+            "performance" => {
+                if let Some(lines) = event.lines {
+                    self.performance = lines;
+                }
+            }
+            "calibration_finished" => {
+                self.phase = if event.success == Some(true) {
+                    "Calibrated".to_owned()
+                } else {
+                    "Calibration incomplete".to_owned()
+                };
+                self.finished = true;
+                self.report = event.report;
+            }
             _ => {}
         }
         if let Some(message) = event.message {
@@ -253,11 +305,42 @@ impl State {
         }
     }
 
-    fn summary(&self) -> String {
+    /// Average verified findings (the issues this pass yields) per hour since it started, once
+    /// the warm-up has passed.
+    fn issues_per_hour(&self, elapsed: Duration) -> Option<f64> {
+        (elapsed >= RATE_WARMUP)
+            .then(|| self.verified_findings as f64 * 3600.0 / elapsed.as_secs_f64())
+    }
+
+    fn issue_rate(&self, elapsed: Duration) -> String {
+        self.issues_per_hour(elapsed)
+            .map_or_else(|| "–".to_owned(), |rate| format!("{rate:.1}"))
+    }
+
+    /// Live capacity line for the verification panel title.
+    fn capacity(&self) -> String {
+        let percent = |value: Option<f64>| {
+            value.map_or_else(|| "–".to_owned(), |value| format!("{:.0}%", value * 100.0))
+        };
+        if self.docker_slots == 0 {
+            return " Verification ".to_owned();
+        }
         format!(
-            "jsspector online: {} static, {} verified findings, {} Satori issues, artifacts {}",
+            " Verification · docker {}/{} (+{} queued) · cpu {} · mem {} ",
+            self.docker_active,
+            self.docker_slots,
+            self.docker_waiting,
+            percent(self.cpu),
+            percent(self.memory)
+        )
+    }
+
+    fn summary(&self, elapsed: Duration) -> String {
+        format!(
+            "jsspector online: {} static, {} verified findings ({}/h), {} Satori issues, artifacts {}",
             self.static_done,
             self.verified_findings,
+            self.issue_rate(elapsed),
             self.synced,
             if self.output.is_empty() {
                 "unavailable"
@@ -334,6 +417,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(8),
+            Constraint::Length(6),
             Constraint::Min(6),
             Constraint::Length(1),
         ])
@@ -342,6 +426,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
         header_area,
         progress_area,
         pipeline_area,
+        improvement_area,
         activity_area,
         footer_area,
     ] = areas.as_ref()
@@ -358,11 +443,16 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "  {}  ·  discovered {}  ·  elapsed {}s",
-            state.phase,
-            state.discovered,
-            started.elapsed().as_secs()
+            "  {}  ·  discovered {}  ·  ",
+            state.phase, state.discovered
         )),
+        Span::styled(
+            format!("issues {}/h", state.issue_rate(started.elapsed())),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  ·  elapsed {}s", started.elapsed().as_secs())),
     ]);
     frame.render_widget(
         Paragraph::new(title).block(Block::default().borders(Borders::ALL)),
@@ -410,7 +500,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
     )
     .block(
         Block::default()
-            .title(" Verification ")
+            .title(state.capacity())
             .borders(Borders::ALL),
     );
     let outcome_rows = [
@@ -418,6 +508,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
             "Verified findings".to_owned(),
             state.verified_findings.to_string(),
             format!("{} repos", state.verified_repositories),
+        ]),
+        Row::new(vec![
+            "Issues per hour".to_owned(),
+            state.issue_rate(started.elapsed()),
+            "average".to_owned(),
         ]),
         Row::new(vec![
             "Proven fixes".to_owned(),
@@ -456,6 +551,26 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
     };
     frame.render_widget(lane_table, *lane_area);
     frame.render_widget(outcome_table, *outcome_area);
+
+    let improvement = if state.performance.is_empty() {
+        vec![Line::raw(
+            "collecting… the first numbers appear after the first verifications",
+        )]
+    } else {
+        state
+            .performance
+            .iter()
+            .map(|value| Line::raw(value.clone()))
+            .collect::<Vec<_>>()
+    };
+    frame.render_widget(
+        Paragraph::new(improvement).block(
+            Block::default()
+                .title(" Where to improve ")
+                .borders(Borders::ALL),
+        ),
+        *improvement_area,
+    );
 
     let activity = state
         .activity
@@ -619,7 +734,10 @@ pub(crate) fn run(mut command: Command) -> io::Result<ExitStatus> {
             }
         }
     };
-    eprintln!("{}", state.summary());
+    if let Some(report) = &state.report {
+        println!("{report}");
+    }
+    eprintln!("{}", state.summary(started.elapsed()));
     Ok(status)
 }
 
@@ -670,6 +788,72 @@ mod tests {
     }
 
     #[test]
+    fn resource_events_drive_the_capacity_line_and_keep_the_report() {
+        let mut state = State::new();
+        assert_eq!(state.capacity(), " Verification ");
+        state.apply(
+            serde_json::from_str::<WireEvent>(
+                r#"{"type":"resources","cpu":0.78,"memory":0.231,"active":9,"waiting":4,"slots":12}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            state.capacity(),
+            " Verification · docker 9/12 (+4 queued) · cpu 78% · mem 23% "
+        );
+        assert!(
+            state.activity.is_empty(),
+            "periodic samples must not flood the activity"
+        );
+        state.apply(
+            serde_json::from_str::<WireEvent>(
+                r#"{"type":"resources","slots":13,"message":"governor: docker slots 12 → 13 (headroom)"}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(state.docker_slots, 13);
+        assert_eq!(state.activity.len(), 1);
+        state.apply(
+            serde_json::from_str::<WireEvent>(
+                r#"{"type":"calibration_finished","success":true,"report":"jsspector online calibration"}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(state.phase, "Calibrated");
+        assert_eq!(
+            state.report.as_deref(),
+            Some("jsspector online calibration")
+        );
+    }
+
+    #[test]
+    fn improvement_panel_shows_the_controller_lines() {
+        let mut state = State::new();
+        state.apply(
+            serde_json::from_str::<WireEvent>(
+                r#"{"type":"performance","lines":["Docker time  issue 3% · timeout 34%","  of which   build/start 38%","Bottleneck   verification 72%","Lanes        deterministic 0.6 issues/slot-h (180 runs)"]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(state.performance.len(), 4);
+        assert!(state.activity.is_empty());
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &state, Instant::now()))
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        for expected in [
+            "Where to improve",
+            "timeout 34%",
+            "verification 72%",
+            "deterministic 0.6",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
     fn dashboard_renders_both_lanes_and_verified_outcomes() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -690,8 +874,32 @@ mod tests {
             "Opus 5.5",
             "Outcomes",
             "Verified findings",
+            "Issues per hour",
+            "issues –/h",
+            "Where to improve",
+            "collecting…",
         ] {
             assert!(rendered.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn issue_rate_is_the_hourly_average_after_the_warm_up() {
+        let mut state = State::new();
+        state.verified_findings = 6;
+        assert_eq!(state.issues_per_hour(Duration::from_secs(60)), None);
+        assert_eq!(state.issue_rate(Duration::from_secs(60)), "–");
+        assert_eq!(
+            state.issues_per_hour(Duration::from_secs(30 * 60)),
+            Some(12.0)
+        );
+        assert_eq!(state.issue_rate(Duration::from_secs(90 * 60)), "4.0");
+        assert!(
+            state
+                .summary(Duration::from_secs(3600))
+                .contains("6 verified findings (6.0/h)")
+        );
+        state.verified_findings = 0;
+        assert_eq!(state.issue_rate(Duration::from_secs(3600)), "0.0");
     }
 }

@@ -3950,6 +3950,32 @@ pub(super) fn listening_probe_excluding_candidates(
     )
 }
 
+/// The package (relative to `root`) whose start script should be tried after the finding's own file,
+/// launched in place with `node`, failed to listen; see `Session::retry_with_start_script`. The app
+/// package's own script, or the repository root's when the file's directory has no package. `None`
+/// when the launch was not a plain `node <file>` of the finding (a host shim: the manifest cannot
+/// serve the route), when the manifest would run the same command, or when it is a front-end dev
+/// server, which would answer on an unrelated port.
+pub(super) fn start_script_retry(
+    root: &std::path::Path,
+    app_path: &std::path::Path,
+    entry_file: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let app_root = root.join(app_path);
+    let entry_rel = entry_file.and_then(|file| file.strip_prefix(app_path).ok());
+    let used = start_command(&app_root, entry_rel)?;
+    if !used.starts_with("[\"node\",") || used.contains("/jss-") {
+        return None;
+    }
+    let (retry_path, retry_root) = if app_root.join("package.json").is_file() {
+        (app_path.to_path_buf(), app_root)
+    } else {
+        (std::path::PathBuf::new(), root.to_path_buf())
+    };
+    let manifest = manifest_start_command(&retry_root)?;
+    (manifest != used && !manifest_launch_is_frontend(&retry_root)).then_some(retry_path)
+}
+
 /// The app's launch command for the image `CMD`. A launchable package manifest
 /// ([`manifest_start_command`]) is preferred; failing that, when the finding's own file
 /// (`entry`, relative to `root`) is a self-contained server that constructs a listener and calls

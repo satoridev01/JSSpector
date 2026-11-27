@@ -287,24 +287,51 @@ struct OnlineArgs {
     /// Replay this deterministic owner/repository inventory instead of searching GitHub.
     #[arg(long, value_name = "FILE")]
     repos_file: Option<PathBuf>,
-    /// Directory holding durable state and private run artifacts.
-    #[arg(long, value_name = "DIR", default_value = "runs/jsspector-online")]
-    out: PathBuf,
-    /// Concurrent one-thread static scans, tuned for this 10-core host.
-    #[arg(long, default_value_t = 12)]
-    static_parallel: usize,
-    /// Maximum run-owned repository checkouts retained across static analysis and verification.
-    #[arg(long, default_value_t = 24)]
-    max_checkouts: usize,
-    /// Deterministically ordered dynamic-verification workers.
-    #[arg(long, default_value_t = 2)]
-    parallel_no_ai: usize,
+    /// Directory holding durable state and private run artifacts [default:
+    /// runs/jsspector-online, or runs/jsspector-calibrate with --calibrate].
+    #[arg(long, value_name = "DIR")]
+    out: Option<PathBuf>,
+    /// Concurrent one-thread static scans [default: auto, at least 12].
+    #[arg(long)]
+    static_parallel: Option<usize>,
+    /// Maximum run-owned repository checkouts retained across static analysis and verification
+    /// [default: auto, at least 24].
+    #[arg(long)]
+    max_checkouts: Option<usize>,
+    /// Deterministically ordered dynamic-verification workers [default: auto, the Docker slots
+    /// left after the Opus lane].
+    #[arg(long)]
+    parallel_no_ai: Option<usize>,
     /// Opus-ranked dynamic-verification workers.
     #[arg(long, default_value_t = 2)]
     parallel_ai: usize,
-    /// Shared Docker verification cap.
-    #[arg(long, default_value_t = 4)]
-    parallel_docker: usize,
+    /// Shared Docker verification cap [default: auto, sized from this host's free CPU and
+    /// memory].
+    #[arg(long)]
+    parallel_docker: Option<usize>,
+    /// Whole-host CPU and memory share that auto-sizing and the governor aim for.
+    #[arg(long, default_value_t = 0.8, value_parser = parse_utilization)]
+    target_utilization: f64,
+    /// Keep auto-sized worker counts fixed instead of adjusting the Docker slots while the pass
+    /// runs. Explicit --parallel-docker or --parallel-no-ai also keep them fixed.
+    #[arg(long)]
+    no_governor: bool,
+    /// Print the concurrency this host supports, and why, then exit without running a pass.
+    #[arg(long, conflicts_with = "calibrate")]
+    estimate: bool,
+    /// Measure what one verification costs on this host and save the host profile that later
+    /// passes size themselves from. Runs a real, local-only pass without fixes or Opus ranking at
+    /// two load levels.
+    #[arg(long)]
+    calibrate: bool,
+    /// Measured calibration window, counted from the first verification.
+    #[arg(
+        long,
+        value_name = "MINUTES",
+        default_value_t = 30,
+        requires = "calibrate"
+    )]
+    calibrate_minutes: usize,
     /// Stop safely if Docker GC cannot preserve this much host disk; 0 disables the guard.
     #[arg(long, default_value_t = 100)]
     min_free_gb: usize,
@@ -1118,11 +1145,15 @@ mod repository_input_tests {
         assert_eq!(args.limit, 0);
         assert_eq!(args.max_repo_size_mb, 100);
         assert_eq!(args.pvr, "off");
-        assert_eq!(args.static_parallel, 12);
-        assert_eq!(args.max_checkouts, 24);
-        assert_eq!(args.parallel_no_ai, 2);
+        // Worker counts are auto-sized by the controller from this host's free resources.
+        assert_eq!(args.static_parallel, None);
+        assert_eq!(args.max_checkouts, None);
+        assert_eq!(args.parallel_no_ai, None);
         assert_eq!(args.parallel_ai, 2);
-        assert_eq!(args.parallel_docker, 4);
+        assert_eq!(args.parallel_docker, None);
+        assert!((args.target_utilization - 0.8).abs() < f64::EPSILON);
+        assert!(!args.no_governor && !args.estimate && !args.calibrate);
+        assert_eq!(online_out(&args), PathBuf::from("runs/jsspector-online"));
         assert_eq!(args.min_free_gb, 100);
         assert_eq!(args.docker_cache_gb, 20);
         assert_eq!(args.docker_gc_every, 8);
@@ -1150,10 +1181,8 @@ mod repository_input_tests {
             "--ai-model",
             "claude-opus-5-5",
             "--fix-model",
-            "--parallel-no-ai",
             "--parallel-ai",
-            "--parallel-docker",
-            "--max-checkouts",
+            "--target-utilization",
             "--max-repo-size-mb",
             "--verify-startup-timeout",
             "--verify-candidate-soft-timeout",
@@ -1188,6 +1217,88 @@ mod repository_input_tests {
     }
 
     #[test]
+    fn online_auto_sizing_passes_only_explicit_counts() {
+        let parse = |extra: &[&str]| {
+            let cli = Cli::try_parse_from(["jsspector", "online"].iter().chain(extra)).unwrap();
+            let Command::Online(args) = cli.command else {
+                panic!("online did not parse as the online command");
+            };
+            let arguments = online_arguments(&args, Path::new("/tmp/jsspector"))
+                .into_iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            (args, arguments)
+        };
+        let (_, automatic) = parse(&[]);
+        for flag in [
+            "--static-parallel",
+            "--max-checkouts",
+            "--parallel-no-ai",
+            "--parallel-docker",
+            "--no-governor",
+            "--estimate",
+            "--calibrate",
+        ] {
+            assert!(!automatic.iter().any(|value| value == flag), "{flag}");
+        }
+        let (_, explicit) = parse(&["--parallel-docker", "16", "--no-governor"]);
+        let position = explicit
+            .iter()
+            .position(|value| value == "--parallel-docker")
+            .unwrap();
+        assert_eq!(explicit[position + 1], "16");
+        assert!(explicit.iter().any(|value| value == "--no-governor"));
+
+        let (args, estimate) = parse(&["--estimate"]);
+        assert!(args.estimate);
+        assert!(estimate.iter().any(|value| value == "--estimate"));
+
+        assert!(
+            Cli::try_parse_from(["jsspector", "online", "--target-utilization", "1.5"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["jsspector", "online", "--estimate", "--calibrate"]).is_err());
+        assert!(Cli::try_parse_from(["jsspector", "online", "--calibrate-minutes", "5"]).is_err());
+    }
+
+    #[test]
+    fn online_calibration_measures_without_publishing_or_fixing() {
+        let cli = Cli::try_parse_from([
+            "jsspector",
+            "online",
+            "--calibrate",
+            "--calibrate-minutes",
+            "20",
+        ])
+        .unwrap();
+        let Command::Online(args) = cli.command else {
+            panic!("online did not parse as the online command");
+        };
+        assert_eq!(online_out(&args), PathBuf::from("runs/jsspector-calibrate"));
+        let arguments = online_arguments(&args, Path::new("/tmp/jsspector"))
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for absent in [
+            "--satori-sync",
+            "--learn-fixes",
+            "--fix-attempts",
+            "--fix-model",
+        ] {
+            assert!(!arguments.iter().any(|value| value == absent), "{absent}");
+        }
+        let position = arguments
+            .iter()
+            .position(|value| value == "--calibrate-minutes")
+            .unwrap();
+        assert_eq!(arguments[position + 1], "20");
+        assert!(
+            arguments
+                .iter()
+                .any(|value| value == "runs/jsspector-calibrate")
+        );
+    }
+
+    #[test]
     fn online_controller_is_bundled_without_the_monitor_checkout() {
         let controller = materialize_online_controller().unwrap();
         let runner = controller.runner;
@@ -1198,6 +1309,7 @@ mod repository_input_tests {
             "discover.py",
             "github.py",
             "claude_limits.py",
+            "resources.py",
         ] {
             assert!(directory.join(module).is_file(), "missing {module}");
         }
@@ -1543,6 +1655,10 @@ const ONLINE_CONTROLLER: &[(&str, &str)] = &[
         "claude_limits.py",
         include_str!("../../../scripts/online/claude_limits.py"),
     ),
+    (
+        "resources.py",
+        include_str!("../../../scripts/online/resources.py"),
+    ),
 ];
 
 fn materialize_online_controller() -> Result<OnlineController, String> {
@@ -1562,6 +1678,37 @@ fn materialize_online_controller() -> Result<OnlineController, String> {
     })
 }
 
+fn parse_utilization(value: &str) -> Result<f64, String> {
+    let number: f64 = value
+        .parse()
+        .map_err(|_| format!("expected a fraction such as 0.8, got {value:?}"))?;
+    if (0.1..=0.95).contains(&number) {
+        Ok(number)
+    } else {
+        Err("expected a fraction between 0.1 and 0.95".to_owned())
+    }
+}
+
+fn online_out(args: &OnlineArgs) -> PathBuf {
+    args.out.clone().unwrap_or_else(|| {
+        PathBuf::from(if args.calibrate {
+            "runs/jsspector-calibrate"
+        } else {
+            "runs/jsspector-online"
+        })
+    })
+}
+
+/// Whether a pass may create Satori issues, attempt fixes or rank with Opus (a calibration never
+/// does: it measures hardware).
+fn online_publishes(args: &OnlineArgs) -> bool {
+    !args.local_only && !args.calibrate
+}
+
+fn online_evolves(args: &OnlineArgs) -> bool {
+    !args.no_evolve && !args.calibrate
+}
+
 fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
     let mut command = vec![
         OsString::from("--scanner"),
@@ -1579,17 +1726,11 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
         OsString::from("--pvr"),
         OsString::from(&args.pvr),
         OsString::from("--out"),
-        args.out.as_os_str().to_owned(),
-        OsString::from("--static-parallel"),
-        OsString::from(args.static_parallel.to_string()),
-        OsString::from("--max-checkouts"),
-        OsString::from(args.max_checkouts.to_string()),
-        OsString::from("--parallel-no-ai"),
-        OsString::from(args.parallel_no_ai.to_string()),
+        online_out(args).into_os_string(),
         OsString::from("--parallel-ai"),
         OsString::from(args.parallel_ai.to_string()),
-        OsString::from("--parallel-docker"),
-        OsString::from(args.parallel_docker.to_string()),
+        OsString::from("--target-utilization"),
+        OsString::from(args.target_utilization.to_string()),
         OsString::from("--min-free-gb"),
         OsString::from(args.min_free_gb.to_string()),
         OsString::from("--docker-cache-gb"),
@@ -1619,14 +1760,38 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
         OsString::from("--ai-timeout"),
         OsString::from(args.ai_timeout.to_string()),
     ];
+    for (flag, value) in [
+        ("--static-parallel", args.static_parallel),
+        ("--max-checkouts", args.max_checkouts),
+        ("--parallel-no-ai", args.parallel_no_ai),
+        ("--parallel-docker", args.parallel_docker),
+    ] {
+        if let Some(value) = value {
+            command.push(OsString::from(flag));
+            command.push(OsString::from(value.to_string()));
+        }
+    }
+    if args.no_governor {
+        command.push(OsString::from("--no-governor"));
+    }
+    if args.estimate {
+        command.push(OsString::from("--estimate"));
+    }
+    if args.calibrate {
+        command.extend([
+            OsString::from("--calibrate"),
+            OsString::from("--calibrate-minutes"),
+            OsString::from(args.calibrate_minutes.to_string()),
+        ]);
+    }
     if let Some(repositories) = &args.repos_file {
         command.push(OsString::from("--repos-file"));
         command.push(repositories.as_os_str().to_owned());
     }
-    if !args.local_only {
+    if online_publishes(args) {
         command.push(OsString::from("--satori-sync"));
     }
-    if !args.no_evolve {
+    if online_evolves(args) {
         command.extend([
             OsString::from("--fix-attempts"),
             OsString::from("1"),
@@ -1641,16 +1806,15 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
 }
 
 fn online(args: &OnlineArgs) -> ExitCode {
-    if [
+    let explicit_counts = [
         args.static_parallel,
         args.max_checkouts,
         args.parallel_no_ai,
-        args.parallel_ai,
         args.parallel_docker,
-        args.docker_cache_gb,
-        args.docker_gc_every,
-    ]
-    .contains(&0)
+    ];
+    if [args.parallel_ai, args.docker_cache_gb, args.docker_gc_every].contains(&0)
+        || explicit_counts.contains(&Some(0))
+        || args.calibrate_minutes == 0
     {
         return fail(EXIT_USAGE, "online worker counts must be positive");
     }
@@ -1666,7 +1830,7 @@ fn online(args: &OnlineArgs) -> ExitCode {
     command
         .arg(&controller.runner)
         .args(online_arguments(args, &scanner));
-    if !args.no_evolve
+    if online_evolves(args)
         && let Some(source_root) = self_heal_source_root()
         && self_heal_unavailable(Some(&source_root)).is_none()
     {
@@ -1677,16 +1841,30 @@ fn online(args: &OnlineArgs) -> ExitCode {
             )
             .env("JSSPECTOR_PUBLISH_FIXES", "1");
     }
-    let use_tui = !args.no_tui && io::stdout().is_terminal() && io::stderr().is_terminal();
-    if !use_tui {
+    // An estimate is a short report, not a pass: print it plainly.
+    let use_tui =
+        !args.no_tui && !args.estimate && io::stdout().is_terminal() && io::stderr().is_terminal();
+    if !use_tui && !args.estimate {
+        let auto =
+            |value: Option<usize>| value.map_or_else(|| "auto".to_owned(), |n| n.to_string());
         eprintln!(
-            "jsspector: online research since={} deterministic={} ai={} docker={} satori={} evolve={}",
+            "jsspector: online {} since={} deterministic={} ai={} docker={} target={} satori={} evolve={}",
+            if args.calibrate {
+                "calibration"
+            } else {
+                "research"
+            },
             args.since,
-            args.parallel_no_ai,
-            args.parallel_ai,
-            args.parallel_docker,
-            !args.local_only,
-            !args.no_evolve,
+            auto(args.parallel_no_ai),
+            if args.calibrate {
+                "off".to_owned()
+            } else {
+                args.parallel_ai.to_string()
+            },
+            auto(args.parallel_docker),
+            args.target_utilization,
+            online_publishes(args),
+            online_evolves(args),
         );
     }
     let status = if use_tui {

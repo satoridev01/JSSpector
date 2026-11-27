@@ -9,6 +9,6 @@
   "before": "const { username, password } = req.body;\nconst user = await User.findOne({ username, password });",
   "after": "const { username, password } = req.body;\nconst user = await User.findOne({ username: String(username), password: String(password) });",
   "proven": 0,
-  "offered": 11,
-  "first_try": 9
+  "offered": 12,
+  "first_try": 10
 }

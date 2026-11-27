@@ -1206,6 +1206,7 @@ impl Session {
                 (&match_none_eq, match_none_eq_status, &match_none_eq_cookies),
                 (&match_none_in, match_none_in_status, &match_none_in_cookies),
                 &case.absent,
+                credential.is_some(),
             );
             if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
                 eprintln!(
@@ -1533,6 +1534,7 @@ fn nosql_response_proves_impact(
     match_none_eq: HttpObservation<'_>,
     match_none_in: HttpObservation<'_>,
     absent: &str,
+    authenticated: bool,
 ) -> bool {
     if !payload::nosql_reproduced(match_all.0, match_none_eq.0, match_none_in.0, absent) {
         return false;
@@ -1546,6 +1548,13 @@ fn nosql_response_proves_impact(
         (200..300).contains(&status) || (authentication && (300..400).contains(&status))
     });
     if !completed {
+        return false;
+    }
+    // On an unauthenticated read-only endpoint, selecting a verifier-planted document proves only
+    // that MongoDB interpreted the operator. It does not prove confidentiality impact: a public
+    // catalog/search endpoint is allowed to return those same records through ordinary filters.
+    // Keep such a result as a static candidate until an authorization boundary can be exercised.
+    if !authentication && !authenticated {
         return false;
     }
     if !authentication {
@@ -1623,6 +1632,7 @@ mod oracle_tests {
                 NO_COOKIES
             ),
             "18ebdf4eae3bee68012fb800",
+            false,
         ));
     }
 
@@ -1643,6 +1653,7 @@ mod oracle_tests {
             controls,
             controls,
             "absent",
+            false,
         ));
 
         let authenticated = r#"{"token":"eyJhbGci.eyJzdWIiOiIxIn0.c2ln"}"#;
@@ -1652,6 +1663,7 @@ mod oracle_tests {
             controls,
             controls,
             "absent",
+            false,
         ));
 
         let redirect_cookie = ["uid=6b62d; Path=/; HttpOnly".to_owned()];
@@ -1661,6 +1673,7 @@ mod oracle_tests {
             controls,
             controls,
             "absent",
+            false,
         ));
         assert!(!nosql_response_proves_impact(
             "/user/login",
@@ -1668,18 +1681,28 @@ mod oracle_tests {
             controls,
             controls,
             "absent",
+            false,
         ));
     }
 
     #[test]
     fn nosql_read_differential_needs_a_successful_positive_response() {
         let controls = (r#"{"items":[]}"#, Some(200), NO_COOKIES);
+        assert!(!nosql_response_proves_impact(
+            "/api/public/catalog",
+            (r#"{"items":[{"id":1}]}"#, Some(200), NO_COOKIES),
+            controls,
+            controls,
+            "absent",
+            false,
+        ));
         assert!(nosql_response_proves_impact(
             "/api/users/search",
             (r#"{"items":[{"id":1}]}"#, Some(200), NO_COOKIES),
             controls,
             controls,
             "absent",
+            true,
         ));
         assert!(!nosql_response_proves_impact(
             "/api/users/search",
@@ -1687,6 +1710,7 @@ mod oracle_tests {
             controls,
             controls,
             "absent",
+            true,
         ));
     }
 

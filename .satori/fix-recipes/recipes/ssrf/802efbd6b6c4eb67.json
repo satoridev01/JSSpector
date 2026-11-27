@@ -15,6 +15,6 @@
   "before": "await sendServiceBadge(req, res, () =>\n  fetchWebsiteStatus(req.query.url, { upMessage, downMessage })",
   "after": "import net from \"node:net\";\nimport dns from \"node:dns/promises\";\nconst forbiddenAddresses = new net.BlockList();\n[[\"0.0.0.0\", 8], [\"10.0.0.0\", 8], [\"100.64.0.0\", 10], [\"127.0.0.0\", 8], [\"169.254.0.0\", 16], [\"172.16.0.0\", 12], [\"192.0.0.0\", 24], [\"192.168.0.0\", 16], [\"198.18.0.0\", 15], [\"224.0.0.0\", 3]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv4\"));\n[[\"::\", 127], [\"64:ff9b::\", 96], [\"fc00::\", 7], [\"fe80::\", 10], [\"ff00::\", 8]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv6\"));\nfunction isForbiddenAddress(address, family) {\n  if (family === 6) {\n    const mapped = /^::ffff:(\\d+\\.\\d+\\.\\d+\\.\\d+)$/i.exec(address);\n    if (mapped) return forbiddenAddresses.check(mapped[1], \"ipv4\");\n    const lower = address.toLower…",
   "proven": 1,
-  "offered": 0,
-  "first_try": 0
+  "offered": 1,
+  "first_try": 1
 }

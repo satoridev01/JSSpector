@@ -880,6 +880,10 @@ fn llm_candidate(
     }
     let output = run_with_timeout(command, &prompt, remaining)?;
     let proposed = extract_file(&output).ok_or("the LLM reply carried no file")?;
+    // Models normally answer with LF even when the source uses CRLF. Preserve the supplied
+    // source's convention before comparing, applying or rendering the diff; otherwise a
+    // five-line repair looks like a whole-file rewrite and may exceed downstream diff limits.
+    let proposed = preserve_line_endings(supplied, &proposed);
     // Keep the supplied source's own ending: the reply's markers swallow a final newline, or add
     // one. For a large file this normalizes only the excerpt before splicing it back into the exact
     // untouched prefix and suffix.
@@ -908,6 +912,21 @@ fn llm_candidate(
         file: file.to_owned(),
         content,
     })
+}
+
+fn preserve_line_endings(original: &str, proposed: &str) -> String {
+    let newlines = original.bytes().filter(|byte| *byte == b'\n').count();
+    let crlf = original
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| *pair == b"\r\n")
+        .count();
+    let normalized = proposed.replace("\r\n", "\n");
+    if newlines > 0 && crlf == newlines {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
+    }
 }
 
 /// A bounded, line-aligned slice around the sink for source files too large to send wholesale.
@@ -1525,6 +1544,18 @@ const response = await fetch(url, { dispatcher })\n";
             Some("const a = 1;\nconst b = 2;")
         );
         assert_eq!(extract_file("no markers"), None);
+    }
+
+    #[test]
+    fn llm_candidates_preserve_the_sources_line_endings() {
+        assert_eq!(
+            preserve_line_endings("one\r\ntwo\r\n", "one\ntwo\nthree"),
+            "one\r\ntwo\r\nthree"
+        );
+        assert_eq!(
+            preserve_line_endings("one\ntwo\n", "one\r\ntwo\r\nthree"),
+            "one\ntwo\nthree"
+        );
     }
 
     #[test]

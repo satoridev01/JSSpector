@@ -1,0 +1,14 @@
+{
+  "id": "97ebb2938cbb8513",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": [
+    "href",
+    "startsWith"
+  ],
+  "before": "",
+  "after": "if (!url.href.startsWith(DIST.href)) continue",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

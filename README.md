@@ -86,9 +86,10 @@ jsspector scan path/to/repo
 ```
 
 PyPI installs the native binary for macOS or Linux (x86_64 or arm64) into the active Python
-environment. Run `jsspector update` to upgrade that same environment to the newest PyPI release.
-For an isolated global CLI, `pipx install jsspector` works as well (use `pipx upgrade jsspector`
-to update that installation). Releases are built with
+environment. For an isolated global CLI — required on distributions whose system Python refuses
+pip installs (PEP 668, e.g. recent Debian and Ubuntu) — use `pipx install jsspector`. Either way,
+`jsspector update` upgrades that same installation to the newest PyPI release, through
+`pipx upgrade` when pipx owns it. Releases are built with
 [dist](https://github.com/axodotdev/cargo-dist) when a version tag is pushed: archives, checksums
 and the shell installer remain available on
 [GitHub Releases](https://github.com/satoridev01/JSSpector/releases). The shell installer is:

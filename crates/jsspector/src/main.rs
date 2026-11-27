@@ -75,7 +75,7 @@ enum Command {
     /// commit validated scanner changes and push them to the configured upstream branch. A normal
     /// scan never evolves the scanner or publishes what it learns.
     Evolve(EvolveArgs),
-    /// Upgrade a pip-installed JSSpector to the newest version available on PyPI.
+    /// Upgrade a pip- or pipx-installed JSSpector to the newest version available on PyPI.
     Update,
     /// List every entry point: HTTP routes with full paths (mount prefixes followed across files),
     /// socket events, IPC channels, GraphQL fields, tRPC procedures and queue processors.

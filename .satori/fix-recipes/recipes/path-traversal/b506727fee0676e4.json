@@ -9,6 +9,6 @@
   "before": "const filePath = path.join(__dirname, \"users\", `${userId}.json`);",
   "after": "const filePath = path.join(__dirname, \"users\", `${path.basename(String(userId))}.json`);",
   "proven": 1,
-  "offered": 1,
-  "first_try": 1
+  "offered": 2,
+  "first_try": 2
 }

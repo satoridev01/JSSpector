@@ -23,11 +23,12 @@ use ratatui::layout::Rect;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Row, Table};
 use serde::Deserialize;
 
 const EVENT_PREFIX: &str = "@@JSSPECTOR_ONLINE@@";
-const MAX_ACTIVITY: usize = 10;
+/// Activity lines kept; the panel shows as many of the newest as its height allows.
+const MAX_ACTIVITY: usize = 500;
 /// The controller reads this file in the run directory to change the Docker slots of a live pass.
 const CONTROL_FILE: &str = "control.json";
 const MAX_DOCKER_SLOTS: u64 = 64;
@@ -498,6 +499,27 @@ fn consume(receiver: &Receiver<ControllerLine>, state: &mut State) {
     }
 }
 
+/// The newest activity lines that fit inside `area`'s borders, one row each (cut to the width; the
+/// full text stays in online.log), so the latest event is always visible however tall the window.
+fn activity_lines(state: &State, area: Rect) -> Vec<Line<'static>> {
+    let rows = usize::from(area.height.saturating_sub(2));
+    let width = usize::from(area.width.saturating_sub(2));
+    let skip = state.activity.len().saturating_sub(rows);
+    state
+        .activity
+        .iter()
+        .skip(skip)
+        .map(|value| {
+            let mut line: String = value.chars().take(width).collect();
+            if value.chars().count() > width && width > 0 {
+                line.pop();
+                line.push('…');
+            }
+            Line::raw(line)
+        })
+        .collect()
+}
+
 /// A `width` × `height` rectangle centered in `area`, shrunk to fit.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
@@ -675,15 +697,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
         *improvement_area,
     );
 
-    let activity = state
-        .activity
-        .iter()
-        .map(|value| Line::raw(value.clone()))
-        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(activity)
-            .block(Block::default().title(" Activity ").borders(Borders::ALL))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(activity_lines(state, *activity_area))
+            .block(Block::default().title(" Activity ").borders(Borders::ALL)),
         *activity_area,
     );
 
@@ -1017,6 +1033,28 @@ mod tests {
             state.on_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
             KeyAction::Stop
         );
+    }
+
+    #[test]
+    fn activity_fills_the_panel_with_the_newest_lines() {
+        let mut state = State::new();
+        for index in 0..40 {
+            state.activity(format!("event {index:02} {}", "x".repeat(150)));
+        }
+        let tall = Rect::new(0, 0, 60, 27); // 25 rows inside the borders
+        let lines = activity_lines(&state, tall);
+        assert_eq!(lines.len(), 25);
+        let first = lines.first().unwrap().to_string();
+        let last = lines.last().unwrap().to_string();
+        assert!(first.starts_with("event 15"), "{first}");
+        assert!(last.starts_with("event 39"), "{last}");
+        assert_eq!(last.chars().count(), 58);
+        assert!(last.ends_with('…'));
+        assert_eq!(activity_lines(&state, Rect::new(0, 0, 60, 2)).len(), 0);
+        for index in 0..600 {
+            state.activity(format!("more {index}"));
+        }
+        assert_eq!(state.activity.len(), MAX_ACTIVITY);
     }
 
     #[test]

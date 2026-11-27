@@ -533,15 +533,16 @@ class ImprovementMetricTests(unittest.TestCase):
         self.assertEqual(summary["bottleneck"]["verification"], 0.6)
         self.assertEqual(summary["lanes"]["no-ai"]["issues"], 2)
         self.assertEqual(summary["lanes"]["ai"]["issues_per_slot_hour"], 0.0)
+        self.assertEqual(summary["lanes"]["no-ai"]["slot_minutes_per_issue"], 8.3)
         lines = resources.performance_lines(summary, summary)
         self.assertEqual(len(lines), 4)
         self.assertIn("timeout 47%", lines[0])
-        self.assertIn("15.8 slot-min/issue", lines[0])
+        self.assertIn("1 issue per 16 Docker-min", lines[0])
         self.assertIn("build/start 25%", lines[1])
         self.assertIn("top skip: the app did not start", lines[1])
         self.assertIn("verification 60%", lines[2])
-        self.assertIn("deterministic", lines[3])
-        self.assertIn("Opus 0 issues/slot-h (1 runs)", lines[3])
+        self.assertIn("deterministic 2 issues in 4 runs, 1 per 8 Docker-min", lines[3])
+        self.assertIn("Opus no issue in 1 runs (15 Docker-min)", lines[3])
 
     def test_empty_summary_reads_as_collecting(self) -> None:
         empty = resources.performance_summary([], [], static_parallel=12)
@@ -549,6 +550,20 @@ class ImprovementMetricTests(unittest.TestCase):
         self.assertIn("collecting", lines[0])
         self.assertIn("collecting", lines[2])
         self.assertIn("collecting", lines[3])
+
+    def test_checkout_budget_grows_while_holders_run(self) -> None:
+        budget = resources.CountedSemaphore(1)
+        self.assertTrue(budget.acquire(timeout=0.1))
+        self.assertFalse(budget.acquire(timeout=0.01))
+        budget.grow_to(3)
+        budget.grow_to(2)  # never shrinks
+        self.assertTrue(budget.acquire(timeout=0.1))
+        self.assertTrue(budget.acquire(timeout=0.1))
+        self.assertEqual((budget.held, budget.capacity), (3, 3))
+        for _ in range(3):
+            budget.release()
+        with self.assertRaises(ValueError):
+            budget.release()
 
     def test_counted_semaphore_reports_held_permits(self) -> None:
         budget = resources.CountedSemaphore(2)
@@ -888,6 +903,90 @@ class ControllerCapacityTests(unittest.TestCase):
         self.assertTrue(busy.saturated)
         self.assertEqual(busy.waiting, 18)
         self.assertEqual(resources.bottleneck(busy, 12), "verification")
+
+    def make_monitor(self, docker: int, **kwargs: object) -> tuple[resources.Monitor, mock.Mock]:
+        plan = resources.estimate(host(), resources.Costs(), parallel_docker=docker)
+        reader = mock.Mock()
+        reader.read.return_value = (8.0, 20.0, None, None)
+        reader.network.return_value = None
+        values: dict[str, object] = {
+            "host": host(),
+            "plan": plan,
+            "target": 0.8,
+            "docker_slots": resources.AdjustableSlots(docker),
+            "no_ai_gate": resources.AdjustableSlots(docker - 2),
+            "ai_workers": 2,
+            "governed": True,
+            "calibration": None,
+            "static_active": lambda: 0,
+            "emit": lambda *_args, **_fields: None,
+            "log": lambda _message: None,
+            "on_calibrated": lambda _message: None,
+            "reader": reader,
+        }
+        values.update(kwargs)
+        return resources.Monitor(**values), reader  # type: ignore[arg-type]
+
+    def test_operator_control_file_sets_and_releases_the_slots(self) -> None:
+        grown: list[int] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            control = Path(temporary) / "control.json"
+            monitor, _reader = self.make_monitor(
+                9, control_path=control, ensure_checkouts=grown.append
+            )
+            self.assertIsNone(monitor.read_control())  # no file yet
+            control.write_text('{"docker_slots": 12}')
+            message = monitor.read_control()
+            self.assertIn("9 → 12", message or "")
+            self.assertEqual(
+                (monitor.docker_slots.limit, monitor.no_ai_gate.limit), (12, 10)
+            )
+            self.assertEqual(grown, [12])
+            self.assertTrue(monitor.manual)
+            self.assertFalse(monitor.governed)
+            self.assertIsNone(monitor.read_control())  # applied once per change
+            control.write_text('{"docker_slots": 1}')
+            os.utime(control, ns=(1, 2_000_000_000))
+            monitor.read_control()
+            self.assertEqual(monitor.docker_slots.limit, 3)  # at least one deterministic slot
+            control.write_text('{"docker_slots": "auto"}')
+            os.utime(control, ns=(1, 3_000_000_000))
+            self.assertIn("governor resumed", monitor.read_control() or "")
+            self.assertTrue(monitor.governed)
+            self.assertFalse(monitor.manual)
+            control.write_text("not json")
+            os.utime(control, ns=(1, 4_000_000_000))
+            self.assertIn("unreadable", monitor.read_control() or "")
+
+    def test_fixed_passes_and_calibrations_reject_the_wrong_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            control = Path(temporary) / "control.json"
+            control.write_text('{"docker_slots": "auto"}')
+            fixed, _reader = self.make_monitor(9, governed=False, control_path=control)
+            self.assertIn("fixed worker counts", fixed.read_control() or "")
+            calibrating, _reader = self.make_monitor(
+                9,
+                governed=False,
+                control_path=control,
+                calibration=resources.Calibration(low=4, high=9, window_s=600),
+            )
+            self.assertIn("calibrating", calibrating.read_control() or "")
+
+    def test_the_memory_guard_still_lowers_a_manual_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            control = Path(temporary) / "control.json"
+            control.write_text('{"docker_slots": 12}')
+            monitor, reader = self.make_monitor(9, control_path=control)
+            reader.read.return_value = (4.0, 30.0, None, None)  # quiet CPU
+            with mock.patch.object(monitor, "now", side_effect=[0.0, 5.0, 10.0]):
+                monitor.tick()
+                self.assertEqual(monitor.docker_slots.limit, 12)
+                monitor.tick()  # CPU headroom does not raise a manual setting
+                self.assertEqual(monitor.docker_slots.limit, 12)
+                reader.read.return_value = (4.0, 110.0, None, 30.0)  # memory stalls
+                monitor.tick()
+            self.assertEqual(monitor.docker_slots.limit, 9)
+            self.assertTrue(monitor.manual)
 
     def test_monitor_governs_both_gates_and_records_samples(self) -> None:
         plan = resources.estimate(host(), resources.Costs())

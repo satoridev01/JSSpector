@@ -98,6 +98,11 @@ Worker counts are derived from the host rather than fixed, by the bundled `resou
   points below the target, every deterministic slot is busy with work waiting, and the last change is
   at least 150 seconds old. Lowering the limit never interrupts a running verification. Explicit lane
   counts, `--calibrate` and `--no-governor` disable it.
+- **Operator control.** Every sample also reads `control.json` in the run directory (the TUI's `+`,
+  `-` and `a` write it): `{"docker_slots": N}` fixes the slots (at least one deterministic slot;
+  the checkout budget grows with them) and pauses the governor except for its memory guard, and
+  `{"docker_slots": "auto"}` resumes it. The deterministic pool is sized for the maximum, so the slot
+  gate, not the pool, is what bounds verifications.
 - **Calibration.** `--calibrate` forces a local, fix-free, deterministic-only pass with its own state.
   Starting at the first verification it holds half the estimated slots for 40% of the window, then
   the estimate; samples after a three-minute warm-up are fitted (least squares) against the number of
@@ -150,6 +155,7 @@ runs/jsspector-online/
     online.log
     online.json
     capacity.json          # probe, costs and plan this pass started with
+    control.json           # optional operator command: {"docker_slots": N | "auto"}
     resources.jsonl        # one whole-host sample every five seconds
     calibration.json       # --calibrate only: fit, per-level throughput and recommendation
     docker-cleanup.json

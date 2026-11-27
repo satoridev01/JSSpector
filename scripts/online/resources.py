@@ -739,8 +739,8 @@ class Sample:
     net_rx_mbps: float | None = None
 
 
-class CountedSemaphore(threading.BoundedSemaphore):
-    """A bounded semaphore that also reports how many permits are held."""
+class CountedSemaphore(threading.Semaphore):
+    """A semaphore that reports how many permits are held and can grow while holders run."""
 
     def __init__(self, value: int) -> None:
         super().__init__(value)
@@ -756,9 +756,20 @@ class CountedSemaphore(threading.BoundedSemaphore):
         return acquired
 
     def release(self, n: int = 1) -> None:
-        super().release(n)
         with self._count_lock:
+            if self._held < n:
+                raise ValueError("permit released more often than acquired")
             self._held -= n
+        super().release(n)
+
+    def grow_to(self, total: int) -> None:
+        """Raise the number of permits to `total` (never lowers it)."""
+        with self._count_lock:
+            extra = total - self.capacity
+            if extra <= 0:
+                return
+            self.capacity = total
+        super().release(extra)
 
     # threading.Semaphore aliases __enter__ to its own acquire, which would bypass the count.
     def __enter__(self) -> bool:
@@ -1051,6 +1062,9 @@ def performance_summary(
             "issues": lane_issues,
             "slot_hours": round(slot_hours, 3),
             "issues_per_slot_hour": round(lane_issues / slot_hours, 2) if slot_hours else None,
+            "slot_minutes_per_issue": (
+                round(slot_hours * 60 / lane_issues, 1) if lane_issues else None
+            ),
         }
     span_s = None
     if window:
@@ -1096,6 +1110,23 @@ def _percentages(values: dict[str, float], labels: dict[str, str] | None = None)
     )
 
 
+LANE_LABELS = {"no-ai": "deterministic", "ai": "Opus"}
+
+
+def lane_yield(lane: str, stats: dict[str, Any]) -> str:
+    """`deterministic 3 issues in 40 runs, 1 per 17 Docker-min`: whole counts, no rates."""
+    label = LANE_LABELS.get(lane, lane)
+    runs = stats["verifications"]
+    issues = stats["issues"]
+    minutes = stats["slot_hours"] * 60
+    if not issues:
+        return f"{label} no issue in {runs} runs ({minutes:.0f} Docker-min)"
+    return (
+        f"{label} {issues} issue{'s' if issues != 1 else ''} in {runs} runs, "
+        f"1 per {minutes / issues:.0f} Docker-min"
+    )
+
+
 def performance_lines(
     overall: dict[str, Any], recent: dict[str, Any], *, window: str = "last 15 min"
 ) -> list[str]:
@@ -1107,7 +1138,11 @@ def performance_lines(
         per_issue = overall["slot_minutes_per_issue"]
         docker = (
             f"Docker time  {_percentages(overall['docker_time'], OUTCOME_LABELS)}  ·  "
-            + (f"{per_issue:g} slot-min/issue" if per_issue is not None else "no issue yet")
+            + (
+                f"1 issue per {per_issue:.0f} Docker-min"
+                if per_issue is not None
+                else "no issue yet"
+            )
         )
         top = overall["top_skip_reasons"]
         phases = f"  of which   {_percentages(overall['phases'], PHASE_LABELS)}" + (
@@ -1121,15 +1156,7 @@ def performance_lines(
         if recent["samples"]
         else "Bottleneck   collecting…"
     )
-    lane_labels = {"no-ai": "deterministic", "ai": "Opus"}
-    lane_parts = []
-    for lane, stats in overall["lanes"].items():
-        rate = stats["issues_per_slot_hour"]
-        lane_parts.append(
-            f"{lane_labels.get(lane, lane)} "
-            + (f"{rate:g}" if rate is not None else "–")
-            + f" issues/slot-h ({stats['verifications']} runs)"
-        )
+    lane_parts = [lane_yield(lane, stats) for lane, stats in overall["lanes"].items()]
     lanes = "Lanes        " + (" · ".join(lane_parts) if lane_parts else "collecting…")
     return [docker, phases, bottleneck_line, lanes]
 
@@ -1450,15 +1477,14 @@ def render_calibration(result: dict[str, Any], *, target: float, profile: Path |
             continue
         rate = stats.get("verifications_per_hour")
         median_slot = stats.get("median_slot_s")
-        lane = stats.get("lanes", {}).get("no-ai", {})
-        yield_rate = lane.get("issues_per_slot_hour")
+        per_issue = stats.get("slot_minutes_per_issue")
         lines.append(
             f"  {name:<5} {level} slots for {stats['minutes']:g} min: "
             f"{stats['verifications']} verifications"
-            + (f" ({rate:g}/h)" if rate is not None else "")
+            + (f" ({rate:.0f}/h)" if rate is not None else "")
             + f", median {median_slot if median_slot is not None else '—'}s, "
             f"{stats['issues']} issues"
-            + (f" ({yield_rate:g}/slot-h)" if yield_rate is not None else "")
+            + (f" (1 per {per_issue:.0f} Docker-min)" if per_issue is not None else "")
         )
         if stats.get("verifications"):
             lines.append(
@@ -1542,6 +1568,8 @@ class Monitor(threading.Thread):
         performance: Performance | None = None,
         checkouts: Callable[[], tuple[int, int]] | None = None,
         backlog: Callable[[], int] | None = None,
+        control_path: Path | None = None,
+        ensure_checkouts: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__(name="jsspector-online-capacity", daemon=True)
         self.host = host
@@ -1562,6 +1590,11 @@ class Monitor(threading.Thread):
         self.performance = performance or Performance()
         self.checkouts = checkouts
         self.backlog = backlog
+        self.control_path = control_path
+        self.ensure_checkouts = ensure_checkouts
+        self.manual = False
+        self._governable = governed
+        self._control_stamp: int | None = None
         self.samples: list[Sample] = []
         self.started = time.monotonic()
         self._stop_event = threading.Event()
@@ -1604,6 +1637,51 @@ class Monitor(threading.Thread):
         self.docker_slots.set_limit(limit)
         self.no_ai_gate.set_limit(max(1, limit - self.ai_workers))
 
+    def read_control(self) -> str | None:
+        """Apply the operator's latest `control.json`, once per change; the message to report.
+
+        `{"docker_slots": 12}` fixes the slots (the governor pauses; only its memory guard may
+        still lower them) and `{"docker_slots": "auto"}` hands them back to the governor.
+        """
+        if self.control_path is None:
+            return None
+        try:
+            stamp = self.control_path.stat().st_mtime_ns
+        except OSError:
+            return None
+        if stamp == self._control_stamp:
+            return None
+        self._control_stamp = stamp
+        try:
+            command = json.loads(self.control_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "control: ignored an unreadable control.json"
+        value = command.get("docker_slots") if isinstance(command, dict) else None
+        if self.calibration is not None:
+            return "control: ignored while calibrating (the calibration sets the slots)"
+        current = self.docker_slots.limit
+        if value == "auto":
+            if not self._governable:
+                return "control: this pass has fixed worker counts, so there is no governor to resume"
+            self.manual = False
+            self.governed = True
+            self._state = GovernorState(
+                limit=current,
+                floor=self.plan.docker_floor,
+                ceiling=max(self.plan.docker_ceiling, current),
+            )
+            return f"control: governor resumed at {current} docker slots"
+        if isinstance(value, int) and not isinstance(value, bool):
+            limit = max(self.ai_workers + 1, min(MAX_DOCKER_SLOTS, value))
+            self.manual = True
+            self.governed = False
+            self.set_limit(limit)
+            self._state.limit = limit
+            if self.ensure_checkouts is not None:
+                self.ensure_checkouts(limit)
+            return f"control: docker slots {current} → {limit} (manual; the governor is paused)"
+        return "control: ignored an unknown command in control.json"
+
     def run(self) -> None:
         while not self._stop_event.wait(self.interval_s):
             try:
@@ -1645,7 +1723,9 @@ class Monitor(threading.Thread):
         if self.record_path is not None:
             with self.record_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(asdict(sample), sort_keys=True) + "\n")
-        message = None
+        message = self.read_control()
+        if message:
+            self.log(f"CONTROL {message}")
         if self.calibration is not None:
             new_limit, message = self.calibration.advance(sample)
             if new_limit is not None:
@@ -1655,10 +1735,16 @@ class Monitor(threading.Thread):
                 self.on_calibrated(message)
             elif message:
                 self.log(f"CALIBRATION {message}")
-        elif self.governed:
+        elif self.governed or self.manual:
             new_limit, reason = govern(
                 self._state, list(self._window), target=self.target, now=sample.t
             )
+            # A manual setting stays as set, except that the memory guard may still shed slots:
+            # running out of memory kills containers mid-verification.
+            if self.manual and not (
+                new_limit < self._state.limit and (reason or "").startswith("memory")
+            ):
+                new_limit = self._state.limit
             if new_limit != self._state.limit:
                 direction = "up" if new_limit > self._state.limit else "down"
                 message = (

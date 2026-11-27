@@ -19,14 +19,33 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Row, Table, Wrap};
 use serde::Deserialize;
 
 const EVENT_PREFIX: &str = "@@JSSPECTOR_ONLINE@@";
 const MAX_ACTIVITY: usize = 10;
+/// The controller reads this file in the run directory to change the Docker slots of a live pass.
+const CONTROL_FILE: &str = "control.json";
+const MAX_DOCKER_SLOTS: u64 = 64;
+const HELP: &[&str] = &[
+    "Keys",
+    "  + / -     raise or lower the Docker verification slots (pauses the governor;",
+    "            its memory guard may still lower them)",
+    "  a         hand the slots back to the governor",
+    "  h / ?     show or hide this help        q / Esc   stop safely (work stays resumable)",
+    "",
+    "Verification   docker active/limit (+queued) · whole-host CPU and memory",
+    "Where to improve",
+    "  Docker time  how slot time ends: issue, no repro, skipped (never driven), timeout,",
+    "               error; build/start vs probing; Docker minutes per verified issue",
+    "  Bottleneck   verification = slots full with work queued → more slots help;",
+    "               static = cloning can't keep up (network); checkouts; discovery = GitHub",
+    "  Lanes        issues and Docker minutes per issue for each lane",
+];
 /// The issue rate is shown only after this long: one early finding would otherwise read as an
 /// absurd hourly average.
 const RATE_WARMUP: Duration = Duration::from_secs(5 * 60);
@@ -54,6 +73,12 @@ struct WireEvent {
     slots: Option<u64>,
     report: Option<String>,
     lines: Option<Vec<String>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeyAction {
+    Stop,
+    Handled,
 }
 
 enum ControllerLine {
@@ -99,6 +124,9 @@ struct State {
     /// Improvement metrics from the controller: where Docker time goes, the limiting stage and
     /// each lane's yield.
     performance: Vec<String>,
+    /// Docker slots the operator asked for that the controller has not confirmed yet.
+    requested_slots: Option<u64>,
+    show_help: bool,
 }
 
 impl State {
@@ -279,6 +307,9 @@ impl State {
                 }
                 if let Some(slots) = event.slots {
                     self.docker_slots = slots;
+                    if self.requested_slots == Some(slots) {
+                        self.requested_slots = None;
+                    }
                 }
                 if let Some(waiting) = event.waiting {
                     self.docker_waiting = waiting;
@@ -317,6 +348,68 @@ impl State {
             .map_or_else(|| "–".to_owned(), |rate| format!("{rate:.1}"))
     }
 
+    /// Everything but a stop is handled here: the slot shortcuts and the help overlay.
+    fn on_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> KeyAction {
+        match code {
+            KeyCode::Esc if self.show_help => self.show_help = false,
+            KeyCode::Char('q') | KeyCode::Esc => return KeyAction::Stop,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                return KeyAction::Stop;
+            }
+            KeyCode::Char('+' | '=') => self.adjust_slots(1),
+            KeyCode::Char('-' | '_') => self.adjust_slots(-1),
+            KeyCode::Char('a') => self.resume_governor(),
+            KeyCode::Char('h' | 'H' | '?') => self.show_help = !self.show_help,
+            _ => {}
+        }
+        KeyAction::Handled
+    }
+
+    fn control_path(&self) -> Option<std::path::PathBuf> {
+        (!self.output.is_empty()).then(|| std::path::Path::new(&self.output).join(CONTROL_FILE))
+    }
+
+    /// Writes one operator command for the controller to pick up (within its 5-second sample).
+    fn send_control(&mut self, value: &serde_json::Value) -> bool {
+        let Some(path) = self.control_path() else {
+            self.activity("the run directory is not known yet; try again in a moment");
+            return false;
+        };
+        let body = serde_json::json!({ "docker_slots": value }).to_string();
+        let temporary = path.with_extension("json.tmp");
+        match std::fs::write(&temporary, body).and_then(|()| std::fs::rename(&temporary, &path)) {
+            Ok(()) => true,
+            Err(error) => {
+                self.activity(format!("cannot write {}: {error}", path.display()));
+                false
+            }
+        }
+    }
+
+    /// `+` / `-`: one more or one fewer Docker slot, from the last value asked for.
+    fn adjust_slots(&mut self, delta: i64) {
+        let base = self.requested_slots.unwrap_or(self.docker_slots);
+        if base == 0 {
+            self.activity("the Docker slots are not known yet; try again in a moment");
+            return;
+        }
+        let wanted = base.saturating_add_signed(delta).clamp(1, MAX_DOCKER_SLOTS);
+        if self.send_control(&serde_json::json!(wanted)) {
+            self.requested_slots = Some(wanted);
+            self.activity(format!(
+                "docker slots → {wanted} (applies within 5 s; governor paused; a: back to auto)"
+            ));
+        }
+    }
+
+    /// `a`: give the Docker slots back to the governor.
+    fn resume_governor(&mut self) {
+        if self.send_control(&serde_json::json!("auto")) {
+            self.requested_slots = None;
+            self.activity("asked the governor to manage the Docker slots again");
+        }
+    }
+
     /// Live capacity line for the verification panel title.
     fn capacity(&self) -> String {
         let percent = |value: Option<f64>| {
@@ -325,8 +418,11 @@ impl State {
         if self.docker_slots == 0 {
             return " Verification ".to_owned();
         }
+        let pending = self
+            .requested_slots
+            .map_or_else(String::new, |wanted| format!(" → {wanted}"));
         format!(
-            " Verification · docker {}/{} (+{} queued) · cpu {} · mem {} ",
+            " Verification · docker {}/{}{pending} (+{} queued) · cpu {} · mem {} ",
             self.docker_active,
             self.docker_slots,
             self.docker_waiting,
@@ -399,6 +495,18 @@ fn consume(receiver: &Receiver<ControllerLine>, state: &mut State) {
         } else {
             state.activity(value);
         }
+    }
+}
+
+/// A `width` × `height` rectangle centered in `area`, shrunk to fit.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
     }
 }
 
@@ -510,11 +618,6 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
             format!("{} repos", state.verified_repositories),
         ]),
         Row::new(vec![
-            "Issues per hour".to_owned(),
-            state.issue_rate(started.elapsed()),
-            "average".to_owned(),
-        ]),
-        Row::new(vec![
             "Proven fixes".to_owned(),
             state.fixes_proven.to_string(),
             format!("{} tried", state.fixes_attempted),
@@ -587,12 +690,24 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &State, started: Instant) {
     let footer = if state.stopping {
         "Stopping safely… completed work will be resumable"
     } else {
-        "q / Ctrl-C: stop safely  ·  static findings never sync without verified exploitation"
+        "q stop  ·  +/- docker slots  ·  a auto  ·  h help  ·  static findings never sync without verified exploitation"
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
         *footer_area,
     );
+    if state.show_help {
+        let area = centered(frame.area(), 90, HELP.len() as u16 + 2);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(HELP.iter().map(|line| Line::raw(*line)).collect::<Vec<_>>()).block(
+                Block::default()
+                    .title(" Help · h, ? or Esc to close ")
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -700,10 +815,7 @@ pub(crate) fn run(mut command: Command) -> io::Result<ExitStatus> {
             if event::poll(Duration::from_millis(80))?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
-                && (key.code == KeyCode::Char('q')
-                    || key.code == KeyCode::Esc
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)))
+                && state.on_key(key.code, key.modifiers) == KeyAction::Stop
             {
                 if state.stopping {
                     state.activity("forcing the unresponsive controller to exit");
@@ -827,6 +939,87 @@ mod tests {
     }
 
     #[test]
+    fn slot_shortcuts_write_the_control_file_and_wait_for_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new();
+        state.adjust_slots(1);
+        assert!(
+            state.requested_slots.is_none(),
+            "nothing to adjust before the first sample"
+        );
+        state.output = dir.path().display().to_string();
+        state.docker_slots = 9;
+        let control = dir.path().join(CONTROL_FILE);
+        let read = || std::fs::read_to_string(&control).unwrap();
+        assert_eq!(
+            state.on_key(KeyCode::Char('+'), KeyModifiers::NONE),
+            KeyAction::Handled
+        );
+        assert_eq!(read(), r#"{"docker_slots":10}"#);
+        state.on_key(KeyCode::Char('+'), KeyModifiers::NONE);
+        state.on_key(KeyCode::Char('+'), KeyModifiers::NONE);
+        assert_eq!(read(), r#"{"docker_slots":12}"#);
+        assert_eq!(
+            state.capacity(),
+            " Verification · docker 0/9 → 12 (+0 queued) · cpu – · mem – "
+        );
+        state.apply(
+            serde_json::from_str::<WireEvent>(r#"{"type":"resources","slots":12,"active":9}"#)
+                .unwrap(),
+        );
+        assert_eq!(state.requested_slots, None);
+        state.on_key(KeyCode::Char('-'), KeyModifiers::NONE);
+        assert_eq!(read(), r#"{"docker_slots":11}"#);
+        state.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(read(), r#"{"docker_slots":"auto"}"#);
+        assert_eq!(state.requested_slots, None);
+        state.docker_slots = 1;
+        state.on_key(KeyCode::Char('-'), KeyModifiers::NONE);
+        assert_eq!(read(), r#"{"docker_slots":1}"#);
+    }
+
+    #[test]
+    fn help_toggles_and_esc_closes_it_before_stopping() {
+        let mut state = State::new();
+        assert_eq!(
+            state.on_key(KeyCode::Char('h'), KeyModifiers::NONE),
+            KeyAction::Handled
+        );
+        assert!(state.show_help);
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &state, Instant::now()))
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        for expected in [
+            "Help",
+            "+ / -",
+            "hand the slots back to the governor",
+            "Bottleneck",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        assert_eq!(
+            state.on_key(KeyCode::Esc, KeyModifiers::NONE),
+            KeyAction::Handled
+        );
+        assert!(!state.show_help);
+        assert_eq!(
+            state.on_key(KeyCode::Esc, KeyModifiers::NONE),
+            KeyAction::Stop
+        );
+        assert_eq!(
+            state.on_key(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyAction::Stop
+        );
+        assert_eq!(
+            state.on_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyAction::Stop
+        );
+    }
+
+    #[test]
     fn improvement_panel_shows_the_controller_lines() {
         let mut state = State::new();
         state.apply(
@@ -874,7 +1067,6 @@ mod tests {
             "Opus 5.5",
             "Outcomes",
             "Verified findings",
-            "Issues per hour",
             "issues –/h",
             "Where to improve",
             "collecting…",

@@ -257,10 +257,13 @@ fn differential_controls_preserve_the_request_and_bounded_response() {
 
 #[test]
 fn nosql_body_query_override_is_explicit_in_the_evidence() {
-    let evidence = nosql_differential_evidence("user_id", true);
+    let evidence = nosql_differential_evidence("user_id", &[], true);
     assert!(evidence.contains("validator-compatible scalar `user_id`"));
     assert!(evidence.contains("{ ...request.body, ...request.query }"));
-    assert!(!nosql_differential_evidence("user_id", false).contains("JSON body"));
+    assert!(!nosql_differential_evidence("user_id", &[], false).contains("JSON body"));
+
+    let credentials = nosql_differential_evidence("email", &["password"], false);
+    assert!(credentials.contains("`email: {$ne}`, `password: {$ne}`"));
 }
 
 #[test]

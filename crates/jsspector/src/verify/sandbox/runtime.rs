@@ -6136,9 +6136,30 @@ pub(super) fn control_observation(
     }
 }
 
-pub(super) fn nosql_differential_evidence(field: &str, body_query_override: bool) -> String {
+pub(super) fn nosql_differential_evidence(
+    field: &str,
+    operator_siblings: &[&str],
+    body_query_override: bool,
+) -> String {
+    let mut operator_fields = vec![field];
+    operator_fields.extend(
+        operator_siblings
+            .iter()
+            .copied()
+            .filter(|name| *name != field),
+    );
+    let operators = operator_fields
+        .iter()
+        .map(|name| format!("`{name}: {{$ne}}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if operator_fields.len() == 1 {
+        "operator"
+    } else {
+        "operators"
+    };
     let mut evidence = format!(
-        "a match-all operator (`{field}: {{$ne}}`) returned a record that the match-none operators \
+        "match-all {noun} ({operators}) returned a record that the match-none operators \
          (`$eq`, `$in: []`) did not, proving the object was interpreted as a MongoDB query operator \
          rather than a scalar"
     );

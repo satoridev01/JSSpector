@@ -8194,6 +8194,21 @@ fn sink_filters_documents(api: &str) -> bool {
         || name == "bulkwrite")
 }
 
+/// Other request-body fields that participate in the same NoSQL filter as the primary tainted
+/// field. Marking these lets the verifier apply the same operator to every attacker-controlled
+/// credential predicate: `findOne({ email, password })` is bypassed by operators in both fields,
+/// while `findOne({ email }); bcrypt.compare(password, ...)` keeps `password` scalar because it is
+/// absent from the sink argument.
+pub fn nosql_filter_sibling_fields(sink_arg: &str, primary: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    for token in identifier_tokens(sink_arg) {
+        if token != primary && !fields.contains(&token) {
+            fields.push(token);
+        }
+    }
+    fields
+}
+
 /// Whether a NoSQL sink changes existing records rather than only reading/filtering them.
 fn sink_mutates_documents(api: &str) -> bool {
     let name = api.rsplit('.').next().unwrap_or(api).to_ascii_lowercase();

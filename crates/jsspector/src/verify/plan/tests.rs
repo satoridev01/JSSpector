@@ -3938,3 +3938,15 @@ fn byte_capped_statements_never_split_a_character() {
     assert_eq!(super::capped_end("ascii only", 400, 300), 10);
     assert_eq!(super::aliases(&source, "body", "a"), ["a"]);
 }
+
+#[test]
+fn nosql_filter_siblings_come_from_the_sink_filter_only() {
+    assert_eq!(
+        super::nosql_filter_sibling_fields("{ email, password }", "email"),
+        ["password"]
+    );
+    assert!(
+        super::nosql_filter_sibling_fields("{ email }", "email").is_empty(),
+        "a password used only by bcrypt must remain a scalar"
+    );
+}

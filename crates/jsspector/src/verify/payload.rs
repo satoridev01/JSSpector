@@ -10,6 +10,7 @@ use jss_core::VulnClass;
 /// The harmless value every non-payload envelope member is filled with, so a handler's early
 /// presence guard (`!obj.from`) passes while the proof still rides the one payload-bearing member.
 const ENVELOPE_PLACEHOLDER: &str = "jsspector";
+pub(super) const NOSQL_OPERATOR_PLACEHOLDER: &str = "__jsspector_nosql_operator__";
 
 /// The network alias the sandbox gives the marker service. An outbound request aimed here reaches
 /// the marker; kept in one place so the host-only SSRF payload and [`Canary::service_url`] agree.
@@ -1626,10 +1627,10 @@ fn nosql_body_case(
             .as_ref()
             .is_some_and(|name| name != field && nosql_identity_sibling(name)));
     let body = |operator: String, identity: u64| {
-        let operator = if wrap_array {
+        let primary_operator = if wrap_array {
             format!("[{operator}]")
         } else {
-            operator
+            operator.clone()
         };
         let mut members = probe.siblings.clone();
         if let Some(name) = primary
@@ -1639,7 +1640,7 @@ fn nosql_body_case(
             members.push((name.clone(), ENVELOPE_PLACEHOLDER.to_owned()));
         }
         members.retain(|(key, _)| key != field);
-        let mut obj = format!("{{\"{}\":{operator}", json_escape(field));
+        let mut obj = format!("{{\"{}\":{primary_operator}", json_escape(field));
         for (key, value) in &members {
             // An unconstrained generic filler becomes a per-probe-unique numeric value: a
             // registration-style handler that inserts the request under a unique key (`username`) then
@@ -1649,24 +1650,30 @@ fn nosql_body_case(
             // document-filtering sink the opposite is needed: the sibling is ANDed into the query, so
             // it must stay one constant string across all three probes (and match the seeded record)
             // and remain a string the handler can call `.toLowerCase()`/`.trim()` on, never a number.
-            let value = if probe.nosql_inserts_before_sink
+            let (value, raw_operator) = if value == NOSQL_OPERATOR_PLACEHOLDER {
+                (operator.clone(), true)
+            } else if probe.nosql_inserts_before_sink
                 && value == "jsspector"
                 && nosql_identity_sibling(key)
             {
-                format!("jsspector-{identity}")
+                (format!("jsspector-{identity}"), false)
             } else if value == ENVELOPE_PLACEHOLDER {
                 if (probe.nosql_lookup && !probe.nosql_inserts_before_sink) || has_unique_identity {
-                    ENVELOPE_PLACEHOLDER.to_owned()
+                    (ENVELOPE_PLACEHOLDER.to_owned(), false)
                 } else {
-                    identity.to_string()
+                    (identity.to_string(), false)
                 }
             } else {
-                value.clone()
+                (value.clone(), false)
             };
             obj.push_str(&format!(
                 ",\"{}\":{}",
                 json_escape(key),
-                json_member_value(&value)
+                if raw_operator {
+                    value
+                } else {
+                    json_member_value(&value)
+                }
             ));
         }
         obj.push('}');
@@ -4825,6 +4832,43 @@ mod tests {
             )
         );
         assert_ne!(identity[0], identity[1]);
+    }
+
+    #[test]
+    fn nosql_cases_apply_operators_to_every_filter_credential() {
+        let canary = Canary::new("abc123".to_owned());
+        let mut p = probe(
+            VulnClass::NosqlInjection,
+            "/user/login",
+            Entry::Body(Some("email".to_owned())),
+        );
+        p.siblings = vec![("password".to_owned(), NOSQL_OPERATOR_PLACEHOLDER.to_owned())];
+
+        let absent = nosql_absent_token(&canary, 4);
+        let cases = nosql_cases(&p, &canary, 4);
+        let email = cases.iter().find(|case| case.field == "email").unwrap();
+        assert_eq!(
+            email.match_all.body.as_deref(),
+            Some(
+                format!(
+                    "{{\"email\":{{\"$ne\":\"{absent}\"}},\"password\":{{\"$ne\":\"{absent}\"}}}}"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            email.match_none_eq.body.as_deref(),
+            Some(
+                format!(
+                    "{{\"email\":{{\"$eq\":\"{absent}\"}},\"password\":{{\"$eq\":\"{absent}\"}}}}"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            email.match_none_in.body.as_deref(),
+            Some("{\"email\":{\"$in\":[]},\"password\":{\"$in\":[]}}")
+        );
     }
 
     #[test]

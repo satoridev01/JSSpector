@@ -622,6 +622,16 @@ fn run_with_policy(
                 }
             }
             probe.siblings = siblings;
+            if finding.class == VulnClass::NosqlInjection
+                && let plan::Entry::Body(Some(primary)) = &probe.entry
+            {
+                let filter_siblings = plan::nosql_filter_sibling_fields(&finding.sink.arg, primary);
+                for (name, value) in &mut probe.siblings {
+                    if filter_siblings.contains(name) {
+                        *value = payload::NOSQL_OPERATOR_PLACEHOLDER.to_owned();
+                    }
+                }
+            }
             if part == "body" {
                 probe.multipart = plan::multipart_form(&source, &target);
                 // The tainted body field may be an array of objects the handler iterates, with the

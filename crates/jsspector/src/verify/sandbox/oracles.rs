@@ -1207,11 +1207,27 @@ impl Session {
                 (&match_none_in, match_none_in_status, &match_none_in_cookies),
                 &case.absent,
             );
+            if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+                eprintln!(
+                    "[verify] nosql differential field={} match-all-status={match_all_status:?} match-all-cookies={match_all_cookies:?} match-none-eq-status={match_none_eq_status:?} match-none-eq-cookies={match_none_eq_cookies:?} match-none-in-status={match_none_in_status:?} match-none-in-cookies={match_none_in_cookies:?} reproduced={reproduced}",
+                    case.field,
+                );
+            }
             if self.accept_bound_effect_with_hit(reproduced, match_all_hit) {
                 let attempt = &case.match_all;
                 let command = include_response_headers(self.poc_command(attempt));
-                let mut evidence =
-                    nosql_differential_evidence(&case.field, probe.body_query_override.is_some());
+                let operator_siblings: Vec<&str> = probe
+                    .siblings
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        (value == payload::NOSQL_OPERATOR_PLACEHOLDER).then_some(name.as_str())
+                    })
+                    .collect();
+                let mut evidence = nosql_differential_evidence(
+                    &case.field,
+                    &operator_siblings,
+                    probe.body_query_override.is_some(),
+                );
                 if authentication_endpoint(&probe.path) {
                     evidence.push_str(
                         "; the match-all response issued an authentication credential that neither match-none control received",
@@ -1521,13 +1537,18 @@ fn nosql_response_proves_impact(
     if !payload::nosql_reproduced(match_all.0, match_none_eq.0, match_none_in.0, absent) {
         return false;
     }
-    if !match_all
-        .1
-        .is_some_and(|status| (200..300).contains(&status))
-    {
+    let authentication = authentication_endpoint(path);
+    // Successful form logins commonly answer with a 302 and set their session cookie on that
+    // redirect. Treat that as success only for an authentication endpoint and only when the
+    // credential oracle below confirms a newly issued session; ordinary read differentials remain
+    // restricted to 2xx responses.
+    let completed = match_all.1.is_some_and(|status| {
+        (200..300).contains(&status) || (authentication && (300..400).contains(&status))
+    });
+    if !completed {
         return false;
     }
-    if !authentication_endpoint(path) {
+    if !authentication {
         return true;
     }
     issued_session(match_all.0, match_all.2)
@@ -1628,6 +1649,22 @@ mod oracle_tests {
         assert!(nosql_response_proves_impact(
             "/api/auth/login",
             (authenticated, Some(200), NO_COOKIES),
+            controls,
+            controls,
+            "absent",
+        ));
+
+        let redirect_cookie = ["uid=6b62d; Path=/; HttpOnly".to_owned()];
+        assert!(nosql_response_proves_impact(
+            "/user/login",
+            ("Found. Redirecting to /", Some(302), &redirect_cookie),
+            controls,
+            controls,
+            "absent",
+        ));
+        assert!(!nosql_response_proves_impact(
+            "/user/login",
+            ("Found. Redirecting to /", Some(302), NO_COOKIES),
             controls,
             controls,
             "absent",

@@ -354,8 +354,9 @@ struct OnlineArgs {
     /// Idle decision point for one candidate before it has made a real request.
     #[arg(long, default_value_t = 180)]
     verify_candidate_soft_timeout: usize,
-    /// Maximum seconds for a candidate that has made real request progress.
-    #[arg(long, default_value_t = 300)]
+    /// Maximum seconds for a candidate that has made real request progress but never reached its
+    /// sink (sink or canary evidence lifts this limit).
+    #[arg(long, default_value_t = 180)]
     verify_candidate_hard_timeout: usize,
     /// Normal seconds for strict dynamic verification of one repository.
     #[arg(long, default_value_t = 900)]
@@ -1163,7 +1164,7 @@ mod repository_input_tests {
         assert_eq!(args.static_timeout, 600);
         assert_eq!(args.verify_startup_timeout, 180);
         assert_eq!(args.verify_candidate_soft_timeout, 180);
-        assert_eq!(args.verify_candidate_hard_timeout, 300);
+        assert_eq!(args.verify_candidate_hard_timeout, 180);
         assert_eq!(args.verify_timeout, 900);
         assert_eq!(args.verify_extended_timeout, 1800);
         assert_eq!(args.fix_timeout, 600);

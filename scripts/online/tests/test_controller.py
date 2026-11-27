@@ -524,7 +524,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args.max_repo_size_mb, 100)
         self.assertEqual(args.verify_startup_timeout, 180)
         self.assertEqual(args.verify_candidate_soft_timeout, 180)
-        self.assertEqual(args.verify_candidate_hard_timeout, 300)
+        self.assertEqual(args.verify_candidate_hard_timeout, 180)
         self.assertEqual(args.verify_timeout, 900)
         self.assertEqual(args.verify_extended_timeout, 1800)
         self.assertEqual(args.ai_attempts, 1)

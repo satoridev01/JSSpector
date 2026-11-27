@@ -1519,7 +1519,7 @@ def verify_repository(
     slug = repository.replace("/", "__")
     startup_timeout = getattr(args, "verify_startup_timeout", 180)
     candidate_soft_timeout = getattr(args, "verify_candidate_soft_timeout", 180)
-    candidate_hard_timeout = getattr(args, "verify_candidate_hard_timeout", 300)
+    candidate_hard_timeout = getattr(args, "verify_candidate_hard_timeout", 180)
     extended_timeout = getattr(args, "verify_extended_timeout", 1800)
     verified_path = run_dir / "reports" / f"{slug}.{lane}.verified.json"
     emit_event(
@@ -2199,8 +2199,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--verify-candidate-hard-timeout",
         type=positive,
-        default=300,
-        help="candidate ceiling after real request activity (default: 300s)",
+        default=180,
+        help=(
+            "ceiling for a candidate whose requests never reached its sink (default: 180s; "
+            "every verified exploit showed its first sink hit within about a minute)"
+        ),
     )
     parser.add_argument(
         "--verify-timeout",

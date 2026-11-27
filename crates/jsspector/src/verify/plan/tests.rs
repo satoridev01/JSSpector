@@ -3935,6 +3935,6 @@ fn byte_capped_statements_never_split_a_character() {
     assert_eq!(rhs.find('鈹'), Some(299));
     assert_eq!(super::capped_end(rhs, rhs.len(), 300), 299);
     assert_eq!(super::capped_end(rhs, 10, 300), 10);
-    assert_eq!(super::capped_end("ascii only", 400, 300), 10.min(400));
+    assert_eq!(super::capped_end("ascii only", 400, 300), 10);
     assert_eq!(super::aliases(&source, "body", "a"), ["a"]);
 }

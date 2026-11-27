@@ -1,0 +1,18 @@
+{
+  "id": "3b2fe3d9562a8f13",
+  "class": "command-injection",
+  "sink": "exec",
+  "introduces": [
+    "String",
+    "basename",
+    "includes",
+    "test",
+    "toLowerCase"
+  ],
+  "note": "When a shell command must select one installed executable, coerce the input to a string, reject shell metacharacters with a strict path-character allowlist, and allow only known executable basenames. Prefer execFile with a fixed argument array when exact-sink verification can preserve a functional benign control.",
+  "before": "const tool = req.query.tool || 'tool';\nexec(`\"${tool}\" list --json`, callback);",
+  "after": "const tool = (() => {\n  const command = String(req.query.tool || 'tool');\n  const safePath = /^[A-Za-z0-9_./:\\\\ -]+$/.test(command);\n  const allowed = ['tool', 'tool.exe'].includes(path.basename(command).toLowerCase());\n  return safePath && allowed ? command : 'tool';\n})();\nexec(`\"${tool}\" list --json`, callback);",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

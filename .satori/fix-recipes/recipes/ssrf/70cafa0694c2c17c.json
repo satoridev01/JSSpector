@@ -12,9 +12,10 @@
     "address",
     "callback"
   ],
+  "note": "Validate every address returned by DNS in the HTTP(S) agent lookup and repeat validation on redirects. Normalize IPv4-mapped IPv6 literals (::ffff:a.b.c.d) to IPv4 before BlockList.check; adding ::ffff:0:0/96 to a Node BlockList can incorrectly classify public IPv4 addresses.",
   "before": "",
-  "after": "const net = require('net');\nconst dns = require('dns');\nconst http = require('http');\nconst https = require('https');\nconst forbiddenAddresses = new net.BlockList();\n[['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 3]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, 'ipv4'));\n[['::', 127], ['::ffff:0:0', 96], ['64:ff9b::', 96], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, 'ipv6'));\nconst isForbiddenAddress = (address) => {\n  const host = String(address || '').replace(/^\\[|\\]$/g, '');\n  const family = net.isIP(host);",
-  "proven": 1,
+  "after": "const net = require('net');\nconst dns = require('dns');\nconst http = require('http');\nconst https = require('https');\nconst forbiddenAddresses = new net.BlockList();\n[['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 3]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, 'ipv4'));\n[['::', 127], ['64:ff9b::', 96], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, 'ipv6'));\nconst isForbiddenAddress = (address) => {\n  const host = String(address || '').replace(/^\\[|\\]$/g, '');\n  const mapped = host.match(/^::ffff:(\\d+\\.\\d+\\.\\d+\\.\\d+)$/i);\n  if (mapped) return forbiddenAddresses.check(mapped[1], 'ipv4');\n  const family = net.isIP(host);",
+  "proven": 2,
   "offered": 1,
   "first_try": 0
 }

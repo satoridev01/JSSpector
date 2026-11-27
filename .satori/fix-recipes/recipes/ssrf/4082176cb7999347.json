@@ -12,8 +12,9 @@
     "forEach",
     "galaxyDomain"
   ],
+  "note": "Normalize IPv4-mapped IPv6 literals to IPv4 before BlockList.check; do not add ::ffff:0:0/96 to Node's BlockList because it can classify public IPv4 addresses as blocked.",
   "before": "",
-  "after": "import net from \"node:net\";\nimport dns from \"node:dns/promises\";\nconst forbiddenAddresses = new net.BlockList();\n[[\"0.0.0.0\", 8], [\"10.0.0.0\", 8], [\"100.64.0.0\", 10], [\"127.0.0.0\", 8], [\"169.254.0.0\", 16], [\"172.16.0.0\", 12], [\"192.0.0.0\", 24], [\"192.168.0.0\", 16], [\"198.18.0.0\", 15], [\"224.0.0.0\", 3]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv4\"));\n[[\"::\", 127], [\"::ffff:0:0\", 96], [\"64:ff9b::\", 96], [\"fc00::\", 7], [\"fe80::\", 10], [\"ff00::\", 8]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv6\"));\nconst assertPublicUrl = async (url) => {\n  const { protocol, hostname } = new URL(url);\n  if (!/^https?:$/.test(protocol)) throw new Error(\"Galaxy domain not allowed\");\n  const addresses = await dns.lookup(hostname.re…",
+  "after": "import net from \"node:net\";\nimport dns from \"node:dns/promises\";\nconst forbiddenAddresses = new net.BlockList();\n[[\"0.0.0.0\", 8], [\"10.0.0.0\", 8], [\"100.64.0.0\", 10], [\"127.0.0.0\", 8], [\"169.254.0.0\", 16], [\"172.16.0.0\", 12], [\"192.0.0.0\", 24], [\"192.168.0.0\", 16], [\"198.18.0.0\", 15], [\"224.0.0.0\", 3]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv4\"));\n[[\"::\", 127], [\"64:ff9b::\", 96], [\"fc00::\", 7], [\"fe80::\", 10], [\"ff00::\", 8]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv6\"));\nconst assertPublicUrl = async (url) => {\n  const { protocol, hostname } = new URL(url);\n  if (!/^https?:$/.test(protocol)) throw new Error(\"Galaxy domain not allowed\");\n  const addresses = await dns.lookup(hostname.re…",
   "proven": 1,
   "offered": 0,
   "first_try": 0

@@ -2297,7 +2297,7 @@ def candidates_from_file(
         seen.add(repository)
         if repository.casefold() not in completed:
             repositories.append(repository)
-    pool = github_pool()
+    pool = github_pool(on_status=lambda message: log(f"DISCOVERY {message}"))
     wanted: list[discover.Candidate] = []
     rejected = []
     pvr_errors = []
@@ -2309,6 +2309,10 @@ def candidates_from_file(
         for offset in range(0, len(repositories), batch_size):
             if args.limit and len(wanted) >= args.limit:
                 break
+            log(
+                f"REPOS_FILE checking {min(offset + batch_size, len(repositories))}/"
+                f"{len(repositories)} (metadata and private vulnerability reporting)"
+            )
             batch = repositories[offset:offset + batch_size]
             metadata = list(pvr_executor.map(pool.repository, batch))
             statuses = (

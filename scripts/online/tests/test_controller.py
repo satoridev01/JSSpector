@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from argparse import Namespace
 from datetime import datetime, timezone
@@ -587,6 +588,22 @@ class ControllerTests(unittest.TestCase):
                 os.environ.pop("GITHUB_TOKENS", None)
                 controller.github_tokens()
             self.assertTrue(any("readable by others" in line for line in logs))
+
+    def test_the_pool_skips_an_exhausted_token(self) -> None:
+        # One account out of core calls until its reset (satoridev05 after a full 24-hour window)
+        # must not park every third call; the other tokens serve while it waits.
+        pool = github.TokenPool(["exhausted", "b", "c"])
+        exhausted, second, third = pool.sessions
+        now = time.time()
+        exhausted.core.remaining, exhausted.core.reset = 0, now + 1500
+        picked = {id(pool._next()) for _ in range(12)}
+        self.assertEqual(picked, {id(second), id(third)})
+        # The search window is separate: the same token still serves searches.
+        self.assertIn(id(exhausted), {id(pool._next("search")) for _ in range(6)})
+        # Every token exhausted: the one whose window resets first.
+        second.core.remaining, second.core.reset = 0, now + 300
+        third.core.remaining, third.core.reset = 0, now + 900
+        self.assertIs(pool._next(), second)
 
     def test_no_github_token_is_a_clear_error(self) -> None:
         missing = subprocess.CompletedProcess(["gh"], 1, "", "not logged in")

@@ -47,6 +47,14 @@ class Budget:
         self.reset = 0.0
         self.waited = 0.0
 
+    def available_by(self):
+        """When this window can serve its next call (now, unless exhausted or deferred)."""
+        with self._lock:
+            ready = self._next
+            if self.remaining is not None and self.remaining <= self.reserve:
+                ready = max(ready, self.reset + 1)
+            return ready
+
     def acquire(self, should_stop=lambda: False):
         """Block until this token may make the next call, unless the run is stopping."""
         with self._lock:
@@ -176,7 +184,7 @@ class Session:
 
 
 class TokenPool:
-    """A pool of tokens that spreads calls across them, round-robin."""
+    """A pool of tokens that spreads calls across them, round-robin among those with budget."""
 
     def __init__(
         self, tokens, should_stop=lambda: False, on_status=lambda _message: None
@@ -187,9 +195,17 @@ class TokenPool:
         self._turn = itertools.cycle(self.sessions)
         self._lock = threading.Lock()
 
-    def _next(self):
+    def _next(self, kind="core"):
+        """The next token in turn whose `kind` window can serve now; when every token is
+        exhausted or deferred, the one that frees up first. A blind turn would park one call in
+        three behind an exhausted account and stall every batch until its window resets."""
         with self._lock:
-            return next(self._turn)
+            now = time.time()
+            for _ in range(len(self.sessions)):
+                session = next(self._turn)
+                if getattr(session, kind).available_by() <= now + 1:
+                    return session
+            return min(self.sessions, key=lambda item: getattr(item, kind).available_by())
 
     @property
     def waited(self):
@@ -221,7 +237,7 @@ class TokenPool:
         """One page of a repository search -> (items, total_count); (None, 0) on failure."""
         url = (f"{API}/search/repositories?q={urllib.parse.quote(query)}"
                f"&per_page={SEARCH_PAGE}&page={page}&sort=updated&order=desc")
-        session = self._next()
+        session = self._next("search")
         status, payload = session.call(url, session.search)
         if status != 200 or payload is None:
             return None, 0

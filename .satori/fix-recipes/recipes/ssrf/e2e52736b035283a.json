@@ -16,6 +16,6 @@
   "before": "  const url = `${baseUrl}/realtime/${websiteId}`;\n  const response = await fetch(url, { headers });\nconst url = `${baseUrl}/websites/${websiteId}/stats?startAt=${startTime}&endAt=${endDate}`;\nconst response = await fetch(url, { headers });",
   "after": "const net = require(\"net\");\nconst dns = require(\"dns\").promises;\nconst forbiddenAddresses = new net.BlockList();\n[[\"0.0.0.0\", 8], [\"10.0.0.0\", 8], [\"100.64.0.0\", 10], [\"127.0.0.0\", 8], [\"169.254.0.0\", 16], [\"172.16.0.0\", 12], [\"192.0.0.0\", 24], [\"192.168.0.0\", 16], [\"198.18.0.0\", 15], [\"224.0.0.0\", 3]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv4\"));\n[[\"::\", 127], [\"64:ff9b::\", 96], [\"fc00::\", 7], [\"fe80::\", 10], [\"ff00::\", 8]]\n  .forEach(([address, prefix]) => forbiddenAddresses.addSubnet(address, prefix, \"ipv6\"));\nasync function assertPublicUrl(url) {\n  const { protocol, hostname } = new URL(url);\n  if (!/^https?:$/.test(protocol)) throw new Error(\"Umami URL not allowed\");\n  const addresses = await dns.lookup(hostname.replace(/…",
   "proven": 2,
-  "offered": 12,
+  "offered": 13,
   "first_try": 6
 }

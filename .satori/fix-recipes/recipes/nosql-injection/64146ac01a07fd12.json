@@ -1,0 +1,13 @@
+{
+  "id": "64146ac01a07fd12",
+  "class": "nosql-injection",
+  "sink": "find",
+  "introduces": [
+    "String"
+  ],
+  "before": "products = await Product.find({ category });\nproducts = await Product.find({ subCategory });",
+  "after": "products = await Product.find({ category: String(category) });\nproducts = await Product.find({ subCategory: String(subCategory) });",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

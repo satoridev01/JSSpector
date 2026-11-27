@@ -1,0 +1,13 @@
+{
+  "id": "a5936c35c6e82aa7",
+  "class": "path-traversal",
+  "sink": "readFileSync",
+  "introduces": [
+    "startsWith"
+  ],
+  "before": "import { join, extname } from 'node:path';\n  if (existsSync(filePath) && statSync(filePath).isDirectory()) {\n  if (!existsSync(filePath)) {",
+  "after": "import { join, extname, sep } from 'node:path';\n  if (filePath.startsWith(DIST + sep) && existsSync(filePath) && statSync(filePath).isDirectory()) {\n  if (!filePath.startsWith(DIST + sep) || !existsSync(filePath)) {",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

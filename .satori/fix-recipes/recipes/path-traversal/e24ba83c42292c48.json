@@ -13,6 +13,6 @@
   "before": "",
   "after": "if (!filePath.startsWith(process.cwd() + path.sep)) {\n  res.writeHead(404);\n  res.end('404');\n  return;\n}",
   "proven": 1,
-  "offered": 9,
-  "first_try": 6
+  "offered": 10,
+  "first_try": 7
 }

@@ -12,6 +12,6 @@
   "before": "",
   "after": "const apiDir = path.resolve(DIST_DIR, 'api');\nif (!path.resolve(jsonFilePath).startsWith(apiDir + path.sep) || !path.resolve(indexJsonPath).startsWith(apiDir + path.sep)) {\n  return next();\n}",
   "proven": 1,
-  "offered": 1,
-  "first_try": 1
+  "offered": 2,
+  "first_try": 2
 }

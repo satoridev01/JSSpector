@@ -1,0 +1,14 @@
+{
+  "id": "a186fc22d8b5e764",
+  "class": "path-traversal",
+  "sink": "sendFile",
+  "introduces": [
+    "basename",
+    "require"
+  ],
+  "before": "fs.readFile(__dirname + '/files/' + req.params.file, function (err) {\nres.sendFile(__dirname + '/files/' + req.params.file);",
+  "after": "var path = require('path');\n    fs.readFile(__dirname + '/files/' + path.basename(req.params.file), function (err) {\n    res.sendFile(__dirname + '/files/' + path.basename(req.params.file));",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

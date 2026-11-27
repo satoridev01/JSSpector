@@ -3,6 +3,11 @@ name: Publish wheels to PyPI
 on:
   release:
     types: [published]
+  # Releases created by the cargo-dist workflow use GITHUB_TOKEN. GitHub deliberately does not
+  # emit another `release` workflow event for those, so chain from the successful Release run.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -16,6 +21,7 @@ permissions:
 jobs:
   build-wheels:
     name: wheel (${{ matrix.target }})
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.event.workflow_run.head_branch }}
           persist-credentials: false
       - name: Build wheel
         uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4

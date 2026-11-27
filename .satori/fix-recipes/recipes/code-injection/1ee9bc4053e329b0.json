@@ -9,6 +9,6 @@
   "before": "username = eval(code) // eslint-disable-line no-eval",
   "after": "username = entities.encode(code)",
   "proven": 1,
-  "offered": 0,
+  "offered": 1,
   "first_try": 0
 }

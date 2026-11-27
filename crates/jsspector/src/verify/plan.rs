@@ -2536,10 +2536,14 @@ fn identifier_tokens(text: &str) -> Vec<String> {
 pub(crate) fn tainted_identifiers(finding: &Finding, entry: &Entry) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     match entry {
+        // A catch-all route may represent its sole anonymous `{}` slot as an empty name. Empty
+        // strings are not identifiers and searching source text for one never advances.
         Entry::Query(name)
         | Entry::PathParam(name)
         | Entry::Header(name)
-        | Entry::Body(Some(name)) => {
+        | Entry::Body(Some(name))
+            if !name.is_empty() =>
+        {
             names.push(name.clone());
         }
         _ => {}

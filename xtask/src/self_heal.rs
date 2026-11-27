@@ -83,6 +83,322 @@ struct RepositoryLock {
     _file: File,
 }
 
+const PUBLIC_RECIPE_SCOPE: &str = ".satori/fix-recipes/recipes";
+
+/// The public half of fix learning. A successful proof may update an anonymous recipe, but the
+/// exact replay example remains in the private store. Promotion is deliberately a release
+/// transaction: validate the data boundary, commit the corpus, bump the patch version, validate
+/// the binary that embeds it, then atomically publish the branch and tag.
+pub fn promote_recipes(root: &Path, push: bool) -> Result<()> {
+    let _integration_lock = acquire_integration_lock()?;
+    let changed = recipe_changes(root)?;
+    if changed.is_empty() {
+        eprintln!("evolve recipes: nothing new to promote");
+        return Ok(());
+    }
+    validate_public_recipe_corpus(root)?;
+    command_ok(
+        Command::new("git")
+            .current_dir(root)
+            .args(["add", "--", PUBLIC_RECIPE_SCOPE]),
+        "stage anonymous fix recipes".to_owned(),
+    )?;
+    validate_staged_recipe_scope(root)?;
+    let staged = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "--cached", "--quiet", "--", PUBLIC_RECIPE_SCOPE])
+        .status()
+        .context("inspect staged recipe evolution")?;
+    if staged.success() {
+        eprintln!("evolve recipes: nothing new to promote");
+        return Ok(());
+    }
+    if staged.code() != Some(1) {
+        bail!("could not inspect staged recipe evolution");
+    }
+    command_ok(
+        Command::new("git").current_dir(root).args([
+            "-c",
+            "user.name=JSSpector evolve",
+            "-c",
+            "user.email=evolve@localhost.invalid",
+            "commit",
+            "-m",
+            "Evolve public fix recipes",
+            "--",
+            PUBLIC_RECIPE_SCOPE,
+        ]),
+        "commit anonymous fix recipes".to_owned(),
+    )?;
+    let release = prepare_patch_release(root)?;
+    validate_recipe_release(root)?;
+    if push {
+        push_recipe_release(root, &release)?;
+    } else {
+        eprintln!("evolve recipes: validated {release} locally (--no-push)");
+    }
+    Ok(())
+}
+
+fn recipe_changes(root: &Path) -> Result<Vec<String>> {
+    let status = git_output(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let mut recipes = Vec::new();
+    let mut outside = Vec::new();
+    for line in status.lines().filter(|line| !line.is_empty()) {
+        let path = line.get(3..).unwrap_or_default();
+        let path = path.rsplit_once(" -> ").map_or(path, |(_, path)| path);
+        if path == PUBLIC_RECIPE_SCOPE
+            || path
+                .strip_prefix(PUBLIC_RECIPE_SCOPE)
+                .is_some_and(|tail| tail.starts_with('/') && tail.ends_with(".json"))
+        {
+            recipes.push(path.to_owned());
+        } else {
+            outside.push(path.to_owned());
+        }
+    }
+    if !outside.is_empty() {
+        bail!(
+            "recipe evolution requires a clean JSSpector checkout outside {PUBLIC_RECIPE_SCOPE}; changed: {}",
+            outside.join(", ")
+        );
+    }
+    Ok(recipes)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicRecipe {
+    id: String,
+    class: String,
+    sink: String,
+    #[serde(default)]
+    introduces: Vec<String>,
+    #[serde(default)]
+    note: Option<String>,
+    before: String,
+    after: String,
+    #[serde(default)]
+    proven: u32,
+    #[serde(default)]
+    offered: u32,
+    #[serde(default)]
+    first_try: u32,
+}
+
+fn validate_public_recipe_corpus(root: &Path) -> Result<()> {
+    let directory = root.join(PUBLIC_RECIPE_SCOPE);
+    let mut files = Vec::new();
+    collect_recipe_json(&directory, &mut files)?;
+    if files.is_empty() {
+        bail!("public recipe corpus is empty");
+    }
+    for path in files {
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect public recipe {}", path.display()))?;
+        if !metadata.file_type().is_file() || metadata.len() > 1_048_576 {
+            bail!(
+                "public recipe is not a bounded regular file: {}",
+                path.display()
+            );
+        }
+        let recipe: PublicRecipe = serde_json::from_slice(
+            &std::fs::read(&path)
+                .with_context(|| format!("read public recipe {}", path.display()))?,
+        )
+        .with_context(|| format!("validate anonymous recipe schema in {}", path.display()))?;
+        let class = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .context("public recipe needs a UTF-8 class directory")?;
+        let file_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("public recipe needs a UTF-8 JSON filename")?;
+        if recipe.class != class || recipe.id != file_id {
+            bail!(
+                "public recipe identity must match its class directory and filename: {}",
+                path.display()
+            );
+        }
+        if !valid_public_recipe_name(&recipe.id, 128)
+            || !valid_public_recipe_name(&recipe.class, 128)
+            || !valid_public_recipe_text(&recipe.sink, 256, false)
+            || recipe.introduces.len() > 8
+            || recipe
+                .introduces
+                .iter()
+                .any(|value| !valid_public_recipe_text(value, 128, false))
+            || recipe
+                .note
+                .as_deref()
+                .is_some_and(|value| !valid_public_recipe_text(value, 800, true))
+            || !valid_public_recipe_text(&recipe.before, 4_096, true)
+            || !valid_public_recipe_text(&recipe.after, 4_096, true)
+        {
+            bail!(
+                "public recipe exceeds the bounded schema: {}",
+                path.display()
+            );
+        }
+        let _counters = (recipe.proven, recipe.offered, recipe.first_try);
+    }
+    Ok(())
+}
+
+fn valid_public_recipe_name(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn valid_public_recipe_text(value: &str, maximum: usize, multiline: bool) -> bool {
+    value.len() <= maximum
+        && value.chars().all(|character| {
+            !character.is_control() || (multiline && matches!(character, '\n' | '\r' | '\t'))
+        })
+}
+
+fn collect_recipe_json(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("read public recipe directory {}", directory.display()))?
+    {
+        let path = entry?.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "public recipe corpus may not contain symlinks: {}",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            collect_recipe_json(&path, files)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            files.push(path);
+        } else {
+            bail!(
+                "public recipe corpus may contain JSON only: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_staged_recipe_scope(root: &Path) -> Result<()> {
+    let staged = git_output(root, &["diff", "--cached", "--name-only", "--"])?;
+    let outside = staged
+        .lines()
+        .filter(|path| {
+            !path
+                .strip_prefix(PUBLIC_RECIPE_SCOPE)
+                .is_some_and(|tail| tail.starts_with('/') && tail.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    if !outside.is_empty() {
+        bail!(
+            "recipe evolution refuses already-staged files outside its anonymous corpus: {}",
+            outside.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn validate_recipe_release(root: &Path) -> Result<()> {
+    eprintln!("evolve recipes: validating the release that embeds the public corpus");
+    for (args, description) in [
+        (
+            vec!["fmt", "--all", "--check"],
+            "validate recipe release formatting",
+        ),
+        (
+            vec!["check", "--workspace", "--all-targets", "--locked"],
+            "compile the recipe release",
+        ),
+        (
+            vec![
+                "test",
+                "-p",
+                "jsspector",
+                "verify::recipes::tests",
+                "--locked",
+            ],
+            "test the embedded recipe corpus",
+        ),
+    ] {
+        command_ok(
+            Command::new("cargo").current_dir(root).args(args),
+            description.to_owned(),
+        )?;
+    }
+    validate_public_recipe_corpus(root)
+}
+
+fn push_recipe_release(root: &Path, tag: &str) -> Result<()> {
+    if push_release_atomically(root, tag)? {
+        eprintln!("evolve recipes: pushed {tag} atomically");
+        return Ok(());
+    }
+    eprintln!("evolve recipes: upstream advanced; rebasing and repeating the recipe gate");
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(["pull", "--rebase"])
+        .status()
+        .context("rebase recipe evolution onto upstream")?;
+    if !status.success() {
+        let _ = Command::new("git")
+            .current_dir(root)
+            .args(["rebase", "--abort"])
+            .status();
+        bail!("upstream changes conflict with the anonymous recipe evolution");
+    }
+    validate_recipe_release(root)?;
+    if !push_release_atomically(root, tag)? {
+        bail!("upstream advanced again after recipe revalidation; retry the evolution");
+    }
+    eprintln!("evolve recipes: rebased, revalidated, and pushed {tag} atomically");
+    Ok(())
+}
+
+fn push_release_atomically(root: &Path, tag: &str) -> Result<bool> {
+    let upstream = git_output(
+        root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )?;
+    let (remote, branch) = upstream
+        .trim()
+        .split_once('/')
+        .context("the upstream branch does not name a remote")?;
+    let branch_ref = format!("HEAD:refs/heads/{branch}");
+    let tag_ref = format!("HEAD:refs/tags/{tag}");
+    let attempt = |without_environment_token: bool| -> Result<bool> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(root)
+            .args(["push", "--atomic", remote, &branch_ref, &tag_ref]);
+        if without_environment_token {
+            command.env_remove("GITHUB_TOKEN");
+        }
+        Ok(command.status().context("push recipe release")?.success())
+    };
+    if attempt(false)? {
+        return Ok(true);
+    }
+    if std::env::var_os("GITHUB_TOKEN").is_some() {
+        eprintln!("evolve recipes: retrying push with the configured Git credentials");
+        return attempt(true);
+    }
+    Ok(false)
+}
+
 pub fn run(options: &Options) -> Result<()> {
     validate_options(options)?;
     let _repository_lock = if options.repair {

@@ -1268,6 +1268,15 @@ def claude_rank(
         return tuple(candidates[: args.max_candidates])
 
 
+def fix_learning_flag() -> str:
+    """Publish anonymous recipes when a source checkout can evolve itself."""
+    return (
+        "--publish-fixes"
+        if os.environ.get("JSSPECTOR_PUBLISH_FIXES")
+        else "--learn-fixes"
+    )
+
+
 def verify_repository(
     static: StaticResult,
     *,
@@ -1348,7 +1357,7 @@ def verify_repository(
             )
         )
         if args.learn_fixes:
-            command.append("--learn-fixes")
+            command.append(fix_learning_flag())
     else:
         command.append("--no-fix")
     for finding in candidates:

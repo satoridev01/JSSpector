@@ -127,6 +127,13 @@ enum Task {
         #[arg(long, default_value_t = 2400)]
         repair_budget: u64,
     },
+    /// Promote anonymous learned fix recipes as a patch release. This is the data-evolution half
+    /// of JSSpector's evolve loop; exact replay examples are never staged.
+    PromoteRecipes {
+        /// Commit and validate locally without publishing the branch and release tag.
+        #[arg(long)]
+        no_push: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -253,6 +260,12 @@ fn main() -> Result<()> {
                 repair_max_turns,
                 repair_budget: std::time::Duration::from_secs(repair_budget),
             })
+        }
+        Task::PromoteRecipes { no_push } => {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .context("workspace root")?;
+            self_heal::promote_recipes(root, !no_push)
         }
     }
 }

@@ -13,8 +13,9 @@
 //! store and must not be published. When the same finding shows up again on the same file content, the
 //! example's change is replayed — and proved again by the same three controls — without an LLM.
 //!
-//! Only generic curated seeds are embedded in the binary. Proven recipes and exact examples live
-//! in the private user-data store; recording is explicit and publication is disabled.
+//! Repository-neutral recipes are public evolution data and are embedded in every release. Exact
+//! examples remain private: their paths, code and PoCs can identify an undisclosed repository even
+//! though the serialized format has no repository-name field.
 //!
 //! The store is a directory: `recipes/<class>/<id>.json` and `examples/<finding>-<file>.json`.
 //! Reads take no lock (every write is a rename); each write takes `.lock` once, for one
@@ -49,6 +50,7 @@ include!(concat!(env!("OUT_DIR"), "/embedded_fix_store.rs"));
 
 /// One fix pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub id: String,
     /// The vulnerability class (`nosql-injection`).
@@ -202,6 +204,15 @@ impl Book {
     /// Records what a fix search learned: the offered recipes' counters, and for a fix an LLM
     /// candidate proved, its recipe (new or merged) and its example.
     pub fn record(&self, learned: &Learned) -> Result<(), String> {
+        self.record_with_examples(learned, true)
+    }
+
+    /// Records public evolution data without the exact, correlatable replay example.
+    pub fn record_public(&self, learned: &Learned) -> Result<(), String> {
+        self.record_with_examples(learned, false)
+    }
+
+    fn record_with_examples(&self, learned: &Learned, examples: bool) -> Result<(), String> {
         let class = learned.finding.class.name();
         let new = learned
             .proven
@@ -228,69 +239,49 @@ impl Book {
             let mut recipe = self.load(class, &found.id).unwrap_or(found);
             recipe.proven += 1;
             self.save_recipe(&recipe)?;
-            let example = Example {
-                recipe: recipe.id,
-                finding: learned.finding.fingerprint.clone(),
-                file: learned.file.to_owned(),
-                original_fingerprint: fingerprint(learned.original),
-                hunks: hunks(learned.original, proven),
-                poc: learned.poc.map(super::redact_poc),
-                benign_status: learned.benign_status,
-            };
-            write_json(
-                &self.example_path(learned.finding, learned.original),
-                &example,
-            )?;
+            if examples {
+                let example = Example {
+                    recipe: recipe.id,
+                    finding: learned.finding.fingerprint.clone(),
+                    file: learned.file.to_owned(),
+                    original_fingerprint: fingerprint(learned.original),
+                    hunks: hunks(learned.original, proven),
+                    poc: learned.poc.map(super::redact_poc),
+                    benign_status: learned.benign_status,
+                };
+                write_json(
+                    &self.example_path(learned.finding, learned.original),
+                    &example,
+                )?;
+            }
         }
         Ok(())
     }
 
-    /// Commits what the fix of `finding` in `file` added or changed, in the git checkout the store
-    /// is in, and pushes it. A push the remote rejects is rebased once and retried, never forced.
-    pub fn publish(&self, finding: &Finding, file: &str) -> Result<String, String> {
+    /// Promotes changed public recipes as a versioned JSSpector evolution. The controller validates
+    /// the schema, bumps the patch version and atomically pushes the branch and release tag.
+    pub fn publish(&self) -> Result<String, String> {
         let lock = std::fs::File::create(self.dir.join(".lock"))
             .map_err(|e| format!("creating the recipe lock: {e}"))?;
         lock.lock_exclusive()
             .map_err(|e| format!("locking {}: {e}", self.dir.display()))?;
-        let git = |args: &[&str]| -> Result<std::process::Output, String> {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&self.dir)
-                .args(args)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(std::process::Stdio::null())
-                .output()
-                .map_err(|e| format!("running git: {e}"))
-        };
-        let run = |args: &[&str]| -> Result<(), String> {
-            let output = git(args)?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "git {}: {}",
-                    args.first().unwrap_or(&""),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ))
-            }
-        };
-        run(&["add", "--", "recipes", "examples"])?;
-        if git(&["diff", "--cached", "--quiet", "--", "recipes", "examples"])?
-            .status
-            .success()
-        {
-            return Ok("nothing new to publish".to_owned());
+        let root = git_text(&self.dir, &["rev-parse", "--show-toplevel"])
+            .map(PathBuf::from)
+            .ok_or_else(|| "the public recipe store is not inside a Git checkout".to_owned())?;
+        let output = Command::new("cargo")
+            .current_dir(&root)
+            .args(["xtask", "promote-recipes"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|error| format!("starting recipe evolution: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "recipe evolution exited {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
-        let message = publish_message(finding, file);
-        run(&["commit", "-q", "-m", &message, "--", "recipes", "examples"])?;
-        if run(&["push", "-q"]).is_err() {
-            if let Err(error) = run(&["pull", "--rebase", "--autostash", "-q"]) {
-                let _ = run(&["rebase", "--abort"]);
-                return Err(format!("the remote moved and the rebase failed: {error}"));
-            }
-            run(&["push", "-q"])?;
-        }
-        Ok("committed and pushed".to_owned())
+        Ok(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
 
     fn load(&self, class: &str, id: &str) -> Option<Recipe> {
@@ -538,15 +529,6 @@ fn seeds() -> Vec<Recipe> {
 /// The first-try rate, smoothed so an untried recipe ranks between a good and a bad one.
 fn rate(recipe: &Recipe) -> f64 {
     (f64::from(recipe.first_try) + 1.0) / (f64::from(recipe.offered) + 2.0)
-}
-
-/// The commit message for a proven fix: its class and file, then the sink it closes.
-fn publish_message(finding: &Finding, file: &str) -> String {
-    format!(
-        "Record proven {} fix in {file}\n\nSink: {}",
-        finding.class.name(),
-        finding.sink.api.trim_end_matches(" =")
-    )
 }
 
 /// The sink's callee: `findOne` for `User.findOne`.
@@ -1091,7 +1073,9 @@ router.post('/login', async (req, res) => {\n\
 
         let writer = Book::new(&clone);
         let login = learn(&writer, "aaaa");
-        writer.publish(&login, "routes/auth.js").unwrap();
+        git(&clone, &["add", "recipes", "examples"]);
+        git(&clone, &["commit", "-qm", "publish store"]);
+        git(&clone, &["push", "-q"]);
         let published = Book::published(&clone);
         assert_eq!(
             published.replay(&login, "routes/auth.js", LOGIN).as_deref(),
@@ -1149,86 +1133,39 @@ router.post('/login', async (req, res) => {\n\
     }
 
     #[test]
-    fn a_store_that_is_a_git_checkout_publishes_what_it_learned() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = dir.path().join("remote.git");
-        let clone = dir.path().join("clone");
-        git(
-            dir.path(),
-            &[
-                "init",
-                "-q",
-                "--bare",
-                "-b",
-                "main",
-                remote.to_str().unwrap(),
-            ],
-        );
-        git(
-            dir.path(),
-            &[
-                "clone",
-                "-q",
-                remote.to_str().unwrap(),
-                clone.to_str().unwrap(),
-            ],
-        );
-        std::fs::write(clone.join("README"), "store\n").unwrap();
-        git(&clone, &["add", "."]);
-        git(&clone, &["commit", "-qm", "initial"]);
-        git(&clone, &["push", "-q", "-u", "origin", "HEAD:main"]);
-        // `publish` commits as the checkout's own identity, which a CI runner does not have
-        // globally.
-        git(&clone, &["config", "user.name", "test"]);
-        git(&clone, &["config", "user.email", "test@localhost.invalid"]);
+    fn public_learning_records_a_recipe_without_a_correlatable_example() {
+        let store = tempfile::tempdir().unwrap();
+        let book = Book::new(store.path());
+        let login = finding(VulnClass::NosqlInjection, "User.findOne", "aaaa");
+        let changed = coerced();
+        book.record_public(&Learned {
+            finding: &login,
+            file: "routes/auth.js",
+            original: LOGIN,
+            proven: Some(&changed),
+            poc: Some("curl https://target.invalid/login"),
+            benign_status: 401,
+            offered: &[],
+            first_try: true,
+        })
+        .unwrap();
 
-        let book = Book::new(&clone);
-        let login = learn(&book, "aaaa");
-        assert_eq!(
-            book.publish(&login, "routes/auth.js").unwrap(),
-            "committed and pushed"
-        );
-        assert_eq!(
-            book.publish(&login, "routes/auth.js").unwrap(),
-            "nothing new to publish"
-        );
-        // The commit says which fix it records.
-        assert_eq!(
-            git(&remote, &["log", "-1", "--format=%s", "main"]),
-            "Record proven nosql-injection fix in routes/auth.js"
-        );
-        assert_eq!(
-            git(&remote, &["log", "-1", "--format=%b", "main"]),
-            "Sink: User.findOne"
-        );
-        assert!(git(&remote, &["ls-tree", "-r", "--name-only", "main"]).contains("examples/"));
-        // The lock file never reaches the remote.
-        assert!(!git(&remote, &["ls-tree", "-r", "--name-only", "main"]).contains(".lock"));
+        assert!(!book.recipe_paths(login.class.name()).is_empty());
+        assert!(!store.path().join("examples").exists());
+    }
 
-        // The remote moves on; the next publish rebases onto it and still pushes.
-        let other = dir.path().join("other");
-        git(
-            dir.path(),
-            &[
-                "clone",
-                "-q",
-                remote.to_str().unwrap(),
-                other.to_str().unwrap(),
-            ],
-        );
-        std::fs::write(other.join("NOTES"), "more\n").unwrap();
-        git(&other, &["add", "."]);
-        git(&other, &["commit", "-qm", "elsewhere"]);
-        git(&other, &["push", "-q"]);
-        let again = learn(&book, "bbbb");
-        assert_eq!(
-            book.publish(&again, "routes/auth.js").unwrap(),
-            "committed and pushed"
-        );
-        let files = git(&remote, &["ls-tree", "-r", "--name-only", "main"]);
+    #[test]
+    fn releases_embed_public_recipes_but_never_private_examples() {
+        assert!(!EMBEDDED_FIX_FILES.is_empty());
         assert!(
-            files.contains("NOTES") && files.matches("examples/").count() == 2,
-            "{files}"
+            EMBEDDED_FIX_FILES
+                .iter()
+                .all(|(path, _)| path.starts_with("recipes/") && path.ends_with(".json"))
+        );
+        assert!(
+            EMBEDDED_FIX_FILES
+                .iter()
+                .all(|(path, _)| !path.contains("examples/"))
         );
     }
 
@@ -1276,10 +1213,10 @@ router.post('/login', async (req, res) => {\n\
     }
 
     #[test]
-    fn installed_binary_does_not_embed_exact_proven_examples() {
+    fn installed_binary_embeds_recipes_but_not_exact_proven_examples() {
         let absent_checkout = tempfile::tempdir().unwrap();
         let book = Book::published(absent_checkout.path());
-        assert!(book.recipe_paths("code-injection").is_empty());
+        assert!(!book.recipe_paths("code-injection").is_empty());
         assert!(
             book.replay(
                 &finding(VulnClass::CodeInjection, "eval", "aaaa"),

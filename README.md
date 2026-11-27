@@ -217,21 +217,23 @@ re-applied and re-proved later.
 
 JSSpector applies no fix pattern by itself. Candidates come from an LLM through the `claude` CLI, which is told why each earlier candidate failed and shown the fix recipes already proven for the finding's class. The outcome is `proven` (with the diff and its strategy), `unproven` (every candidate failed a control, each one listed with its reason) or `unsupported` (nothing could be tried here, such as a DOM XSS that imports a module from the URL, or no LLM and no recorded fix).
 
-When explicitly requested, a proven fix can be kept in a private recipe store under
+When explicitly requested, a proven fix can be kept in a recipe store under
 `$JSSPECTOR_FIX_RECIPES`, `$XDG_DATA_HOME/jsspector/fix-recipes`, or
-`~/.local/share/jsspector/fix-recipes` (in that order). Exact examples never belong in the public
-JSSpector checkout: even without an owner/repository field, their code, paths and PoCs can disclose
-an unreported vulnerability by correlation.
+`~/.local/share/jsspector/fix-recipes` (in that order). Repository-neutral recipes are public
+evolution data. Exact examples never belong in the public JSSpector checkout: even without an
+owner/repository field, their code, paths and PoCs can disclose an unreported vulnerability by
+correlation.
 
 - as a **recipe**: its class, the sink's callee, what the change introduced and a short before/after. Recipes of the same class, the same sink first, are shown to the LLM so later fixes of that pattern tend to pass on the first candidate. Each recipe counts the times it was shown and the times the first candidate was then proven. A few recipes ship with JSSpector as a starting point.
 - as an **example**: the finding's and the file's fingerprints, the file's path, the exact change, the request that reproduced the exploit (with credential headers and tokens redacted) and the status a benign request kept. When the same finding shows up again on the same file content, the change is replayed and proved again, with no LLM. This is how a rescan of the same commit reproduces both the exploit and its fix deterministically.
 
-Ordinary verification reads the private user-data store. Generic curated seeds remain built in.
-`--learn-fixes` explicitly records in the private store; `--publish-fixes` is disabled because
-publishing exact examples would cross the disclosure boundary.
-retried, never forced; without push access it reports the failure and carries on. Examples name no
-repository or commit, only the file's path, but publishing what was learned from a private
-repository can still disclose its vulnerable lines and request to this repository.
+`--learn-fixes` records both the reusable recipe and the exact replay example in the private local
+store. `--publish-fixes` records only the bounded anonymous recipe schema, never an example, then
+runs it through the same versioned evolution transaction: validate the complete public corpus,
+commit it, bump the patch version, compile and test the binary with that corpus embedded, and
+atomically push the branch and release tag. A wheel installed from PyPI therefore uses the evolved
+recipes without depending on this source checkout. A failed validation or push never forces or
+partially publishes a release.
 
 ```sh
 jsspector scan . --verify                  # verify, then prove a fix for each verified finding
@@ -240,7 +242,7 @@ jsspector scan . --verify --no-fix         # verification only
 jsspector scan . --verify --verify-until-first \
   --verify-fingerprint FIRST --verify-fingerprint SECOND  # ranked backlog: stop at first proof
 jsspector scan . --verify --learn-fixes    # also record newly proven fixes locally
-jsspector scan . --verify --publish-fixes  # record, commit and push newly proven fixes
+jsspector scan . --verify --publish-fixes  # evolve, release and embed an anonymous proven recipe
 ```
 
 `--fix-attempts` (default 3) bounds the LLM candidates, `--fix-timeout` (default 600 seconds) the
@@ -330,13 +332,15 @@ jsspector scan --repo owner/repository@revision --verify
 
 ### Auto-evolution across consecutive runs
 
-Scanner evolution is a separate, explicitly mutating command. It requires a clean, published
-JSSpector checkout and may invoke the repair agent and commit validated changes. Validated repairs
-push by default; `--no-push` keeps a single-repository evolution local for review. Batch workers
-always publish because they exchange validated generations through the upstream branch. This makes
-consecutive runs cumulative: every worker begins from the latest accepted scanner generation, and
-only a generation that passes the deterministic promotion gates can become the starting point for
-the next run:
+Evolution covers both scanner capability repairs and anonymous recipes learned from proven fixes.
+It requires a clean, published JSSpector checkout and may invoke the repair agent and commit
+validated changes. Validated repairs push by default; `--no-push` keeps a single-repository scanner
+evolution local for review. Online fix learning promotes its anonymous recipe automatically through
+a patch release; exact replay examples remain private. Batch workers always publish because they
+exchange validated generations through the upstream branch. This makes consecutive runs
+cumulative: every worker begins from the latest accepted scanner and recipe generation, and only a
+generation that passes the deterministic promotion gates can become the starting point for the
+next run:
 
 ```sh
 jsspector evolve --repo owner/repository

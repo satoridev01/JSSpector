@@ -363,20 +363,23 @@ pub fn prove(
                 offered: &search.offered,
                 first_try: search.proven_by_llm.is_some() && search.llm_attempts == 1,
             };
-            match book.record(&learned) {
+            let recorded = if options.publish {
+                book.record_public(&learned)
+            } else {
+                book.record(&learned)
+            };
+            match recorded {
                 Err(error) => eprintln!(
                     "jsspector: recording the fix in {}: {error}",
                     book_dir(options)
                 ),
-                Ok(()) if options.publish && learned.proven.is_some() => {
-                    match book.publish(finding, file) {
-                        Ok(what) => eprintln!("jsspector: {}: {what}", book_dir(options)),
-                        Err(error) => eprintln!(
-                            "jsspector: publishing the fix from {}: {error}",
-                            book_dir(options)
-                        ),
-                    }
-                }
+                Ok(()) if options.publish && learned.proven.is_some() => match book.publish() {
+                    Ok(what) => eprintln!("jsspector: {}: {what}", book_dir(options)),
+                    Err(error) => eprintln!(
+                        "jsspector: publishing the fix from {}: {error}",
+                        book_dir(options)
+                    ),
+                },
                 Ok(()) => {}
             }
         }

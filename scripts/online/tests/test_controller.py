@@ -298,6 +298,14 @@ class ControllerTests(unittest.TestCase):
             frozenset({"owner/clean", "owner/permanent-failure"}),
         )
 
+    def test_public_recipe_promotion_is_selected_by_the_evolution_environment(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(controller.fix_learning_flag(), "--learn-fixes")
+        with mock.patch.dict(
+            os.environ, {"JSSPECTOR_PUBLISH_FIXES": "1"}, clear=True
+        ):
+            self.assertEqual(controller.fix_learning_flag(), "--publish-fixes")
+
     def test_verification_reuses_checkout_and_fixes_in_the_proof_pass(self) -> None:
         finding = {
             "fingerprint": "verified",

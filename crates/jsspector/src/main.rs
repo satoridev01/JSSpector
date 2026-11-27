@@ -228,8 +228,8 @@ struct ScanArgs {
     /// default; the store is never written inside the public JSSpector checkout.
     #[arg(long, requires = "verify")]
     learn_fixes: bool,
-    /// Deprecated: publishing exact exploit/fix examples is disabled because it can disclose an
-    /// unreported vulnerability. Use --learn-fixes to keep them in the private local store.
+    /// Promote repository-neutral proven fix recipes through a versioned evolve release. Exact
+    /// replay examples remain private and are never included in that release.
     #[arg(long, requires = "verify")]
     publish_fixes: bool,
     #[command(flatten)]
@@ -1666,6 +1666,17 @@ fn online(args: &OnlineArgs) -> ExitCode {
     command
         .arg(&controller.runner)
         .args(online_arguments(args, &scanner));
+    if !args.no_evolve
+        && let Some(source_root) = self_heal_source_root()
+        && self_heal_unavailable(Some(&source_root)).is_none()
+    {
+        command
+            .env(
+                "JSSPECTOR_FIX_RECIPES",
+                source_root.join(".satori/fix-recipes"),
+            )
+            .env("JSSPECTOR_PUBLISH_FIXES", "1");
+    }
     let use_tui = !args.no_tui && io::stdout().is_terminal() && io::stderr().is_terminal();
     if !use_tui {
         eprintln!(
@@ -1924,12 +1935,6 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 verify::use_local_runtime();
             }
             let defaults = verify::FixOptions::default();
-            if args.publish_fixes {
-                return fail(
-                    EXIT_USAGE,
-                    "--publish-fixes is disabled: exact exploit/fix examples stay in the private local recipe store",
-                );
-            }
             let fix_options = verify::FixOptions {
                 enabled: !args.no_fix,
                 llm: !args.no_fix_llm,
@@ -1940,7 +1945,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
                     .map_or(defaults.timeout, std::time::Duration::from_secs),
                 recipes: private_fix_recipes(),
                 learn: args.learn_fixes,
-                publish: false,
+                publish: args.publish_fixes,
                 allow_unpublished_recipes: true,
             };
             let result = if args.verify_until_first {

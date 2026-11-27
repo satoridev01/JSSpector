@@ -16,6 +16,49 @@ fn patch_release_rejects_prerelease_or_missing_versions() {
     assert!(next_patch_manifest("[package]\nversion = \"1.2.3\"\n").is_err());
 }
 
+fn write_public_recipe(root: &Path, extra: &str) -> Result<()> {
+    let directory = root.join(PUBLIC_RECIPE_SCOPE).join("path-traversal");
+    std::fs::create_dir_all(&directory)?;
+    std::fs::write(
+        directory.join("anonymous.json"),
+        format!(
+            r#"{{
+  "id": "anonymous",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": ["basename"],
+  "before": "readFile(input)",
+  "after": "readFile(basename(input))",
+  "proven": 1,
+  "offered": 1,
+  "first_try": 1{extra}
+}}"#
+        ),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn public_recipe_schema_has_no_place_for_repository_identity() -> Result<()> {
+    let accepted = tempfile::tempdir()?;
+    write_public_recipe(accepted.path(), "")?;
+    validate_public_recipe_corpus(accepted.path())?;
+
+    let rejected = tempfile::tempdir()?;
+    write_public_recipe(rejected.path(), ",\n  \"repository\": \"owner/name\"")?;
+    let error = validate_public_recipe_corpus(rejected.path()).unwrap_err();
+    assert!(error.to_string().contains("anonymous recipe schema"));
+    Ok(())
+}
+
+#[test]
+fn checked_in_public_recipe_corpus_satisfies_the_release_boundary() -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("workspace root")?;
+    validate_public_recipe_corpus(root)
+}
+
 #[cfg(unix)]
 #[test]
 fn timeout_stops_descendant_processes() -> Result<()> {

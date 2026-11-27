@@ -10,6 +10,6 @@
   "before": "element.innerHTML = `<p>${untrusted}</p>`;",
   "after": "const escapeHtml = value => String(value).replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[char]);\nelement.innerHTML = `<p>${escapeHtml(untrusted)}</p>`;",
   "proven": 1,
-  "offered": 1,
-  "first_try": 1
+  "offered": 2,
+  "first_try": 2
 }

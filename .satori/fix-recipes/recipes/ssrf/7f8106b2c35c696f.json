@@ -12,8 +12,9 @@
     "isIP",
     "isSafeTargetUrl"
   ],
+  "note": "Reject literal private targets, then validate DNS results in a custom lookup passed to the outbound request so the checked address is the address actually used for the connection. Preserve the absolute target URL when forwarding through an upstream proxy.",
   "before": "? { host: up.host, port: up.port, method: req.method, path: req.url, headers }\n: { host: target.hostname, port: target.port || 80, method: req.method, path: target.pathname + target.search, headers };",
-  "after": "import dns from 'node:dns';\nconst isSafeAddr = (a, f) => isSafeTargetUrl('http://' + ((f === 6 || net.isIP(a) === 6) ? '[' + a + ']' : a) + '/');\nfunction safeLookup(hostname, options, cb) {\n  if (typeof options === 'function') { cb = options; options = {}; }\n  dns.lookup(hostname, options, (err, address, family) => {\n    if (err) return cb(err);\n    const list = Array.isArray(address) ? address : [{ address, family }];\n    for (const a of list) if (!isSafeAddr(a.address, a.family)) return cb(new Error('blocked address'));\n    cb(null, address, family);\n  });\n}\n  if (!isSafeTargetUrl(target.href)) { res.writeHead(403); return res.end('target not allowed'); }",
+  "after": "import dns from 'node:dns';\nfunction safeLookup(hostname, options, cb) {\n  dns.lookup(hostname, options, (err, address, family) => {\n    if (err) return cb(err);\n    const list = Array.isArray(address) ? address : [{ address, family }];\n    for (const a of list) if (!isSafeAddr(a.address, a.family)) return cb(new Error('blocked address'));\n    cb(null, address, family);\n  });\n}\nif (!isSafeTargetUrl(target.href)) return deny(res);\nconst opts = up ? { host: up.host, path: target.href, headers } : { host: target.hostname, path: target.pathname + target.search, headers, lookup: safeLookup };",
   "proven": 1,
   "offered": 0,
   "first_try": 0

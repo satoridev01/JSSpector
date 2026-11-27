@@ -1,0 +1,13 @@
+{
+  "id": "a4747af74e3c36a7",
+  "class": "path-traversal",
+  "sink": "createReadStream",
+  "introduces": [
+    "replace"
+  ],
+  "before": "const file = join(OUT, path);",
+  "after": "const file = join(OUT, join(\"/\", path.replace(/\\\\/g, \"/\")));",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

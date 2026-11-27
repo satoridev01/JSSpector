@@ -10,6 +10,6 @@
   "before": "if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {",
   "after": "if (!path.resolve(filePath).startsWith(path.resolve(DIST) + path.sep) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {",
   "proven": 1,
-  "offered": 2,
-  "first_try": 0
+  "offered": 3,
+  "first_try": 1
 }

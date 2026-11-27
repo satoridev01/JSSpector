@@ -1,0 +1,15 @@
+{
+  "id": "seed-xss-html-escape-interpolation",
+  "class": "xss",
+  "sink": "innerHTML",
+  "introduces": [
+    "String",
+    "replace"
+  ],
+  "note": "Encode every attacker-controlled interpolation before inserting it into an HTML sink. Escape ampersands first, then angle brackets and both quote characters, so legitimate text remains visible without becoming markup.",
+  "before": "element.innerHTML = `<p>${untrusted}</p>`;",
+  "after": "const escapeHtml = value => String(value).replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[char]);\nelement.innerHTML = `<p>${escapeHtml(untrusted)}</p>`;",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

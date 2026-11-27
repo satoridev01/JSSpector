@@ -1,0 +1,17 @@
+{
+  "id": "de9d6b36465e6f66",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": [
+    "end",
+    "return",
+    "sep",
+    "startsWith",
+    "writeHead"
+  ],
+  "before": "",
+  "after": "if (filePath !== __dirname && !filePath.startsWith(__dirname + path.sep)) {\n  res.writeHead(404, { 'Content-Type': 'text/plain' });\n  res.end('404 Not Found');\n  return;\n}",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

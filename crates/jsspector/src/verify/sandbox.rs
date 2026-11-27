@@ -4728,10 +4728,14 @@ fn observed_evidence(
 ) -> String {
     match signal {
         Signal::InResponse if response.contains(canary_token) => {
-            "the planted out-of-root file's exact canary contents appeared in the application response, proving local file content disclosure".to_owned()
+            format!(
+                "the planted out-of-root file's exact contents `CANARY {canary_token}` appeared in the application response, proving local file content disclosure"
+            )
         }
         Signal::InResponse => {
-            "the application serialized the planted out-of-root file's exact canary contents as ordered numeric JSON entries; reconstructing those entries produced the per-run token, proving local file content disclosure".to_owned()
+            format!(
+                "the application serialized the planted out-of-root file's exact contents as ordered numeric JSON entries; reconstructing those entries produced `CANARY {canary_token}`, proving local file content disclosure"
+            )
         }
         Signal::ResponseContains(expected) => {
             if expected == "uid=" {

@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn file_read_evidence_names_the_exact_human_readable_canary() {
+    let evidence = observed_evidence(
+        &Signal::InResponse,
+        None,
+        r#"{"content":"CANARY 18eb-example"}"#,
+        "18eb-example",
+        None,
+    );
+    assert!(evidence.contains("`CANARY 18eb-example`"), "{evidence}");
+    assert!(
+        evidence.contains("local file content disclosure"),
+        "{evidence}"
+    );
+}
+
+#[test]
 fn included_curl_transcript_keeps_headers_but_compares_only_the_body() {
     let transcript = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
     assert_eq!(included_http_body(transcript), r#"{"ok":true}"#);

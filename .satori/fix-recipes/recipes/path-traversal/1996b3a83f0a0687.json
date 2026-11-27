@@ -1,0 +1,19 @@
+{
+  "id": "1996b3a83f0a0687",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": [
+    "end",
+    "includes",
+    "resolve",
+    "return",
+    "sep",
+    "startsWith",
+    "writeHead"
+  ],
+  "before": "let u = decodeURIComponent(urlObj.pathname);",
+  "after": "let u;\ntry {\n  u = decodeURIComponent(urlObj.pathname);\n} catch {\n  u = \"\\0\";\n}\nconst rootResolved = path.resolve(ROOT);\nif (u.includes(\"\\0\") || !path.resolve(f).startsWith(rootResolved + path.sep)) {\n  res.writeHead(404, { \"Content-Type\": \"text/plain; charset=utf-8\" });\n  res.end(\"404 Not Found\");\n  return;\n}",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

@@ -7705,7 +7705,10 @@ const errors = [];
 function attempt(){
   if(ci>=combos.length){if(errors.length){console.error(errors.join('; '));} process.exit(0);}
   const [name,mod,host] = combos[ci++];
-  const options = {host,port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:10000};
+  // Mongoose's default buffered-operation failure is 10 seconds. Give the application enough
+  // time to return that controlled error so fix verification can preserve the route's real benign
+  // behavior instead of racing the driver timeout at the same deadline.
+  const options = {host,port:spec.port,method:spec.method,path:spec.path,headers:spec.headers,timeout:15000};
   if(name==='https'){options.rejectUnauthorized=false;}
   let sent = false;
   const done = (data)=>{if(sent){return;} sent=true; try{process.stdout.write(data,()=>process.exit(0));}catch(e){process.exit(0);}};

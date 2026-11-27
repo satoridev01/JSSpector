@@ -611,6 +611,15 @@ fn worker_host_serves_a_vercel_node_req_res_function() {
 }
 
 #[test]
+fn request_driver_outlives_mongoose_default_buffer_timeout() {
+    let driver = String::from_utf8(local_helper_source(DRIVER_JS)).unwrap();
+    assert!(
+        driver.contains("timeout:15000"),
+        "the driver must not race Mongoose's 10-second buffered-operation timeout"
+    );
+}
+
+#[test]
 fn generated_configuration_retry_requires_an_explicit_generation_message() {
     assert!(generated_startup_config(
         "Config file not found, generating defaults.\nSPX exit!"

@@ -9,6 +9,6 @@
   "before": "res.end(`<!DOCTYPE html><html><head><title>404 Not Found</title></head><body style=\"font-family:sans-serif;padding:40px;background:#0d1109;color:#c0dbc0;\"><h2>404 Not Found</h2><p>Cannot find <code>${pathname}</code></p><p><a href=\"/\" style=\"color:#98ce7b;\">Go to Home</a> | <a href=\"/desktop\" style=\"color:#98ce7b;\">Go to Desktop</a> | <a href=\"/editor\" style=\"color:#98ce7b;\">Go to Editor</a></p></body></html>`);",
   "after": "res.end(`<!DOCTYPE html><html><head><title>404 Not Found</title></head><body style=\"font-family:sans-serif;padding:40px;background:#0d1109;color:#c0dbc0;\"><h2>404 Not Found</h2><p>Cannot find <code>${String(pathname).replace(/[&<>\"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[ch])}</code></p><p><a href=\"/\" style=\"color:#98ce7b;\">Go to Home</a> | <a href=\"/desktop\" style=\"color:#98ce7b;\">Go to Desktop</a> | <a href=\"/editor\" style=\"color:#98ce7b;\">Go to Editor</a></p></body></html>`);",
   "proven": 1,
-  "offered": 1,
-  "first_try": 1
+  "offered": 2,
+  "first_try": 2
 }

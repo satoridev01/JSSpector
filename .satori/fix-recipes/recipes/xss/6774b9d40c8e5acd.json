@@ -1,0 +1,14 @@
+{
+  "id": "6774b9d40c8e5acd",
+  "class": "xss",
+  "sink": "innerHTML",
+  "introduces": [
+    "String",
+    "replace"
+  ],
+  "before": "                        <p style=\"margin-top: 10px;\">Article ID: ${decodedArticleId}</p>\n                        <p>Raw ID: ${articleId}</p>\n                <p>${error.message}</p>\nError: ${error.message}\nURL: ${window.location.href}\nArticle ID: ${decodedArticleId}\nUser Agent: ${navigator.userAgent}",
+  "after": "const escapeHtml = value => String(value).replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[char]);\n                        <p style=\"margin-top: 10px;\">Article ID: ${escapeHtml(decodedArticleId)}</p>\n                        <p>Raw ID: ${escapeHtml(articleId)}</p>\n                <p>${escapeHtml(error.message)}</p>\nError: ${escapeHtml(error.message)}\nURL: ${escapeHtml(window.location.href)}\nArticle ID: ${escapeHtml(decodedArticleId)}\nUser Agent: ${escapeHtml(navigator.userAgent)}",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

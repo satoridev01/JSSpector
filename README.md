@@ -89,7 +89,10 @@ measurements that point at a change: where Docker slot time goes (verified, not 
 because the app never launched, timeout; and build/start versus probing), which stage limits the
 pass (verification, checkouts, static/clone or discovery), and issues per slot-hour for each lane.
 The same summary is saved as `performance` in each pass's `online.json`, so passes can be compared
-before and after a change. Press `q` or Ctrl-C for a bounded stop;
+before and after a change. `+` and `-` raise or lower the Docker verification slots while the pass
+runs (the governor pauses; its memory guard still applies), `a` hands them back to the governor, and
+`h` shows the keys and what each measurement means. Without the TUI, writing `{"docker_slots": 12}`
+or `{"docker_slots": "auto"}` to `control.json` in the run directory does the same. Press `q` or Ctrl-C for a bounded stop;
 finished work remains in `runs/jsspector-online` and the next run skips it.
 
 AI only orders candidates and proposes a best-effort fix. It cannot declare a vulnerability real.

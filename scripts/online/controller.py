@@ -2666,6 +2666,10 @@ def main(argv: list[str] | None = None) -> int:
         record_path=run_dir / "resources.jsonl",
         checkouts=lambda: (checkout_slots.held, checkout_slots.capacity),
         backlog=lambda: verification_backlog,
+        control_path=run_dir / "control.json",
+        ensure_checkouts=lambda limit: checkout_slots.grow_to(
+            args.static_parallel + resources.QUEUE_PER_SLOT * limit
+        ),
     )
     checkout_slots = resources.CountedSemaphore(args.max_checkouts)
     state_lock = threading.Lock()
@@ -3160,13 +3164,10 @@ def main(argv: list[str] | None = None) -> int:
         f"satori_sync={args.satori_sync} satori_blacklist={len(remote_blacklist)}"
     )
     static_executor = ThreadPoolExecutor(max_workers=args.static_parallel)
-    # A governed pass may widen the deterministic gate up to the ceiling, so its pool is sized for
-    # that; idle pool threads cost nothing and queued repositories wait at the gate in order.
-    no_ai_workers = (
-        max(args.parallel_no_ai, plan.docker_ceiling - ai_workers)
-        if capacity.governed or capacity.calibration is not None
-        else args.parallel_no_ai
-    )
+    # The gate, not the pool, bounds deterministic verifications: the governor or the operator
+    # (`control.json`, the TUI's +/-) may widen it while the pass runs. Pool threads start only as
+    # repositories arrive and then wait at the gate in order.
+    no_ai_workers = max(args.parallel_no_ai, resources.MAX_DOCKER_SLOTS - ai_workers)
     no_ai_executor = ThreadPoolExecutor(max_workers=no_ai_workers)
     ai_executor = ThreadPoolExecutor(max_workers=args.parallel_ai)
     storage_monitor_stop = threading.Event()
@@ -3186,6 +3187,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     storage_monitor.start()
     monitor.start()
+    log(
+        f"CONTROL write {{\"docker_slots\": N}} or {{\"docker_slots\": \"auto\"}} to "
+        f"{run_dir / 'control.json'} to change the Docker slots while the pass runs"
+    )
     emit_event(
         "resources",
         slots=docker_slots.limit,

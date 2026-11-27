@@ -25,5 +25,17 @@
     "note": "Reduce the request-controlled segment to its base name before joining it to the base directory, so ../ sequences cannot leave it.",
     "before": "const filepath = path.join(FILES, req.params.filename);",
     "after": "const filepath = path.join(FILES, path.basename(req.params.filename));"
+  },
+  {
+    "id": "seed-command-execfile-arguments",
+    "class": "command-injection",
+    "sink": "child_process.exec",
+    "introduces": [
+      "execFile",
+      "shell: false"
+    ],
+    "note": "Replace a shell command assembled from request data with execFile (or spawn without a shell), pass every fixed token as a separate argument, and validate any request-selected executable against the application's legitimate executable names or paths. Update the existing child_process import instead of adding a second import.",
+    "before": "const { exec } = require('child_process');\nconst output = await new Promise((resolve, reject) => {\n  exec(`\"${tool}\" env list --json`, options, (err, stdout) => {\n    if (err) reject(err);\n    else resolve(stdout || '');\n  });\n});",
+    "after": "const { exec, execFile } = require('child_process');\nconst allowedTool = tool === 'conda' ? tool : null;\nif (!allowedTool) throw new Error('unsupported executable');\nconst output = await new Promise((resolve, reject) => {\n  execFile(allowedTool, ['env', 'list', '--json'], { ...options, shell: false }, (err, stdout) => {\n    if (err) reject(err);\n    else resolve(stdout || '');\n  });\n});"
   }
 ]

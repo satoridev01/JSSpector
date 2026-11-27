@@ -667,8 +667,11 @@ pub(crate) fn check(
     // can write text instead of HTML, and a stored interpreter can return the planted plain value
     // without evaluating it. Merely deleting the route or hardcoding a response fails that control.
     let functional_control = benign.shows.is_some();
+    let safe_sink_replacement =
+        replaces_shell_with_argument_api(finding, &original, &candidate.content);
     if candidate.file == sink_file(finding)
         && !functional_control
+        && !safe_sink_replacement
         && !keeps_sink(finding, &original, &candidate.content)
     {
         return Err(format!(
@@ -686,10 +689,11 @@ pub(crate) fn check(
         files.push((previous, restored));
     }
     state.applied = Some(candidate.file.clone());
-    let replaces_sink =
-        candidate.file == sink_file(finding) && !keeps_sink(finding, &original, &candidate.content);
+    let replaces_sink = candidate.file == sink_file(finding)
+        && ((!keeps_sink(finding, &original, &candidate.content) && functional_control)
+            || safe_sink_replacement);
     target
-        .relaunch_with_files(&files, replaces_sink && functional_control)
+        .relaunch_with_files(&files, replaces_sink)
         .map_err(|e| format!("the app does not start with the change: {e}"))?;
     match target.reproduce() {
         Outcome::NotReproduced { .. } => {}
@@ -726,7 +730,7 @@ pub(crate) fn check(
     target
         .relaunch_with_files(
             &[(candidate.file.clone(), candidate.content.clone())],
-            replaces_sink && functional_control,
+            replaces_sink,
         )
         .map_err(|e| format!("the app does not restart with the candidate: {e}"))?;
     match target.reproduce() {
@@ -772,6 +776,29 @@ fn keeps_sink(finding: &Finding, original: &str, changed: &str) -> bool {
         .unwrap_or_default()
         .trim();
     callee.is_empty() || !original.contains(callee) || changed.contains(callee)
+}
+
+/// A shell command sink is correctly removed when it is replaced by Node's argument-vector API.
+/// `execFile` never invokes a shell by default, so metacharacters in a request-selected value are
+/// passed as data instead of being evaluated. This narrowly permits the canonical command-injection
+/// repair while keeping the general rule that a candidate may not merely delete its dangerous
+/// operation. The full vulnerable/candidate/vulnerable/candidate sandwich and benign-route control
+/// still have to pass before the fix is reported as proven.
+fn replaces_shell_with_argument_api(finding: &Finding, original: &str, changed: &str) -> bool {
+    if finding.class != VulnClass::CommandInjection || changed.contains("shell: true") {
+        return false;
+    }
+    let callee = finding
+        .sink
+        .api
+        .trim_end_matches(" =")
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    matches!(callee, "exec" | "execSync")
+        && original.contains(callee)
+        && (changed.contains("execFile(") || changed.contains("execFileSync("))
 }
 
 /// Reject the common SSRF "fix" that resolves and checks a hostname, then gives the original URL
@@ -1458,6 +1485,30 @@ mod tests {
             "User.findOne({ u: String(u) })"
         ));
         assert!(!keeps_sink(&f, "User.findOne({ u })", "res.end()"));
+    }
+
+    #[test]
+    fn command_exec_may_be_replaced_by_an_argument_vector_without_a_shell() {
+        let f = finding(
+            VulnClass::CommandInjection,
+            "route.js",
+            ("child_process.exec", "command", 2, 1),
+            ("req.query.tool", 1, 14),
+            &[],
+        );
+        let original =
+            "exec('unrelated', callback);\nexec(`\"${tool}\" env list --json`, callback)";
+        assert!(replaces_shell_with_argument_api(
+            &f,
+            original,
+            "exec('unrelated', callback);\nexecFile(tool, ['env', 'list', '--json'], { shell: false }, callback)"
+        ));
+        assert!(!replaces_shell_with_argument_api(
+            &f,
+            original,
+            "execFile(tool, ['env'], { shell: true }, callback)"
+        ));
+        assert!(!replaces_shell_with_argument_api(&f, original, "res.end()"));
     }
 
     #[test]

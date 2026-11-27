@@ -8,6 +8,6 @@
   "before": "const user = await User.findOne({ username, password });",
   "after": "const user = await User.findOne({ username: String(username), password: String(password) });",
   "proven": 7,
-  "offered": 11,
-  "first_try": 9
+  "offered": 13,
+  "first_try": 10
 }

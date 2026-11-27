@@ -1,0 +1,13 @@
+{
+  "id": "aa13c832d30e5276",
+  "class": "nosql-injection",
+  "sink": "findById",
+  "introduces": [
+    "String"
+  ],
+  "before": "const food = await foodModel.findById(req.body.id);\nawait foodModel.findByIdAndDelete(req.body.id);",
+  "after": "const food = await foodModel.findById(String(req.body.id));\nawait foodModel.findByIdAndDelete(String(req.body.id));",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

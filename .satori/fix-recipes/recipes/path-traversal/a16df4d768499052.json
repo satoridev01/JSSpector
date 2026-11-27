@@ -1,0 +1,14 @@
+{
+  "id": "a16df4d768499052",
+  "class": "path-traversal",
+  "sink": "sendFile",
+  "introduces": [
+    "String",
+    "basename"
+  ],
+  "before": "var image = req.params.image;",
+  "after": "var image = path.basename(String(req.params.image));",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

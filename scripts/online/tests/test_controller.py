@@ -53,7 +53,10 @@ class ControllerTests(unittest.TestCase):
         self.addCleanup(probe.stop)
         profile = mock.patch.dict(
             os.environ,
-            {"JSSPECTOR_ONLINE_PROFILE": str(Path(tempfile.gettempdir()) / "jss-no-profile.json")},
+            {
+                "JSSPECTOR_ONLINE_PROFILE": str(Path(tempfile.gettempdir()) / "jss-no-profile.json"),
+                "JSSPECTOR_GITHUB_TOKENS_FILE": str(Path(tempfile.gettempdir()) / "jss-no-tokens"),
+            },
         )
         profile.start()
         self.addCleanup(profile.stop)
@@ -552,6 +555,53 @@ class ControllerTests(unittest.TestCase):
         budget.observe({"event": "fix_started"}, 1800)
         self.assertIsNone(budget.timed_out(2399))
         self.assertEqual(budget.timed_out(2400), "fix-timeout")
+
+    def test_every_available_github_token_joins_the_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "github-tokens"
+            path.write_text("# extra accounts\ntok-file-a\n\ntok-file-b, tok-env\n")
+            path.chmod(0o600)
+            gh = subprocess.CompletedProcess(["gh"], 0, "tok-gh\n", "")
+            logs: list[str] = []
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"GITHUB_TOKENS": "tok-env", "JSSPECTOR_GITHUB_TOKENS_FILE": str(path)},
+                ),
+                mock.patch.object(controller.subprocess, "run", return_value=gh),
+                mock.patch.object(controller, "log", side_effect=logs.append),
+            ):
+                self.assertEqual(
+                    controller.github_tokens(),
+                    ["tok-env", "tok-file-a", "tok-file-b", "tok-gh"],
+                )
+                pool = controller.github_pool()
+            self.assertEqual(len(pool.sessions), 4)
+            self.assertIn("GITHUB_TOKENS count=4", logs)
+            path.chmod(0o644)
+            with (
+                mock.patch.dict(os.environ, {"JSSPECTOR_GITHUB_TOKENS_FILE": str(path)}, clear=False),
+                mock.patch.object(controller.subprocess, "run", return_value=gh),
+                mock.patch.object(controller, "log", side_effect=logs.append),
+            ):
+                os.environ.pop("GITHUB_TOKENS", None)
+                controller.github_tokens()
+            self.assertTrue(any("readable by others" in line for line in logs))
+
+    def test_no_github_token_is_a_clear_error(self) -> None:
+        missing = subprocess.CompletedProcess(["gh"], 1, "", "not logged in")
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.dict(
+                os.environ,
+                {"JSSPECTOR_GITHUB_TOKENS_FILE": str(Path(temporary) / "none")},
+            ),
+            mock.patch.object(controller.subprocess, "run", return_value=missing),
+        ):
+            os.environ.pop("GITHUB_TOKENS", None)
+            os.environ.pop("GITHUB_TOKEN", None)
+            with self.assertRaisesRegex(SystemExit, "no GitHub token"):
+                controller.github_pool()
 
     def test_an_answering_route_is_activity_not_evidence(self) -> None:
         budget = controller.VerificationBudgetState(

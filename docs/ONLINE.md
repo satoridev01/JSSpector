@@ -46,7 +46,10 @@ It does not import or execute `jsspector-monitor`.
 - State and artifacts are written atomically, so interruption is resumable.
 - One controller exclusively owns each output directory; parallelism lives inside its bounded
   queues, so concurrent processes cannot overwrite the same `state.json`.
-- Search and GitHub core budgets are separate, paced and retry bounded.
+- Search and GitHub core budgets are separate, paced and retry bounded. The pool uses every token it
+  finds (`GITHUB_TOKENS`, then `~/.config/jsspector/github-tokens`, then `gh auth token`): the
+  private-vulnerability-reporting check costs one core call per discovered repository, so a full
+  24-hour window outgrows one account's 5,000 calls an hour.
 - Advisory checks use at most two overlapping requests per GitHub token. Secondary-limit
   cooldowns are shared by all workers and surfaced in both the TUI and `online.log`.
 - Claude capacity limits pause the shared AI lane until the reported reset instead of converting a

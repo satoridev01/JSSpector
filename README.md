@@ -118,7 +118,9 @@ Use `--local-only` to disable Satori synchronization, `--no-evolve` to disable t
 attempt, `--repos-file FILE` to replay a frozen inventory, and `--no-tui` for append-only logs in an
 automation. Worker counts, stage deadlines and the discovery window remain individually
 overrideable. The bundled
-controller requires Python 3, authenticated `gh`, `claude` and `satori-v2` CLIs, and Docker; it has
+controller requires Python 3, authenticated `gh`, `claude` and `satori-v2` CLIs, and Docker. GitHub
+calls are spread over every token it finds — `GITHUB_TOKENS`, `~/.config/jsspector/github-tokens` (one
+per line; keep it `chmod 600` and outside any checkout) and `gh`'s — each with its own hourly budget. It has
 no runtime dependency on `jsspector-monitor` or on a JSSpector source checkout. See
 [`docs/ONLINE.md`](docs/ONLINE.md) for the pipeline invariants and artifact layout.
 

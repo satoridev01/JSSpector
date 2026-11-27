@@ -662,27 +662,67 @@ def sync_key(
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def github_token_file() -> Path:
+    """Local file of extra GitHub tokens (one per line, `#` comments); never inside a checkout."""
+    override = os.environ.get("JSSPECTOR_GITHUB_TOKENS_FILE")
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "jsspector" / "github-tokens"
+
+
+def _split_tokens(text: str) -> list[str]:
+    return [
+        token
+        for line in text.splitlines()
+        if not line.lstrip().startswith("#")
+        for token in line.replace(",", " ").split()
+    ]
+
+
+def github_tokens() -> list[str]:
+    """Every GitHub token this host offers, in order and without repeats.
+
+    `GITHUB_TOKENS` (or `GITHUB_TOKEN`), then the local token file, then the authenticated `gh`
+    CLI. Each token is its own rate-limit budget, and the pool spreads calls across all of them:
+    one account's 5,000 core calls an hour do not cover the private-vulnerability-reporting check of
+    a full 24-hour discovery window.
+    """
+    tokens = _split_tokens(os.environ.get("GITHUB_TOKENS") or os.environ.get("GITHUB_TOKEN") or "")
+    path = github_token_file()
+    try:
+        if path.is_file():
+            if path.stat().st_mode & 0o077:
+                log(f"GITHUB_TOKENS_FILE_PERMISSIONS {path} is readable by others; chmod 600 it")
+            tokens += _split_tokens(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        log(f"GITHUB_TOKENS_FILE_UNREADABLE {path}: {error}")
+    try:
+        completed = subprocess.run(
+            ["gh", "auth", "token"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=DOCKER_QUERY_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+    if completed is not None and not completed.returncode:
+        tokens += _split_tokens(completed.stdout)
+    return list(dict.fromkeys(tokens))
+
+
 def github_pool(on_status: Callable[[str], None] = lambda _message: None) -> github.TokenPool:
-    """Use the existing token pool convention, falling back to the authenticated gh CLI."""
-    pool = discover.pool_from_env(
-        should_stop=SHUTDOWN.is_set, on_status=on_status
-    )
-    if pool is not None:
-        return pool
-    token = subprocess.run(
-        ["gh", "auth", "token"],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if token.returncode or not token.stdout.strip():
-        raise SystemExit("GITHUB_TOKENS is unset and gh is not authenticated")
-    return github.TokenPool(
-        [token.stdout.strip()],
-        should_stop=SHUTDOWN.is_set,
-        on_status=on_status,
-    )
+    """A token pool over every available GitHub token (see github_tokens)."""
+    tokens = github_tokens()
+    if not tokens:
+        raise SystemExit(
+            "no GitHub token: set GITHUB_TOKENS, add tokens to "
+            f"{github_token_file()}, or authenticate gh"
+        )
+    log(f"GITHUB_TOKENS count={len(tokens)}")
+    return github.TokenPool(tokens, should_stop=SHUTDOWN.is_set, on_status=on_status)
 
 
 def _docker_ids(arguments: list[str]) -> tuple[str, ...]:

@@ -1,6 +1,16 @@
 use super::*;
 
 #[test]
+fn included_curl_transcript_keeps_headers_but_compares_only_the_body() {
+    let transcript = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}";
+    assert_eq!(included_http_body(transcript), r#"{"ok":true}"#);
+    assert_eq!(
+        included_http_body("body without headers"),
+        "body without headers"
+    );
+}
+
+#[test]
 fn indexed_json_report_command_prints_the_reconstructed_file_contents() {
     let command = decode_indexed_json_response("curl -sS http://TARGET/file");
     assert!(command.starts_with("curl -sS http://TARGET/file | node -e '"));

@@ -1184,24 +1184,43 @@ impl Session {
             self.seed_db();
         }
         for case in &cases {
-            let Some(match_all) = self.fetch(&case.match_all) else {
+            let Some((match_all, match_all_status, match_all_cookies)) =
+                self.fetch_meta(&case.match_all)
+            else {
                 continue;
             };
             let match_all_hit = self.last_sink_hit.get();
-            let (Some(match_none_eq), Some(match_none_in)) = (
-                self.fetch(&case.match_none_eq),
-                self.fetch(&case.match_none_in),
-            ) else {
+            let (
+                Some((match_none_eq, match_none_eq_status, match_none_eq_cookies)),
+                Some((match_none_in, match_none_in_status, match_none_in_cookies)),
+            ) = (
+                self.fetch_meta(&case.match_none_eq),
+                self.fetch_meta(&case.match_none_in),
+            )
+            else {
                 continue;
             };
-            let reproduced =
-                payload::nosql_reproduced(&match_all, &match_none_eq, &match_none_in, &case.absent);
+            let reproduced = nosql_response_proves_impact(
+                &probe.path,
+                (&match_all, match_all_status, &match_all_cookies),
+                (&match_none_eq, match_none_eq_status, &match_none_eq_cookies),
+                (&match_none_in, match_none_in_status, &match_none_in_cookies),
+                &case.absent,
+            );
             if self.accept_bound_effect_with_hit(reproduced, match_all_hit) {
                 let attempt = &case.match_all;
+                let command = include_response_headers(self.poc_command(attempt));
+                let mut evidence =
+                    nosql_differential_evidence(&case.field, probe.body_query_override.is_some());
+                if authentication_endpoint(&probe.path) {
+                    evidence.push_str(
+                        "; the match-all response issued an authentication credential that neither match-none control received",
+                    );
+                }
                 return Outcome::Verified {
                     how: format!("{} {} ({}[$ne])", attempt.verb, attempt.target, case.field),
                     poc: Reproduction {
-                        command: self.poc_command(attempt),
+                        command,
                         command_redacted: false,
                         method: attempt.verb.to_owned(),
                         target: attempt.target.clone(),
@@ -1211,10 +1230,7 @@ impl Session {
                             .map(|(name, value)| format!("{name}: {value}"))
                             .collect(),
                         body: attempt.body.clone(),
-                        evidence: nosql_differential_evidence(
-                            &case.field,
-                            probe.body_query_override.is_some(),
-                        ),
+                        evidence,
                         response: response_excerpt(&match_all),
                         stdout: None,
                         stderr: None,
@@ -1484,6 +1500,66 @@ impl Session {
     }
 }
 
+type HttpObservation<'a> = (&'a str, Option<u16>, &'a [String]);
+
+/// A response differential proves an exploitable read only when the positive request completed
+/// successfully. A 5xx/4xx split can be manufactured by a schema-incomplete document planted in
+/// the disposable database: the operator selects it, then unrelated downstream code crashes while
+/// reading a required field. That proves operator semantics, not confidentiality, integrity or
+/// authentication impact.
+///
+/// Login-like endpoints are stricter still. A 2xx body difference is not an authentication bypass;
+/// the operator leg must actually receive a bearer token or session cookie that neither match-none
+/// control receives.
+fn nosql_response_proves_impact(
+    path: &str,
+    match_all: HttpObservation<'_>,
+    match_none_eq: HttpObservation<'_>,
+    match_none_in: HttpObservation<'_>,
+    absent: &str,
+) -> bool {
+    if !payload::nosql_reproduced(match_all.0, match_none_eq.0, match_none_in.0, absent) {
+        return false;
+    }
+    if !match_all
+        .1
+        .is_some_and(|status| (200..300).contains(&status))
+    {
+        return false;
+    }
+    if !authentication_endpoint(path) {
+        return true;
+    }
+    issued_session(match_all.0, match_all.2)
+        && !issued_session(match_none_eq.0, match_none_eq.2)
+        && !issued_session(match_none_in.0, match_none_in.2)
+}
+
+fn authentication_endpoint(path: &str) -> bool {
+    path.split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .split('/')
+        .any(|segment| {
+            matches!(
+                segment.to_ascii_lowercase().as_str(),
+                "login" | "log-in" | "signin" | "sign-in" | "authenticate"
+            )
+        })
+}
+
+fn issued_session(body: &str, cookies: &[String]) -> bool {
+    payload::extract_bearer_token(body).is_some() || payload::session_cookie_pair(cookies).is_some()
+}
+
+fn include_response_headers(command: String) -> String {
+    if command.contains(" --include") {
+        command
+    } else {
+        command.replacen("curl -sS", "curl -sS --include", 1)
+    }
+}
+
 /// The distinct case variants of a filesystem path a case-normalizing sink might write to: the path as
 /// given, fully upper-cased, and fully lower-cased, de-duplicated (an all-lowercase path yields two, an
 /// already-mixed one up to three). A sink that applies `.toUpperCase()` / `.toLowerCase()` to the
@@ -1502,7 +1578,87 @@ fn path_case_variants(path: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod oracle_tests {
-    use super::path_case_variants;
+    use super::{include_response_headers, nosql_response_proves_impact, path_case_variants};
+
+    const NO_COOKIES: &[String] = &[];
+
+    #[test]
+    fn nosql_crash_differential_is_not_security_impact() {
+        assert!(!nosql_response_proves_impact(
+            "/api/auth/login",
+            (
+                r#"{"message":"Server error during login"}"#,
+                Some(500),
+                NO_COOKIES
+            ),
+            (
+                r#"{"message":"Invalid credentials"}"#,
+                Some(400),
+                NO_COOKIES
+            ),
+            (
+                r#"{"message":"Invalid credentials"}"#,
+                Some(400),
+                NO_COOKIES
+            ),
+            "18ebdf4eae3bee68012fb800",
+        ));
+    }
+
+    #[test]
+    fn nosql_login_differential_requires_an_issued_session() {
+        let controls = (
+            r#"{"message":"Invalid credentials"}"#,
+            Some(401),
+            NO_COOKIES,
+        );
+        assert!(!nosql_response_proves_impact(
+            "/api/auth/login",
+            (
+                r#"{"message":"different but unauthenticated"}"#,
+                Some(200),
+                NO_COOKIES
+            ),
+            controls,
+            controls,
+            "absent",
+        ));
+
+        let authenticated = r#"{"token":"eyJhbGci.eyJzdWIiOiIxIn0.c2ln"}"#;
+        assert!(nosql_response_proves_impact(
+            "/api/auth/login",
+            (authenticated, Some(200), NO_COOKIES),
+            controls,
+            controls,
+            "absent",
+        ));
+    }
+
+    #[test]
+    fn nosql_read_differential_needs_a_successful_positive_response() {
+        let controls = (r#"{"items":[]}"#, Some(200), NO_COOKIES);
+        assert!(nosql_response_proves_impact(
+            "/api/users/search",
+            (r#"{"items":[{"id":1}]}"#, Some(200), NO_COOKIES),
+            controls,
+            controls,
+            "absent",
+        ));
+        assert!(!nosql_response_proves_impact(
+            "/api/users/search",
+            (r#"{"error":"query crashed"}"#, Some(500), NO_COOKIES),
+            controls,
+            controls,
+            "absent",
+        ));
+    }
+
+    #[test]
+    fn nosql_report_command_includes_response_headers_once() {
+        let command = include_response_headers("curl -sS --request POST /login".to_owned());
+        assert_eq!(command.matches("--include").count(), 1);
+        assert_eq!(include_response_headers(command.clone()), command);
+    }
 
     #[test]
     fn case_variants_cover_a_normalizing_sink_without_duplicates() {

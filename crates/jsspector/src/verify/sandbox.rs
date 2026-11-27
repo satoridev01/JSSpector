@@ -3117,7 +3117,12 @@ impl Session {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let expected = poc.response.trim();
-        let repeats_positive_response = stdout.trim().starts_with(expected);
+        let response_body = if poc.command.contains("--include") {
+            included_http_body(&stdout)
+        } else {
+            &stdout
+        };
+        let repeats_positive_response = response_body.trim().starts_with(expected);
         let bound = self.sink_binding.is_none() || self.last_sink_hit.get();
         if output.status.success() && repeats_positive_response && bound {
             poc.stdout = Some(stdout.into_owned());
@@ -4432,6 +4437,16 @@ impl Session {
         }
         false
     }
+}
+
+/// Returns the response body from curl's `--include` output. PoCs retain the original stdout so a
+/// reviewer sees the status and headers, while exact-command qualification compares the same body
+/// the in-process driver observed. Curl emits CRLF on the wire but a few test doubles use LF only.
+fn included_http_body(output: &str) -> &str {
+    output
+        .split_once("\r\n\r\n")
+        .or_else(|| output.split_once("\n\n"))
+        .map_or(output, |(_, body)| body)
 }
 
 /// Reads `rel` as it existed before a local verifier session instrumented it. `overwritten` is

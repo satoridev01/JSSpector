@@ -1504,8 +1504,9 @@ fn marker_certificate_validates_private_and_callback_hostnames_only() {
     assert!(key_public.status.success());
     assert_eq!(cert_public.stdout, key_public.stdout);
 
-    // `openssl x509 -checkhost` reports its verdict on stdout ("does match" / "does NOT match");
-    // OpenSSL 3.0 exits 0 either way, so the exit status alone cannot tell them apart.
+    // `openssl x509 -checkhost` reports its verdict on stdout ("does match" / "does NOT match"),
+    // and OpenSSL 3.0 exits 0 either way; other builds signal it only through the exit status.
+    // Trust the printed verdict when there is one, the exit status otherwise.
     let validates = |hostname: &str| {
         let output = std::process::Command::new("openssl")
             .args(["x509", "-in"])
@@ -1514,9 +1515,13 @@ fn marker_certificate_validates_private_and_callback_hostnames_only() {
             .output()
             .expect("OpenSSL is required to validate the marker certificate");
         let verdict = String::from_utf8_lossy(&output.stdout);
-        output.status.success()
-            && verdict.contains("does match")
-            && !verdict.contains("does NOT match")
+        if verdict.contains("does NOT match") {
+            false
+        } else if verdict.contains("does match") {
+            true
+        } else {
+            output.status.success()
+        }
     };
 
     assert!(validates("jss-marker"));

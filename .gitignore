@@ -28,7 +28,7 @@ __pycache__/
 # Exact learned examples now live under the user's private data directory, never in this public
 # checkout. Ignore the legacy on-tree store so a future research run cannot stage a disclosure.
 /.satori/fix-recipes/examples/
-/.satori/fix-recipes/recipes/
+# Repository-neutral recipes are public evolution data and ship embedded in every release.
 
 # Online research artifacts can contain undisclosed repositories, PoCs and callback tokens.
 /runs/

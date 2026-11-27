@@ -57,12 +57,14 @@ deterministic lane, first at half the estimate and then at the estimate, for `--
 (30 by default, counted from the first verification). Fitting the sampled whole-host CPU and memory
 against the number of running verifications yields this host's per-verification cost, which is
 saved to `~/.config/jsspector/online-profile.json`; later passes on the same hardware size
-themselves from it. The same improvement metrics judge whether running that many pays: if
-verifications per hour did not grow with the slots, or the downloads that every clone, npm install
-and image pull share stayed at the link's ceiling, the profile caps the slots at the lower level; a
-static-bound pass raises static workers, unless the clones share a saturated link; and timeouts that
-are significantly more frequent at the higher level (a one-sided Fisher exact test, since repositories
-differ widely) cap the slots there. A smaller rise is reported, not acted on. Every sample also
+themselves from it. The same improvement metrics decide where a pass starts: never above the highest
+level calibration ran, and at the lower level when the downloads that every clone, npm install and
+image pull share levelled off (their ceiling is kept) or when more slots did not raise throughput
+while Docker was the limit. The governor then climbs from there while CPU, memory and the link keep
+headroom and verifications queue, which also covers what calibration cannot see, such as slots held
+by Opus fix passes. A static-bound pass raises static workers, unless the clones share a saturated
+link, and only timeouts that are significantly more frequent at the higher level (a one-sided Fisher
+exact test, since repositories differ widely) set a hard cap. A smaller rise is reported, not acted on. Every sample also
 records the bytes received on physical network interfaces. A calibration keeps its own state in its run directory, so the repositories it
 touched remain eligible for real passes.
 

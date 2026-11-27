@@ -306,6 +306,27 @@ class GovernorTests(unittest.TestCase):
         state.last_increase = 150
         self.assertEqual(resources.govern(state, busy, target=0.8, now=200)[0], 12)
 
+    def test_headroom_respects_the_links_ceiling(self) -> None:
+        def busy_window(network: float) -> list[resources.Sample]:
+            return [
+                resources.Sample(
+                    **{
+                        **sample(float(t), cpu=0.5, saturated=True, active=12, waiting=8).__dict__,
+                        "net_rx_mbps": network,
+                    }
+                )
+                for t in range(0, 201, 5)
+            ]
+
+        state = resources.GovernorState(limit=12, floor=3, ceiling=18, network_ceiling=13.3)
+        held, _reason = resources.govern(state, busy_window(12.8), target=0.8, now=200)
+        self.assertEqual(held, 12)  # downloads at 96% of the link: adding builds only slows them
+        raised, reason = resources.govern(state, busy_window(6.0), target=0.8, now=200)
+        self.assertEqual(raised, 13)
+        self.assertIn("network 6.0 MB/s", reason or "")
+        unknown = resources.GovernorState(limit=12, floor=3, ceiling=18)
+        self.assertEqual(resources.govern(unknown, busy_window(12.8), target=0.8, now=200)[0], 13)
+
     def test_inside_the_band_holds(self) -> None:
         state = resources.GovernorState(limit=12, floor=3, ceiling=18)
         steady = self.window(300, cpu=0.8, memory=0.6, saturated=True, waiting=3)
@@ -410,13 +431,17 @@ class CalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(result["fit"]["cpu_r2"], 1.0, places=3)
         # 0.8 × 20 − 0.5 busy = 15.5 CPU; overhead 1.0 (intercept 1.5 − 0.5 busy) leaves 14.5,
         # i.e. 18 verifications at 0.8 CPU each.
-        self.assertEqual(result["recommended"]["parallel_docker"], 18)
-        self.assertEqual(result["recommended"]["limited_by"], "cpu")
+        # The fit says 18 at the target, but calibration only ran up to 12: start there and let the
+        # governor climb (its ceiling covers the fit).
+        self.assertEqual(result["recommended"]["parallel_docker"], 12)
+        self.assertEqual(result["recommended"]["limited_by"], "calibrated start")
+        self.assertEqual(result["costs"]["start_docker_slots"], 12.0)
+        self.assertEqual(result["costs"]["max_docker_slots"], 64.0)
         self.assertEqual(result["checks"], [])
         self.assertGreater(result["high"]["verifications"], 0)
         self.assertEqual(result["high"]["bottleneck"]["verification"], 1.0)
         text = resources.render_calibration(result, target=0.8, profile=Path("/tmp/p.json"))
-        self.assertIn("docker 18", text)
+        self.assertIn("docker 12", text)
         self.assertIn("saved to /tmp/p.json", text)
 
     def test_flat_load_cannot_be_fitted(self) -> None:
@@ -637,33 +662,37 @@ class ImprovementMetricTests(unittest.TestCase):
                 "bottleneck": shares,
             }
 
-        notes, per_slot, cap = resources.calibration_checks(
+        checks = resources.calibration_checks(
             level(20, 1, verification=0.9), level(30, 1, verification=0.8), high_slots=12
         )
-        self.assertEqual((notes, per_slot, cap), ([], resources.STATIC_PER_SLOT, 64.0))
+        self.assertEqual(checks.notes, [])
+        self.assertEqual(
+            (checks.static_per_slot, checks.start_docker_slots, checks.max_docker_slots),
+            (resources.STATIC_PER_SLOT, 12.0, 64.0),
+        )
 
-        notes, per_slot, cap = resources.calibration_checks(
+        checks = resources.calibration_checks(
             level(20, 0, verification=0.9),
             level(30, 0, verification=0.3, static=0.6, discovery=0.1),
             high_slots=12,
         )
-        self.assertEqual(per_slot, resources.STATIC_BOUND_PER_SLOT)
-        self.assertEqual(cap, 64.0)
-        self.assertIn("static 60%", notes[0])
+        self.assertEqual(checks.static_per_slot, resources.STATIC_BOUND_PER_SLOT)
+        self.assertEqual(checks.max_docker_slots, 64.0)
+        self.assertIn("static 60%", checks.notes[0])
 
         # The first calibration on the GB10: 0/46 then 7/127 is a rise, but not a significant one.
-        notes, per_slot, cap = resources.calibration_checks(
+        checks = resources.calibration_checks(
             level(46, 0, verification=0.88), level(127, 7, verification=1.0), high_slots=12
         )
-        self.assertEqual(cap, 64.0)
-        self.assertIn("p=0.11", notes[0])
-        self.assertIn("not significant", notes[0])
+        self.assertEqual(checks.max_docker_slots, 64.0)
+        self.assertIn("p=0.11", checks.notes[0])
+        self.assertIn("not significant", checks.notes[0])
 
-        notes, per_slot, cap = resources.calibration_checks(
+        checks = resources.calibration_checks(
             level(60, 1, verification=0.9), level(120, 20, verification=0.9), high_slots=12
         )
-        self.assertEqual(cap, 12.0)
-        self.assertIn("contention", notes[0])
+        self.assertEqual((checks.max_docker_slots, checks.start_docker_slots), (12.0, 12.0))
+        self.assertIn("contention", checks.notes[0])
 
     def test_flat_downloads_while_slots_grow_flag_the_network(self) -> None:
         def level(verifications: int, network: float) -> dict:
@@ -675,15 +704,17 @@ class ImprovementMetricTests(unittest.TestCase):
                 "net_rx_mean": network,
             }
 
-        notes, _per_slot, cap = resources.calibration_checks(
-            level(40, 12.0), level(80, 13.5), high_slots=18, low_slots=9
+        checks = resources.calibration_checks(
+            {**level(40, 12.0)}, {**level(80, 13.5), "net_rx_p95": 14.2}, high_slots=18, low_slots=9
         )
-        self.assertEqual(cap, 64.0)
-        self.assertIn("network link is saturated", notes[0])
-        notes, _per_slot, _cap = resources.calibration_checks(
+        self.assertEqual(checks.max_docker_slots, 64.0)
+        self.assertEqual(checks.start_docker_slots, 9.0)
+        self.assertEqual(checks.network_ceiling_mbps, 14.2)
+        self.assertIn("levels off near 14.2 MB/s", checks.notes[0])
+        checks = resources.calibration_checks(
             level(40, 6.0), level(80, 11.0), high_slots=18, low_slots=9
         )
-        self.assertEqual(notes, [])
+        self.assertEqual((checks.notes, checks.start_docker_slots), ([], 18.0))
 
     def test_network_rate_counts_only_physical_interfaces(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -729,32 +760,53 @@ class ImprovementMetricTests(unittest.TestCase):
                 "net_rx_mean": network,
             }
 
-        # The GB10 on a ~110 Mbit/s link: the network was full at 9 slots; 18 slots added
-        # nothing, and the static stage (cloning on the same link) became the visible limit.
-        notes, per_slot, cap = resources.calibration_checks(
+        # Docker limited the 9-slot level, 18 slots added nothing and the link was full: start at 9
+        # (a soft start, not a cap) and keep static workers as they are.
+        checks = resources.calibration_checks(
             level(300, 13.3, 0.9), level(310, 13.3, 0.3), high_slots=18, low_slots=9
         )
-        self.assertEqual(cap, 9.0)
-        self.assertEqual(per_slot, resources.STATIC_PER_SLOT)
-        joined = " | ".join(notes)
-        self.assertIn("network link is saturated", joined)
-        self.assertIn("did not pay, capped at 9", joined)
+        self.assertEqual((checks.start_docker_slots, checks.max_docker_slots), (9.0, 64.0))
+        self.assertEqual(checks.static_per_slot, resources.STATIC_PER_SLOT)
+        joined = " | ".join(checks.notes)
+        self.assertIn("levels off near 13.3 MB/s", joined)
+        self.assertIn("while Docker was the limit: passes start at 9", joined)
         self.assertIn("share the saturated link", joined)
 
+        # The GB10's second calibration: the 9-slot level was clone-bound (Docker 26%), so the
+        # flat throughput says nothing about slots and must not lower the start by itself.
+        checks = resources.calibration_checks(
+            {**level(379, 0.0, 0.26), "net_rx_mean": None},
+            {**level(392, 0.0, 0.01), "net_rx_mean": None},
+            high_slots=18,
+            low_slots=9,
+        )
+        self.assertEqual(checks.start_docker_slots, 18.0)
+        self.assertIn("says nothing about slots", " | ".join(checks.notes))
+
         # Calibration 1 (no network data): 232 -> 425/h when doubling the slots pays.
-        notes, per_slot, cap = resources.calibration_checks(
+        checks = resources.calibration_checks(
             {**level(232, 0.0, 0.88), "net_rx_mean": None},
             {**level(425, 0.0, 1.0), "net_rx_mean": None},
             high_slots=12,
             low_slots=6,
         )
-        self.assertEqual(cap, 64.0)
+        self.assertEqual((checks.start_docker_slots, checks.max_docker_slots), (12.0, 64.0))
 
     def test_fisher_exact_tail(self) -> None:
         self.assertAlmostEqual(resources.fisher_greater(0, 46, 7, 127), 0.1098, places=4)
         self.assertEqual(resources.fisher_greater(0, 10, 0, 10), 1.0)
         self.assertLess(resources.fisher_greater(1, 60, 20, 120), 0.01)
         self.assertGreater(resources.fisher_greater(5, 10, 1, 10), 0.9)
+
+    def test_a_calibrated_start_leaves_the_governor_room_to_climb(self) -> None:
+        costs = resources.Costs(start_docker_slots=9)
+        plan = resources.estimate(host(), costs)
+        self.assertEqual(plan.parallel_docker, 9)
+        self.assertEqual(plan.limited_by, "calibrated start")
+        self.assertGreaterEqual(plan.docker_ceiling, 12)
+        self.assertLessEqual(plan.docker_ceiling, 18)
+        explicit = resources.estimate(host(), costs, parallel_docker=12)
+        self.assertEqual(explicit.parallel_docker, 12)
 
     def test_calibrated_static_scaling_and_cap_shape_the_plan(self) -> None:
         costs = resources.Costs(static_per_slot=1.5, max_docker_slots=8)

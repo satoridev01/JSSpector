@@ -95,8 +95,10 @@ Worker counts are derived from the host rather than fixed, by the bundled `resou
 - **Governor.** Every five seconds the monitor samples whole-host CPU, memory and PSI. Memory above
   target + 7 points (or memory stalls) cuts the Docker slot limit by a quarter; a two-minute CPU
   mean above target + 8 points removes one slot; one slot is added only when both resources are 10
-  points below the target, every deterministic slot is busy with work waiting, and the last change is
-  at least 150 seconds old. Lowering the limit never interrupts a running verification. Explicit lane
+  points below the target, downloads are below 90% of the link ceiling a calibration measured,
+  every deterministic slot is busy with work waiting, and the last change is at least 150 seconds
+  old. It may climb past a calibrated start up to what CPU and memory fit (at most twice the start),
+  never past a hard cap. Lowering the limit never interrupts a running verification. Explicit lane
   counts, `--calibrate` and `--no-governor` disable it.
 - **Operator control.** Every sample also reads `control.json` in the run directory (the TUI's `+`,
   `-` and `a` write it): `{"docker_slots": N}` fixes the slots (at least one deterministic slot;
@@ -108,17 +110,17 @@ Worker counts are derived from the host rather than fixed, by the bundled `resou
   the estimate; samples after a three-minute warm-up are fitted (least squares) against the number of
   running verifications. The slope is the per-verification CPU and memory and the intercept the
   pass's own overhead above what was busy at the start. The improvement metrics below then judge
-  whether those slots pay. If verifications per hour grew by less than a quarter of the proportional
-  gain (doubling the slots must add 25%), the slots are capped at the low level. If the bytes received
-  on physical interfaces stayed flat while the slots grew by half or more, the shared link (clones,
-  npm installs inside image builds, base-image pulls) is reported as saturated. If verification
+  where a pass should start. It starts at most at the highest level calibration ran, and at the low
+  level when the bytes received on physical interfaces stayed flat while the slots grew by half or
+  more (the link levelled off; its p95 is kept as the link ceiling) or when verifications per hour
+  grew by less than a quarter of the proportional gain while Docker limited the low level (with a
+  clone- or discovery-bound low level the comparison says nothing about slots). If verification
   limited the high level less than half the time, more slots alone would not help; a static-bound
-  level raises static workers to 1.5 per slot for later passes, unless the link is saturated (then
-  more clones only split it). If timeouts are significantly more frequent at the high level
-  (one-sided Fisher exact test, p < 0.05, at least three timeouts), the slots are capped at the high
-  level. A smaller rise is reported but not acted
-  on: an Electron app or a large monorepo can exceed the startup budget on an idle host, so a few
-  extra timeouts are not evidence of contention by themselves. The profile is keyed to the hardware (CPU model, logical CPUs, memory, Docker engine)
+  level raises static workers to 1.5 per slot, unless the link was saturated. Only timeouts that are
+  significantly more frequent at the high level (one-sided Fisher exact test, p < 0.05, at least
+  three) set a hard cap. A smaller rise is reported but not acted on: an Electron app or a large
+  monorepo can exceed the startup budget on an idle host, so a few extra timeouts are not evidence
+  of contention by themselves. The profile is keyed to the hardware (CPU model, logical CPUs, memory, Docker engine)
   and ignored elsewhere.
 - **Improvement metrics.** Issues per hour is verifications per hour times issues per verification;
   three measurements say which factor to work on. *Docker time* splits slot time by outcome

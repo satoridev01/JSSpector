@@ -90,6 +90,8 @@ NETWORK_FLAT_RATIO = 1.25
 # More slots must buy throughput: at least this share of the proportional gain in verifications per
 # hour (doubling the slots must add 25%), or the low level was already the useful maximum.
 THROUGHPUT_SCALING_SHARE = 0.25
+# The governor adds a slot only while downloads stay below this share of the link's measured ceiling.
+NETWORK_HEADROOM = 0.9
 
 # Improvement metrics: only what changes a decision.
 OUTCOMES = ("verified", "not-reproduced", "skipped", "timeout", "error")
@@ -381,8 +383,15 @@ class Costs:
     # Static workers per Docker slot (at least MIN_STATIC); a calibration that found the static
     # stage limiting raises it.
     static_per_slot: float = STATIC_PER_SLOT
-    # Most Docker slots worth running here; a calibration that saw timeouts grow with load caps it.
+    # Hard cap: most Docker slots worth running here. Only a calibration that saw timeouts grow
+    # significantly with load (contention) sets it; the governor never goes above it.
     max_docker_slots: float = MAX_DOCKER_SLOTS
+    # Where a pass starts: the highest level a calibration saw pay off. The governor may climb from
+    # here while the host keeps headroom and verifications queue.
+    start_docker_slots: float = MAX_DOCKER_SLOTS
+    # MB/s the downloads levelled off at during calibration (0 when unknown); the governor stops
+    # adding slots near it.
+    network_ceiling_mbps: float = 0.0
     source: str = "built-in"
 
 
@@ -488,6 +497,11 @@ def estimate(
     else:
         cpu_ok, memory_ok = fits(docker + 1)
         limited_by = "cpu" if not cpu_ok else "memory"
+    fitted = docker
+    start = int(costs.start_docker_slots)
+    if start < docker:
+        docker = start
+        limited_by = "calibrated start"
     if docker < floor:
         docker = floor
         limited_by = "minimum"
@@ -509,7 +523,9 @@ def estimate(
 
     usable_memory = mem_budget - costs.overhead_mem_gib - static * costs.static_mem_gib
     memory_ceiling = math.floor(usable_memory / costs.verify_peak_mem_gib)
-    ceiling = max(docker, min(max_docker, 2 * docker, memory_ceiling))
+    # The governor may climb past a calibrated start up to what CPU and memory fit (at most twice
+    # the start), never past the hard cap or what memory allows at the per-verification peak.
+    ceiling = max(docker, min(max_docker, max(2 * docker, fitted), memory_ceiling))
     if max_checkouts is not None:
         explicit.append("max_checkouts")
         checkouts = max_checkouts
@@ -890,6 +906,7 @@ class GovernorState:
     ceiling: int
     last_increase: float = -math.inf
     last_decrease: float = -math.inf
+    network_ceiling: float = 0.0
 
 
 def govern(
@@ -898,8 +915,9 @@ def govern(
     """Next Docker slot limit and why, from recent whole-host samples.
 
     Memory is guarded first and cut by a quarter, because exhausting it kills containers; CPU above
-    the band sheds one slot; one slot is added only when both resources have headroom, every slot is
-    busy and work is waiting, and the previous change has had time to show in the samples.
+    the band sheds one slot; one slot is added only when CPU and memory have headroom, downloads are
+    below the link's calibrated ceiling, every slot is busy and work is waiting, and the previous
+    change has had time to show in the samples.
     """
     if not window:
         return state.limit, None
@@ -923,15 +941,22 @@ def govern(
         and now - state.last_decrease >= CPU_DECREASE_COOLDOWN_S
     ):
         return state.limit - 1, f"cpu {cpu:.0%}"
+    network = [sample.net_rx_mbps for sample in recent if sample.net_rx_mbps is not None]
+    network_mean = sum(network) / len(network) if network else 0.0
+    network_ok = not state.network_ceiling or network_mean < NETWORK_HEADROOM * state.network_ceiling
     if (
         cpu <= target - CPU_LOW_MARGIN
         and memory <= target - MEMORY_LOW_MARGIN
+        and network_ok
         and latest.saturated
         and state.limit < state.ceiling
         and history >= CPU_WINDOW_S
         and now - max(state.last_increase, state.last_decrease) >= INCREASE_COOLDOWN_S
     ):
-        return state.limit + 1, f"headroom: cpu {cpu:.0%}, memory {memory:.0%}"
+        return state.limit + 1, (
+            f"headroom: cpu {cpu:.0%}, memory {memory:.0%}"
+            + (f", network {network_mean:.1f} MB/s" if network else "")
+        )
     return state.limit, None
 
 
@@ -1259,10 +1284,25 @@ def fisher_greater(low_hits: int, low_n: int, high_hits: int, high_n: int) -> fl
     return min(1.0, tail / denominator)
 
 
+@dataclass(frozen=True)
+class Checks:
+    """What the two calibration levels say beyond the CPU and memory fit."""
+
+    notes: list[str]
+    static_per_slot: float
+    start_docker_slots: float
+    max_docker_slots: float
+    network_ceiling_mbps: float
+
+
 def calibration_checks(
     low: dict[str, Any], high: dict[str, Any], *, high_slots: int, low_slots: int | None = None
-) -> tuple[list[str], float, float]:
-    """(findings, static workers per slot, Docker slot cap) from the two levels' metrics.
+) -> Checks:
+    """Start level, hard cap, static scaling and link ceiling from the two levels' metrics.
+
+    A pass starts at most at the highest level calibration ran (the governor explores beyond it);
+    the low level when the link was saturated or when more slots did not raise throughput while
+    Docker was the limit. Only significant contention sets a hard cap.
 
     The CPU and memory fit says what the host could run; these checks say whether running it pays.
     More slots must raise verifications per hour; Docker must have been what limited the high level;
@@ -1272,6 +1312,8 @@ def calibration_checks(
     notes: list[str] = []
     static_per_slot = STATIC_PER_SLOT
     max_docker = float(MAX_DOCKER_SLOTS)
+    start = float(high_slots)
+    network_ceiling = 0.0
 
     low_network = low.get("net_rx_mean")
     high_network = high.get("net_rx_mean")
@@ -1283,22 +1325,33 @@ def calibration_checks(
         and high_network < low_network * NETWORK_FLAT_RATIO
     )
     if network_saturated:
+        network_ceiling = float(high.get("net_rx_p95") or high_network)
+        start = float(low_slots or high_slots)
         notes.append(
             f"downloads stayed near {high_network:g} MB/s at {high_slots} slots "
-            f"({low_network:g} MB/s at {low_slots}): the network link is saturated, so more "
-            "slots or static workers only lengthen every clone, npm install and image pull"
+            f"({low_network:g} MB/s at {low_slots}): the link levels off near "
+            f"{network_ceiling:g} MB/s; passes start at {int(start)} slots and the governor adds "
+            "slots only below it"
         )
 
     low_rate = low.get("verifications_per_hour")
     high_rate = high.get("verifications_per_hour")
+    low_bound = low.get("bottleneck", {}).get("verification", 0.0) >= VERIFICATION_BOUND_SHARE
     if low_slots and high_slots > low_slots and low_rate and high_rate is not None:
         wanted = 1 + THROUGHPUT_SCALING_SHARE * (high_slots / low_slots - 1)
-        if high_rate < low_rate * wanted:
-            max_docker = float(low_slots)
+        if high_rate < low_rate * wanted and low_bound:
+            start = min(start, float(low_slots))
             notes.append(
                 f"throughput went from {low_rate:g} to {high_rate:g} verifications/h as the "
-                f"slots went from {low_slots} to {high_slots}: more slots did not pay, capped at "
-                f"{low_slots}"
+                f"slots went from {low_slots} to {high_slots} while Docker was the limit: passes "
+                f"start at {low_slots}"
+            )
+        elif high_rate < low_rate * wanted:
+            notes.append(
+                f"throughput went from {low_rate:g} to {high_rate:g} verifications/h, but Docker "
+                f"limited the {low_slots}-slot level only "
+                f"{low.get('bottleneck', {}).get('verification', 0.0):.0%} of the time, so this "
+                "says nothing about slots"
             )
 
     shares = high.get("bottleneck", {})
@@ -1339,13 +1392,20 @@ def calibration_checks(
             )
             if high_timeouts >= MIN_CONTENTION_TIMEOUTS and p_value < CONTENTION_P_VALUE:
                 max_docker = min(max_docker, float(high_slots))
+                start = min(start, max_docker)
                 notes.append(f"{rise}: contention, capped at {int(max_docker)}")
             else:
                 notes.append(
                     f"{rise}, not significant: not capped; watch the timeout share of Docker "
                     "time in real passes"
                 )
-    return notes, static_per_slot, max_docker
+    return Checks(
+        notes=notes,
+        static_per_slot=static_per_slot,
+        start_docker_slots=start,
+        max_docker_slots=max_docker,
+        network_ceiling_mbps=round(network_ceiling, 1),
+    )
 
 
 def analyze_calibration(
@@ -1416,10 +1476,16 @@ def analyze_calibration(
         ),
         source="calibrated",
     )
-    checks, static_per_slot, max_docker = calibration_checks(
+    checks = calibration_checks(
         result["low"], result["high"], high_slots=calibration.high, low_slots=calibration.low
     )
-    costs = replace(costs, static_per_slot=static_per_slot, max_docker_slots=max_docker)
+    costs = replace(
+        costs,
+        static_per_slot=checks.static_per_slot,
+        start_docker_slots=checks.start_docker_slots,
+        max_docker_slots=checks.max_docker_slots,
+        network_ceiling_mbps=checks.network_ceiling_mbps,
+    )
     plan = estimate(
         host,
         costs,
@@ -1450,7 +1516,7 @@ def analyze_calibration(
                     (sample.mem_pressure or 0.0 for sample in usable), default=0.0
                 ),
             },
-            "checks": checks,
+            "checks": checks.notes,
             "costs": {
                 name: value for name, value in asdict(costs).items() if name != "source"
             },
@@ -1565,6 +1631,7 @@ class Monitor(threading.Thread):
         record_path: Path | None = None,
         reader: UsageReader | None = None,
         interval_s: float = SAMPLE_INTERVAL_S,
+        network_ceiling: float = 0.0,
         performance: Performance | None = None,
         checkouts: Callable[[], tuple[int, int]] | None = None,
         backlog: Callable[[], int] | None = None,
@@ -1599,10 +1666,12 @@ class Monitor(threading.Thread):
         self.started = time.monotonic()
         self._stop_event = threading.Event()
         self._window: deque[Sample] = deque(maxlen=int(CPU_WINDOW_S * 3 / interval_s) + 1)
+        self.network_ceiling = network_ceiling
         self._state = GovernorState(
             limit=docker_slots.limit,
             floor=plan.docker_floor,
             ceiling=plan.docker_ceiling,
+            network_ceiling=network_ceiling,
         )
         self._last_log = -math.inf
         self._last_performance = -math.inf
@@ -1669,6 +1738,7 @@ class Monitor(threading.Thread):
                 limit=current,
                 floor=self.plan.docker_floor,
                 ceiling=max(self.plan.docker_ceiling, current),
+                network_ceiling=self.network_ceiling,
             )
             return f"control: governor resumed at {current} docker slots"
         if isinstance(value, int) and not isinstance(value, bool):

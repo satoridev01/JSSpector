@@ -2667,6 +2667,7 @@ def main(argv: list[str] | None = None) -> int:
         checkouts=lambda: (checkout_slots.held, checkout_slots.capacity),
         backlog=lambda: verification_backlog,
         control_path=run_dir / "control.json",
+        network_ceiling=capacity.costs.network_ceiling_mbps,
         ensure_checkouts=lambda limit: checkout_slots.grow_to(
             args.static_parallel + resources.QUEUE_PER_SLOT * limit
         ),

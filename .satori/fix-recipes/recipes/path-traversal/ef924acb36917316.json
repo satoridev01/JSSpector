@@ -12,7 +12,7 @@
   ],
   "before": "",
   "after": "const resolvedRoot = path.resolve(root);\nconst resolvedFile = path.resolve(file);\nif (resolvedFile !== resolvedRoot && !resolvedFile.startsWith(resolvedRoot + path.sep)) { res.writeHead(404); res.end('nope'); return; }",
-  "proven": 6,
+  "proven": 7,
   "offered": 0,
   "first_try": 0
 }

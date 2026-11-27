@@ -1,0 +1,14 @@
+{
+  "id": "b506727fee0676e4",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": [
+    "String",
+    "basename"
+  ],
+  "before": "const filePath = path.join(__dirname, \"users\", `${userId}.json`);",
+  "after": "const filePath = path.join(__dirname, \"users\", `${path.basename(String(userId))}.json`);",
+  "proven": 1,
+  "offered": 1,
+  "first_try": 1
+}

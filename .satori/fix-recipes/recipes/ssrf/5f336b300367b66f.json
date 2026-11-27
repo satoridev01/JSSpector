@@ -1,0 +1,20 @@
+{
+  "id": "5f336b300367b66f",
+  "class": "ssrf",
+  "sink": "fetch",
+  "introduces": [
+    "CORS_HEADERS",
+    "Response",
+    "URL",
+    "com",
+    "endsWith",
+    "hostname",
+    "io",
+    "new"
+  ],
+  "before": "",
+  "after": "const PROXY_ALLOWED_HOSTS = ['hentaimama.io', 'hentaisea.com', 'hentai.tv'];\nfunction isAllowedProxyUrl(targetUrl) {\n  let parsed;\n  try {\n    parsed = new URL(targetUrl);\n  } catch {\n    return false;\n  }\n  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;\n  if (parsed.username || parsed.password) return false;\n  const host = parsed.hostname.toLowerCase();\n  return PROXY_ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h));",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

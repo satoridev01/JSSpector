@@ -1,0 +1,13 @@
+{
+  "id": "e822f4745b15bc07",
+  "class": "command-injection",
+  "sink": "exec",
+  "introduces": [
+    "replace"
+  ],
+  "before": "var nameQ = JSON.stringify(String(connName));",
+  "after": "var nameQ = \"'\" + String(connName).replace(/'/g, \"'\\\\''\") + \"'\";",
+  "proven": 1,
+  "offered": 4,
+  "first_try": 1
+}

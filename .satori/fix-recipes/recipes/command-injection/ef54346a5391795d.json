@@ -1,0 +1,14 @@
+{
+  "id": "ef54346a5391795d",
+  "class": "command-injection",
+  "sink": "execSync",
+  "introduces": [
+    "String",
+    "replace"
+  ],
+  "before": "return execSync(`gcloud secrets versions access latest --secret=\"${tokenSecret}\"`, { encoding: 'utf8' }).trim();",
+  "after": "const secretQ = \"'\" + String(tokenSecret).replace(/'/g, \"'\\\\''\") + \"'\";\nreturn execSync(`gcloud secrets versions access latest --secret=${secretQ}`, { encoding: 'utf8' }).trim();",
+  "proven": 1,
+  "offered": 1,
+  "first_try": 0
+}

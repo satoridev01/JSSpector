@@ -1,0 +1,18 @@
+{
+  "id": "66a24da488df7dbc",
+  "class": "path-traversal",
+  "sink": "readFile",
+  "introduces": [
+    "$",
+    "resolve",
+    "return",
+    "send404",
+    "sep",
+    "startsWith"
+  ],
+  "before": "",
+  "after": "const frontRoot = path.resolve(`.${baseFrontPath}`);\nconst resolvedPath = path.resolve(pathName);\nif (resolvedPath !== frontRoot && !resolvedPath.startsWith(frontRoot + path.sep)) {\n    send404(pathName, response);\n    return;\n}",
+  "proven": 1,
+  "offered": 0,
+  "first_try": 0
+}

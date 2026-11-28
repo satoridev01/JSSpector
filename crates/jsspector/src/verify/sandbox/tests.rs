@@ -1093,6 +1093,20 @@ fn a_traversal_poc_preserves_dot_segments() {
 }
 
 #[test]
+fn a_nosql_query_poc_disables_curl_url_globbing() {
+    let attempt = Attempt {
+        verb: "GET",
+        target: "/users?token[$ne]=jsspector".to_owned(),
+        body: None,
+        headers: Vec::new(),
+        signal: Signal::InResponse,
+    };
+    let command = curl_command(&attempt, 3000);
+    assert!(command.contains("curl -sS --globoff"), "{command}");
+    assert!(command.contains("token[\\$ne]=jsspector"), "{command}");
+}
+
+#[test]
 fn a_stored_poc_writes_then_carries_the_rotated_cookie_into_the_read() {
     let write = Attempt {
         verb: "POST",

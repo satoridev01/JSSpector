@@ -4910,7 +4910,11 @@ fn raw_curl_command_with_marker(attempt: &Attempt, port: u16, normalize_marker: 
     }
     let mut parts = vec![
         "TARGET_HOST=\"${TARGET_HOST:-127.0.0.1}\";".to_owned(),
-        "curl -sS --max-time 15".to_owned(),
+        // Request targets are evidence, not curl URL templates. In particular, Mongo-style
+        // query operators such as `token[$ne]` are literal parameter names; without --globoff
+        // curl interprets their brackets as a range, exits 3, and the copyable PoC cannot retain
+        // the exact response transcript that the verifier already proved internally.
+        "curl -sS --globoff --max-time 15".to_owned(),
         format!("--request {}", attempt.verb),
     ];
     if attempt.signal.service_token().is_some() {

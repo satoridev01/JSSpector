@@ -35,6 +35,16 @@ impl Session {
         let absent = self.fetch(&absent_attempt)?;
         let absent_sub = self.fetch(&absent_sub_attempt)?;
         let present = self.fetch(&present_attempt)?;
+        if std::env::var_os("JSS_VERIFY_DEBUG").is_some() {
+            eprintln!(
+                "[verify] traversal read oracle proof={:?} value={:?} present={:?} absent={:?} absent2={:?}",
+                oracle.proof,
+                oracle.present_value,
+                response_excerpt(&present),
+                response_excerpt(&absent),
+                response_excerpt(&absent_sub)
+            );
+        }
         let sink_hit = self.last_sink_hit.get();
         if present.trim().is_empty() {
             return None;
@@ -50,6 +60,59 @@ impl Session {
             present_n != absent_n && present_n != absent_sub_n && absent_n == absent_sub_n;
         if !self.accept_bound_effect_with_hit(differential, sink_hit) {
             return None;
+        }
+        // Prefer a material confidentiality proof when the positive leg returned bytes from the
+        // real operating-system target. This can happen even when the planner saw a filename suffix:
+        // many static servers append that suffix only after `existsSync(path)` fails, so an existing
+        // `/etc/shadow` or `/etc/passwd` path is opened unchanged. The two missing siblings above
+        // still have to agree, and the selected sink must execute in the positive request.
+        if let payload::ReadOracleProof::SensitiveFile { path } = &oracle.proof
+            && let Some(prefix) = sensitive_file_prefix(path)
+            && present.contains(prefix)
+        {
+            let command = self.poc_command(&present_attempt);
+            let transcript = self.exact_http_transcript(&present_attempt, &command);
+            return Some(Reproduction {
+                command,
+                command_redacted: false,
+                method: present_attempt.verb.to_owned(),
+                target: present_attempt.target.clone(),
+                headers: present_attempt
+                    .headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect(),
+                body: present_attempt.body.clone(),
+                evidence: format!(
+                    "the traversal returned the contents of the real operating-system file `{path}` \
+                     (including `{prefix}`), proving local file content disclosure"
+                ),
+                response: response_excerpt(&present),
+                stdout: transcript
+                    .as_ref()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned()),
+                stderr: transcript
+                    .as_ref()
+                    .map(|output| String::from_utf8_lossy(&output.stderr).into_owned()),
+                exit_code: transcript.as_ref().and_then(|output| output.status.code()),
+                output_safety: transcript.map(|_| "oracle-proof".to_owned()),
+                controls: vec![
+                    ControlObservation {
+                        label: "missing sibling control".to_owned(),
+                        method: absent_attempt.verb.to_owned(),
+                        target: absent_attempt.target.clone(),
+                        body: absent_attempt.body.clone(),
+                        response: response_excerpt(&absent),
+                    },
+                    ControlObservation {
+                        label: "second missing sibling control".to_owned(),
+                        method: absent_sub_attempt.verb.to_owned(),
+                        target: absent_sub_attempt.target.clone(),
+                        body: absent_sub_attempt.body.clone(),
+                        response: response_excerpt(&absent_sub),
+                    },
+                ],
+            });
         }
         // The read oracle runs before the broad reflected-content matrix, so it must preserve the
         // stronger result when its positive leg actually returns the planted bytes. JavaScript
@@ -1517,6 +1580,14 @@ impl Session {
     }
 }
 
+fn sensitive_file_prefix(path: &str) -> Option<&'static str> {
+    match path {
+        "/etc/shadow" => Some("root:"),
+        "/etc/passwd" => Some("root:x:0:0:root:"),
+        _ => None,
+    }
+}
+
 type HttpObservation<'a> = (&'a str, Option<u16>, &'a [String]);
 
 /// A response differential proves an exploitable read only when the positive request completed
@@ -1608,7 +1679,10 @@ fn path_case_variants(path: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod oracle_tests {
-    use super::{include_response_headers, nosql_response_proves_impact, path_case_variants};
+    use super::{
+        include_response_headers, nosql_response_proves_impact, path_case_variants,
+        sensitive_file_prefix,
+    };
 
     const NO_COOKIES: &[String] = &[];
 
@@ -1634,6 +1708,16 @@ mod oracle_tests {
             "18ebdf4eae3bee68012fb800",
             false,
         ));
+    }
+
+    #[test]
+    fn sensitive_file_content_signatures_are_specific_to_the_target() {
+        assert_eq!(sensitive_file_prefix("/etc/shadow"), Some("root:"));
+        assert_eq!(
+            sensitive_file_prefix("/etc/passwd"),
+            Some("root:x:0:0:root:")
+        );
+        assert_eq!(sensitive_file_prefix("/tmp/jss-canary-read"), None);
     }
 
     #[test]

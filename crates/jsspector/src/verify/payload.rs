@@ -793,9 +793,13 @@ pub fn read_oracle(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<ReadOracle
     // Prefer a real sensitive-file proof for a blind read. `/etc/shadow` has the strongest impact
     // when the app runs with permission to read it; `/etc/passwd` is the portable non-root fallback.
     // Two nonexistent siblings under `/etc` are the negative controls, so a status/error difference
-    // can only come from the named OS file existing and being readable. A fixed appended segment
-    // cannot name either file exactly and therefore skips straight to a purpose-built fixture.
-    if probe.read_suffix.is_none() && probe.read_filename_suffix.is_none() && !probe.lists_dir {
+    // can only come from the named OS file existing and being readable. A fixed appended path
+    // segment cannot name either file exactly. A *filename* suffix is still attempted: it may be a
+    // conditional missing-file fallback (`if (!existsSync(p)) p += '.html'`), in which case an
+    // existing `/etc` target bypasses the suffix and remains exactly representable. If the suffix
+    // is truly unconditional these candidates simply agree with their missing controls and the
+    // purpose-built suffixed fixture below remains the fallback.
+    if probe.read_suffix.is_none() && !probe.lists_dir {
         for spec in oracle_placements(probe) {
             for path in ["/etc/shadow", "/etc/passwd"] {
                 let relative = path.trim_start_matches('/');
@@ -4736,17 +4740,22 @@ mod tests {
         let oracles = read_oracle(&p, &canary, 1);
         assert!(!oracles.is_empty());
         assert!(
-            oracles
-                .iter()
-                .all(|oracle| !matches!(oracle.proof, ReadOracleProof::SensitiveFile { .. }))
+            oracles.iter().any(|oracle| matches!(
+                &oracle.proof,
+                ReadOracleProof::SensitiveFile { path } if path == "/etc/shadow"
+            )),
+            "an inferred filename suffix may be a conditional fallback, so sensitive files must still be tried"
         );
-        assert!(oracles.iter().all(|oracle| matches!(
-            &oracle.proof,
-            ReadOracleProof::CraftedFixture {
-                effective_path,
-                constraint: Some(constraint),
-            } if effective_path.ends_with(".json") && constraint.contains(".json")
-        )));
+        assert!(
+            oracles.iter().any(|oracle| matches!(
+                &oracle.proof,
+                ReadOracleProof::CraftedFixture {
+                    effective_path,
+                    constraint: Some(constraint),
+                } if effective_path.ends_with(".json") && constraint.contains(".json")
+            )),
+            "the exact suffixed fixture must remain the fallback"
+        );
     }
 
     #[test]

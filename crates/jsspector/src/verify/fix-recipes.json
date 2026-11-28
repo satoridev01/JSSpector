@@ -27,6 +27,15 @@
     "after": "const filepath = path.join(FILES, path.basename(req.params.filename));"
   },
   {
+    "id": "seed-path-root-confinement",
+    "class": "path-traversal",
+    "sink": "",
+    "introduces": ["realpathSync", "relative", "isAbsolute"],
+    "note": "For a file server that must preserve legitimate nested paths, canonicalize both the serving root and the existing target with realpath, then reject targets whose path.relative result is '..', starts with '..' plus the platform separator, or is absolute. Open the validated canonical target so a symlink inside the root cannot redirect the sink outside it. Reapply the same check after appending an index filename to a requested directory; basename alone is inappropriate when nested paths are part of the route contract.",
+    "before": "const root = path.resolve(__dirname, 'public');\nconst requested = path.join(root, req.url);\nfs.createReadStream(requested).pipe(res);",
+    "after": "const root = fs.realpathSync(path.resolve(__dirname, 'public'));\nlet pathname;\ntry {\n  pathname = decodeURIComponent(req.url.split('?')[0]);\n} catch {\n  res.writeHead(400);\n  res.end('Bad Request');\n  return;\n}\nconst candidate = path.resolve(root, `.${pathname}`);\nconst requested = fs.realpathSync(candidate);\nconst relative = path.relative(root, requested);\nif (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {\n  res.writeHead(403);\n  res.end('Forbidden');\n  return;\n}\nfs.createReadStream(requested).pipe(res);"
+  },
+  {
     "id": "seed-command-execfile-arguments",
     "class": "command-injection",
     "sink": "child_process.exec",

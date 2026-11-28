@@ -1670,11 +1670,10 @@ fn verify_mcp(
 }
 
 /// Applies the express-validator body requirements mined for one route. The payload field's own
-/// typed filler is retained as a sibling because NoSQL verification also probes alternate common
-/// fields in the same body: the body builder removes this sibling when the primary field itself
-/// carries the operator, and keeps it for an alternate field (`token[$ne]`) so a required primary
-/// `.isEmail()` still passes. The same filler remains the scalar body half of a body/query overwrite
-/// probe when that specialized case is enabled.
+/// typed filler is retained as a sibling for specialized body/query overwrite probes and for any
+/// request construction that needs a validator-valid scalar. The body builder removes this sibling
+/// when that field itself carries the operator. The same filler remains the scalar body half of a
+/// body/query overwrite probe when that specialized case is enabled.
 fn apply_body_validator_fillers(
     siblings: &mut Vec<(String, String)>,
     body_query_override: &mut Option<String>,

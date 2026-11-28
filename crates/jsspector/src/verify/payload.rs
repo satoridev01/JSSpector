@@ -1571,9 +1571,14 @@ pub fn nosql_cases(probe: &Probe, canary: &Canary, nonce: u32) -> Vec<NosqlCase>
     let mut fields = Vec::new();
     if let Some(name) = &primary {
         fields.push(name.clone());
-    }
-    for name in NOSQL_FIELDS {
-        if !fields.iter().any(|existing| existing == name) {
+    } else {
+        // When static analysis resolved the request member that reaches the filter, keep the
+        // differential bound to that member. Trying unrelated common names (`id`, `token`, ...)
+        // can change unrelated handler behavior while the planned sink merely happens to execute,
+        // making the sink marker look causal even though the operator never entered its query.
+        // A whole-object filter (`findOne(req.body)`) deliberately has no primary member; only in
+        // that genuinely unresolved shape do we enumerate conventional document keys.
+        for name in NOSQL_FIELDS {
             fields.push(name.to_owned());
         }
     }
@@ -4829,6 +4834,7 @@ mod tests {
         ];
         let absent2 = nosql_absent_token(&canary, 2);
         let targeted = nosql_cases(&targeted, &canary, 2);
+        assert_eq!(targeted.len(), 1);
         assert_eq!(targeted[0].field, "email");
         // The generic `name` filler is replaced by this case's per-probe-unique numeric identity (so a
         // write handler's unique-key insert does not collide across the three probes); the constrained
@@ -4970,39 +4976,26 @@ mod tests {
     }
 
     #[test]
-    fn alternate_nosql_field_keeps_the_primary_fields_typed_validator_filler() {
+    fn resolved_nosql_field_does_not_probe_unrelated_common_names() {
         let canary = Canary::new("abc123".to_owned());
         let mut p = probe(
             VulnClass::NosqlInjection,
             "/api/v2/users/completeEmailLogin",
             Entry::Body(Some("email".to_owned())),
         );
-        // The planner mined this from `body("email").isEmail()`. When `token` is the
-        // operator-bearing alternate field, the email must remain valid instead of receiving the
-        // generic envelope placeholder.
+        // The planner mined this from `body("email").isEmail()`. Earlier versions then tried an
+        // unrelated `token[$ne]` body member and could attribute a response difference to the
+        // email sink merely because its runtime marker also fired. Once the tainted member is known,
+        // only that member may carry the operator.
         p.siblings
             .push(("email".to_owned(), "jss@jsspector.test".to_owned()));
         let absent = nosql_absent_token(&canary, 9);
         let cases = nosql_cases(&p, &canary, 9);
-        let token = cases.iter().find(|case| case.field == "token").unwrap();
-
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].field, "email");
         assert_eq!(
-            token.match_all.body.as_deref(),
-            Some(
-                format!("{{\"token\":{{\"$ne\":\"{absent}\"}},\"email\":\"jss@jsspector.test\"}}")
-                    .as_str()
-            )
-        );
-        assert_eq!(
-            token.match_none_eq.body.as_deref(),
-            Some(
-                format!("{{\"token\":{{\"$eq\":\"{absent}\"}},\"email\":\"jss@jsspector.test\"}}")
-                    .as_str()
-            )
-        );
-        assert_eq!(
-            token.match_none_in.body.as_deref(),
-            Some("{\"token\":{\"$in\":[]},\"email\":\"jss@jsspector.test\"}")
+            cases[0].match_all.body.as_deref(),
+            Some(format!("{{\"email\":{{\"$ne\":\"{absent}\"}}}}").as_str())
         );
     }
 
@@ -5059,18 +5052,10 @@ mod tests {
             primary.match_none_in.body.as_deref(),
             Some("{\"device_names\":[{\"$in\":[]}]}")
         );
-        // Other probed field names keep the direct (non-array) operator form.
-        let other = cases.iter().find(|c| c.field == "id").unwrap();
-        // The generic `device_names` placeholder sibling takes this case's per-probe numeric identity.
         assert_eq!(
-            other.match_all.body.as_deref(),
-            Some(
-                format!(
-                    "{{\"id\":{{\"$ne\":\"{absent}\"}},\"device_names\":{}}}",
-                    other.identity[0]
-                )
-                .as_str()
-            )
+            cases.len(),
+            1,
+            "resolved fields must not grow unrelated probes"
         );
     }
 

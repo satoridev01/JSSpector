@@ -2317,7 +2317,15 @@ fn mount_marker_url(value: &str, probe: &Probe) -> String {
 /// The probe's own request with a plain, harmless value in place of the payload: the legitimate
 /// behavior of the route, which a fix must leave unchanged.
 pub fn benign(probe: &Probe) -> Attempt {
-    benign_with_value(probe, ENVELOPE_PLACEHOLDER)
+    // An invalid placeholder URL commonly exercises only a proxy route's error handler (HTTP 500),
+    // which lets a fix that blocks every destination appear to preserve legitimate behavior. Use a
+    // stable public URL so an SSRF fix must still demonstrate that ordinary outbound proxying works.
+    let value = if probe.class == VulnClass::Ssrf {
+        "https://example.com/"
+    } else {
+        ENVELOPE_PLACEHOLDER
+    };
+    benign_with_value(probe, value)
 }
 
 /// The probe's harmless request with a caller-selected value. Fix proof uses a per-session value
@@ -3490,6 +3498,13 @@ mod tests {
             mcp: None,
             element_body: None,
         }
+    }
+
+    #[test]
+    fn an_ssrf_fix_control_uses_a_working_public_url() {
+        let p = probe(VulnClass::Ssrf, "/proxy", Entry::Query("url".to_owned()));
+        let attempt = benign(&p);
+        assert_eq!(attempt.target, "/proxy?url=https%3A%2F%2Fexample.com%2F");
     }
 
     #[test]

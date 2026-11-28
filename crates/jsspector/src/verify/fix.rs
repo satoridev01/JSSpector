@@ -465,6 +465,14 @@ impl Search {
                 reason: reason.to_owned(),
             };
         };
+        if finding.class == VulnClass::Ssrf && benign.status >= 500 {
+            return FixOutcome::Unsupported {
+                reason: format!(
+                    "the SSRF route's harmless public-URL control returned HTTP {}, so it does not prove legitimate proxy behavior",
+                    benign.status
+                ),
+            };
+        }
         if matches!(target, Target::Browser { .. }) && benign.shows.is_none() {
             return FixOutcome::Unsupported {
                 reason: "the page does nothing visible with a benign value sent the way the \
@@ -668,7 +676,8 @@ pub(crate) fn check(
     // without evaluating it. Merely deleting the route or hardcoding a response fails that control.
     let functional_control = benign.shows.is_some();
     let safe_sink_replacement =
-        replaces_shell_with_argument_api(finding, &original, &candidate.content);
+        replaces_shell_with_argument_api(finding, &original, &candidate.content)
+            || replaces_ssrf_with_pinned_request(finding, &original, &candidate.content);
     if candidate.file == sink_file(finding)
         && !functional_control
         && !safe_sink_replacement
@@ -801,6 +810,17 @@ fn replaces_shell_with_argument_api(finding: &Finding, original: &str, changed: 
         && (changed.contains("execFile(") || changed.contains("execFileSync("))
 }
 
+/// A generic URL proxy cannot keep using `fetch(raw_url)` after a DNS preflight: the client resolves
+/// the hostname again and is vulnerable to rebinding. Replacing it with Node's HTTP(S) request API
+/// is a valid sink replacement only when the connection itself receives a guarded `lookup` hook.
+/// The dynamic exploit sandwich and public-URL functional control still have to pass.
+fn replaces_ssrf_with_pinned_request(finding: &Finding, original: &str, changed: &str) -> bool {
+    finding.class == VulnClass::Ssrf
+        && original.contains("fetch(")
+        && (changed.contains("http.request(") || changed.contains("https.request("))
+        && changed.contains("lookup:")
+}
+
 /// Reject the common SSRF "fix" that resolves and checks a hostname, then gives the original URL
 /// to `fetch`. The HTTP client resolves it again, so an attacker-controlled DNS answer can change
 /// between the check and the connection (DNS rebinding). A proven automatic fix must bind the
@@ -810,13 +830,22 @@ fn reject_incomplete_ssrf_dns_pinning(
     original: &str,
     changed: &str,
 ) -> Result<(), String> {
-    if finding.class != VulnClass::Ssrf || !changed.contains("fetch(") {
+    if finding.class != VulnClass::Ssrf {
         return Ok(());
     }
-    let added_dns_lookup = (changed.contains("dns.lookup") && !original.contains("dns.lookup"))
-        || (changed.contains("node:dns")
-            && changed.contains("lookup(")
-            && !(original.contains("node:dns") && original.contains("lookup(")));
+    let added_dns_api = changed.contains("dns.lookup")
+        || changed.contains("dns.promises.lookup")
+        || changed.contains("resolve4(")
+        || changed.contains("resolve6(")
+        || ((changed.contains("from 'dns'")
+            || changed.contains("from \"dns\"")
+            || changed.contains("node:dns"))
+            && changed.contains("lookup("));
+    let original_dns_api = original.contains("dns.lookup")
+        || original.contains("dns.promises.lookup")
+        || original.contains("resolve4(")
+        || original.contains("resolve6(");
+    let added_dns_lookup = added_dns_api && !original_dns_api;
     let binds_checked_address = changed.contains("dispatcher:")
         || changed.contains("agent:")
         || changed.contains("lookup:");
@@ -848,6 +877,7 @@ was supplied) between a line containing only \
 const LLM_MAX_FILE: usize = 200_000;
 const LLM_CONTEXT_RADIUS: usize = 220;
 const LLM_MAX_CHANGED_LINES: usize = 80;
+const LLM_MAX_SSRF_CHANGED_LINES: usize = 140;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LlmExcerpt {
@@ -929,9 +959,14 @@ fn llm_candidate(
         None => proposed,
     };
     let changed = changed_lines(original, &content);
-    if changed > LLM_MAX_CHANGED_LINES {
+    let max_changed = if finding.class == VulnClass::Ssrf {
+        LLM_MAX_SSRF_CHANGED_LINES
+    } else {
+        LLM_MAX_CHANGED_LINES
+    };
+    if changed > max_changed {
         return Err(format!(
-            "the LLM change touches {changed} lines, not a minimal fix"
+            "the LLM change touches {changed} lines, exceeding the {max_changed}-line limit"
         ));
     }
     Ok(Candidate {
@@ -1055,6 +1090,16 @@ fn llm_prompt(
             "\nFor this cross-site scripting finding, encoding the value for the context it is \
              written into, or writing it as text instead of markup, neutralizes it; the value must \
              still be shown.\n",
+        );
+    }
+    if finding.class == VulnClass::Ssrf {
+        prompt.push_str(
+            "\nFor this SSRF finding, a DNS lookup performed before `fetch` is not a fix: DNS can \
+             change before the client connects. Prefer a narrow trusted-host allowlist when the \
+             application has known upstreams. For a generic proxy, validate every resolved address \
+             in the HTTP client's socket-level `lookup` hook and revalidate every redirect. Block \
+             loopback, private, link-local, carrier-grade NAT, multicast, reserved, IPv4-mapped IPv6 \
+             and IPv6 local ranges. Do not merely remove proxy functionality.\n",
         );
     }
     if !rejected.is_empty() {
@@ -1554,6 +1599,36 @@ const response = await fetch(url, { redirect: 'error' })\n";
 const dispatcher = makeDispatcher({ lookup: dns.lookup })\n\
 const response = await fetch(url, { dispatcher })\n";
         assert!(reject_incomplete_ssrf_dns_pinning(&f, original, pinned).is_ok());
+
+        let promises_preflight = "import dns from 'dns'\n\
+async function allowed(url) { return dns.promises.lookup(new URL(url).hostname) }\n\
+if (await allowed(url)) await fetch(url)\n";
+        assert!(
+            reject_incomplete_ssrf_dns_pinning(&f, original, promises_preflight).is_err(),
+            "dns.promises.lookup followed by a fresh fetch is the same rebinding flaw"
+        );
+    }
+
+    #[test]
+    fn an_ssrf_fetch_may_be_replaced_by_a_socket_pinned_http_request() {
+        let f = finding(
+            VulnClass::Ssrf,
+            "route.js",
+            ("fetch", "url", 2, 1),
+            ("req.body.url", 1, 13),
+            &[],
+        );
+        let original = "const response = await fetch(url)\n";
+        assert!(replaces_ssrf_with_pinned_request(
+            &f,
+            original,
+            "const response = await http.request(url, { lookup: safeLookup })\n"
+        ));
+        assert!(!replaces_ssrf_with_pinned_request(
+            &f,
+            original,
+            "const response = await http.request(url)\n"
+        ));
     }
 
     #[test]

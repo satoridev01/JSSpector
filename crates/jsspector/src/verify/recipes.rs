@@ -3,7 +3,8 @@
 //! A **recipe** is one fix pattern: the vulnerability class, the sink's callee, what the change
 //! introduced (`String`, `basename`, …), a short before/after taken from the first fix that proved
 //! it, and counters. Recipes of the finding's class are shown to the LLM as fixes already proven
-//! elsewhere; they are never applied by themselves.
+//! elsewhere. A narrowly defined deterministic platform recipe may also be materialized directly,
+//! then validated by that platform's compiler before it is reported.
 //!
 //! An **example** is one proven fix as a deterministic reproduction case: the finding's and the
 //! original file's fingerprints, the file's path, the exact change, the request that reproduced
@@ -32,8 +33,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::fix::{Op, line_ops};
 
-/// Recipes shown to the LLM per finding.
-const OFFERED: usize = 3;
+/// Recipes shown to the LLM per finding. Fix classes such as SSRF have materially different
+/// contracts (a generic public proxy, a fixed upstream allowlist, S3-only access, or a platform
+/// guarantee). Three examples let historical counters hide the only applicable family, so keep a
+/// small but diverse working set instead.
+const OFFERED: usize = 8;
 /// Lines and characters kept of each side of a recipe's before/after.
 const SNIPPET_LINES: usize = 12;
 const SNIPPET_CHARS: usize = 800;
@@ -175,7 +179,15 @@ impl Book {
 
     /// The recipes to show the LLM for `finding`: its class only, the same sink first, then the
     /// best first-try rate, then the most proven.
+    #[cfg(test)]
     pub fn lookup(&self, finding: &Finding) -> Vec<Recipe> {
+        self.lookup_with_context(finding, "")
+    }
+
+    /// The recipes to show the LLM, ranked with the concrete exploit/source context as well as the
+    /// class and sink. The context is controller-owned evidence (source plus reproduced request),
+    /// never instructions; it is used only for deterministic scoring here.
+    pub fn lookup_with_context(&self, finding: &Finding, context: &str) -> Vec<Recipe> {
         let class = finding.class.name();
         let sink = sink_callee(finding);
         let mut recipes: Vec<Recipe> = self
@@ -193,12 +205,37 @@ impl Book {
             let same = |recipe: &Recipe| recipe.sink == sink;
             same(b)
                 .cmp(&same(a))
+                .then_with(|| contextual_score(b, context).cmp(&contextual_score(a, context)))
                 .then_with(|| rate(b).total_cmp(&rate(a)))
                 .then_with(|| b.proven.cmp(&a.proven))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        recipes.truncate(OFFERED);
-        recipes
+        if class != "ssrf" {
+            recipes.truncate(OFFERED);
+            return recipes;
+        }
+
+        // Always preserve one representative of each SSRF contract before filling remaining slots
+        // by score. Otherwise dozens of successful generic-fetch recipes can crowd out the exact
+        // allowlist or Cloudflare configuration recipe that the current route needs.
+        let mut offered = Vec::new();
+        let mut families = BTreeSet::new();
+        for recipe in &recipes {
+            let family = ssrf_family(recipe);
+            if families.insert(family) {
+                offered.push(recipe.clone());
+            }
+        }
+        for recipe in recipes {
+            if offered.iter().all(|kept| kept.id != recipe.id) {
+                offered.push(recipe);
+            }
+            if offered.len() == OFFERED {
+                break;
+            }
+        }
+        offered.truncate(OFFERED);
+        offered
     }
 
     /// Records what a fix search learned: the offered recipes' counters, and for a fix an LLM
@@ -529,6 +566,92 @@ fn seeds() -> Vec<Recipe> {
 /// The first-try rate, smoothed so an untried recipe ranks between a good and a bad one.
 fn rate(recipe: &Recipe) -> f64 {
     (f64::from(recipe.first_try) + 1.0) / (f64::from(recipe.offered) + 2.0)
+}
+
+/// Broad remediation family, used to keep the offered SSRF set diverse. This deliberately derives
+/// from anonymous recipe content rather than repository identities, so learned recipes participate
+/// without growing a second hand-maintained taxonomy.
+fn ssrf_family(recipe: &Recipe) -> &'static str {
+    let text = format!(
+        "{} {} {} {}",
+        recipe.id,
+        recipe.note.as_deref().unwrap_or_default(),
+        recipe.introduces.join(" "),
+        recipe.after
+    )
+    .to_ascii_lowercase();
+    if text.contains("global_fetch_strictly_public") || text.contains("wrangler") {
+        "platform"
+    } else if text.contains("amazonaws.com") || text.contains("s3") {
+        "s3"
+    } else if text.contains("blocklist")
+        || text.contains("socket-level")
+        || text.contains("lookup:")
+    {
+        "socket-pinning"
+    } else if text.contains("allowlist")
+        || text.contains("allowed_host")
+        || text.contains("allowedhost")
+    {
+        "allowlist"
+    } else {
+        "other"
+    }
+}
+
+/// Prefer the recipe whose security contract matches this source and reproduced route. Historical
+/// success remains a tie-breaker, not the primary signal: a popular generic proxy repair is still
+/// wrong for a Worker platform guarantee or an S3-only endpoint.
+fn contextual_score(recipe: &Recipe, context: &str) -> i32 {
+    if context.is_empty() {
+        return 0;
+    }
+    let context = context.to_ascii_lowercase();
+    let family = ssrf_family(recipe);
+    let cloudflare = context.contains("wrangler.toml")
+        || context.contains("wrangler.json")
+        || context.contains("cloudflare worker")
+        || context.contains("export default {") && context.contains("fetch(request");
+    let s3 = context.contains("amazonaws.com")
+        || context.contains("s3.amazonaws")
+        || context.contains("aws_s3")
+        || context.contains("s3_url");
+    let known_upstream = context.contains("allowed_hosts")
+        || context.contains("allowedhosts")
+        || context.contains("base_url")
+        || context.contains("baseurl")
+        || context.contains("new set(")
+        || context.contains("upstream");
+    let mut score = match (family, cloudflare, s3, known_upstream) {
+        ("platform", true, _, _) => 120,
+        ("s3", _, true, _) => 110,
+        ("allowlist", false, false, true) => 90,
+        ("socket-pinning", false, false, false) => 70,
+        ("socket-pinning", _, _, _) => 30,
+        ("allowlist", _, _, _) => 20,
+        ("platform", _, _, _) | ("s3", _, _, _) => 0,
+        _ => 10,
+    };
+
+    // Anonymous learned recipes often capture framework/API details not represented by a family.
+    // Reward bounded token overlap with the evidence so those examples can outrank generic seeds.
+    let recipe_text = format!(
+        "{} {} {}",
+        recipe.note.as_deref().unwrap_or_default(),
+        recipe.before,
+        recipe.after
+    )
+    .to_ascii_lowercase();
+    let context_words = context
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+        .filter(|word| word.len() >= 5)
+        .collect::<BTreeSet<_>>();
+    score += recipe_text
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+        .filter(|word| word.len() >= 5 && context_words.contains(word))
+        .take(12)
+        .count() as i32;
+    score
 }
 
 /// The sink's callee: `findOne` for `User.findOne`.
@@ -1222,6 +1345,45 @@ router.post('/login', async (req, res) => {\n\
                 recipe.id
             );
         }
+    }
+
+    #[test]
+    fn ssrf_recipes_follow_the_route_contract_and_keep_each_family() {
+        let book = Book::new(tempfile::tempdir().unwrap().path());
+        let ssrf = finding(VulnClass::Ssrf, "fetch", "ssrf-context");
+
+        let cloudflare = book.lookup_with_context(
+            &ssrf,
+            "project config: worker/wrangler.toml\nexport default { async fetch(request) {} }",
+        );
+        assert_eq!(
+            cloudflare.first().map(|recipe| recipe.id.as_str()),
+            Some("seed-ssrf-cloudflare-strict-public-fetch")
+        );
+
+        let s3 = book.lookup_with_context(
+            &ssrf,
+            "const objectUrl = `https://${bucket}.s3.amazonaws.com/${key}`; fetch(objectUrl)",
+        );
+        assert_eq!(
+            s3.first().map(|recipe| recipe.id.as_str()),
+            Some("seed-ssrf-s3-host-allowlist")
+        );
+
+        let generic = book.lookup_with_context(&ssrf, "fetch(req.query.url)");
+        assert_eq!(
+            generic.first().map(|recipe| recipe.id.as_str()),
+            Some("seed-ssrf-socket-lookup")
+        );
+        assert!(generic.len() <= OFFERED);
+        assert_eq!(
+            generic
+                .iter()
+                .map(ssrf_family)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
     }
 
     #[test]

@@ -2641,12 +2641,24 @@ impl Session {
         if let Some(write) = &probe.stored_write {
             return self.stored_benign_status(probe, write);
         }
+        // A fixed-upstream SSRF route can legitimately answer 4xx/5xx for a generic public URL
+        // even though it still reached its intended outbound client. Observe the exact sink around
+        // this control request: for an error response, that hit is the functional behavior a fix
+        // must preserve, and prevents a block-everything patch from passing on status alone.
+        let marker_before =
+            (probe.class == jss_core::VulnClass::Ssrf).then(|| self.begin_sink_observation());
         let status = self
             .fetch_meta(&payload::benign(probe))
             .and_then(|(_, status, _)| status)?;
+        if let Some(marker_before) = marker_before {
+            self.finish_sink_observation(marker_before);
+        }
         // A socket.io event the handler never acks (204) shows no behavior a change could keep or
         // break, so it gives no control at all, the same as a route that answers nothing.
-        (!(probe.method == Method::Socket && status == 204)).then_some((status, false))
+        (!(probe.method == Method::Socket && status == 204)).then_some((
+            status,
+            probe.class == jss_core::VulnClass::Ssrf && status >= 500 && self.last_sink_hit.get(),
+        ))
     }
 
     /// Exercises the legitimate two-request behavior of a stored finding. A plain value must be

@@ -1,15 +1,17 @@
 //! A proven fix for a verified finding: a minimal code change that stops the exploit from
 //! reproducing while the route keeps its legitimate behavior.
 //!
-//! A candidate comes from one of two places. When the recipe store holds an example proven before
+//! A candidate comes from three places. When the recipe store holds an example proven before
 //! for this very finding on this very file content, its exact change is replayed first, with no
-//! LLM. Otherwise an LLM (the `claude` CLI, optionally authenticated through OpenRouter) proposes
-//! the change, shown the fix recipes already
-//! proven for the finding's class and told why every earlier candidate failed. JSSpector applies no
-//! fix pattern by itself.
+//! LLM. A narrow deployment recipe can produce an alternate configuration-file candidate and have
+//! the platform compiler validate it. Otherwise an LLM (the `claude` CLI, optionally authenticated
+//! through OpenRouter) proposes the source change, shown context-ranked fix recipes already proven
+//! for the finding's class and told why every earlier candidate failed.
 //!
-//! Whatever its origin, a candidate becomes a `proven` fix only after the sandbox that reproduced
-//! the finding relaunches the app with the change and five controls hold:
+//! A source candidate becomes a `proven` fix only after the sandbox that reproduced the finding
+//! relaunches the app with the change and five controls hold. A deployment-configuration candidate
+//! is instead restricted to a controller-authored exact transformation and must pass the platform's
+//! own dry-run compiler; its strategy is explicitly reported as `platform-config-validated`.
 //!
 //! 1. the app still starts;
 //! 2. the same reproduction no longer succeeds: the exact HTTP request that verified (falling back
@@ -247,16 +249,20 @@ impl Target<'_> {
     fn benign(&mut self, only: Option<usize>) -> Option<Benign> {
         match self {
             Self::Http { session, probe } => {
-                session
-                    .benign_status_and_value(probe)
-                    .map(|(status, shows_value)| Benign {
-                        status,
-                        shows: shows_value.then(|| {
-                            "returning the harmless stored value from the authenticated read route"
-                                .to_owned()
-                        }),
-                        at: None,
-                    })
+                let (status, shows_value) = session.benign_status_and_value(probe)?;
+                let shows = shows_value.then(|| {
+                    if probe.class == VulnClass::Ssrf {
+                        "reaching the planned outbound request sink with harmless input".to_owned()
+                    } else {
+                        "returning the harmless stored value from the authenticated read route"
+                            .to_owned()
+                    }
+                });
+                Some(Benign {
+                    status,
+                    shows,
+                    at: None,
+                })
             }
             Self::ReflectedXss { session, probe } => session
                 .reflected_benign(probe, BENIGN_VALUE)
@@ -465,10 +471,10 @@ impl Search {
                 reason: reason.to_owned(),
             };
         };
-        if finding.class == VulnClass::Ssrf && benign.status >= 500 {
+        if finding.class == VulnClass::Ssrf && benign.status >= 500 && benign.shows.is_none() {
             return FixOutcome::Unsupported {
                 reason: format!(
-                    "the SSRF route's harmless public-URL control returned HTTP {}, so it does not prove legitimate proxy behavior",
+                    "the SSRF route's harmless public-URL control returned HTTP {} without reaching the planned outbound sink, so it does not prove legitimate proxy behavior",
                     benign.status
                 ),
             };
@@ -488,6 +494,11 @@ impl Search {
             Err(reason) => return FixOutcome::Unsupported { reason },
         };
         self.trial.state.remember(&file, &original);
+        let context = fix_context(root, finding, &original, poc);
+        let recipes = book
+            .map(|book| book.lookup_with_context(finding, &context))
+            .unwrap_or_default();
+        self.offered = recipes.iter().map(|recipe| recipe.id.clone()).collect();
 
         // The exact change proven before for this finding on this content, proved again.
         if let Some(content) = book.and_then(|book| book.replay(finding, &file, &original)) {
@@ -501,10 +512,20 @@ impl Search {
             }
         }
 
+        // Some SSRF protections are deployment guarantees rather than source wrappers. In a
+        // Cloudflare Worker, global_fetch_strictly_public deliberately preserves an arbitrary
+        // public-URL feature while preventing fetch from bypassing Cloudflare's public front door.
+        // Local workerd does not implement that routing distinction, so validate the exact config
+        // change with Wrangler instead of pretending the local exploit sandwich can prove it.
+        if let Some(candidate) = cloudflare_public_fetch_candidate(root, finding) {
+            match self.trial.run_platform(root, candidate, deadline) {
+                Ok(proven) => return self.proven(root, proven, benign.status),
+                Err(reason) => self.trial.reject("platform-config", reason),
+            }
+        }
+
         let llm = options.llm && claude_available();
         if llm {
-            let recipes = book.map(|book| book.lookup(finding)).unwrap_or_default();
-            self.offered = recipes.iter().map(|recipe| recipe.id.clone()).collect();
             for _ in 0..options.attempts {
                 if Instant::now() >= deadline {
                     break;
@@ -650,6 +671,285 @@ impl Trial {
             Err(reason) => {
                 self.reject(&candidate.strategy, reason);
                 None
+            }
+        }
+    }
+
+    /// Validates a deployment-configuration candidate with its platform compiler. This is kept
+    /// separate from `run`: the Cloudflare routing guarantee is absent from local workerd, so a
+    /// local replay would reject the correct deployment fix for the wrong reason.
+    fn run_platform(
+        &mut self,
+        root: &Path,
+        candidate: Candidate,
+        deadline: Instant,
+    ) -> Result<Candidate, String> {
+        self.attempts += 1;
+        self.seen.push(candidate.content.clone());
+        let original = self.state.original(root, &candidate.file)?;
+        validate_cloudflare_public_fetch(root, &candidate, &original, deadline)?;
+        Ok(candidate)
+    }
+}
+
+/// Evidence used to choose among anonymous fix patterns. Include the verified request and nearby
+/// project configuration names, because those distinguish a generic proxy from a Worker or a
+/// fixed-upstream route much better than the common `fetch` sink does.
+fn fix_context(
+    root: &Path,
+    finding: &Finding,
+    original: &str,
+    poc: Option<&Reproduction>,
+) -> String {
+    let mut context = format!(
+        "class={} sink={} entry={:?}\n{}",
+        finding.class.name(),
+        finding.sink.api,
+        finding.entry,
+        original
+    );
+    if let Some(poc) = poc {
+        context.push_str("\nverified request:\n");
+        context.push_str(&poc.command);
+        context.push_str("\nobserved:\n");
+        context.push_str(&poc.evidence);
+    }
+    if let Some(config) = nearest_wrangler_config(root, fix_file(finding)) {
+        context.push_str("\nproject config: ");
+        context.push_str(&config.to_string_lossy());
+    }
+    context
+}
+
+/// A deterministic Cloudflare Worker SSRF repair. It is intentionally narrow: only a `fetch` SSRF
+/// under a real Wrangler project qualifies, and the candidate changes only that project's config.
+fn cloudflare_public_fetch_candidate(root: &Path, finding: &Finding) -> Option<Candidate> {
+    if finding.class != VulnClass::Ssrf || !finding.sink.api.to_ascii_lowercase().contains("fetch")
+    {
+        return None;
+    }
+    let file = nearest_wrangler_config(root, fix_file(finding))?;
+    if file.extension().and_then(|extension| extension.to_str()) != Some("toml") {
+        return None;
+    }
+    let original = std::fs::read_to_string(root.join(&file)).ok()?;
+    let content = add_cloudflare_strict_public_flag(&original)?;
+    Some(Candidate {
+        strategy: "platform-config-validated".to_owned(),
+        file: file.to_string_lossy().replace('\\', "/"),
+        content,
+    })
+}
+
+/// Find the Wrangler config governing `source_file`, preferring the closest ancestor so a
+/// monorepo's unrelated Worker is never edited.
+fn nearest_wrangler_config(root: &Path, source_file: &str) -> Option<PathBuf> {
+    let mut directory = Path::new(source_file).parent();
+    while let Some(at) = directory {
+        for name in ["wrangler.toml", "wrangler.json", "wrangler.jsonc"] {
+            let candidate = at.join(name);
+            if root.join(&candidate).is_file() {
+                return Some(candidate);
+            }
+        }
+        directory = at.parent();
+    }
+    for name in ["wrangler.toml", "wrangler.json", "wrangler.jsonc"] {
+        let candidate = PathBuf::from(name);
+        if root.join(&candidate).is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Add the opt-in without disturbing other compatibility flags or formatting. Return `None` when
+/// the guarantee is already enabled, or when a hand-written flag expression is too ambiguous to
+/// edit safely.
+fn add_cloudflare_strict_public_flag(original: &str) -> Option<String> {
+    if let Some((open, close)) = toml_array_bounds(original, "compatibility_flags") {
+        let body = &original[open + 1..close];
+        if body.contains("global_fetch_strictly_public") {
+            return None;
+        }
+        let mut flags = body
+            .split(',')
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty())
+            .filter(|flag| !flag.contains("global_fetch_private_origin"))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        flags.push("\"global_fetch_strictly_public\"".to_owned());
+        let replacement = if body.contains('\n') {
+            let indent = body
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| &line[..line.len() - line.trim_start().len()])
+                .unwrap_or("  ");
+            format!("\n{}{}\n", indent, flags.join(&format!(",\n{indent}")))
+        } else {
+            format!(
+                "{}{}{}",
+                if body.trim().is_empty() { "" } else { " " },
+                flags.join(", "),
+                if body.trim().is_empty() { "" } else { " " }
+            )
+        };
+        return Some(format!(
+            "{}{}{}",
+            &original[..open + 1],
+            replacement,
+            &original[close..]
+        ));
+    }
+
+    let mut insert = 0;
+    for line in original.split_inclusive('\n') {
+        insert += line.len();
+        if line.trim_start().starts_with("compatibility_date") {
+            break;
+        }
+    }
+    (insert > 0).then(|| {
+        format!(
+            "{}compatibility_flags = [\"global_fetch_strictly_public\"]\n{}",
+            &original[..insert],
+            &original[insert..]
+        )
+    })
+}
+
+fn toml_array_bounds(source: &str, key: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=') {
+            let key_at = offset + line.len() - trimmed.len();
+            let open = key_at + source[key_at..].find('[')?;
+            let close = open + source[open..].find(']')?;
+            return Some((open, close));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Compile the changed Worker configuration with the repository's installed Wrangler. The
+/// candidate is restored before returning, even on failure; this step never deploys.
+fn validate_cloudflare_public_fetch(
+    root: &Path,
+    candidate: &Candidate,
+    original: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    if !candidate.content.contains("global_fetch_strictly_public")
+        || candidate.content.contains("global_fetch_private_origin")
+    {
+        return Err("the candidate does not enable strict public fetch routing".to_owned());
+    }
+    let path = root.join(&candidate.file);
+    std::fs::write(&path, &candidate.content)
+        .map_err(|error| format!("writing {} for validation: {error}", candidate.file))?;
+    let directory = path.parent().unwrap_or(root);
+    let local = directory.join("node_modules/.bin/wrangler");
+    let mut command = if local.is_file() {
+        Command::new(local)
+    } else {
+        let mut command = Command::new("npx");
+        command.args(["--no-install", "wrangler"]);
+        command
+    };
+    command
+        .args(["deploy", "--dry-run", "--config"])
+        .arg(path.file_name().unwrap_or_default())
+        .current_dir(directory);
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(180));
+    let result = run_platform_command(command, remaining);
+    let restored = std::fs::write(&path, original)
+        .map_err(|error| format!("restoring {} after validation: {error}", candidate.file));
+    match (result, restored) {
+        (_, Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn run_platform_command(mut command: Command, timeout: Duration) -> Result<(), String> {
+    if timeout < Duration::from_secs(5) {
+        return Err("the fix time budget ran out before platform validation".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start Wrangler dry-run: {error}"))?;
+    let group = child.id();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or("Wrangler dry-run had no stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or("Wrangler dry-run had no stderr")?;
+    let mut stdout_reader = Some(std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    }));
+    let mut stderr_reader = Some(std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    }));
+    let finish_reader = |reader: &mut Option<std::thread::JoinHandle<String>>| {
+        reader
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default()
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = finish_reader(&mut stdout_reader);
+                let stderr = finish_reader(&mut stderr_reader);
+                if status.success() {
+                    return Ok(());
+                }
+                let detail = if stderr.trim().is_empty() {
+                    stdout
+                } else {
+                    stderr
+                };
+                return Err(format!(
+                    "Wrangler rejected the deployment config: {}",
+                    detail.chars().take(500).collect::<String>()
+                ));
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                stop_llm_process_group(group);
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = finish_reader(&mut stdout_reader);
+                let _ = finish_reader(&mut stderr_reader);
+                return Err("Wrangler dry-run exceeded the fix time budget".to_owned());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                stop_llm_process_group(group);
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = finish_reader(&mut stdout_reader);
+                let _ = finish_reader(&mut stderr_reader);
+                return Err(format!("waiting for Wrangler dry-run: {error}"));
             }
         }
     }
@@ -1629,6 +1929,105 @@ if (await allowed(url)) await fetch(url)\n";
             original,
             "const response = await http.request(url)\n"
         ));
+    }
+
+    #[test]
+    fn cloudflare_flag_edit_preserves_existing_flags_and_removes_the_legacy_override() {
+        assert_eq!(
+            add_cloudflare_strict_public_flag(
+                "name = \"worker\"\ncompatibility_date = \"2026-09-21\"\n"
+            )
+            .as_deref(),
+            Some(
+                "name = \"worker\"\ncompatibility_date = \"2026-09-21\"\ncompatibility_flags = [\"global_fetch_strictly_public\"]\n"
+            )
+        );
+        assert_eq!(
+            add_cloudflare_strict_public_flag(
+                "compatibility_flags = [\"nodejs_compat\", \"global_fetch_private_origin\"]\n"
+            )
+            .as_deref(),
+            Some("compatibility_flags = [ \"nodejs_compat\", \"global_fetch_strictly_public\" ]\n")
+        );
+        assert!(
+            add_cloudflare_strict_public_flag(
+                "compatibility_flags = [\"global_fetch_strictly_public\"]\n"
+            )
+            .is_none()
+        );
+        assert!(
+            add_cloudflare_strict_public_flag(
+                "# compatibility_flags = [\"global_fetch_strictly_public\"]\ncompatibility_date = \"2026-09-21\"\n"
+            )
+            .unwrap()
+            .contains("compatibility_flags = [\"global_fetch_strictly_public\"]")
+        );
+    }
+
+    #[test]
+    fn cloudflare_candidate_uses_the_nearest_worker_config_not_a_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("apps/a/src")).unwrap();
+        std::fs::create_dir_all(root.path().join("apps/b/src")).unwrap();
+        std::fs::write(
+            root.path().join("apps/a/wrangler.toml"),
+            "name = \"a\"\ncompatibility_date = \"2026-09-21\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("apps/b/wrangler.toml"),
+            "name = \"b\"\ncompatibility_date = \"2026-09-21\"\n",
+        )
+        .unwrap();
+        let ssrf = finding(
+            VulnClass::Ssrf,
+            "apps/a/src/index.js",
+            ("fetch", "url", 2, 1),
+            ("req.url", 1, 1),
+            &[],
+        );
+        let candidate = cloudflare_public_fetch_candidate(root.path(), &ssrf).unwrap();
+        assert_eq!(candidate.file, "apps/a/wrangler.toml");
+        assert!(candidate.content.contains("global_fetch_strictly_public"));
+        assert!(!candidate.content.contains("name = \"b\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloudflare_platform_validation_uses_wrangler_and_restores_the_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("worker");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(project.join("node_modules/.bin")).unwrap();
+        let original = "name = \"worker\"\ncompatibility_date = \"2026-09-21\"\n";
+        std::fs::write(project.join("wrangler.toml"), original).unwrap();
+        let wrangler = project.join("node_modules/.bin/wrangler");
+        std::fs::write(
+            &wrangler,
+            "#!/bin/sh\ntest \"$1 $2 $3\" = 'deploy --dry-run --config' || exit 2\ngrep -q global_fetch_strictly_public \"$4\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&wrangler).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrangler, permissions).unwrap();
+        let candidate = Candidate {
+            strategy: "platform-config-validated".to_owned(),
+            file: "worker/wrangler.toml".to_owned(),
+            content: add_cloudflare_strict_public_flag(original).unwrap(),
+        };
+        validate_cloudflare_public_fetch(
+            root.path(),
+            &candidate,
+            original,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.join("wrangler.toml")).unwrap(),
+            original
+        );
     }
 
     #[test]

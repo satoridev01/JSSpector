@@ -64,5 +64,14 @@
     "note": "When the application already has a finite set of legitimate upstreams, derive an exact hostname allowlist from those call sites. Parse the URL; require HTTPS; reject credentials and non-default ports; compare the complete lower-cased hostname rather than using contains or an unsafe suffix; and use manual redirects so every redirect target is parsed and checked against the same allowlist before it is fetched.",
     "before": "const response = await fetch(req.query.url);",
     "after": "const ALLOWED_HOSTS = new Set(['api.example.com']);\nfunction parseAllowedTarget(raw) {\n  const target = new URL(String(raw));\n  if (target.protocol !== 'https:' || target.username || target.password || (target.port && target.port !== '443') || !ALLOWED_HOSTS.has(target.hostname.toLowerCase())) throw new Error('blocked target');\n  return target;\n}\nasync function fetchAllowed(raw, init = {}, redirects = 0) {\n  if (redirects > 5) throw new Error('too many redirects');\n  const target = parseAllowedTarget(raw);\n  const response = await fetch(target, { ...init, redirect: 'manual' });\n  if (response.status >= 300 && response.status < 400) {\n    const location = response.headers.get('location');\n    if (!location) throw new Error('redirect without location');\n    return fetchAllowed(new URL(location, target), init, redirects + 1);\n  }\n  return response;\n}\nconst response = await fetchAllowed(req.query.url);"
+  },
+  {
+    "id": "seed-ssrf-cloudflare-strict-public-fetch",
+    "class": "ssrf",
+    "sink": "fetch",
+    "introduces": ["wrangler.toml", "compatibility_flags", "global_fetch_strictly_public"],
+    "note": "For a Cloudflare Worker whose intended feature accepts arbitrary public URLs, preserve that contract by enabling Cloudflare's global_fetch_strictly_public compatibility flag in wrangler.toml. This forces global fetch through the public Internet instead of bypassing the front door to a same-zone origin. This is a deployment-configuration repair: validate it with Wrangler and test same-zone behavior on a deployed Worker because the flag has no effect in local workerd.",
+    "before": "compatibility_date = \"2024-01-01\"",
+    "after": "compatibility_date = \"2024-01-01\"\ncompatibility_flags = [\"global_fetch_strictly_public\"]"
   }
 ]

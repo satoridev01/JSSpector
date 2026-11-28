@@ -30,7 +30,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import discover
+import experiment
 import github
+import peer_review
 import resources
 from claude_limits import UsageGate, usage_limit_message
 
@@ -52,6 +54,10 @@ RETRYABLE_STATUSES = {
     "verify-candidate-hard-timeout",
     "verify-repository-timeout",
     "fix-timeout",
+    "peer-review-timeout",
+    "peer-review-failed",
+    "peer-review-inconclusive",
+    "peer-review-shadow",
 }
 VERIFY_RUN_LABEL_KEY = "ci.satori.jsspector.verify-run"
 GIB = 1024**3
@@ -59,12 +65,16 @@ DOCKER_QUERY_TIMEOUT_S = 30
 DOCKER_CLEANUP_TIMEOUT_S = 180
 DISK_WATCHDOG_INTERVAL_S = 60
 DOCKER_CLEANUP_LOCK = threading.Lock()
+RECIPE_PROMOTION_LOCK = threading.Lock()
 EVENT_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
 EVENT_PREFIX = "@@JSSPECTOR_ONLINE@@"
 VERIFY_PROGRESS_PREFIX = "@@JSSPECTOR_VERIFY@@"
 LOG_PATH: Path | None = None
+EVENT_RECORDER: experiment.EventRecorder | None = None
 SHUTDOWN = threading.Event()
+ADMISSION_CLOSED = threading.Event()
+EXPERIMENT_DEADLINE_REACHED = threading.Event()
 ACTIVE_PROCESSES: dict[int, subprocess.Popen[str]] = {}
 ACTIVE_PROCESSES_LOCK = threading.Lock()
 CLAUDE_USAGE_GATE = UsageGate()
@@ -94,6 +104,30 @@ class ResearchResult:
     phases: dict[str, float] = field(default_factory=dict)
     driven: str = ""
     skip_reason: str | None = None
+    fix_stages: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class RecipePromotion:
+    """One exact staged recipe and the peer attestation that may promote it."""
+
+    fingerprint: str
+    stage: Path
+    attestation: Path
+
+
+@dataclass(frozen=True)
+class ReviewedResult:
+    """One locally verified result after the independent Codex publication gate."""
+
+    result: ResearchResult
+    runs: tuple[peer_review.PeerReviewRun, ...] = ()
+    approved: tuple[dict[str, Any], ...] = ()
+    false_positive: int = 0
+    inconclusive: int = 0
+    failed: int = 0
+    promotions: tuple[RecipePromotion, ...] = ()
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -237,6 +271,11 @@ def log(message: str) -> None:
 
 def emit_event(kind: str, **fields: Any) -> None:
     """Publish one machine-readable TUI event without making logs the API."""
+    # Repeated embedded invocations (notably the unit suite) may remove the previous run's
+    # temporary directory while the module remains imported.  A stale recorder must not break
+    # later controller work.
+    if EVENT_RECORDER is not None and EVENT_RECORDER.path.parent.is_dir():
+        EVENT_RECORDER.record(kind, **fields)
     if os.environ.get("JSSPECTOR_ONLINE_EVENTS") != "1":
         return
     payload = {"schema": 1, "type": kind, **fields}
@@ -487,12 +526,29 @@ def write_json(path: Path, value: dict[str, Any]) -> None:
 def read_state(path: Path) -> dict[str, Any]:
     """Global deduplication across bounded 24-hour runs."""
     if not path.exists():
-        return {"schema_version": 1, "processed": {}, "synced": {}}
+        return {
+            "schema_version": 2,
+            "processed": {},
+            "synced": {},
+            "pending_sync": {},
+            "reviews": {},
+            "recipe_promotions": {},
+        }
     state = read_json(path)
     if not isinstance(state.get("processed"), dict) or not isinstance(
         state.get("synced"), dict
     ):
         raise RuntimeError(f"invalid online state: {path}")
+    reviews = state.setdefault("reviews", {})
+    if not isinstance(reviews, dict):
+        raise RuntimeError(f"invalid online review state: {path}")
+    promotions = state.setdefault("recipe_promotions", {})
+    if not isinstance(promotions, dict):
+        raise RuntimeError(f"invalid online recipe promotion state: {path}")
+    pending_sync = state.setdefault("pending_sync", {})
+    if not isinstance(pending_sync, dict):
+        raise RuntimeError(f"invalid online pending sync state: {path}")
+    state["schema_version"] = max(2, int(state.get("schema_version", 1)))
     return state
 
 
@@ -657,8 +713,41 @@ def sync_key(
     repository: str, revision: str, findings: tuple[dict[str, Any], ...]
 ) -> str:
     """Stable idempotency key for exactly this verified evidence."""
-    fingerprints = sorted(finding["fingerprint"] for finding in findings)
-    value = "\0".join((repository.lower(), revision, *fingerprints))
+    evidence = []
+    for finding in sorted(findings, key=lambda item: item["fingerprint"]):
+        review = finding.get("peer_review")
+        fix = finding.get("fix")
+        evidence.append(
+            {
+                "fingerprint": finding["fingerprint"],
+                "artifact_sha256": review.get("artifact_sha256")
+                if isinstance(review, dict)
+                else None,
+                "decision": review.get("decision") if isinstance(review, dict) else None,
+                "policy_version": (review.get("controller_receipt") or {}).get(
+                    "policy_version"
+                )
+                if isinstance(review, dict)
+                and isinstance(review.get("controller_receipt"), dict)
+                else None,
+                "diff_sha256": (review.get("fix") or {}).get("diff_sha256")
+                if isinstance(review, dict) and isinstance(review.get("fix"), dict)
+                else (
+                    hashlib.sha256(str(fix.get("diff")).encode()).hexdigest()
+                    if isinstance(fix, dict) and isinstance(fix.get("diff"), str)
+                    else None
+                ),
+            }
+        )
+    value = json.dumps(
+        {
+            "repository": repository.casefold(),
+            "revision": revision,
+            "findings": evidence,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(value.encode()).hexdigest()
 
 
@@ -1121,6 +1210,7 @@ def remove_checkout(checkout: Path, run_dir: Path) -> None:
 def clone_repository(
     repository: str,
     *,
+    revision: str | None = None,
     args: argparse.Namespace,
     run_dir: Path,
 ) -> tuple[Path | None, str | None]:
@@ -1160,6 +1250,35 @@ def clone_repository(
         if completed.returncode == 130 or SHUTDOWN.is_set():
             return None, "cancelled"
         return None, "clone-timeout" if completed.returncode == 124 else "clone-failed"
+    if revision is not None:
+        if not (
+            40 <= len(revision) <= 64
+            and all(character in "0123456789abcdef" for character in revision.lower())
+        ):
+            remove_checkout(checkout, run_dir)
+            return None, "invalid-pinned-revision"
+        fetched = run(
+            [git, "-C", str(checkout), "fetch", "--depth", "1", "--no-tags", "origin", revision],
+            timeout=args.clone_timeout,
+            log_path=run_dir / "logs" / f"{slug}.clone.log",
+            environment={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            timeout_label=f"fetch-pinned:{repository}",
+        )
+        if fetched.returncode:
+            remove_checkout(checkout, run_dir)
+            if fetched.returncode == 130 or SHUTDOWN.is_set():
+                return None, "cancelled"
+            return None, "clone-timeout" if fetched.returncode == 124 else "clone-failed"
+        checked_out = run(
+            [git, "-C", str(checkout), "checkout", "--detach", revision],
+            timeout=args.clone_timeout,
+            log_path=run_dir / "logs" / f"{slug}.clone.log",
+            environment={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            timeout_label=f"checkout-pinned:{repository}",
+        )
+        if checked_out.returncode:
+            remove_checkout(checkout, run_dir)
+            return None, "clone-failed"
     return checkout, None
 
 
@@ -1182,6 +1301,7 @@ def static_repository(
 
     checkout, clone_failure = clone_repository(
         repository,
+        revision=candidate.revision,
         args=args,
         run_dir=run_dir,
     )
@@ -1206,6 +1326,26 @@ def static_repository(
             elapsed_s=round(time.monotonic() - started, 1),
         )
     assert checkout is not None
+    resolved = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    checkout_revision = resolved.stdout.strip() if resolved.returncode == 0 else ""
+    if not checkout_revision:
+        remove_checkout(checkout, run_dir)
+        return StaticResult(
+            repository=repository,
+            security_advisories=security_advisories,
+            repository_forks=repository_forks,
+            repository_stars=repository_stars,
+            failed=True,
+            failure_reason="missing-revision",
+            elapsed_s=round(time.monotonic() - started, 1),
+        )
 
     result = run(
         [
@@ -1243,6 +1383,7 @@ def static_repository(
         reason = "static-timeout" if result.returncode == 124 else "static-failed"
         return StaticResult(
             repository=repository,
+            revision=checkout_revision,
             security_advisories=security_advisories,
             repository_forks=repository_forks,
             repository_stars=repository_stars,
@@ -1253,6 +1394,35 @@ def static_repository(
 
     static = read_json(static_path)
     revision = (static.get("git") or {}).get("revision")
+    if revision != checkout_revision:
+        log(
+            f"REVISION_MISMATCH {repository} checkout={checkout_revision} report={revision}"
+        )
+        remove_checkout(checkout, run_dir)
+        return StaticResult(
+            repository=repository,
+            revision=checkout_revision,
+            security_advisories=security_advisories,
+            repository_forks=repository_forks,
+            repository_stars=repository_stars,
+            failed=True,
+            failure_reason="revision-mismatch",
+            elapsed_s=round(time.monotonic() - started, 1),
+        )
+    if candidate.revision is not None and revision != candidate.revision:
+        log(
+            f"REVISION_MISMATCH {repository} expected={candidate.revision} actual={revision}"
+        )
+        remove_checkout(checkout, run_dir)
+        return StaticResult(
+            repository=repository,
+            security_advisories=security_advisories,
+            repository_forks=repository_forks,
+            repository_stars=repository_stars,
+            failed=True,
+            failure_reason="revision-mismatch",
+            elapsed_s=round(time.monotonic() - started, 1),
+        )
     candidates = [
         finding
         for finding in static.get("findings", [])
@@ -1481,6 +1651,46 @@ def fix_learning_flag() -> str:
     )
 
 
+def staged_fixes_by_fingerprint(paths: tuple[Path, ...]) -> dict[str, Path]:
+    """Index valid controller-owned stages without trusting their filenames."""
+
+    indexed: dict[str, Path] = {}
+    ambiguous: set[str] = set()
+    for path in paths:
+        try:
+            staged = read_json(path)
+        except RuntimeError:
+            continue
+        if not isinstance(staged, dict) or staged.get("schema_version") != 1:
+            continue
+        fingerprint = staged.get("source_fingerprint")
+        recipe = staged.get("recipe")
+        if (
+            not isinstance(fingerprint, str)
+            or not fingerprint
+            or not isinstance(recipe, dict)
+        ):
+            continue
+        if fingerprint in indexed or fingerprint in ambiguous:
+            # Ambiguous stages are deliberately not offered for promotion.  The verified fix can
+            # still be reviewed and published without evolving the shared corpus.
+            indexed.pop(fingerprint, None)
+            ambiguous.add(fingerprint)
+            continue
+        indexed[fingerprint] = path
+    return indexed
+
+
+def file_sha256(path: Path) -> str:
+    """Hash the exact bytes bound by the Rust promotion command."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def verify_repository(
     static: StaticResult,
     *,
@@ -1522,6 +1732,7 @@ def verify_repository(
     candidate_hard_timeout = getattr(args, "verify_candidate_hard_timeout", 180)
     extended_timeout = getattr(args, "verify_extended_timeout", 1800)
     verified_path = run_dir / "reports" / f"{slug}.{lane}.verified.json"
+    fix_stage_dir = run_dir / "fix-stages" / f"{slug}.{lane}"
     emit_event(
         "verification_started",
         repository=repository,
@@ -1560,7 +1771,11 @@ def verify_repository(
                 args.fix_model,
             )
         )
-        if args.learn_fixes:
+        if getattr(args, "peer_review", False):
+            # Peer review sees a repository-neutral stage but the shared corpus remains immutable
+            # until Satori synchronization and an attested promotion both succeed.
+            command.extend(("--stage-fixes", str(fix_stage_dir)))
+        elif args.learn_fixes:
             command.append(fix_learning_flag())
     else:
         command.append("--no-fix")
@@ -1677,6 +1892,11 @@ def verify_repository(
     )
     if fix_attempted:
         log(f"FIX_ATTEMPTED {pinned} proven={str(fix_proven).lower()} single_pass=true")
+    fix_stages = (
+        tuple(sorted(fix_stage_dir.glob("*.stage.json")))
+        if fix_stage_dir.is_dir()
+        else ()
+    )
     return ResearchResult(
         repository=repository,
         revision=revision,
@@ -1691,7 +1911,601 @@ def verify_repository(
         elapsed_s=round(time.monotonic() - started, 1),
         slot_s=slot_s,
         phases=phases,
+        fix_stages=fix_stages,
     )
+
+
+def peer_review_config(args: argparse.Namespace) -> peer_review.PeerReviewConfig:
+    """The fully explicit Codex policy recorded with every review artifact."""
+
+    return peer_review.PeerReviewConfig(
+        codex_cli=args.codex_cli,
+        model=args.peer_review_model,
+        reasoning_effort=args.peer_review_reasoning,
+        cyber_access_program=args.peer_review_program,
+        timeout_s=args.peer_review_timeout,
+        subagents=3,
+    )
+
+
+def review_repository(
+    result: ResearchResult,
+    *,
+    checkout: Path,
+    args: argparse.Namespace,
+    run_dir: Path,
+    lane: str,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+) -> ReviewedResult:
+    """Run or resume one independent, schema-bound review per verified finding."""
+
+    if result.report is None or result.revision is None or not result.findings:
+        return ReviewedResult(result=result)
+    config = peer_review_config(args)
+    slug = result.repository.replace("/", "__")
+    approved: list[dict[str, Any]] = []
+    runs: list[peer_review.PeerReviewRun] = []
+    promotions: list[RecipePromotion] = []
+    false_positive = 0
+    inconclusive = 0
+    failed = 0
+    cancelled = False
+    fix_stages = staged_fixes_by_fingerprint(result.fix_stages)
+    for index, finding in enumerate(result.findings):
+        fingerprint = finding["fingerprint"]
+        fix_stage = fix_stages.get(fingerprint)
+        fix_stage_sha256 = file_sha256(fix_stage) if fix_stage is not None else None
+        fix_stage_value = read_json(fix_stage) if fix_stage is not None else None
+        review_root = (
+            run_dir
+            / "peer-reviews"
+            / f"{slug}.{lane}.{index + 1}-{fingerprint[:16]}"
+        )
+        bundle = peer_review.prepare_review_bundle(
+            review_root,
+            subject=checkout,
+            repository=result.repository,
+            revision=result.revision,
+            report=result.report,
+            finding=finding,
+            recipe_stage=fix_stage_value,
+            recipe_stage_sha256=fix_stage_sha256,
+            config=config,
+        )
+        emit_event(
+            "peer_review_started",
+            repository=result.repository,
+            fingerprint=fingerprint,
+            lane=lane,
+            model=config.model,
+            reasoning=config.reasoning_effort,
+            program=config.cyber_access_program,
+            artifact_sha256=bundle.artifact_sha256,
+        )
+        with state_lock:
+            cached = state["reviews"].get(bundle.artifact_sha256)
+        review_run: peer_review.PeerReviewRun
+        if (
+            isinstance(cached, dict)
+            and cached.get("policy_version") == peer_review.POLICY_VERSION
+            and isinstance(cached.get("verdict"), dict)
+        ):
+            try:
+                cached_receipt = peer_review.validate_collaboration_receipt(
+                    cached.get("collaboration_receipt"), config, bundle
+                )
+                verdict = peer_review.validate_verdict(
+                    cached["verdict"], bundle, config
+                )
+            except ValueError:
+                verdict = None
+            if verdict is not None:
+                write_json(bundle.receipt, cached_receipt)
+                bundle.receipt.chmod(0o400)
+                review_run = peer_review.PeerReviewRun(
+                    bundle=bundle,
+                    elapsed_s=0.0,
+                    returncode=0,
+                    verdict=verdict,
+                    collaboration_receipt=cached_receipt,
+                )
+                log(
+                    f"PEER_REVIEW_CACHE {result.repository}@{result.revision} "
+                    f"fingerprint={fingerprint} decision={verdict.decision}"
+                )
+            else:
+                review_run = peer_review.run_peer_review(
+                    bundle, config, cancel_event=SHUTDOWN
+                )
+        else:
+            review_run = peer_review.run_peer_review(
+                bundle, config, cancel_event=SHUTDOWN
+            )
+        if review_run.verdict is not None:
+            try:
+                peer_review.validate_collaboration_receipt(
+                    review_run.collaboration_receipt, config, bundle
+                )
+            except ValueError as error:
+                review_run = replace(
+                    review_run,
+                    returncode=65,
+                    verdict=None,
+                    error=f"peer-review-invalid-collaboration-receipt: {error}",
+                )
+        runs.append(review_run)
+        if review_run.verdict is None:
+            if SHUTDOWN.is_set():
+                cancelled = True
+                emit_event(
+                    "peer_review_cancelled",
+                    repository=result.repository,
+                    fingerprint=fingerprint,
+                    lane=lane,
+                    elapsed_s=review_run.elapsed_s,
+                )
+                break
+            failed += 1
+            reason = review_run.error or "peer-review-failed"
+            log(
+                f"PEER_REVIEW_FAILED {result.repository}@{result.revision} "
+                f"fingerprint={fingerprint} reason={reason}"
+            )
+            emit_event(
+                "peer_review_finished",
+                repository=result.repository,
+                fingerprint=fingerprint,
+                lane=lane,
+                outcome="timeout" if review_run.timed_out else "failed",
+                elapsed_s=review_run.elapsed_s,
+                message=reason,
+            )
+            continue
+
+        verdict = review_run.verdict
+        if not bundle.verdict.exists():
+            # A resumed verdict is still materialized inside this immutable run bundle because the
+            # Rust promotion boundary accepts a file, never mutable controller state.
+            write_json(bundle.verdict, verdict.raw)
+        with state_lock:
+            state["reviews"][bundle.artifact_sha256] = {
+                "repository": result.repository,
+                "revision": result.revision,
+                "fingerprint": fingerprint,
+                "policy_version": peer_review.POLICY_VERSION,
+                "reviewed_at": datetime.now(UTC).isoformat(),
+                "elapsed_s": review_run.elapsed_s,
+                "verdict": verdict.raw,
+                "collaboration_receipt": review_run.collaboration_receipt,
+            }
+            write_json(state_path, state)
+        emit_event(
+            "peer_review_finished",
+            repository=result.repository,
+            fingerprint=fingerprint,
+            lane=lane,
+            outcome=verdict.decision,
+            elapsed_s=review_run.elapsed_s,
+            exploit=verdict.exploit_verdict,
+            fix=verdict.fix_status,
+            dissent=len(verdict.dissent),
+            agents_verified=len(
+                (review_run.collaboration_receipt or {}).get("agents", [])
+            ),
+        )
+
+        if verdict.decision == "delete_false_positive":
+            false_positive += 1
+            continue
+        if verdict.decision == "hold_inconclusive":
+            inconclusive += 1
+            continue
+        if verdict.decision == "retry_fix":
+            # The reviewers found a real exploit but explicitly asked for another fix attempt.
+            # Treat that as held work: publishing it as unfixed would erase the distinction and
+            # make a retry request indistinguishable from a final publish_unfixed decision.
+            inconclusive += 1
+            continue
+        if verdict.decision in {"publish_fixed", "publish_unfixed"}:
+            reviewed_finding = dict(finding)
+            reviewed_finding["peer_review"] = verdict.raw
+            if verdict.decision != "publish_fixed":
+                # Never send a rejected diff to Satori.  Preserve only the reason that the issue
+                # is intentionally being published without a fix.
+                reviewed_finding["fix"] = {
+                    "outcome": "unproven",
+                    "reason": (
+                        "peer review rejected or could not verify the proposed fix; "
+                        "the independently confirmed exploit remains reportable"
+                    ),
+                    "attempts": finding.get("fix", {}).get("attempts", 0)
+                    if isinstance(finding.get("fix"), dict)
+                    else 0,
+                    "rejected": [],
+                }
+            approved.append(reviewed_finding)
+            if (
+                verdict.decision == "publish_fixed"
+                and verdict.recipe_action == "promote"
+                and fix_stage is not None
+            ):
+                promotions.append(
+                    RecipePromotion(
+                        fingerprint=fingerprint,
+                        stage=fix_stage,
+                        attestation=bundle.verdict,
+                    )
+                )
+
+    reviewed_report = dict(result.report)
+    reviewed_report["findings"] = approved
+    reviewed_result = replace(
+        result,
+        report=reviewed_report,
+        findings=tuple(approved),
+        fix_proven=any(
+            isinstance(finding.get("fix"), dict)
+            and finding["fix"].get("outcome") == "proven"
+            for finding in approved
+        ),
+    )
+    return ReviewedResult(
+        result=reviewed_result,
+        runs=tuple(runs),
+        approved=tuple(approved),
+        false_positive=false_positive,
+        inconclusive=inconclusive,
+        failed=failed,
+        promotions=tuple(promotions),
+        cancelled=cancelled,
+    )
+
+
+def promote_reviewed_recipes(
+    promotions: tuple[RecipePromotion, ...],
+    *,
+    scanner: Path,
+    publish: bool,
+) -> bool:
+    """Promote only SHA-bound peer-approved recipe stages, serializing the shared store."""
+
+    if not promotions:
+        return True
+    with RECIPE_PROMOTION_LOCK:
+        for promotion in promotions:
+            command = [
+                str(scanner),
+                "promote-fix-stage",
+                "--stage",
+                str(promotion.stage),
+                "--attestation",
+                str(promotion.attestation),
+            ]
+            if publish:
+                command.append("--publish")
+            started = time.monotonic()
+            promoted = run(
+                command,
+                capture=True,
+                timeout=600,
+                echo_capture=False,
+                timeout_label="recipe-promotion",
+            )
+            elapsed_s = round(time.monotonic() - started, 1)
+            emit_event(
+                "recipe_promotion_finished",
+                fingerprint=promotion.fingerprint,
+                success=promoted.returncode == 0,
+                published=publish,
+                elapsed_s=elapsed_s,
+            )
+            if promoted.returncode:
+                detail = (promoted.stderr or promoted.stdout or "promotion failed").strip()
+                log(
+                    f"RECIPE_PROMOTION_FAILED fingerprint={promotion.fingerprint} "
+                    f"exit={promoted.returncode} detail={detail[:500]}"
+                )
+                return False
+            log(
+                f"RECIPE_PROMOTED fingerprint={promotion.fingerprint} "
+                f"published={str(publish).lower()} elapsed={elapsed_s}s"
+            )
+    return True
+
+
+def promote_reviewed_recipe_batch(
+    promotions: tuple[RecipePromotion, ...],
+    *,
+    scanner: Path,
+) -> bool:
+    """Record every approved recipe, then create one versioned release for the batch."""
+
+    if not promotions:
+        return True
+    if not promote_reviewed_recipes(promotions, scanner=scanner, publish=False):
+        return False
+    # Replaying the last idempotent stage with --publish releases every corpus change recorded
+    # above.  This avoids one slow version bump/PyPI workflow per finding.
+    return promote_reviewed_recipes((promotions[-1],), scanner=scanner, publish=True)
+
+
+def queue_recipe_promotions(
+    promotions: tuple[RecipePromotion, ...],
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+    publish: bool,
+    status: str = "pending",
+    sync_key_value: str | None = None,
+) -> tuple[str, ...]:
+    """Persist promotions before executing them so release failures are resumable."""
+
+    if status not in {"awaiting-sync", "pending"}:
+        raise ValueError(f"invalid recipe promotion status: {status}")
+    if status == "awaiting-sync" and not sync_key_value:
+        raise ValueError("awaiting-sync recipe promotions require a sync key")
+
+    keys: list[str] = []
+    with state_lock:
+        pending = state.setdefault("recipe_promotions", {})
+        for promotion in promotions:
+            key = file_sha256(promotion.stage)
+            keys.append(key)
+            pending[key] = {
+                "fingerprint": promotion.fingerprint,
+                "stage": str(promotion.stage.resolve()),
+                "attestation": str(promotion.attestation.resolve()),
+                "publish": publish,
+                "status": status,
+                "sync_key": sync_key_value,
+                "queued_at": datetime.now(UTC).isoformat(),
+            }
+        write_json(state_path, state)
+    return tuple(keys)
+
+
+def activate_recipe_promotions(
+    keys: tuple[str, ...],
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+) -> None:
+    """Make pre-recorded promotions runnable only after their Satori sync is durable."""
+
+    with state_lock:
+        entries = state.setdefault("recipe_promotions", {})
+        synced = state.setdefault("synced", {})
+        for key in keys:
+            entry = entries.get(key)
+            if not isinstance(entry, dict) or entry.get("status") != "awaiting-sync":
+                continue
+            sync_identity = entry.get("sync_key")
+            confirmation = synced.get(sync_identity) if isinstance(sync_identity, str) else None
+            if not isinstance(confirmation, dict) or confirmation.get("confirmed_status") != "TP":
+                raise RuntimeError(
+                    "recipe promotion cannot activate before Satori confirms the matching sync"
+                )
+            entry["status"] = "pending"
+            entry["activated_at"] = datetime.now(UTC).isoformat()
+        write_json(state_path, state)
+
+
+def activate_confirmed_recipe_promotions(
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+) -> tuple[str, ...]:
+    """Recover a crash between Satori confirmation and recipe activation."""
+
+    entries = state.get("recipe_promotions", {})
+    synced = state.get("synced", {})
+    keys = tuple(
+        key
+        for key, entry in entries.items()
+        if isinstance(key, str)
+        and isinstance(entry, dict)
+        and entry.get("status") == "awaiting-sync"
+        and isinstance(entry.get("sync_key"), str)
+        and isinstance(synced.get(entry["sync_key"]), dict)
+        and synced[entry["sync_key"]].get("confirmed_status") == "TP"
+    ) if isinstance(entries, dict) and isinstance(synced, dict) else ()
+    if keys:
+        activate_recipe_promotions(
+            keys,
+            state=state,
+            state_path=state_path,
+            state_lock=state_lock,
+        )
+    return keys
+
+
+def finish_recipe_promotions(
+    keys: tuple[str, ...],
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+    success: bool,
+) -> None:
+    """Record terminal success while retaining failed work as pending."""
+
+    with state_lock:
+        pending = state.setdefault("recipe_promotions", {})
+        for key in keys:
+            entry = pending.get(key)
+            if not isinstance(entry, dict):
+                continue
+            entry["status"] = "promoted" if success else "pending"
+            entry["last_attempt_at"] = datetime.now(UTC).isoformat()
+        write_json(state_path, state)
+
+
+def mark_recipe_promotions_recorded(
+    keys: tuple[str, ...],
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+) -> None:
+    """Keep successfully merged recipes pending until one batched release pushes them."""
+
+    with state_lock:
+        pending = state.setdefault("recipe_promotions", {})
+        for key in keys:
+            entry = pending.get(key)
+            if isinstance(entry, dict):
+                entry["status"] = "recorded"
+                entry["last_attempt_at"] = datetime.now(UTC).isoformat()
+        write_json(state_path, state)
+
+
+def pending_recipe_promotions(state: dict[str, Any]) -> tuple[RecipePromotion, ...]:
+    """Recover bounded, still-present stages from earlier interrupted releases."""
+
+    recovered: list[RecipePromotion] = []
+    values = state.get("recipe_promotions", {})
+    if not isinstance(values, dict):
+        return ()
+    for entry in values.values():
+        if not isinstance(entry, dict) or entry.get("status") not in {
+            "pending",
+            "recorded",
+        }:
+            continue
+        fingerprint = entry.get("fingerprint")
+        stage = entry.get("stage")
+        attestation = entry.get("attestation")
+        if not all(isinstance(value, str) and value for value in (fingerprint, stage, attestation)):
+            continue
+        promotion = RecipePromotion(
+            fingerprint=fingerprint,
+            stage=Path(stage),
+            attestation=Path(attestation),
+        )
+        if promotion.stage.is_file() and promotion.attestation.is_file():
+            recovered.append(promotion)
+    return tuple(recovered)
+
+
+def queue_pending_synchronization(
+    result: ResearchResult,
+    *,
+    run_dir: Path,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+    promotions: tuple[RecipePromotion, ...] = (),
+    publish_recipes: bool = False,
+) -> tuple[str, tuple[str, ...]]:
+    """Persist the exact reviewed report before starting any external Satori mutation."""
+
+    if result.report is None or result.revision is None or not result.findings:
+        raise ValueError("cannot queue an incomplete Satori synchronization")
+    key = sync_key(result.repository, result.revision, result.findings)
+    path = run_dir / "sync-pending" / f"{key}.json"
+    write_json(path, result.report)
+    promotion_keys: list[str] = []
+    with state_lock:
+        state.setdefault("pending_sync", {})[key] = {
+            "repository": result.repository,
+            "revision": result.revision,
+            "security_advisories": result.security_advisories,
+            "repository_forks": result.repository_forks,
+            "repository_stars": result.repository_stars,
+            "report": str(path.resolve()),
+            "fix_attempted": result.fix_attempted,
+            "fix_proven": result.fix_proven,
+            "elapsed_s": result.elapsed_s,
+            "queued_at": datetime.now(UTC).isoformat(),
+        }
+        recipe_entries = state.setdefault("recipe_promotions", {})
+        for promotion in promotions:
+            promotion_key = file_sha256(promotion.stage)
+            promotion_keys.append(promotion_key)
+            recipe_entries[promotion_key] = {
+                "fingerprint": promotion.fingerprint,
+                "stage": str(promotion.stage.resolve()),
+                "attestation": str(promotion.attestation.resolve()),
+                "publish": publish_recipes,
+                "status": "awaiting-sync",
+                "sync_key": key,
+                "queued_at": datetime.now(UTC).isoformat(),
+            }
+        write_json(state_path, state)
+    return key, tuple(promotion_keys)
+
+
+def pending_synchronizations(
+    state: dict[str, Any],
+) -> tuple[tuple[str, ResearchResult], ...]:
+    """Recover reviewed Satori work even when discovery now blacklists its repository."""
+
+    recovered: list[tuple[str, ResearchResult]] = []
+    entries = state.get("pending_sync", {})
+    if not isinstance(entries, dict):
+        return ()
+    for key, entry in entries.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        report_path = entry.get("report")
+        if not isinstance(report_path, str) or not Path(report_path).is_file():
+            continue
+        try:
+            report = read_json(Path(report_path))
+        except RuntimeError:
+            continue
+        findings = tuple(verified_findings(report))
+        repository = entry.get("repository")
+        revision = entry.get("revision")
+        if (
+            not isinstance(repository, str)
+            or not repository
+            or not isinstance(revision, str)
+            or not revision
+            or not findings
+            or sync_key(repository, revision, findings) != key
+        ):
+            continue
+        recovered.append(
+            (
+                key,
+                ResearchResult(
+                    repository=repository,
+                    revision=revision,
+                    security_advisories=str(entry.get("security_advisories", "unknown")),
+                    repository_forks=int(entry.get("repository_forks", 0)),
+                    repository_stars=int(entry.get("repository_stars", 0)),
+                    report=report,
+                    findings=findings,
+                    fix_attempted=bool(entry.get("fix_attempted", False)),
+                    fix_proven=bool(entry.get("fix_proven", False)),
+                    elapsed_s=float(entry.get("elapsed_s", 0.0)),
+                ),
+            )
+        )
+    return tuple(recovered)
+
+
+def finish_pending_synchronization(
+    key: str,
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    state_lock: threading.Lock,
+) -> None:
+    """Drop only a Satori queue entry whose TP confirmation is already durable."""
+
+    with state_lock:
+        confirmation = state.get("synced", {}).get(key)
+        if not isinstance(confirmation, dict) or confirmation.get("confirmed_status") != "TP":
+            raise RuntimeError("cannot finish an unconfirmed Satori synchronization")
+        state.setdefault("pending_sync", {}).pop(key, None)
+        write_json(state_path, state)
 
 
 def synchronize(
@@ -1701,10 +2515,23 @@ def synchronize(
     state: dict[str, Any],
     state_path: Path,
     state_lock: threading.Lock,
+    require_peer_review: bool = False,
 ) -> bool:
     """Create one private Satori execution and expose its verified issues for reporting."""
     if result.report is None or result.revision is None or not result.findings:
         return True
+    if require_peer_review:
+        for finding in result.findings:
+            review = finding.get("peer_review")
+            if not isinstance(review, dict) or review.get("decision") not in {
+                "publish_fixed",
+                "publish_unfixed",
+            }:
+                raise RuntimeError(
+                    "Satori synchronization refused a finding without approved peer review"
+                )
+            if review.get("finding_fingerprint") != finding.get("fingerprint"):
+                raise RuntimeError("Satori synchronization peer-review identity mismatch")
     key = sync_key(result.repository, result.revision, result.findings)
     with state_lock:
         synced_state = state["synced"].get(key)
@@ -1792,6 +2619,9 @@ def synchronize(
                 "--tag",
                 "sync_key",
                 key,
+                "--tag",
+                "peer_review_policy",
+                peer_review.POLICY_VERSION if require_peer_review else "disabled",
                 "--sync",
             ]
             synced = run(command, capture=True)
@@ -2245,6 +3075,66 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="record only dynamically proven fixes in JSSpector's local recipe corpus",
     )
+    parser.add_argument(
+        "--peer-review",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "require an adversarial Codex review before Satori synchronization and recipe "
+            "promotion (default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--peer-review-mode",
+        choices=("enforce", "shadow"),
+        default="enforce",
+        help=(
+            "enforce blocks publication on the verdict; shadow records verdicts without "
+            "publishing or evolving (default: enforce)"
+        ),
+    )
+    parser.add_argument(
+        "--peer-review-timeout",
+        type=positive,
+        default=600,
+        help="hard wall-clock peer-review ceiling per verified finding (default: 600s)",
+    )
+    parser.add_argument(
+        "--parallel-peer-review",
+        type=positive,
+        default=1,
+        help="concurrent Codex peer-review coordinators (default: 1)",
+    )
+    parser.add_argument("--peer-review-model", default="gpt-5.6-sol")
+    parser.add_argument(
+        "--peer-review-reasoning",
+        choices=("low", "medium", "high", "xhigh", "max", "ultra"),
+        default="medium",
+    )
+    parser.add_argument(
+        "--peer-review-program",
+        choices=("standard", "daybreak_blue", "daybreak_red"),
+        default="daybreak_blue",
+    )
+    parser.add_argument("--codex-cli", default="codex")
+    parser.add_argument(
+        "--experiment-minutes",
+        type=positive,
+        help=(
+            "run a bounded shadow experiment for this many minutes; new work stops before "
+            "the final drain window"
+        ),
+    )
+    parser.add_argument(
+        "--experiment-drain-minutes",
+        type=positive,
+        default=30,
+        help="minutes reserved to drain in-flight work in an experiment (default: 30)",
+    )
+    parser.add_argument(
+        "--experiment-id",
+        help="stable label included in experiment artifacts and metrics",
+    )
     parser.add_argument("--scanner", type=Path, default=DEFAULT_SCANNER)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--satori-cli", default="satori-v2")
@@ -2265,12 +3155,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--verify-extended-timeout must be at least --verify-timeout")
     if args.estimate and args.calibrate:
         parser.error("--estimate and --calibrate are mutually exclusive")
+    if (
+        args.experiment_minutes is not None
+        and args.experiment_drain_minutes >= args.experiment_minutes
+    ):
+        parser.error("--experiment-drain-minutes must be smaller than --experiment-minutes")
     # A calibration measures hardware: it never publishes, fixes or spends Opus usage.
     args.ai_lane = not args.calibrate
     if args.calibrate:
         args.satori_sync = False
         args.fix_attempts = 0
         args.learn_fixes = False
+        args.peer_review = False
+    if args.experiment_minutes is not None:
+        # An experiment measures the complete local pipeline without creating account state or
+        # publishing recipes.  The same artifacts are replayed in a later enforce-mode epoch.
+        args.peer_review = True
+        args.peer_review_mode = "shadow"
+        args.satori_sync = False
+        args.learn_fixes = False
+    # Shadow experiments still exclude repositories already present in the Satori account.  This
+    # is read-only and keeps repeated epochs focused on genuinely unseen targets.
+    args.satori_blacklist = args.satori_sync or args.experiment_minutes is not None
+    if not args.peer_review and (args.satori_sync or args.learn_fixes):
+        parser.error(
+            "--no-peer-review is local diagnostics only and cannot synchronize or evolve"
+        )
+    if args.learn_fixes and not args.satori_sync:
+        parser.error("--learn-fixes requires --satori-sync")
     return args
 
 
@@ -2287,15 +3199,84 @@ def candidates_from_file(
     inventory = path.expanduser().resolve()
     if not inventory.is_file():
         raise SystemExit(f"repository inventory not found: {inventory}")
+    lines = [
+        line.strip()
+        for line in inventory.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    json_lines = [line.startswith("{") for line in lines]
+    if any(json_lines) and not all(json_lines):
+        raise SystemExit("repository inventory cannot mix names and pinned JSON records")
+    if lines and all(json_lines):
+        wanted: list[discover.Candidate] = []
+        seen: set[str] = set()
+        oversized: list[str] = []
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise SystemExit(f"invalid pinned inventory JSON: {error}") from error
+            repository = item.get("repository") if isinstance(item, dict) else None
+            revision = item.get("revision") if isinstance(item, dict) else None
+            if not isinstance(repository, str) or not repository or not isinstance(revision, str):
+                raise SystemExit("pinned inventory records need repository and revision")
+            key = repository.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            size_kb = int(item.get("size_kb") or 0)
+            if size_kb > args.max_repo_size_mb * 1024:
+                oversized.append(repository)
+                continue
+            candidate = discover.Candidate(
+                repo=repository,
+                stars=int(item.get("stars") or 0),
+                forks=int(item.get("forks") or 0),
+                size_kb=size_kb,
+                security_advisories=str(item.get("security_advisories") or "unknown"),
+                revision=revision,
+            )
+            wanted.append(candidate)
+            if on_found is not None:
+                on_found(candidate)
+            emit_event(
+                "discovery_progress",
+                repository=repository,
+                found=len(wanted),
+                checked=len(wanted) + len(oversized),
+                pinned=True,
+            )
+            if args.limit and len(wanted) >= args.limit:
+                break
+        (run_dir / "repos.txt").write_text(
+            "".join(f"{candidate.repo}\n" for candidate in wanted), encoding="utf-8"
+        )
+        (run_dir / "checked.txt").write_text("", encoding="utf-8")
+        (run_dir / "pvr-errors.txt").write_text("", encoding="utf-8")
+        (run_dir / "oversized.txt").write_text(
+            "".join(f"{repository}\n" for repository in oversized), encoding="utf-8"
+        )
+        return (
+            wanted,
+            {
+                "source": str(inventory),
+                "source_total": len(lines),
+                "inventory": len(wanted) + len(oversized),
+                "found": len(wanted),
+                "pvr_filtered": 0,
+                "pvr_errors": 0,
+                "oversized": len(oversized),
+                "pinned": True,
+            },
+        )
     repositories = []
     seen = set()
     completed = {
         repository.casefold()
         for repository in completed_repositories(state) | remote_blacklist
     }
-    for line in inventory.read_text(encoding="utf-8").splitlines():
-        repository = line.strip()
-        if not repository or repository.startswith("#") or repository in seen:
+    for repository in lines:
+        if repository in seen:
             continue
         seen.add(repository)
         if repository.casefold() not in completed:
@@ -2310,6 +3291,8 @@ def candidates_from_file(
     oversized = []
     try:
         for offset in range(0, len(repositories), batch_size):
+            if ADMISSION_CLOSED.is_set() or SHUTDOWN.is_set():
+                break
             if args.limit and len(wanted) >= args.limit:
                 break
             log(
@@ -2324,6 +3307,8 @@ def candidates_from_file(
                 else list(pvr_executor.map(pool.has_pvr, batch))
             )
             for repository, info, enabled in zip(batch, metadata, statuses, strict=True):
+                if ADMISSION_CLOSED.is_set() or SHUTDOWN.is_set():
+                    break
                 if args.limit and len(wanted) >= args.limit:
                     break
                 if info is None:
@@ -2414,7 +3399,7 @@ def discover_candidates(
         pvr_parallel=args.pvr_parallel,
         out=run_dir,
         exclude=completed_repositories(state) | remote_blacklist,
-        should_stop=SHUTDOWN.is_set,
+        should_stop=lambda: SHUTDOWN.is_set() or ADMISSION_CLOSED.is_set(),
         on_progress=progress,
     )
     discovery = discover.Discovery(pool, cfg)
@@ -2523,7 +3508,9 @@ def plan_capacity(args: argparse.Namespace, out: Path) -> Capacity:
     args.static_parallel = plan.static_parallel
     args.max_checkouts = plan.max_checkouts
     args.parallel_no_ai = plan.parallel_no_ai
+    args.parallel_ai = plan.parallel_ai
     args.parallel_docker = plan.parallel_docker
+    args.ai_lane = args.ai_lane and plan.parallel_ai > 0
     return Capacity(
         host=host,
         costs=costs,
@@ -2537,8 +3524,10 @@ def plan_capacity(args: argparse.Namespace, out: Path) -> Capacity:
 
 def main(argv: list[str] | None = None) -> int:
     """Discover, scan, and run separate deterministic and Claude-ranked lanes."""
-    global LOG_PATH
+    global EVENT_RECORDER, LOG_PATH
     SHUTDOWN.clear()
+    ADMISSION_CLOSED.clear()
+    EXPERIMENT_DEADLINE_REACHED.clear()
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGINT, request_shutdown)
         signal.signal(signal.SIGTERM, request_shutdown)
@@ -2565,7 +3554,7 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         return 0
-    if args.satori_sync:
+    if args.satori_blacklist:
         satori_cli = shutil.which(args.satori_cli)
         if satori_cli is None:
             raise SystemExit(f"Satori CLI not found: {args.satori_cli}")
@@ -2589,10 +3578,28 @@ def main(argv: list[str] | None = None) -> int:
     run_label = f"online_{stamp}_{os.getpid()}"
     run_dir = out / "runs" / stamp
     run_dir.mkdir(parents=True, exist_ok=False)
-    if args.calibrate:
+    if args.calibrate or args.experiment_minutes is not None:
+        # Calibration and shadow epochs are isolated treatments. They may read the remote Satori
+        # blacklist, but they neither mark production repositories complete nor reuse prior review
+        # cache entries; a later epoch can therefore replay the same frozen inventory.
         state_path = run_dir / "state.json"
         state = read_state(state_path)
     LOG_PATH = run_dir / "online.log"
+    EVENT_RECORDER = experiment.EventRecorder(
+        run_dir / "events.jsonl",
+        experiment_id=args.experiment_id or stamp,
+        policy_version=peer_review.POLICY_VERSION,
+    )
+    snapshot_configuration = dict(vars(args))
+    # Epoch identity belongs in the snapshot metadata, not in the configuration hash: two runs
+    # with different names but identical policy must compare as the same experiment treatment.
+    snapshot_configuration.pop("experiment_id", None)
+    snapshot_configuration["runtime_fingerprints"] = {
+        "scanner_sha256": file_sha256(scanner),
+        "controller_sha256": file_sha256(Path(__file__).resolve()),
+        "peer_review_sha256": file_sha256(Path(peer_review.__file__).resolve()),
+        "experiment_sha256": file_sha256(Path(experiment.__file__).resolve()),
+    }
     for note in capacity.notes:
         log(f"CAPACITY_NOTE {note}")
     plan = capacity.plan
@@ -2626,7 +3633,7 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     remote_blacklist: frozenset[str] = frozenset()
-    if args.satori_sync:
+    if args.satori_blacklist:
         try:
             inventory = satori_repository_blacklist(satori_cli)
         except RuntimeError as error:
@@ -2654,6 +3661,30 @@ def main(argv: list[str] | None = None) -> int:
             f"advisories={len(inventory['advisories'])} "
             f"unique={len(remote_blacklist)}"
         )
+    repos_file = args.repos_file.expanduser().resolve() if args.repos_file else None
+    snapshot_configuration["input_fingerprints"] = {
+        "repos_file_sha256": (
+            file_sha256(repos_file) if repos_file is not None and repos_file.is_file() else None
+        ),
+        "satori_blacklist_sha256": hashlib.sha256(
+            json.dumps(
+                sorted(remote_blacklist, key=str.casefold),
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+    }
+    snapshot_configuration["resolved_capacity"] = {
+        "host": asdict(capacity.host),
+        "costs": asdict(capacity.costs),
+        "plan": asdict(plan),
+        "governed": capacity.governed,
+    }
+    experiment.write_configuration_snapshot(
+        run_dir / "experiment-configuration.json",
+        snapshot_configuration,
+        experiment_id=args.experiment_id or stamp,
+        policy_version=peer_review.POLICY_VERSION,
+    )
     started = time.monotonic()
     docker_baseline = capture_docker_inventory()
     initial_gc = cleanup_online_docker_storage(
@@ -2663,6 +3694,12 @@ def main(argv: list[str] | None = None) -> int:
         artifact=run_dir / "docker-storage-initial.json",
     )
     initial_free_gb = free_disk_gb(out)
+    emit_event(
+        "storage_gc",
+        phase="initial",
+        free_gib=initial_free_gb,
+        failures=len(initial_gc["failures"]),
+    )
     log(
         f"DISK_PREFLIGHT free_gb={initial_free_gb:.1f} "
         f"required_gb={args.min_free_gb}"
@@ -2697,11 +3734,25 @@ def main(argv: list[str] | None = None) -> int:
         "verification_timeout": 0,
         "fix_attempted": 0,
         "fix_proven": 0,
+        "peer_review_queued": 0,
+        "peer_review_completed": 0,
+        "peer_review_approved": 0,
+        "peer_review_false_positive": 0,
+        "peer_review_inconclusive": 0,
+        "peer_review_failed": 0,
+        "recipe_staged": 0,
+        "recipe_promoted": 0,
+        "recipe_promotion_failed": 0,
         "sync_failed": 0,
         "docker_cleanup_failed": 0,
         "docker_storage_gc_failed": len(initial_gc["failures"]),
         "docker_storage_gc_cycles": 1,
+        "experiment_censored": 0,
+        "experiment_not_admitted": 0,
     }
+    experiment_inventory_lock = threading.Lock()
+    admitted_candidates: dict[str, discover.Candidate] = {}
+    pinned_inventory: dict[str, dict[str, Any]] = {}
     docker_slots = resources.AdjustableSlots(args.parallel_docker, wake=SHUTDOWN)
     no_ai_gate = resources.AdjustableSlots(args.parallel_no_ai, wake=SHUTDOWN)
     if capacity.calibration is not None:
@@ -2748,6 +3799,53 @@ def main(argv: list[str] | None = None) -> int:
     state_lock = threading.Lock()
     failures_lock = threading.Lock()
     storage_gc_lock = threading.Lock()
+    if args.satori_sync:
+        for pending_key, pending_result in pending_synchronizations(state):
+            resumed = synchronize(
+                pending_result,
+                satori_cli=satori_cli,
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+                require_peer_review=True,
+            )
+            if resumed:
+                finish_pending_synchronization(
+                    pending_key,
+                    state=state,
+                    state_path=state_path,
+                    state_lock=state_lock,
+                )
+            else:
+                counters["sync_failed"] += 1
+    if (
+        args.learn_fixes
+        and args.peer_review_mode == "enforce"
+        and os.environ.get("JSSPECTOR_PUBLISH_FIXES") == "1"
+    ):
+        activate_confirmed_recipe_promotions(
+            state=state,
+            state_path=state_path,
+            state_lock=state_lock,
+        )
+        resumed_promotions = pending_recipe_promotions(state)
+        if resumed_promotions:
+            resumed_keys = tuple(file_sha256(item.stage) for item in resumed_promotions)
+            resumed_ok = promote_reviewed_recipe_batch(
+                resumed_promotions,
+                scanner=scanner,
+            )
+            finish_recipe_promotions(
+                resumed_keys,
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+                success=resumed_ok,
+            )
+            if resumed_ok:
+                counters["recipe_promoted"] += len(resumed_promotions)
+            else:
+                counters["recipe_promotion_failed"] += 1
     verification_completions = 0
     timeout_repositories: set[str] = set()
     failures: list[dict[str, Any]] = []
@@ -2863,13 +3961,83 @@ def main(argv: list[str] | None = None) -> int:
             run_label=run_label,
         )
 
+    def publish_and_record(
+        result: ResearchResult,
+        *,
+        lane: str,
+        peer_status: str | None = None,
+        queued_sync_key: str | None = None,
+    ) -> bool:
+        """Synchronize an approved result and persist its terminal repository state."""
+
+        if args.satori_sync and result.findings:
+            pending_sync_key = queued_sync_key
+            if pending_sync_key is None:
+                pending_sync_key, _promotion_keys = queue_pending_synchronization(
+                    result,
+                    run_dir=run_dir,
+                    state=state,
+                    state_path=state_path,
+                    state_lock=state_lock,
+                )
+            elif result.revision is None or pending_sync_key != sync_key(
+                result.repository, result.revision, result.findings
+            ):
+                raise RuntimeError("queued Satori synchronization identity mismatch")
+            if not synchronize(
+                result,
+                satori_cli=satori_cli,
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+                require_peer_review=args.peer_review,
+            ):
+                record_failure(
+                    stage="sync",
+                    repository=result.repository,
+                    reason="sync-failed",
+                    elapsed_s=result.elapsed_s,
+                    lane=lane,
+                    artifact="online.log",
+                )
+                with state_lock:
+                    counters["sync_failed"] += 1
+                return False
+            finish_pending_synchronization(
+                pending_sync_key,
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+            )
+        with state_lock:
+            state["processed"][result.repository] = {
+                "revision": result.revision,
+                "verified": len(result.findings),
+                "fix_attempted": result.fix_attempted,
+                "fix_proven": result.fix_proven,
+                "peer_review": peer_status,
+                "lane": lane,
+                "elapsed_s": result.elapsed_s,
+                "processed_at": datetime.now(UTC).isoformat(),
+            }
+            write_json(state_path, state)
+        return True
+
     def finish_verification(
         future: Future[ResearchResult], *, lane: str, repository: str
-    ) -> None:
+    ) -> ResearchResult | None:
         """Persist a terminal verification immediately, while discovery still runs."""
         try:
             result = future.result()
         except CancelledError:
+            with state_lock:
+                counters["experiment_censored"] += 1
+            emit_event(
+                "verification_censored",
+                repository=repository,
+                lane=lane,
+                reason="experiment-deadline" if EXPERIMENT_DEADLINE_REACHED.is_set() else "shutdown",
+            )
             return
         except Exception as error:
             if SHUTDOWN.is_set():
@@ -2927,6 +4095,14 @@ def main(argv: list[str] | None = None) -> int:
                 repository=result.repository,
                 message="Docker garbage collection failed",
             )
+        for phase, elapsed_s in result.phases.items():
+            emit_event(
+                "stage_finished",
+                stage=f"verification.{phase}",
+                repository=result.repository,
+                lane=lane,
+                duration_ms=round(elapsed_s * 1000, 3),
+            )
         outcome = resources.outcome_kind(
             cancelled=result.cancelled,
             failed=result.failed,
@@ -2949,6 +4125,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         if result.cancelled:
+            with state_lock:
+                counters["experiment_censored"] += 1
+            emit_event(
+                "verification_censored",
+                repository=result.repository,
+                lane=lane,
+                reason="experiment-deadline" if EXPERIMENT_DEADLINE_REACHED.is_set() else "shutdown",
+            )
             return
         if result.failed:
             slug = result.repository.replace("/", "__")
@@ -2983,6 +4167,7 @@ def main(argv: list[str] | None = None) -> int:
                 outcome="failed",
                 findings=0,
                 message=result.failure_reason,
+                elapsed_s=result.elapsed_s,
             )
             return
         with state_lock:
@@ -3001,37 +4186,195 @@ def main(argv: list[str] | None = None) -> int:
             findings=len(result.findings),
             fix_attempted=result.fix_attempted,
             fix_proven=result.fix_proven,
+            elapsed_s=result.elapsed_s,
         )
-        if (
-            args.satori_sync
-            and result.findings
-            and not synchronize(
-                result,
-                satori_cli=satori_cli,
-                state=state,
-                state_path=state_path,
-                state_lock=state_lock,
-            )
-        ):
-            record_failure(
-                stage="sync",
+        if args.peer_review and result.findings:
+            with state_lock:
+                counters["peer_review_queued"] += len(result.findings)
+            emit_event(
+                "peer_review_queued",
                 repository=result.repository,
-                reason="sync-failed",
-                elapsed_s=result.elapsed_s,
+                lane=lane,
+                findings=len(result.findings),
+            )
+            return result
+        publish_and_record(result, lane=lane, peer_status="disabled")
+        return None
+
+    def finish_peer_review(
+        future: Future[ReviewedResult], *, lane: str, repository: str
+    ) -> None:
+        """Apply the peer verdict as the sole publication and evolution gate."""
+
+        try:
+            reviewed = future.result()
+        except CancelledError:
+            with state_lock:
+                counters["experiment_censored"] += 1
+            emit_event(
+                "peer_review_censored",
+                repository=repository,
+                lane=lane,
+                reason="experiment-deadline" if EXPERIMENT_DEADLINE_REACHED.is_set() else "shutdown",
+            )
+            return
+        except Exception as error:
+            if SHUTDOWN.is_set():
+                return
+            record_failure(
+                stage="peer-review",
+                repository=repository,
+                reason="peer-review-failed",
                 lane=lane,
                 artifact="online.log",
             )
             with state_lock:
-                counters["sync_failed"] += 1
+                counters["peer_review_failed"] += 1
+                state["processed"][repository] = {
+                    "status": "peer-review-failed",
+                    "lane": lane,
+                    "error": str(error),
+                    "processed_at": datetime.now(UTC).isoformat(),
+                }
+                write_json(state_path, state)
+            log(f"PEER_REVIEW_EXCEPTION {repository}: {error}")
             return
+
+        if reviewed.cancelled:
+            with state_lock:
+                counters["experiment_censored"] += 1
+            emit_event(
+                "peer_review_censored",
+                repository=repository,
+                lane=lane,
+                reason="experiment-deadline" if EXPERIMENT_DEADLINE_REACHED.is_set() else "shutdown",
+            )
+            return
+
         with state_lock:
-            state["processed"][result.repository] = {
-                "revision": result.revision,
-                "verified": len(result.findings),
-                "fix_attempted": result.fix_attempted,
-                "fix_proven": result.fix_proven,
+            counters["peer_review_completed"] += len(reviewed.runs)
+            counters["peer_review_approved"] += len(reviewed.approved)
+            counters["peer_review_false_positive"] += reviewed.false_positive
+            counters["peer_review_inconclusive"] += reviewed.inconclusive
+            counters["peer_review_failed"] += reviewed.failed
+
+        if args.peer_review_mode == "shadow":
+            with state_lock:
+                state["processed"][repository] = {
+                    "revision": reviewed.result.revision,
+                    "status": "peer-review-shadow",
+                    "approved": len(reviewed.approved),
+                    "false_positive": reviewed.false_positive,
+                    "inconclusive": reviewed.inconclusive,
+                    "failed": reviewed.failed,
+                    "lane": lane,
+                    "processed_at": datetime.now(UTC).isoformat(),
+                }
+                write_json(state_path, state)
+            return
+
+        if reviewed.failed or reviewed.inconclusive:
+            status = (
+                "peer-review-failed"
+                if reviewed.failed
+                else "peer-review-inconclusive"
+            )
+            record_failure(
+                stage="peer-review",
+                repository=repository,
+                reason=status,
+                lane=lane,
+                artifact="peer-reviews",
+            )
+            with state_lock:
+                state["processed"][repository] = {
+                    "revision": reviewed.result.revision,
+                    "status": status,
+                    "lane": lane,
+                    "processed_at": datetime.now(UTC).isoformat(),
+                }
+                write_json(state_path, state)
+            return
+
+        if reviewed.approved:
+            promotion_keys: tuple[str, ...] = ()
+            publish_recipes = os.environ.get("JSSPECTOR_PUBLISH_FIXES") == "1"
+            queued_sync_key: str | None = None
+            if args.satori_sync:
+                queued_sync_key, promotion_keys = queue_pending_synchronization(
+                    reviewed.result,
+                    run_dir=run_dir,
+                    state=state,
+                    state_path=state_path,
+                    state_lock=state_lock,
+                    promotions=(reviewed.promotions if args.learn_fixes else ()),
+                    publish_recipes=publish_recipes,
+                )
+            published = publish_and_record(
+                reviewed.result,
+                lane=lane,
+                peer_status="approved",
+                queued_sync_key=queued_sync_key,
+            )
+            if not published:
+                return
+            if promotion_keys:
+                activate_recipe_promotions(
+                    promotion_keys,
+                    state=state,
+                    state_path=state_path,
+                    state_lock=state_lock,
+                )
+            if args.learn_fixes and reviewed.promotions:
+                promotion_ok = promote_reviewed_recipes(
+                    reviewed.promotions,
+                    scanner=scanner,
+                    publish=False,
+                )
+                if promotion_ok and publish_recipes:
+                    # The anonymous recipes are already part of the local corpus.  Keep their
+                    # durable entries non-terminal until the run drains and creates one release
+                    # for the whole batch instead of blocking this finding on tag/PyPI latency.
+                    mark_recipe_promotions_recorded(
+                        promotion_keys,
+                        state=state,
+                        state_path=state_path,
+                        state_lock=state_lock,
+                    )
+                else:
+                    finish_recipe_promotions(
+                        promotion_keys,
+                        state=state,
+                        state_path=state_path,
+                        state_lock=state_lock,
+                        success=promotion_ok,
+                    )
+                with state_lock:
+                    if promotion_ok:
+                        counters["recipe_staged"] += len(reviewed.promotions)
+                        if publish_recipes:
+                            state["processed"][repository]["recipe_promotion"] = (
+                                "recorded"
+                            )
+                        else:
+                            counters["recipe_promoted"] += len(reviewed.promotions)
+                            state["processed"][repository]["recipes_promoted"] = len(
+                                reviewed.promotions
+                            )
+                    else:
+                        counters["recipe_promotion_failed"] += 1
+                        state["processed"][repository]["recipe_promotion"] = "failed"
+                    write_json(state_path, state)
+            return
+
+        # Every locally verified finding was independently refuted.  Future runs skip the exact
+        # terminal repository state, while the retained review artifact remains reversible.
+        with state_lock:
+            state["processed"][repository] = {
+                "revision": reviewed.result.revision,
+                "status": "peer-review-false-positive",
+                "false_positive": reviewed.false_positive,
                 "lane": lane,
-                "elapsed_s": result.elapsed_s,
                 "processed_at": datetime.now(UTC).isoformat(),
             }
             write_json(state_path, state)
@@ -3043,30 +4386,60 @@ def main(argv: list[str] | None = None) -> int:
         repository: str,
         checkout: Path | None,
     ) -> None:
+        deferred = False
         try:
-            finish_verification(future, lane=lane, repository=repository)
+            result = finish_verification(future, lane=lane, repository=repository)
+            if result is not None and checkout is not None:
+                submitted = peer_review_executor.submit(
+                    review_repository,
+                    result,
+                    checkout=checkout,
+                    args=args,
+                    run_dir=run_dir,
+                    lane=lane,
+                    state=state,
+                    state_path=state_path,
+                    state_lock=state_lock,
+                )
+                deferred = True
+                submitted.add_done_callback(
+                    lambda done, selected_lane=lane, selected_repository=repository, selected_checkout=checkout: (
+                        finish_peer_review_with_cleanup(
+                            done,
+                            lane=selected_lane,
+                            repository=selected_repository,
+                            checkout=selected_checkout,
+                        )
+                    )
+                )
         finally:
-            if checkout is not None and checkout.exists():
+            if not deferred:
+                if checkout is not None and checkout.exists():
+                    remove_checkout(checkout, run_dir)
+                checkout_slots.release()
+                maintain_docker_storage()
+
+    def finish_peer_review_with_cleanup(
+        future: Future[ReviewedResult],
+        *,
+        lane: str,
+        repository: str,
+        checkout: Path,
+    ) -> None:
+        try:
+            finish_peer_review(future, lane=lane, repository=repository)
+        finally:
+            if checkout.exists():
                 remove_checkout(checkout, run_dir)
             checkout_slots.release()
             maintain_docker_storage()
 
     def static_job(candidate: discover.Candidate) -> StaticResult:
         """Bound retained checkouts while allowing discovery itself to continue streaming."""
-        while not SHUTDOWN.is_set():
-            if checkout_slots.acquire(timeout=0.5):
-                break
-        else:
-            return StaticResult(
-                repository=candidate.repo,
-                security_advisories=candidate.security_advisories,
-                repository_forks=candidate.forks,
-                repository_stars=candidate.stars,
-                cancelled=True,
-            )
         nonlocal static_running
         with static_running_lock:
             static_running += 1
+        emit_event("static_started", repository=candidate.repo)
         try:
             result = static_repository(
                 candidate,
@@ -3091,6 +4464,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             static = future.result()
         except CancelledError:
+            with state_lock:
+                counters["experiment_censored"] += 1
+            emit_event(
+                "static_censored",
+                repository=repository,
+                reason="experiment-deadline" if EXPERIMENT_DEADLINE_REACHED.is_set() else "shutdown",
+            )
             return
         except Exception as error:
             if SHUTDOWN.is_set():
@@ -3112,7 +4492,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             return
 
+        if static.revision is not None:
+            with experiment_inventory_lock:
+                candidate = admitted_candidates.get(static.repository)
+                pinned_inventory[static.repository] = {
+                    "repository": static.repository,
+                    "revision": static.revision,
+                    "stars": static.repository_stars,
+                    "forks": static.repository_forks,
+                    "size_kb": candidate.size_kb if candidate is not None else 0,
+                    "security_advisories": static.security_advisories,
+                }
+
         if static.cancelled:
+            with state_lock:
+                counters["experiment_censored"] += 1
+            emit_event(
+                "static_censored",
+                repository=static.repository,
+                reason="experiment-deadline" if EXPERIMENT_DEADLINE_REACHED.is_set() else "shutdown",
+            )
             return
         with state_lock:
             counters["static_completed"] += 1
@@ -3149,6 +4548,7 @@ def main(argv: list[str] | None = None) -> int:
                 repository=static.repository,
                 outcome="failed",
                 message=static.failure_reason,
+                elapsed_s=static.elapsed_s,
             )
             return
         if not static.candidates:
@@ -3165,6 +4565,7 @@ def main(argv: list[str] | None = None) -> int:
                 "static_finished",
                 repository=static.repository,
                 outcome="clean",
+                elapsed_s=static.elapsed_s,
             )
             return
 
@@ -3173,6 +4574,7 @@ def main(argv: list[str] | None = None) -> int:
             repository=static.repository,
             outcome="candidates",
             findings=len(static.candidates),
+            elapsed_s=static.elapsed_s,
         )
         if SHUTDOWN.is_set():
             if static.checkout is not None and static.checkout.exists():
@@ -3254,7 +4656,13 @@ def main(argv: list[str] | None = None) -> int:
     # repositories arrive and then wait at the gate in order.
     no_ai_workers = max(args.parallel_no_ai, resources.MAX_DOCKER_SLOTS - ai_workers)
     no_ai_executor = ThreadPoolExecutor(max_workers=no_ai_workers)
-    ai_executor = ThreadPoolExecutor(max_workers=args.parallel_ai)
+    # Auto-sizing may suspend the optional AI lane entirely on an already-loaded host.  Keep one
+    # inert executor worker so lifecycle/shutdown remains uniform; choose_lane never targets it.
+    ai_executor = ThreadPoolExecutor(max_workers=max(1, args.parallel_ai))
+    peer_review_executor = ThreadPoolExecutor(
+        max_workers=args.parallel_peer_review,
+        thread_name_prefix="jsspector-peer-review",
+    )
     storage_monitor_stop = threading.Event()
 
     def monitor_disk_budget() -> None:
@@ -3301,12 +4709,44 @@ def main(argv: list[str] | None = None) -> int:
     def schedule(candidate: discover.Candidate) -> None:
         """Feed discovery directly into the static stage without a global barrier."""
         nonlocal scheduled
+        if ADMISSION_CLOSED.is_set() or SHUTDOWN.is_set():
+            with state_lock:
+                counters["experiment_not_admitted"] += 1
+            emit_event(
+                "work_not_admitted",
+                repository=candidate.repo,
+                stage="admission",
+                reason="experiment-drain" if ADMISSION_CLOSED.is_set() else "shutdown",
+            )
+            return
+        while not ADMISSION_CLOSED.is_set() and not SHUTDOWN.is_set():
+            if checkout_slots.acquire(timeout=0.5):
+                break
+        else:
+            with state_lock:
+                counters["experiment_not_admitted"] += 1
+            emit_event(
+                "work_not_admitted",
+                repository=candidate.repo,
+                stage="admission",
+                reason="experiment-drain" if ADMISSION_CLOSED.is_set() else "shutdown",
+            )
+            return
         index = scheduled
         scheduled += 1
-        submitted = static_executor.submit(
-            static_job,
-            candidate,
-        )
+        with experiment_inventory_lock:
+            admitted_candidates[candidate.repo] = candidate
+        emit_event("static_queued", repository=candidate.repo)
+        try:
+            submitted = static_executor.submit(
+                static_job,
+                candidate,
+            )
+        except RuntimeError:
+            checkout_slots.release()
+            if not SHUTDOWN.is_set():
+                raise
+            return
         submitted.add_done_callback(
             lambda done, selected_index=index, repository=candidate.repo: (
                 finish_static(
@@ -3315,6 +4755,44 @@ def main(argv: list[str] | None = None) -> int:
                     repository=repository,
                 )
             )
+        )
+
+    experiment_clock_stop = threading.Event()
+    experiment_clock: threading.Thread | None = None
+    if args.experiment_minutes is not None:
+        total_s = args.experiment_minutes * 60
+        drain_s = args.experiment_drain_minutes * 60
+        admission_s = total_s - drain_s
+
+        def run_experiment_clock() -> None:
+            if experiment_clock_stop.wait(admission_s):
+                return
+            ADMISSION_CLOSED.set()
+            log(
+                f"EXPERIMENT_DRAIN id={args.experiment_id or stamp} "
+                f"remaining_s={drain_s}"
+            )
+            emit_event(
+                "experiment_draining",
+                experiment_id=args.experiment_id or stamp,
+                remaining_s=drain_s,
+            )
+            if experiment_clock_stop.wait(drain_s):
+                return
+            EXPERIMENT_DEADLINE_REACHED.set()
+            request_shutdown(message="experiment hard deadline reached")
+
+        experiment_clock = threading.Thread(
+            target=run_experiment_clock,
+            name="jsspector-online-experiment-clock",
+            daemon=True,
+        )
+        experiment_clock.start()
+        emit_event(
+            "experiment_started",
+            experiment_id=args.experiment_id or stamp,
+            total_s=total_s,
+            drain_s=drain_s,
         )
 
     try:
@@ -3346,10 +4824,52 @@ def main(argv: list[str] | None = None) -> int:
         static_executor.shutdown(wait=True, cancel_futures=SHUTDOWN.is_set())
         no_ai_executor.shutdown(wait=True, cancel_futures=SHUTDOWN.is_set())
         ai_executor.shutdown(wait=True, cancel_futures=SHUTDOWN.is_set())
+        # Verification callbacks are the only review producers, so closing reviews after both
+        # verification lanes guarantees no late submission can race this shutdown.
+        peer_review_executor.shutdown(wait=True, cancel_futures=SHUTDOWN.is_set())
+        if (
+            args.learn_fixes
+            and args.peer_review_mode == "enforce"
+            and os.environ.get("JSSPECTOR_PUBLISH_FIXES") == "1"
+            and not SHUTDOWN.is_set()
+        ):
+            batched_promotions = pending_recipe_promotions(state)
+            if batched_promotions:
+                batched_keys = tuple(
+                    file_sha256(item.stage) for item in batched_promotions
+                )
+                batch_ok = promote_reviewed_recipe_batch(
+                    batched_promotions,
+                    scanner=scanner,
+                )
+                finish_recipe_promotions(
+                    batched_keys,
+                    state=state,
+                    state_path=state_path,
+                    state_lock=state_lock,
+                    success=batch_ok,
+                )
+                if batch_ok:
+                    counters["recipe_promoted"] += len(batched_promotions)
+                else:
+                    counters["recipe_promotion_failed"] += 1
+        experiment_clock_stop.set()
+        if experiment_clock is not None:
+            experiment_clock.join(timeout=5)
         storage_monitor_stop.set()
         storage_monitor.join(timeout=10)
         monitor.stop()
         monitor.join(timeout=10)
+
+    with experiment_inventory_lock:
+        pinned_records = [
+            pinned_inventory[repository]
+            for repository in sorted(pinned_inventory, key=str.casefold)
+        ]
+    (run_dir / "experiment-inventory.jsonl").write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in pinned_records),
+        encoding="utf-8",
+    )
 
     checkouts_root = run_dir / "checkouts"
     if checkouts_root.exists():
@@ -3365,6 +4885,11 @@ def main(argv: list[str] | None = None) -> int:
         run_label, artifact=run_dir / "docker-cleanup.json"
     )
     counters["docker_cleanup_failed"] += len(cleanup["failures"])
+    emit_event(
+        "docker_cleanup_finished",
+        phase="final",
+        failures=len(cleanup["failures"]),
+    )
     final_storage_gc = cleanup_online_docker_storage(
         docker_baseline,
         cache_gb=args.docker_cache_gb,
@@ -3373,6 +4898,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     counters["docker_storage_gc_cycles"] += 1
     counters["docker_storage_gc_failed"] += len(final_storage_gc["failures"])
+    emit_event(
+        "storage_gc",
+        phase="final",
+        free_gib=free_disk_gb(out),
+        failures=len(final_storage_gc["failures"]),
+    )
 
     # Repositories rejected by the PVR filter are not queried again on every bounded run unless
     # the operator explicitly clears state.json.
@@ -3412,6 +4943,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     for line in resources.performance_lines(performance, performance, window="whole pass"):
         log(f"PERFORMANCE {line}")
+    repository_failures = counters["static_failed"] + counters["verification_failed"]
+    fatal_failures = (
+        counters["sync_failed"]
+        + counters["docker_cleanup_failed"]
+        + counters["docker_storage_gc_failed"]
+        + counters["recipe_promotion_failed"]
+    )
+    expected_experiment_deadline = bool(
+        args.experiment_minutes is not None and EXPERIMENT_DEADLINE_REACHED.is_set()
+    )
+    if args.experiment_minutes is not None:
+        emit_event(
+            "experiment_finished",
+            experiment_id=args.experiment_id or stamp,
+            outcome=("deadline" if expected_experiment_deadline else "inventory-exhausted"),
+            censored=counters["experiment_censored"],
+            not_admitted=counters["experiment_not_admitted"],
+        )
+    if SHUTDOWN.is_set() and not expected_experiment_deadline:
+        emit_event("run_interrupted", output=str(run_dir))
+    else:
+        emit_event(
+            "run_finished",
+            output=str(run_dir),
+            verified_findings=counters["verified_findings"],
+            failures=repository_failures + fatal_failures,
+            expected_deadline=expected_experiment_deadline,
+        )
     run_metrics = {
         "discovery": discovery_metrics,
         **counters,
@@ -3421,6 +4980,7 @@ def main(argv: list[str] | None = None) -> int:
             "pvr_parallel": args.pvr_parallel,
             "max_repo_size_mb": args.max_repo_size_mb,
             "satori_profile": args.satori_profile,
+            "satori_blacklist_enabled": args.satori_blacklist,
             "satori_blacklist": len(remote_blacklist),
             "static_parallel": args.static_parallel,
             "max_checkouts": args.max_checkouts,
@@ -3434,6 +4994,9 @@ def main(argv: list[str] | None = None) -> int:
             "capacity_limited_by": plan.limited_by,
             "costs": capacity.costs.source,
             "calibrate": args.calibrate,
+            "experiment_id": args.experiment_id,
+            "experiment_minutes": args.experiment_minutes,
+            "experiment_drain_minutes": args.experiment_drain_minutes,
             "min_free_gb": args.min_free_gb,
             "docker_cache_gb": args.docker_cache_gb,
             "docker_gc_every": args.docker_gc_every,
@@ -3449,6 +5012,13 @@ def main(argv: list[str] | None = None) -> int:
             "fix_timeout": args.fix_timeout,
             "fix_model": args.fix_model,
             "learn_fixes": args.learn_fixes,
+            "peer_review": args.peer_review,
+            "peer_review_mode": args.peer_review_mode,
+            "peer_review_timeout": args.peer_review_timeout,
+            "parallel_peer_review": args.parallel_peer_review,
+            "peer_review_model": args.peer_review_model,
+            "peer_review_reasoning": args.peer_review_reasoning,
+            "peer_review_program": args.peer_review_program,
             "clone_timeout": args.clone_timeout,
             "static_timeout": args.static_timeout,
             "verify_timeout": args.verify_timeout,
@@ -3459,12 +5029,13 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
     write_json(run_dir / "online.json", run_metrics)
-    repository_failures = counters["static_failed"] + counters["verification_failed"]
-    fatal_failures = (
-        counters["sync_failed"]
-        + counters["docker_cleanup_failed"]
-        + counters["docker_storage_gc_failed"]
+    verdict_paths = sorted((run_dir / "peer-reviews").glob("**/verdict.json"))
+    experiment_summary = experiment.summarize_files(
+        [run_dir / "events.jsonl"],
+        verdict_paths,
+        resource_paths=[run_dir / "resources.jsonl"],
     )
+    experiment.write_summary(run_dir, experiment_summary)
     log(
         f"ONLINE_DONE discovered={discovery_metrics['found']} "
         f"static={counters['static_completed']} "
@@ -3510,17 +5081,10 @@ def main(argv: list[str] | None = None) -> int:
         if saved is not None:
             return 0
         return 130 if SHUTDOWN.is_set() and not completed_window else 1
-    if SHUTDOWN.is_set():
-        emit_event("run_interrupted", output=str(run_dir))
+    if SHUTDOWN.is_set() and not expected_experiment_deadline:
         _run_lock.close()
         LOG_PATH = None
         return 130
-    emit_event(
-        "run_finished",
-        output=str(run_dir),
-        verified_findings=counters["verified_findings"],
-        failures=repository_failures + fatal_failures,
-    )
     exit_code = 1 if fatal_failures else 0
     _run_lock.close()
     LOG_PATH = None

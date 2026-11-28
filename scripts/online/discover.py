@@ -112,6 +112,9 @@ class Candidate:
     org: bool = False
     licensed: bool = False
     security_advisories: str = "unknown"
+    # Present only for a replay manifest. Live discovery resolves the immutable revision after
+    # cloning; paired experiments feed that exact revision back through this field.
+    revision: str | None = None
 
 
 @dataclass

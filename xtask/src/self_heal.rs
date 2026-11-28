@@ -93,6 +93,20 @@ pub fn promote_recipes(root: &Path, push: bool) -> Result<()> {
     let _integration_lock = acquire_integration_lock()?;
     let changed = recipe_changes(root)?;
     if changed.is_empty() {
+        if let Some(release) = pending_recipe_release(root)? {
+            if recipe_release_is_upstream(root, &release)? {
+                eprintln!("evolve recipes: release {release} is already upstream");
+                return Ok(());
+            }
+            eprintln!("evolve recipes: resuming interrupted release {release}");
+            validate_recipe_release(root)?;
+            if push {
+                push_recipe_release(root, &release)?;
+            } else {
+                eprintln!("evolve recipes: validated {release} locally (--no-push)");
+            }
+            return Ok(());
+        }
         eprintln!("evolve recipes: nothing new to promote");
         return Ok(());
     }
@@ -339,6 +353,9 @@ fn validate_recipe_release(root: &Path) -> Result<()> {
 
 fn push_recipe_release(root: &Path, tag: &str) -> Result<()> {
     if push_release_atomically(root, tag)? {
+        if !recipe_release_is_upstream(root, tag)? {
+            bail!("recipe release push returned success but upstream does not contain {tag}");
+        }
         eprintln!("evolve recipes: pushed {tag} atomically");
         return Ok(());
     }
@@ -359,11 +376,14 @@ fn push_recipe_release(root: &Path, tag: &str) -> Result<()> {
     if !push_release_atomically(root, tag)? {
         bail!("upstream advanced again after recipe revalidation; retry the evolution");
     }
+    if !recipe_release_is_upstream(root, tag)? {
+        bail!("recipe release retry returned success but upstream does not contain {tag}");
+    }
     eprintln!("evolve recipes: rebased, revalidated, and pushed {tag} atomically");
     Ok(())
 }
 
-fn push_release_atomically(root: &Path, tag: &str) -> Result<bool> {
+fn upstream_remote_and_branch(root: &Path) -> Result<(String, String)> {
     let upstream = git_output(
         root,
         &[
@@ -377,13 +397,101 @@ fn push_release_atomically(root: &Path, tag: &str) -> Result<bool> {
         .trim()
         .split_once('/')
         .context("the upstream branch does not name a remote")?;
+    Ok((remote.to_owned(), branch.to_owned()))
+}
+
+fn pending_recipe_release(root: &Path) -> Result<Option<String>> {
+    let subject = git_output(root, &["show", "-s", "--format=%s", "HEAD"])?;
+    let Some(tag) = subject.trim().strip_prefix("Release ") else {
+        return Ok(None);
+    };
+    if !valid_release_tag(tag) {
+        return Ok(None);
+    }
+    let release_files = git_output(
+        root,
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    )?;
+    let release_files = release_files.lines().collect::<BTreeSet<_>>();
+    if !release_files.contains("Cargo.toml")
+        || release_files
+            .iter()
+            .any(|path| !matches!(*path, "Cargo.toml" | "Cargo.lock"))
+    {
+        return Ok(None);
+    }
+    let parent_subject = git_output(root, &["show", "-s", "--format=%s", "HEAD^"])?;
+    if parent_subject.trim() != "Evolve public fix recipes" {
+        return Ok(None);
+    }
+    let parent_files = git_output(
+        root,
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD^"],
+    )?;
+    if parent_files.lines().next().is_none()
+        || parent_files.lines().any(|path| {
+            !path
+                .strip_prefix(PUBLIC_RECIPE_SCOPE)
+                .is_some_and(|tail| tail.starts_with('/') && tail.ends_with(".json"))
+        })
+    {
+        return Ok(None);
+    }
+    Ok(Some(tag.to_owned()))
+}
+
+fn valid_release_tag(tag: &str) -> bool {
+    let Some(version) = tag.strip_prefix('v') else {
+        return false;
+    };
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn recipe_release_is_upstream(root: &Path, tag: &str) -> Result<bool> {
+    let (remote, branch) = upstream_remote_and_branch(root)?;
+    let head = git_output(root, &["rev-parse", "HEAD"])?;
+    let output = Command::new("git")
+        .current_dir(root)
+        .args([
+            "ls-remote",
+            &remote,
+            &format!("refs/heads/{branch}"),
+            &format!("refs/tags/{tag}"),
+        ])
+        .output()
+        .context("inspect upstream recipe release")?;
+    if !output.status.success() {
+        bail!("could not inspect upstream recipe release {tag}");
+    }
+    let values = String::from_utf8(output.stdout).context("git ls-remote output is not UTF-8")?;
+    let mut branch_head = None;
+    let mut tag_head = None;
+    for line in values.lines() {
+        let Some((revision, reference)) = line.split_once('\t') else {
+            continue;
+        };
+        if reference == format!("refs/heads/{branch}") {
+            branch_head = Some(revision);
+        } else if reference == format!("refs/tags/{tag}") {
+            tag_head = Some(revision);
+        }
+    }
+    Ok(branch_head == Some(head.trim()) && tag_head == Some(head.trim()))
+}
+
+fn push_release_atomically(root: &Path, tag: &str) -> Result<bool> {
+    let (remote, branch) = upstream_remote_and_branch(root)?;
     let branch_ref = format!("HEAD:refs/heads/{branch}");
     let tag_ref = format!("HEAD:refs/tags/{tag}");
     let attempt = |without_environment_token: bool| -> Result<bool> {
         let mut command = Command::new("git");
         command
             .current_dir(root)
-            .args(["push", "--atomic", remote, &branch_ref, &tag_ref]);
+            .args(["push", "--atomic", &remote, &branch_ref, &tag_ref]);
         if without_environment_token {
             command.env_remove("GITHUB_TOKEN");
         }

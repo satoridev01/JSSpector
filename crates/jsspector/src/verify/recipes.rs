@@ -30,6 +30,7 @@ use fs2::FileExt;
 use jss_core::Finding;
 use jss_core::finding::fingerprint;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 
 use super::fix::{Op, line_ops};
 
@@ -118,6 +119,79 @@ pub struct Learned<'a> {
     pub offered: &'a [String],
     /// Whether the LLM's first candidate was the proven one.
     pub first_try: bool,
+}
+
+/// An anonymous recipe delta waiting for an independent peer-review attestation.
+///
+/// Staging deliberately contains neither the repository nor the changed file. The exact diff and
+/// its provenance remain in the private verification report; this artifact is only the small,
+/// repository-neutral corpus update that may be promoted after review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedRecipe {
+    pub schema_version: u8,
+    pub source_fingerprint: String,
+    pub recipe: Recipe,
+    #[serde(default)]
+    pub offered: Vec<String>,
+    #[serde(default)]
+    pub first_try: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromotionAttestation {
+    schema_version: u8,
+    finding_fingerprint: String,
+    reviewed_commit: String,
+    artifact_sha256: String,
+    decision: String,
+    fix: AttestedFix,
+    recipe: AttestedRecipe,
+    controller_receipt: ControllerReceipt,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttestedFix {
+    status: String,
+    diff_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AttestedRecipe {
+    action: String,
+    anonymous: bool,
+    safe_to_publish: bool,
+    stage_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerReceipt {
+    schema_version: u8,
+    verified: bool,
+    policy_version: String,
+    root_thread_sha256: String,
+    artifact_sha256: String,
+    finding_fingerprint: String,
+    reviewed_commit: String,
+    recipe_stage_sha256: String,
+    agents: Vec<ReceiptAgent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiptAgent {
+    agent: String,
+    model: String,
+    reasoning_effort: String,
+    thread_sha256: String,
+    duration_ms: i64,
+    completed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PromotionMarker {
+    stage_sha256: String,
+    recorded: bool,
+    published: bool,
 }
 
 /// Where recipe bytes are allowed to come from. Ordinary verification reads the published `HEAD`
@@ -249,6 +323,35 @@ impl Book {
         self.record_with_examples(learned, false)
     }
 
+    /// Writes a repository-neutral recipe delta without changing the configured recipe store.
+    ///
+    /// Only an LLM change that passed the full fix proof produces a stage. Replayed recipes are
+    /// already part of the corpus, and failed attempts must not change its counters before review.
+    pub fn stage_public(dir: &Path, learned: &Learned) -> Result<Option<PathBuf>, String> {
+        let Some(proven) = learned.proven else {
+            return Ok(None);
+        };
+        let mut recipe = pattern(learned.finding, learned.original, proven);
+        recipe.proven = 1;
+        let staged = StagedRecipe {
+            schema_version: 1,
+            source_fingerprint: learned.finding.fingerprint.clone(),
+            recipe,
+            offered: learned.offered.to_vec(),
+            first_try: learned.first_try,
+        };
+        if !valid_staged_recipe(&staged) {
+            return Err("refusing to stage an invalid fix recipe".to_owned());
+        }
+        let path = dir.join(format!(
+            "{}-{}.stage.json",
+            file_name(&staged.source_fingerprint),
+            file_name(&staged.recipe.id)
+        ));
+        write_json(&path, &staged)?;
+        Ok(Some(path))
+    }
+
     fn record_with_examples(&self, learned: &Learned, examples: bool) -> Result<(), String> {
         let class = learned.finding.class.name();
         let new = learned
@@ -293,6 +396,38 @@ impl Book {
             }
         }
         Ok(())
+    }
+
+    fn merge_staged(&self, staged: &StagedRecipe) -> Result<(), String> {
+        if !valid_staged_recipe(staged) {
+            return Err("invalid staged fix recipe".to_owned());
+        }
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("creating {}: {e}", self.dir.display()))?;
+        let lock = std::fs::File::create(self.dir.join(".lock"))
+            .map_err(|e| format!("creating the recipe lock: {e}"))?;
+        lock.lock_exclusive()
+            .map_err(|e| format!("locking {}: {e}", self.dir.display()))?;
+        for id in &staged.offered {
+            if let Some(mut recipe) = self.load(&staged.recipe.class, id) {
+                recipe.offered = recipe.offered.saturating_add(1);
+                if staged.first_try {
+                    recipe.first_try = recipe.first_try.saturating_add(1);
+                }
+                self.save_recipe(&recipe)?;
+            }
+        }
+        let mut recipe = self
+            .load(&staged.recipe.class, &staged.recipe.id)
+            .unwrap_or_else(|| {
+                let mut recipe = staged.recipe.clone();
+                recipe.proven = 0;
+                recipe.offered = 0;
+                recipe.first_try = 0;
+                recipe
+            });
+        recipe.proven = recipe.proven.saturating_add(staged.recipe.proven);
+        self.save_recipe(&recipe)
     }
 
     /// Promotes changed public recipes as a versioned JSSpector evolution. The controller validates
@@ -414,6 +549,127 @@ impl Book {
     }
 }
 
+/// Merge one peer-reviewed staged recipe into `store`, optionally publishing an evolve release.
+///
+/// Unknown verdict fields are ignored, but the controller-owned receipt must bind the complete
+/// review identity and all three completed agents to these exact stage bytes. A sidecar next to
+/// the stage makes a retry after a release failure idempotent without dirtying the recipe checkout.
+pub fn promote_staged_recipe(
+    store: &Path,
+    stage_path: &Path,
+    attestation_path: &Path,
+    publish: bool,
+) -> Result<String, String> {
+    let stage_text = bounded_file(stage_path)
+        .ok_or_else(|| format!("reading bounded staged recipe {}", stage_path.display()))?;
+    let staged: StagedRecipe = serde_json::from_str(&stage_text)
+        .map_err(|error| format!("parsing {}: {error}", stage_path.display()))?;
+    if !valid_staged_recipe(&staged) {
+        return Err("invalid staged fix recipe".to_owned());
+    }
+    let digest = format!("{:x}", Sha256::digest(stage_text.as_bytes()));
+    let attestation_text = bounded_file(attestation_path)
+        .ok_or_else(|| format!("reading bounded attestation {}", attestation_path.display()))?;
+    let attestation: PromotionAttestation = serde_json::from_str(&attestation_text)
+        .map_err(|error| format!("parsing {}: {error}", attestation_path.display()))?;
+    if !valid_promotion_attestation(&attestation, &staged, &digest) {
+        return Err("peer-review attestation does not approve this staged recipe".to_owned());
+    }
+
+    let marker_path = stage_path.with_extension("promoted.json");
+    let mut marker = bounded_file(&marker_path)
+        .and_then(|text| serde_json::from_str::<PromotionMarker>(&text).ok())
+        .filter(|marker| marker.stage_sha256 == digest)
+        .unwrap_or(PromotionMarker {
+            stage_sha256: digest.clone(),
+            recorded: false,
+            published: false,
+        });
+    let book = Book::new(store);
+    if !marker.recorded {
+        book.merge_staged(&staged)?;
+        marker.recorded = true;
+        write_json(&marker_path, &marker)?;
+    }
+    if publish && !marker.published {
+        let result = book.publish()?;
+        marker.published = true;
+        write_json(&marker_path, &marker)?;
+        return Ok(result);
+    }
+    Ok(if marker.published {
+        "staged recipe already recorded and published".to_owned()
+    } else {
+        "staged recipe recorded".to_owned()
+    })
+}
+
+fn valid_promotion_attestation(
+    attestation: &PromotionAttestation,
+    staged: &StagedRecipe,
+    stage_sha256: &str,
+) -> bool {
+    const POLICY: &str = "jsspector-peer-review-v2";
+    const ROLES: [&str; 3] = ["exploit_replayer", "exploit_skeptic", "fix_adversary"];
+
+    let receipt = &attestation.controller_receipt;
+    let roles = receipt
+        .agents
+        .iter()
+        .map(|agent| agent.agent.as_str())
+        .collect::<BTreeSet<_>>();
+    let threads = receipt
+        .agents
+        .iter()
+        .map(|agent| agent.thread_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    let model = receipt.agents.first().map(|agent| agent.model.as_str());
+    let effort = receipt
+        .agents
+        .first()
+        .map(|agent| agent.reasoning_effort.as_str());
+
+    attestation.schema_version == 1
+        && attestation.decision == "publish_fixed"
+        && attestation.finding_fingerprint == staged.source_fingerprint
+        && safe_name(&attestation.finding_fingerprint, 128)
+        && safe_text(&attestation.reviewed_commit, 128, false)
+        && valid_sha256(&attestation.artifact_sha256)
+        && attestation.fix.status == "verified"
+        && valid_sha256(&attestation.fix.diff_sha256)
+        && attestation.recipe.action == "promote"
+        && attestation.recipe.anonymous
+        && attestation.recipe.safe_to_publish
+        && attestation.recipe.stage_sha256.as_deref() == Some(stage_sha256)
+        && receipt.verified
+        && receipt.schema_version == 1
+        && receipt.policy_version == POLICY
+        && valid_sha256(&receipt.root_thread_sha256)
+        && receipt.artifact_sha256 == attestation.artifact_sha256
+        && receipt.finding_fingerprint == attestation.finding_fingerprint
+        && receipt.reviewed_commit == attestation.reviewed_commit
+        && receipt.recipe_stage_sha256 == stage_sha256
+        && receipt.agents.len() == ROLES.len()
+        && roles == ROLES.into_iter().collect()
+        && threads.len() == ROLES.len()
+        && receipt.agents.iter().all(|agent| {
+            agent.completed
+                && safe_text(&agent.model, 128, false)
+                && safe_text(&agent.reasoning_effort, 32, false)
+                && Some(agent.model.as_str()) == model
+                && Some(agent.reasoning_effort.as_str()) == effort
+                && valid_sha256(&agent.thread_sha256)
+                && agent.duration_ms >= 0
+        })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn published_files(dir: &Path) -> Option<(PathBuf, String, BTreeSet<String>)> {
     let dir = dir.canonicalize().ok()?;
     let root = git_text(&dir, &["rev-parse", "--show-toplevel"]);
@@ -511,6 +767,17 @@ fn valid_recipe(recipe: &Recipe, class: &str) -> bool {
             .is_none_or(|note| safe_text(note, 800, true))
         && safe_text(&recipe.before, 4_096, true)
         && safe_text(&recipe.after, 4_096, true)
+}
+
+fn valid_staged_recipe(staged: &StagedRecipe) -> bool {
+    staged.schema_version == 1
+        && safe_name(&staged.source_fingerprint, 128)
+        && valid_recipe(&staged.recipe, &staged.recipe.class)
+        && staged.recipe.proven == 1
+        && staged.recipe.offered == 0
+        && staged.recipe.first_try == 0
+        && staged.offered.len() <= OFFERED
+        && staged.offered.iter().all(|id| safe_name(id, 128))
 }
 
 fn valid_example(example: &Example) -> bool {
@@ -939,6 +1206,64 @@ mod tests {
         }
     }
 
+    fn approved_promotion_attestation(fingerprint: &str, stage_sha256: &str) -> serde_json::Value {
+        let artifact_sha256 = "a".repeat(64);
+        let reviewed_commit = "b".repeat(40);
+        serde_json::json!({
+            "schema_version": 1,
+            "finding_fingerprint": fingerprint,
+            "reviewed_commit": reviewed_commit,
+            "artifact_sha256": artifact_sha256,
+            "decision": "publish_fixed",
+            "fix": {
+                "status": "verified",
+                "diff_sha256": "c".repeat(64),
+            },
+            "recipe": {
+                "action": "promote",
+                "anonymous": true,
+                "safe_to_publish": true,
+                "stage_sha256": stage_sha256,
+            },
+            "controller_receipt": {
+                "schema_version": 1,
+                "verified": true,
+                "policy_version": "jsspector-peer-review-v2",
+                "root_thread_sha256": "f".repeat(64),
+                "artifact_sha256": artifact_sha256,
+                "finding_fingerprint": fingerprint,
+                "reviewed_commit": reviewed_commit,
+                "recipe_stage_sha256": stage_sha256,
+                "agents": [
+                    {
+                        "agent": "exploit_replayer",
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "medium",
+                        "thread_sha256": "1".repeat(64),
+                        "duration_ms": 1000,
+                        "completed": true,
+                    },
+                    {
+                        "agent": "exploit_skeptic",
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "medium",
+                        "thread_sha256": "2".repeat(64),
+                        "duration_ms": 1000,
+                        "completed": true,
+                    },
+                    {
+                        "agent": "fix_adversary",
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "medium",
+                        "thread_sha256": "3".repeat(64),
+                        "duration_ms": 1000,
+                        "completed": true,
+                    },
+                ],
+            },
+        })
+    }
+
     const LOGIN: &str = "const { User } = require('../db');\n\
 router.post('/login', async (req, res) => {\n\
     const { username, password } = req.body;\n\
@@ -1323,6 +1648,127 @@ router.post('/login', async (req, res) => {\n\
         .unwrap();
         let recipe = book.load("nosql-injection", &seed).unwrap();
         assert_eq!((recipe.offered, recipe.first_try), (2, 1));
+    }
+
+    #[test]
+    fn staged_recipe_requires_matching_peer_review_before_promotion() {
+        let stage_dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let review = stage_dir.path().join("review.json");
+        let login = finding(VulnClass::NosqlInjection, "User.findOne", "stage-finding");
+        let changed = coerced();
+        let stage = Book::stage_public(
+            stage_dir.path(),
+            &Learned {
+                finding: &login,
+                file: "routes/auth.js",
+                original: LOGIN,
+                proven: Some(&changed),
+                poc: Some("curl http://target/login"),
+                benign_status: 401,
+                offered: &[],
+                first_try: true,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!store.path().join("recipes").exists());
+        let staged: StagedRecipe = read_json(&stage).unwrap();
+        assert_eq!(staged.recipe.proven, 1);
+        assert!(
+            !std::fs::read_to_string(&stage)
+                .unwrap()
+                .contains("routes/auth.js")
+        );
+
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read_to_string(&stage).unwrap().as_bytes())
+        );
+        write_json(
+            &review,
+            &serde_json::json!({
+                "decision": "publish_fixed",
+                "fix": {"status": "verified", "diff_sha256": "c".repeat(64)},
+                "recipe": {
+                    "action": "promote",
+                    "anonymous": true,
+                    "safe_to_publish": true,
+                    "stage_sha256": digest,
+                },
+            }),
+        )
+        .unwrap();
+        assert!(
+            promote_staged_recipe(store.path(), &stage, &review, false)
+                .unwrap_err()
+                .contains("parsing")
+        );
+        assert!(!store.path().join("recipes").exists());
+
+        write_json(
+            &review,
+            &approved_promotion_attestation("stage-finding", &"0".repeat(64)),
+        )
+        .unwrap();
+        assert!(
+            promote_staged_recipe(store.path(), &stage, &review, false)
+                .unwrap_err()
+                .contains("does not approve")
+        );
+        assert!(!store.path().join("recipes").exists());
+
+        let approved = approved_promotion_attestation("stage-finding", &digest);
+        for rejected in [
+            {
+                let mut value = approved.clone();
+                value["controller_receipt"]["verified"] = serde_json::json!(false);
+                value
+            },
+            {
+                let mut value = approved.clone();
+                value["fix"]["diff_sha256"] = serde_json::json!("not-a-digest");
+                value
+            },
+            {
+                let mut value = approved.clone();
+                value["controller_receipt"]["artifact_sha256"] = serde_json::json!("d".repeat(64));
+                value
+            },
+            {
+                let mut value = approved.clone();
+                value["controller_receipt"]["agents"][2]["agent"] =
+                    serde_json::json!("exploit_replayer");
+                value
+            },
+        ] {
+            write_json(&review, &rejected).unwrap();
+            assert!(
+                promote_staged_recipe(store.path(), &stage, &review, false)
+                    .unwrap_err()
+                    .contains("does not approve")
+            );
+            assert!(!store.path().join("recipes").exists());
+        }
+
+        write_json(&review, &approved).unwrap();
+        assert_eq!(
+            promote_staged_recipe(store.path(), &stage, &review, false).unwrap(),
+            "staged recipe recorded"
+        );
+        let promoted = Book::new(store.path())
+            .load("nosql-injection", &staged.recipe.id)
+            .unwrap();
+        assert_eq!(promoted.proven, 1);
+        // Retrying the same approved stage is idempotent.
+        promote_staged_recipe(store.path(), &stage, &review, false).unwrap();
+        assert_eq!(
+            Book::new(store.path())
+                .load("nosql-injection", &staged.recipe.id)
+                .unwrap()
+                .proven,
+            1
+        );
     }
 
     #[test]

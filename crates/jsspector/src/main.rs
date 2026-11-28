@@ -75,6 +75,9 @@ enum Command {
     /// commit validated scanner changes and push them to the configured upstream branch. A normal
     /// scan never evolves the scanner or publishes what it learns.
     Evolve(EvolveArgs),
+    /// Promote one peer-reviewed anonymous fix recipe delta into the evolution corpus.
+    #[command(hide = true)]
+    PromoteFixStage(PromoteFixStageArgs),
     /// Upgrade a pip- or pipx-installed JSSpector to the newest version available on PyPI.
     Update,
     /// List every entry point: HTTP routes with full paths (mount prefixes followed across files),
@@ -233,8 +236,33 @@ struct ScanArgs {
     /// replay examples remain private and are never included in that release.
     #[arg(long, requires = "verify")]
     publish_fixes: bool,
+    /// Stage repository-neutral proven fix recipes for peer review without changing the shared
+    /// corpus. The trusted controller promotes an approved stage separately.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "verify",
+        conflicts_with_all = ["learn_fixes", "publish_fixes"]
+    )]
+    stage_fixes: Option<PathBuf>,
     #[command(flatten)]
     config: ConfigArgs,
+}
+
+#[derive(Args)]
+struct PromoteFixStageArgs {
+    /// Anonymous staged recipe JSON produced by `scan --stage-fixes`.
+    #[arg(long, value_name = "FILE")]
+    stage: PathBuf,
+    /// Peer-review verdict binding and approving the staged file's SHA-256.
+    #[arg(long, value_name = "FILE")]
+    attestation: PathBuf,
+    /// Recipe corpus to update [default: JSSPECTOR_FIX_RECIPES or user data].
+    #[arg(long, value_name = "DIR")]
+    store: Option<PathBuf>,
+    /// Commit, tag and push the resulting anonymous recipe evolution.
+    #[arg(long)]
+    publish: bool,
 }
 
 #[derive(Args)]
@@ -368,6 +396,36 @@ struct OnlineArgs {
     /// Maximum seconds spent proving a fix after exploitation succeeds.
     #[arg(long, default_value_t = 1200)]
     fix_timeout: usize,
+    /// Maximum seconds for the adversarial Codex gate after exploitation and fixing.
+    #[arg(long, default_value_t = 600)]
+    peer_review_timeout: usize,
+    /// Concurrent Codex peer-review coordinators.
+    #[arg(long, default_value_t = 1)]
+    parallel_peer_review: usize,
+    /// Codex model used by the final adversarial review.
+    #[arg(long, default_value = "gpt-5.6-sol")]
+    peer_review_model: String,
+    /// Reasoning effort used by the peer-review coordinator and its subagents.
+    #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
+    peer_review_reasoning: String,
+    /// Cyber access program requested for the peer-review turn.
+    #[arg(long, default_value = "daybreak_blue", value_parser = ["standard", "daybreak_blue", "daybreak_red"])]
+    peer_review_program: String,
+    /// Codex executable used for peer review.
+    #[arg(long, default_value = "codex")]
+    codex_cli: String,
+    /// Disable the final Codex review gate (local diagnostics only).
+    #[arg(long)]
+    no_peer_review: bool,
+    /// Bound this run to an experimental window; publication and recipe promotion stay disabled.
+    #[arg(long, value_name = "MINUTES")]
+    experiment_minutes: Option<usize>,
+    /// Reserve the final part of an experiment for draining in-flight work.
+    #[arg(long, default_value_t = 30, requires = "experiment_minutes")]
+    experiment_drain_minutes: usize,
+    /// Stable label included in experimental artifacts.
+    #[arg(long, requires = "experiment_minutes")]
+    experiment_id: Option<String>,
     /// Maximum seconds for one optional Opus candidate-ranking call.
     #[arg(long, default_value_t = 60)]
     ai_timeout: usize,
@@ -845,10 +903,27 @@ fn main() -> ExitCode {
         Command::Scan(args) => scan(&args),
         Command::Online(args) => online(&args),
         Command::Evolve(args) => evolve(&args),
+        Command::PromoteFixStage(args) => promote_fix_stage(&args),
         Command::Update => update_cli(),
         Command::Routes(args) => routes(&args),
         Command::Explain(args) => explain(&args),
         Command::Ir(args) => ir(&args),
+    }
+}
+
+fn promote_fix_stage(args: &PromoteFixStageArgs) -> ExitCode {
+    let Some(store) = args.store.clone().or_else(private_fix_recipes) else {
+        return fail(
+            EXIT_USAGE,
+            "no fix recipe store; pass --store or set JSSPECTOR_FIX_RECIPES",
+        );
+    };
+    match verify::promote_staged_recipe(&store, &args.stage, &args.attestation, args.publish) {
+        Ok(message) => {
+            let _ = writeln!(io::stderr(), "jsspector: {message}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(EXIT_ENGINE, error),
     }
 }
 
@@ -1168,6 +1243,15 @@ mod repository_input_tests {
         assert_eq!(args.verify_timeout, 900);
         assert_eq!(args.verify_extended_timeout, 1800);
         assert_eq!(args.fix_timeout, 1200);
+        assert_eq!(args.peer_review_timeout, 600);
+        assert_eq!(args.parallel_peer_review, 1);
+        assert_eq!(args.peer_review_model, "gpt-5.6-sol");
+        assert_eq!(args.peer_review_reasoning, "medium");
+        assert_eq!(args.peer_review_program, "daybreak_blue");
+        assert_eq!(args.codex_cli, "codex");
+        assert!(!args.no_peer_review);
+        assert_eq!(args.experiment_minutes, None);
+        assert_eq!(args.experiment_drain_minutes, 30);
         assert_eq!(args.ai_timeout, 60);
         assert_eq!(args.satori_profile, "satoridev05");
         assert!(!args.local_only);
@@ -1192,6 +1276,12 @@ mod repository_input_tests {
             "--verify-candidate-hard-timeout",
             "--verify-extended-timeout",
             "--satori-profile",
+            "--peer-review",
+            "--peer-review-timeout",
+            "--parallel-peer-review",
+            "gpt-5.6-sol",
+            "medium",
+            "daybreak_blue",
         ] {
             assert!(
                 arguments.iter().any(|value| value == expected),
@@ -1217,6 +1307,61 @@ mod repository_input_tests {
         assert!(!arguments.iter().any(|value| value == "--satori-sync"));
         assert!(!arguments.iter().any(|value| value == "--learn-fixes"));
         assert!(!arguments.iter().any(|value| value == "--fix-attempts"));
+    }
+
+    #[test]
+    fn online_local_only_may_test_fixes_but_never_promotes_them() {
+        let cli = Cli::try_parse_from(["jsspector", "online", "--local-only"]).unwrap();
+        let Command::Online(args) = cli.command else {
+            panic!("online did not parse as the online command");
+        };
+        let arguments = online_arguments(&args, Path::new("/tmp/jsspector"));
+        assert!(arguments.iter().any(|value| value == "--fix-attempts"));
+        assert!(!arguments.iter().any(|value| value == "--satori-sync"));
+        assert!(!arguments.iter().any(|value| value == "--learn-fixes"));
+    }
+
+    #[test]
+    fn online_experiment_is_shadowed_and_never_publishes_or_promotes() {
+        let cli = Cli::try_parse_from([
+            "jsspector",
+            "online",
+            "--experiment-minutes",
+            "60",
+            "--experiment-id",
+            "epoch-1",
+        ])
+        .unwrap();
+        let Command::Online(args) = cli.command else {
+            panic!("online did not parse as the online command");
+        };
+        assert!(!online_publishes(&args));
+        assert!(online_fixes(&args));
+        assert!(!online_evolves(&args));
+        let arguments = online_arguments(&args, Path::new("/tmp/jsspector"));
+        let values = arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(values.iter().any(|value| value == "--peer-review-mode"));
+        assert!(values.iter().any(|value| value == "shadow"));
+        assert!(values.iter().any(|value| value == "--fix-attempts"));
+        assert!(!values.iter().any(|value| value == "--satori-sync"));
+        assert!(!values.iter().any(|value| value == "--learn-fixes"));
+    }
+
+    #[test]
+    fn online_without_peer_review_is_local_diagnostics_only() {
+        let cli = Cli::try_parse_from(["jsspector", "online", "--no-peer-review"]).unwrap();
+        let Command::Online(args) = cli.command else {
+            panic!("online did not parse as the online command");
+        };
+        assert!(!online_publishes(&args));
+        assert!(!online_evolves(&args));
+        let arguments = online_arguments(&args, Path::new("/tmp/jsspector"));
+        assert!(!arguments.iter().any(|value| value == "--satori-sync"));
+        assert!(!arguments.iter().any(|value| value == "--learn-fixes"));
+        assert!(arguments.iter().any(|value| value == "--no-peer-review"));
     }
 
     #[test]
@@ -1313,6 +1458,8 @@ mod repository_input_tests {
             "github.py",
             "claude_limits.py",
             "resources.py",
+            "experiment.py",
+            "peer_review.py",
         ] {
             assert!(directory.join(module).is_file(), "missing {module}");
         }
@@ -1408,6 +1555,7 @@ mod repository_input_tests {
     fn fix_learning_and_publication_are_explicit_verify_options() {
         assert!(Cli::try_parse_from(["jsspector", "scan", ".", "--learn-fixes"]).is_err());
         assert!(Cli::try_parse_from(["jsspector", "scan", ".", "--publish-fixes"]).is_err());
+        assert!(Cli::try_parse_from(["jsspector", "scan", ".", "--stage-fixes", "stage"]).is_err());
         assert!(
             Cli::try_parse_from(["jsspector", "scan", ".", "--verify", "--learn-fixes"]).is_ok_and(
                 |cli| matches!(
@@ -1422,6 +1570,43 @@ mod repository_input_tests {
                     cli.command,
                     Command::Scan(ref scan) if scan.publish_fixes
                 ))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "jsspector",
+                "scan",
+                ".",
+                "--verify",
+                "--stage-fixes",
+                "stage",
+            ])
+            .is_ok_and(|cli| matches!(
+                cli.command,
+                Command::Scan(ref scan) if scan.stage_fixes.as_deref() == Some(Path::new("stage"))
+            ))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "jsspector",
+                "scan",
+                ".",
+                "--verify",
+                "--stage-fixes",
+                "stage",
+                "--publish-fixes",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "jsspector",
+                "promote-fix-stage",
+                "--stage",
+                "stage.json",
+                "--attestation",
+                "review.json",
+            ])
+            .is_ok()
         );
     }
 
@@ -1662,6 +1847,14 @@ const ONLINE_CONTROLLER: &[(&str, &str)] = &[
         "resources.py",
         include_str!("../../../scripts/online/resources.py"),
     ),
+    (
+        "experiment.py",
+        include_str!("../../../scripts/online/experiment.py"),
+    ),
+    (
+        "peer_review.py",
+        include_str!("../../../scripts/online/peer_review.py"),
+    ),
 ];
 
 fn materialize_online_controller() -> Result<OnlineController, String> {
@@ -1702,14 +1895,18 @@ fn online_out(args: &OnlineArgs) -> PathBuf {
     })
 }
 
-/// Whether a pass may create Satori issues, attempt fixes or rank with Opus (a calibration never
-/// does: it measures hardware).
+/// Whether a pass may create Satori issues. Calibration, experiments and explicitly ungated local
+/// diagnostics never publish.
 fn online_publishes(args: &OnlineArgs) -> bool {
-    !args.local_only && !args.calibrate
+    !args.local_only && !args.calibrate && !args.no_peer_review && args.experiment_minutes.is_none()
+}
+
+fn online_fixes(args: &OnlineArgs) -> bool {
+    !args.no_evolve && !args.calibrate
 }
 
 fn online_evolves(args: &OnlineArgs) -> bool {
-    !args.no_evolve && !args.calibrate
+    online_fixes(args) && online_publishes(args)
 }
 
 fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
@@ -1762,7 +1959,38 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
         OsString::from("claude-opus-5-5"),
         OsString::from("--ai-timeout"),
         OsString::from(args.ai_timeout.to_string()),
+        OsString::from("--peer-review-timeout"),
+        OsString::from(args.peer_review_timeout.to_string()),
+        OsString::from("--parallel-peer-review"),
+        OsString::from(args.parallel_peer_review.to_string()),
+        OsString::from("--peer-review-model"),
+        OsString::from(&args.peer_review_model),
+        OsString::from("--peer-review-reasoning"),
+        OsString::from(&args.peer_review_reasoning),
+        OsString::from("--peer-review-program"),
+        OsString::from(&args.peer_review_program),
+        OsString::from("--codex-cli"),
+        OsString::from(&args.codex_cli),
     ];
+    if args.no_peer_review {
+        command.push(OsString::from("--no-peer-review"));
+    } else {
+        command.push(OsString::from("--peer-review"));
+    }
+    if let Some(minutes) = args.experiment_minutes {
+        command.extend([
+            OsString::from("--experiment-minutes"),
+            OsString::from(minutes.to_string()),
+            OsString::from("--experiment-drain-minutes"),
+            OsString::from(args.experiment_drain_minutes.to_string()),
+            OsString::from("--peer-review-mode"),
+            OsString::from("shadow"),
+        ]);
+        if let Some(id) = &args.experiment_id {
+            command.push(OsString::from("--experiment-id"));
+            command.push(OsString::from(id));
+        }
+    }
     for (flag, value) in [
         ("--static-parallel", args.static_parallel),
         ("--max-checkouts", args.max_checkouts),
@@ -1794,7 +2022,7 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
     if online_publishes(args) {
         command.push(OsString::from("--satori-sync"));
     }
-    if online_evolves(args) {
+    if online_fixes(args) {
         command.extend([
             OsString::from("--fix-attempts"),
             OsString::from("1"),
@@ -1802,8 +2030,10 @@ fn online_arguments(args: &OnlineArgs, scanner: &Path) -> Vec<OsString> {
             OsString::from(args.fix_timeout.to_string()),
             OsString::from("--fix-model"),
             OsString::from("claude-opus-5-5"),
-            OsString::from("--learn-fixes"),
         ]);
+        if online_evolves(args) {
+            command.push(OsString::from("--learn-fixes"));
+        }
     }
     command
 }
@@ -1815,11 +2045,25 @@ fn online(args: &OnlineArgs) -> ExitCode {
         args.parallel_no_ai,
         args.parallel_docker,
     ];
-    if [args.parallel_ai, args.docker_cache_gb, args.docker_gc_every].contains(&0)
+    if [
+        args.parallel_ai,
+        args.parallel_peer_review,
+        args.docker_cache_gb,
+        args.docker_gc_every,
+        args.peer_review_timeout,
+    ]
+    .contains(&0)
         || explicit_counts.contains(&Some(0))
         || args.calibrate_minutes == 0
+        || args.experiment_minutes == Some(0)
+        || args
+            .experiment_minutes
+            .is_some_and(|minutes| args.experiment_drain_minutes >= minutes)
     {
-        return fail(EXIT_USAGE, "online worker counts must be positive");
+        return fail(
+            EXIT_USAGE,
+            "online worker counts and timeouts must be positive; experiment drain must be shorter than the experiment",
+        );
     }
     let controller = match online_runner(args.runner.as_deref()) {
         Ok(controller) => controller,
@@ -2127,6 +2371,7 @@ fn scan(args: &ScanArgs) -> ExitCode {
                 recipes: private_fix_recipes(),
                 learn: args.learn_fixes,
                 publish: args.publish_fixes,
+                stage: args.stage_fixes.clone(),
                 allow_unpublished_recipes: true,
             };
             let result = if args.verify_until_first {

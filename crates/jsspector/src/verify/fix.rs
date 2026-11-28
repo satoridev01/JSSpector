@@ -66,6 +66,9 @@ pub struct FixOptions {
     pub learn: bool,
     /// Commit and push newly recorded recipes. This never happens implicitly.
     pub publish: bool,
+    /// Write a repository-neutral recipe delta here for later peer review instead of mutating the
+    /// shared recipe store. Online research uses this two-phase path.
+    pub stage: Option<PathBuf>,
     /// Test/internal override for a caller that deliberately owns an unpublished store. Production
     /// verification leaves this false and reads only the store's published Git tree.
     pub allow_unpublished_recipes: bool,
@@ -82,6 +85,7 @@ impl Default for FixOptions {
             recipes: None,
             learn: false,
             publish: false,
+            stage: None,
             allow_unpublished_recipes: cfg!(test),
         }
     }
@@ -350,9 +354,7 @@ pub fn prove(
     if let Err(error) = target.restore_files() {
         eprintln!("jsspector: {error}");
     }
-    if (options.learn || options.publish)
-        && let Some(book) = &book
-    {
+    if options.learn || options.publish || options.stage.is_some() {
         let file = fix_file(finding);
         let benign_status = match &result {
             FixOutcome::Proven { benign_status, .. } => *benign_status,
@@ -369,23 +371,38 @@ pub fn prove(
                 offered: &search.offered,
                 first_try: search.proven_by_llm.is_some() && search.llm_attempts == 1,
             };
-            let recorded = if options.publish {
+            let recorded = if let Some(stage) = &options.stage {
+                Book::stage_public(stage, &learned).map(|_| ())
+            } else if options.publish
+                && let Some(book) = &book
+            {
                 book.record_public(&learned)
-            } else {
+            } else if let Some(book) = &book {
                 book.record(&learned)
+            } else {
+                Err("no fix recipe store is configured".to_owned())
             };
             match recorded {
                 Err(error) => eprintln!(
                     "jsspector: recording the fix in {}: {error}",
-                    book_dir(options)
+                    options
+                        .stage
+                        .as_deref()
+                        .map_or_else(|| book_dir(options), |path| path.display().to_string())
                 ),
-                Ok(()) if options.publish && learned.proven.is_some() => match book.publish() {
-                    Ok(what) => eprintln!("jsspector: {}: {what}", book_dir(options)),
-                    Err(error) => eprintln!(
-                        "jsspector: publishing the fix from {}: {error}",
-                        book_dir(options)
-                    ),
-                },
+                Ok(())
+                    if options.publish && options.stage.is_none() && learned.proven.is_some() =>
+                {
+                    if let Some(book) = &book {
+                        match book.publish() {
+                            Ok(what) => eprintln!("jsspector: {}: {what}", book_dir(options)),
+                            Err(error) => eprintln!(
+                                "jsspector: publishing the fix from {}: {error}",
+                                book_dir(options)
+                            ),
+                        }
+                    }
+                }
                 Ok(()) => {}
             }
         }

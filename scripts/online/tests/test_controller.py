@@ -62,6 +62,38 @@ class ControllerTests(unittest.TestCase):
         profile.start()
         self.addCleanup(profile.stop)
 
+    @staticmethod
+    def peer_receipt(bundle=None) -> dict:
+        receipt = {
+            "schema_version": 1,
+            "verified": True,
+            "root_thread_sha256": "a" * 64,
+            "agents": [
+                {
+                    "agent": name,
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "medium",
+                    "duration_ms": 100,
+                    "thread_sha256": str(index) * 64,
+                    "completed": True,
+                }
+                for index, name in enumerate(
+                    sorted(controller.peer_review.AGENT_NAMES), start=1
+                )
+            ],
+        }
+        if bundle is not None:
+            receipt.update(
+                {
+                    "policy_version": controller.peer_review.POLICY_VERSION,
+                    "artifact_sha256": bundle.artifact_sha256,
+                    "finding_fingerprint": bundle.fingerprint,
+                    "reviewed_commit": bundle.revision,
+                    "recipe_stage_sha256": bundle.recipe_stage_sha256,
+                }
+            )
+        return receipt
+
     def test_only_structurally_verified_findings_cross_the_gate(self) -> None:
         verified = {
             "fingerprint": "verified",
@@ -341,6 +373,406 @@ class ControllerTests(unittest.TestCase):
         ):
             self.assertEqual(controller.fix_learning_flag(), "--publish-fixes")
 
+    def test_peer_review_rejects_a_fix_without_suppressing_a_real_exploit(self) -> None:
+        finding = {
+            "fingerprint": "verified",
+            "exploitation": {"outcome": "verified"},
+            "poc": {"command": "curl example", "evidence": "CANARY token"},
+            "fix": {
+                "outcome": "proven",
+                "attempts": 1,
+                "diff": "--- a/a.js\n+++ b/a.js\n",
+            },
+        }
+        result = controller.ResearchResult(
+            repository="owner/repo",
+            revision="abc123",
+            report={"findings": [finding]},
+            findings=(finding,),
+            fix_attempted=True,
+            fix_proven=True,
+        )
+        args = Namespace(
+            codex_cli="codex",
+            peer_review_model="gpt-5.6-sol",
+            peer_review_reasoning="medium",
+            peer_review_program="daybreak_blue",
+            peer_review_timeout=600,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            state = {"schema_version": 2, "processed": {}, "synced": {}, "reviews": {}}
+
+            def rejected_fix(bundle, _config, **_kwargs):
+                raw = {
+                    "finding_fingerprint": "verified",
+                    "decision": "publish_unfixed",
+                }
+                verdict = controller.peer_review.PeerReviewVerdict(
+                    decision="publish_unfixed",
+                    fingerprint="verified",
+                    reviewed_commit="abc123",
+                    artifact_sha256=bundle.artifact_sha256,
+                    exploit_verdict="real",
+                    exploit_reproduced=True,
+                    cia=("confidentiality",),
+                    sink_observed=True,
+                    fix_status="rejected",
+                    diff_sha256=None,
+                    exploit_blocked=False,
+                    legitimate_behavior_preserved=True,
+                    recipe_action="none",
+                    recipe_stage_sha256=None,
+                    recipe_anonymous=True,
+                    recipe_safe_to_publish=False,
+                    dissent=(),
+                    operational_errors=(),
+                    raw=raw,
+                )
+                return controller.peer_review.PeerReviewRun(
+                    bundle=bundle,
+                    elapsed_s=2.0,
+                    returncode=0,
+                    verdict=verdict,
+                    collaboration_receipt=self.peer_receipt(bundle),
+                )
+
+            with mock.patch.object(
+                controller.peer_review,
+                "run_peer_review",
+                side_effect=rejected_fix,
+            ):
+                reviewed = controller.review_repository(
+                    result,
+                    checkout=checkout,
+                    args=args,
+                    run_dir=root,
+                    lane="no-ai",
+                    state=state,
+                    state_path=root / "state.json",
+                    state_lock=threading.Lock(),
+                )
+
+        self.assertEqual(len(reviewed.approved), 1)
+        self.assertEqual(reviewed.result.findings[0]["fix"]["outcome"], "unproven")
+        self.assertFalse(reviewed.result.fix_proven)
+        self.assertEqual(reviewed.result.findings[0]["peer_review"]["decision"], "publish_unfixed")
+
+    def test_peer_review_binds_an_anonymous_fix_stage_before_promotion(self) -> None:
+        finding = {
+            "fingerprint": "verified",
+            "exploitation": {"outcome": "verified"},
+            "fix": {"outcome": "proven"},
+        }
+        args = Namespace(
+            codex_cli="codex",
+            peer_review_model="gpt-5.6-sol",
+            peer_review_reasoning="medium",
+            peer_review_program="daybreak_blue",
+            peer_review_timeout=600,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            stage = root / "fix.stage.json"
+            stage.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "source_fingerprint": "verified",
+                        "recipe": {"id": "anonymous-recipe"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = controller.ResearchResult(
+                repository="owner/repo",
+                revision="abc123",
+                report={"findings": [finding]},
+                findings=(finding,),
+                fix_attempted=True,
+                fix_proven=True,
+                fix_stages=(stage,),
+            )
+            state = {"schema_version": 2, "processed": {}, "synced": {}, "reviews": {}}
+
+            def approved_fix(bundle, _config, **_kwargs):
+                self.assertEqual(bundle.recipe_stage_sha256, controller.file_sha256(stage))
+                raw = {
+                    "finding_fingerprint": "verified",
+                    "decision": "publish_fixed",
+                    "recipe": {"stage_sha256": bundle.recipe_stage_sha256},
+                }
+                bundle.verdict.write_text(json.dumps(raw), encoding="utf-8")
+                verdict = controller.peer_review.PeerReviewVerdict(
+                    decision="publish_fixed",
+                    fingerprint="verified",
+                    reviewed_commit="abc123",
+                    artifact_sha256=bundle.artifact_sha256,
+                    exploit_verdict="real",
+                    exploit_reproduced=True,
+                    cia=("confidentiality",),
+                    sink_observed=True,
+                    fix_status="verified",
+                    diff_sha256="a" * 64,
+                    exploit_blocked=True,
+                    legitimate_behavior_preserved=True,
+                    recipe_action="promote",
+                    recipe_stage_sha256=bundle.recipe_stage_sha256,
+                    recipe_anonymous=True,
+                    recipe_safe_to_publish=True,
+                    dissent=(),
+                    operational_errors=(),
+                    raw=raw,
+                )
+                return controller.peer_review.PeerReviewRun(
+                    bundle=bundle,
+                    elapsed_s=2.0,
+                    returncode=0,
+                    verdict=verdict,
+                    collaboration_receipt=self.peer_receipt(bundle),
+                )
+
+            with mock.patch.object(
+                controller.peer_review, "run_peer_review", side_effect=approved_fix
+            ):
+                reviewed = controller.review_repository(
+                    result,
+                    checkout=checkout,
+                    args=args,
+                    run_dir=root,
+                    lane="no-ai",
+                    state=state,
+                    state_path=root / "state.json",
+                    state_lock=threading.Lock(),
+                )
+
+            self.assertEqual(len(reviewed.promotions), 1)
+            self.assertEqual(reviewed.promotions[0].stage, stage)
+            self.assertTrue(reviewed.promotions[0].attestation.is_file())
+
+    def test_recipe_promotion_uses_the_attested_stage_and_pushes_by_default(self) -> None:
+        promotion = controller.RecipePromotion(
+            fingerprint="verified",
+            stage=Path("/tmp/fix.stage.json"),
+            attestation=Path("/tmp/verdict.json"),
+        )
+        with mock.patch.object(
+            controller,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            self.assertTrue(
+                controller.promote_reviewed_recipes(
+                    (promotion,), scanner=Path("/tmp/jsspector"), publish=True
+                )
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[1], "promote-fix-stage")
+        self.assertIn("--publish", command)
+        self.assertEqual(command[command.index("--stage") + 1], str(promotion.stage))
+        self.assertEqual(
+            command[command.index("--attestation") + 1], str(promotion.attestation)
+        )
+
+    def test_recipe_release_batches_many_stages_into_one_publish(self) -> None:
+        promotions = tuple(
+            controller.RecipePromotion(
+                fingerprint=f"verified-{index}",
+                stage=Path(f"/tmp/fix-{index}.stage.json"),
+                attestation=Path(f"/tmp/verdict-{index}.json"),
+            )
+            for index in range(2)
+        )
+        with mock.patch.object(
+            controller,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            self.assertTrue(
+                controller.promote_reviewed_recipe_batch(
+                    promotions,
+                    scanner=Path("/tmp/jsspector"),
+                )
+            )
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(sum("--publish" in command for command in commands), 1)
+        self.assertNotIn("--publish", commands[0])
+        self.assertNotIn("--publish", commands[1])
+        self.assertIn("--publish", commands[2])
+        self.assertEqual(
+            commands[2][commands[2].index("--stage") + 1],
+            str(promotions[-1].stage),
+        )
+
+    def test_recorded_recipe_promotions_remain_resumable_until_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "fix.stage.json"
+            attestation = root / "verdict.json"
+            stage.write_text("{}\n", encoding="utf-8")
+            attestation.write_text("{}\n", encoding="utf-8")
+            promotion = controller.RecipePromotion(
+                fingerprint="verified",
+                stage=stage,
+                attestation=attestation,
+            )
+            state: dict[str, object] = {}
+            state_path = root / "state.json"
+            state_lock = threading.Lock()
+            keys = controller.queue_recipe_promotions(
+                (promotion,),
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+                publish=True,
+            )
+            controller.mark_recipe_promotions_recorded(
+                keys,
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+            )
+            recovered = controller.pending_recipe_promotions(state)
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0].fingerprint, promotion.fingerprint)
+            self.assertEqual(recovered[0].stage, promotion.stage.resolve())
+            self.assertEqual(
+                recovered[0].attestation, promotion.attestation.resolve()
+            )
+
+            controller.finish_recipe_promotions(
+                keys,
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+                success=True,
+            )
+            self.assertEqual(controller.pending_recipe_promotions(state), ())
+
+    def test_recipe_promotion_waits_for_durable_satori_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "fix.stage.json"
+            attestation = root / "verdict.json"
+            stage.write_text("{}\n", encoding="utf-8")
+            attestation.write_text("{}\n", encoding="utf-8")
+            state: dict[str, object] = {
+                "synced": {},
+                "recipe_promotions": {},
+            }
+            state_path = root / "state.json"
+            state_lock = threading.Lock()
+            keys = controller.queue_recipe_promotions(
+                (
+                    controller.RecipePromotion(
+                        fingerprint="verified",
+                        stage=stage,
+                        attestation=attestation,
+                    ),
+                ),
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+                publish=True,
+                status="awaiting-sync",
+                sync_key_value="sync-1",
+            )
+            self.assertEqual(controller.pending_recipe_promotions(state), ())
+            with self.assertRaisesRegex(RuntimeError, "before Satori confirms"):
+                controller.activate_recipe_promotions(
+                    keys,
+                    state=state,
+                    state_path=state_path,
+                    state_lock=state_lock,
+                )
+
+            state["synced"]["sync-1"] = {"confirmed_status": "TP"}
+            recovered = controller.activate_confirmed_recipe_promotions(
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+            )
+            self.assertEqual(recovered, keys)
+            self.assertEqual(len(controller.pending_recipe_promotions(state)), 1)
+
+    def test_reviewed_satori_sync_survives_blacklisting_and_restart(self) -> None:
+        finding = {
+            "fingerprint": "verified",
+            "exploitation": {"outcome": "verified"},
+            "peer_review": {
+                "decision": "publish_unfixed",
+                "finding_fingerprint": "verified",
+            },
+        }
+        result = controller.ResearchResult(
+            repository="owner/repo",
+            revision="a" * 40,
+            security_advisories="disabled",
+            report={"findings": [finding]},
+            findings=(finding,),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = {
+                "processed": {},
+                "synced": {},
+                "pending_sync": {},
+                "reviews": {},
+                "recipe_promotions": {},
+            }
+            state_path = root / "state.json"
+            lock = threading.Lock()
+            key, promotion_keys = controller.queue_pending_synchronization(
+                result,
+                run_dir=root,
+                state=state,
+                state_path=state_path,
+                state_lock=lock,
+            )
+            self.assertEqual(promotion_keys, ())
+            recovered = controller.pending_synchronizations(state)
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0][0], key)
+            self.assertEqual(recovered[0][1].repository, "owner/repo")
+
+            state["synced"][key] = {"confirmed_status": "TP"}
+            controller.finish_pending_synchronization(
+                key,
+                state=state,
+                state_path=state_path,
+                state_lock=lock,
+            )
+            self.assertEqual(controller.pending_synchronizations(state), ())
+
+    def test_sync_can_require_peer_review_attestation(self) -> None:
+        finding = {
+            "fingerprint": "verified",
+            "exploitation": {"outcome": "verified"},
+        }
+        result = controller.ResearchResult(
+            repository="owner/repo",
+            revision="abc123",
+            report={"findings": [finding]},
+            findings=(finding,),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, "without approved peer review"):
+                controller.synchronize(
+                    result,
+                    satori_cli="satori-v2",
+                    state={"schema_version": 2, "processed": {}, "synced": {}, "reviews": {}},
+                    state_path=Path(temporary) / "state.json",
+                    state_lock=threading.Lock(),
+                    require_peer_review=True,
+                )
+
     def test_verification_reuses_checkout_and_fixes_in_the_proof_pass(self) -> None:
         finding = {
             "fingerprint": "verified",
@@ -371,6 +803,7 @@ class ControllerTests(unittest.TestCase):
                 fix_timeout=600,
                 fix_model="claude-opus-5-5",
                 learn_fixes=True,
+                peer_review=True,
             )
 
             def verified_once(command, **kwargs):
@@ -379,7 +812,8 @@ class ControllerTests(unittest.TestCase):
                 self.assertIn("--no-inline-ignores", command)
                 self.assertNotIn("--no-fix", command)
                 self.assertIn("--fix-attempts", command)
-                self.assertIn("--learn-fixes", command)
+                self.assertNotIn("--learn-fixes", command)
+                self.assertIn("--stage-fixes", command)
                 budgets = kwargs["budgets"]
                 self.assertEqual(budgets.normal_s, 900)
                 self.assertEqual(budgets.extended_s, 1800)
@@ -388,6 +822,18 @@ class ControllerTests(unittest.TestCase):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text(
                     json.dumps({"findings": [finding]}), encoding="utf-8"
+                )
+                stage_dir = Path(command[command.index("--stage-fixes") + 1])
+                stage_dir.mkdir(parents=True)
+                (stage_dir / "verified-recipe.stage.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "source_fingerprint": "verified",
+                            "recipe": {"id": "recipe"},
+                        }
+                    ),
+                    encoding="utf-8",
                 )
                 return mock.Mock(returncode=0)
 
@@ -428,6 +874,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result.repository_stars, 99)
         self.assertTrue(result.fix_attempted)
         self.assertTrue(result.fix_proven)
+        self.assertEqual(len(result.fix_stages), 1)
 
     def test_interrupted_static_work_is_not_an_operational_failure(self) -> None:
         candidate = discover.Candidate(
@@ -444,6 +891,11 @@ class ControllerTests(unittest.TestCase):
                     controller,
                     "clone_repository",
                     return_value=(checkout, None),
+                ),
+                mock.patch.object(
+                    controller.subprocess,
+                    "run",
+                    return_value=mock.Mock(returncode=0, stdout="a" * 40 + "\n"),
                 ),
                 mock.patch.object(controller, "run", return_value=interrupted),
             ):
@@ -530,7 +982,42 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(args.ai_attempts, 1)
         self.assertEqual(args.ai_timeout, 60)
         self.assertEqual(args.fix_timeout, 1200)
+        self.assertTrue(args.peer_review)
+        self.assertEqual(args.peer_review_mode, "enforce")
+        self.assertEqual(args.peer_review_timeout, 600)
+        self.assertEqual(args.parallel_peer_review, 1)
+        self.assertEqual(args.peer_review_model, "gpt-5.6-sol")
+        self.assertEqual(args.peer_review_reasoning, "medium")
+        self.assertEqual(args.peer_review_program, "daybreak_blue")
+        self.assertIsNone(args.experiment_minutes)
         self.assertEqual(args.satori_profile, "satoridev05")
+        self.assertFalse(args.satori_blacklist)
+
+    def test_experiment_mode_is_shadowed_and_non_mutating(self) -> None:
+        args = controller.parse_args(
+            ["--experiment-minutes", "60", "--experiment-drain-minutes", "10", "--satori-sync", "--learn-fixes"]
+        )
+        self.assertTrue(args.peer_review)
+        self.assertEqual(args.peer_review_mode, "shadow")
+        self.assertFalse(args.satori_sync)
+        self.assertFalse(args.learn_fixes)
+        self.assertTrue(args.satori_blacklist)
+
+    def test_peer_review_cannot_be_bypassed_for_publication_or_evolution(self) -> None:
+        for mutating_flag in ("--satori-sync", "--learn-fixes"):
+            with (
+                self.subTest(flag=mutating_flag),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                controller.parse_args(["--no-peer-review", mutating_flag])
+
+    def test_fix_evolution_requires_the_satori_publication_gate(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            controller.parse_args(["--learn-fixes"])
+        args = controller.parse_args(["--learn-fixes", "--satori-sync"])
+        self.assertTrue(args.learn_fixes)
+        self.assertTrue(args.satori_sync)
 
     def test_adaptive_budget_only_extends_on_positive_evidence(self) -> None:
         budget = controller.VerificationBudgetState(

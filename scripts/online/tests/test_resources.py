@@ -179,12 +179,16 @@ class EstimateTests(unittest.TestCase):
         plan = resources.estimate(host(mem_available_gib=22.0), resources.Costs())
         self.assertEqual(plan.parallel_docker, plan.docker_floor)
         self.assertEqual(plan.limited_by, "minimum")
+        self.assertEqual(plan.parallel_ai, 0)
         self.assertLess(plan.mem_budget_gib, 0)
 
     def test_cpu_held_by_other_processes_shrinks_the_plan(self) -> None:
         idle = resources.estimate(host(), resources.Costs())
-        busy = resources.estimate(host(busy_cpus=8.0), resources.Costs())
+        busy = resources.estimate(host(busy_cpus=30.0), resources.Costs())
         self.assertLess(busy.parallel_docker, idle.parallel_docker)
+        self.assertEqual(busy.parallel_docker, 1)
+        self.assertEqual(busy.parallel_ai, 0)
+        self.assertEqual(busy.parallel_no_ai, 1)
 
     def test_explicit_counts_win_and_the_rest_stays_coherent(self) -> None:
         costs = resources.Costs()
@@ -733,7 +737,7 @@ class ImprovementMetricTests(unittest.TestCase):
                     header
                     + f"  eth0: {eth} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
                     + f"docker0: {docker} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
-                    + f"    lo: 999999 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+                    + "    lo: 999999 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
                 )
 
             write(1_000_000, 5_000_000)

@@ -69,6 +69,7 @@ fn prove_fix_with_progress(
 }
 
 pub use fix::{FixOptions, FixOutcome};
+pub use recipes::promote_staged_recipe;
 
 /// Order parsed-URL fields by how strongly they identify the value that reaches the sink.
 ///

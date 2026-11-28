@@ -469,8 +469,11 @@ def estimate(
     overhead_cpu = costs.overhead_cpu * weight
     cpu_budget = target * host.logical_cpus - host.busy_cpus
     mem_budget = target * host.mem_total_gib - host.mem_used_gib
-    ai_workers = parallel_ai if ai_lane else 0
-    floor = ai_workers + 1
+    requested_ai_workers = parallel_ai if ai_lane else 0
+    # One verification is the only irreducible floor.  Treat the Opus count as a preferred lane
+    # width, not reserved Docker capacity: forcing two AI slots plus one deterministic slot made a
+    # busy host exceed the utilization target before the governor could react.
+    floor = 1
 
     max_docker = max(1, min(MAX_DOCKER_SLOTS, int(costs.max_docker_slots)))
 
@@ -511,7 +514,8 @@ def estimate(
         docker = parallel_docker
         explicit.append("parallel_docker")
     elif parallel_no_ai is not None:
-        docker = parallel_no_ai + ai_workers
+        docker = parallel_no_ai + requested_ai_workers
+    ai_workers = min(requested_ai_workers, max(0, docker - 1))
     if parallel_no_ai is not None:
         explicit.append("parallel_no_ai")
         no_ai = parallel_no_ai
@@ -535,7 +539,7 @@ def estimate(
         static_parallel=static,
         max_checkouts=checkouts,
         parallel_no_ai=no_ai,
-        parallel_ai=parallel_ai,
+        parallel_ai=ai_workers,
         parallel_docker=docker,
         docker_floor=floor,
         docker_ceiling=ceiling,
@@ -597,10 +601,17 @@ def render_plan(
         f"the host with current load) and ≈{memory_load:.1f} GiB",
     ]
     if governed:
-        lines.append(
-            f"  governor keeps the host near {target:.0%} with {plan.docker_floor}–"
-            f"{plan.docker_ceiling} docker slots while the pass runs"
-        )
+        projected = (host.busy_cpus + cpu_load) / host.logical_cpus
+        if projected > target and plan.parallel_docker == plan.docker_floor:
+            lines.append(
+                f"  governor starts at its {plan.docker_floor}-slot minimum; current external "
+                f"load leaves too little budget to reach {target:.0%} until that load falls"
+            )
+        else:
+            lines.append(
+                f"  governor keeps the host near {target:.0%} with {plan.docker_floor}–"
+                f"{plan.docker_ceiling} docker slots while the pass runs"
+            )
     else:
         lines.append("  governor off: worker counts stay fixed")
     if plan.explicit:

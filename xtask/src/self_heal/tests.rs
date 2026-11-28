@@ -16,6 +16,91 @@ fn patch_release_rejects_prerelease_or_missing_versions() {
     assert!(next_patch_manifest("[package]\nversion = \"1.2.3\"\n").is_err());
 }
 
+#[test]
+fn interrupted_recipe_release_tags_are_strict_stable_versions() {
+    assert!(valid_release_tag("v1.2.3"));
+    assert!(!valid_release_tag("1.2.3"));
+    assert!(!valid_release_tag("v1.2.3-alpha.1"));
+    assert!(!valid_release_tag("v1.2"));
+}
+
+#[test]
+fn interrupted_recipe_release_is_resumable_from_clean_head() -> Result<()> {
+    let repository = tempfile::tempdir()?;
+    let root = repository.path();
+    command_ok(
+        Command::new("git").current_dir(root).args(["init", "-q"]),
+        "initialize recipe release test".to_owned(),
+    )?;
+    write_public_recipe(root, "")?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace.package]\nversion = \"1.0.0\"\n",
+    )?;
+    std::fs::write(root.join("Cargo.lock"), "version = 3\n")?;
+    command_ok(
+        Command::new("git").current_dir(root).args(["add", "."]),
+        "stage recipe release fixture".to_owned(),
+    )?;
+    command_ok(
+        Command::new("git").current_dir(root).args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ]),
+        "commit recipe release fixture".to_owned(),
+    )?;
+
+    write_public_recipe(root, ",\n  \"note\": \"generalized\"")?;
+    command_ok(
+        Command::new("git")
+            .current_dir(root)
+            .args(["add", PUBLIC_RECIPE_SCOPE]),
+        "stage evolved recipe".to_owned(),
+    )?;
+    command_ok(
+        Command::new("git").current_dir(root).args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "Evolve public fix recipes",
+        ]),
+        "commit evolved recipe".to_owned(),
+    )?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace.package]\nversion = \"1.0.1\"\n",
+    )?;
+    command_ok(
+        Command::new("git")
+            .current_dir(root)
+            .args(["add", "Cargo.toml"]),
+        "stage recipe release version".to_owned(),
+    )?;
+    command_ok(
+        Command::new("git").current_dir(root).args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "Release v1.0.1",
+        ]),
+        "commit recipe release version".to_owned(),
+    )?;
+
+    assert_eq!(pending_recipe_release(root)?.as_deref(), Some("v1.0.1"));
+    Ok(())
+}
+
 fn write_public_recipe(root: &Path, extra: &str) -> Result<()> {
     let directory = root.join(PUBLIC_RECIPE_SCOPE).join("path-traversal");
     std::fs::create_dir_all(&directory)?;

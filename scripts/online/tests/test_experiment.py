@@ -226,6 +226,42 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(summary["quality"]["real_held"], 1)
         self.assertEqual(summary["quality"].get("correct", 0), 0)
 
+    def test_exploit_and_exploit_plus_fix_rates_are_reported(self) -> None:
+        events = [
+            {"type": "experiment_started", "monotonic_ms": 0},
+            {"type": "run_completed", "monotonic_ms": 3_600_000},
+        ]
+        verdicts = [
+            {
+                "decision": "publish_fixed",
+                "exploit": {"verdict": "real"},
+                "fix": {"status": "verified"},
+            },
+            {
+                "decision": "publish_fixed",
+                "exploit": {"verdict": "real"},
+                "fix": {"status": "verified"},
+            },
+            {
+                "decision": "publish_unfixed",
+                "exploit": {"verdict": "real"},
+                "fix": {"status": "absent"},
+            },
+            {
+                "decision": "delete_false_positive",
+                "exploit": {"verdict": "false_positive"},
+                "fix": {"status": "absent"},
+            },
+        ]
+        summary = experiment.summarize(events, verdicts)
+
+        self.assertEqual(summary["rates"]["measurement_hours"], 1.0)
+        self.assertEqual(summary["rates"]["exploit_yield"], 0.75)
+        self.assertEqual(summary["rates"]["exploit_plus_fix_yield"], 0.5)
+        self.assertEqual(summary["rates"]["verified_fix_given_exploit"], 0.6667)
+        self.assertEqual(summary["rates"]["exploits_per_hour"], 3.0)
+        self.assertEqual(summary["rates"]["exploits_plus_fixes_per_hour"], 2.0)
+
     def test_composite_evidence_identity_and_missing_verdict_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run = Path(temporary)

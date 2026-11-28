@@ -36,15 +36,14 @@ It does not import or execute `jsspector-monitor`.
    against the same exploit and a benign control can continue. A newly learned recipe is staged as
    repository-neutral JSON; it does not yet enter or publish the shared corpus. Fix failure does not
    hide the issue.
-8. A ten-minute Codex gate pins `gpt-5.6-sol`, medium effort and `daybreak_blue`. Its coordinator
-   starts `exploit_replayer`, `exploit_skeptic` and `fix_adversary` concurrently, records each
-   independent conclusion and adjudicates their dissent. A real exploit may continue with or
+8. A single ten-minute Codex reviewer pins `gpt-5.6-sol`, medium effort and `daybreak_blue`. In one
+   adversarial pass it first challenges exploit causality and CIA impact, then validates an optional
+   fix and its bypass controls. It cannot spawn subagents. A real exploit may continue with or
    without a fix; a timeout or operational failure is inconclusive, never a false positive. The
    session is read-only and receives neither Satori nor GitHub environment credentials. The
-   controller does not trust the model-authored agent list: it independently verifies three spawn
-   edges, their pinned model/effort and three completed turns in Codex's local state, records a
-   hashed collaboration receipt, then deletes all four Codex sessions. Missing evidence blocks the
-   finding.
+   controller independently verifies the root turn, pinned model/effort and absence of spawn edges
+   in Codex's local state, records a hashed receipt, then deletes the session. Missing evidence
+   blocks the finding.
 9. Only a peer-approved exploit is synchronized privately to Satori. The uploaded report contains only
    verified findings (plus a proven fix when one exists) and uses a
    repository/revision/fingerprint idempotency key. Completion is recorded only after Satori has
@@ -104,7 +103,7 @@ proof and the independent peer attestation.
 
 ## One-hour improvement epochs
 
-The first iterations run in shadow mode: they execute exploitation, fixing and the three-agent
+The first iterations run in shadow mode: they execute exploitation, fixing and the single-agent
 review but cannot create Satori state or promote recipes. Shadow mode still reads the Satori issue
 and advisory inventory with the `satoridev05` profile so already-reported repositories are excluded
 before discovery; it performs no Satori writes.
@@ -126,11 +125,12 @@ summary. Each epoch uses a run-local state/cache, so it cannot mark production r
 processed and a frozen inventory can be replayed in the next epoch. Compare epochs on the same
 inventory before changing one policy variable. Promote shadow
 mode to the enforced Satori gate only after reviewing false-publish/real-delete counts, rejected-fix
-rate, p50/p90/p95 stage times, throughput, censored work, Docker cleanup and disk deltas.
+rate, exploit yield, exploit-plus-fix yield, p50/p90/p95 stage times, throughput, censored work,
+Docker cleanup and disk deltas.
 
-The peer-review allowance is one ten-minute wall-clock budget, not ten minutes per agent: the three
-specialists run concurrently inside it, then the coordinator adjudicates and the controller verifies
-and deletes their sessions. A missing specialist, timeout or invalid receipt holds the finding.
+The peer-review allowance is one ten-minute wall-clock budget for one adversarial reviewer. The
+controller rejects any delegated child thread and deletes the reviewer session afterward. A
+timeout or invalid receipt holds the finding.
 
 For blind quality measurements, keep labels outside the checkout and pass them only to the offline
 metrics join. They are never accepted by `jsspector online` and are never copied into a reviewer

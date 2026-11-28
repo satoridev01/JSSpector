@@ -664,6 +664,35 @@ def summarize(
         decisions[value]
         for value in ("hold_inconclusive", "inconclusive", "review_operational_failure")
     )
+    reviewed = funnel["peer_reviewed_findings"]
+    real_findings = funnel["peer_real_findings"]
+    real_with_fix = funnel["would_publish_fixed"]
+    clocks = [
+        clock
+        for event in events
+        if (clock := _clock_ms(event)) is not None
+    ]
+    measured_ms = max(clocks) - min(clocks) if len(clocks) >= 2 else None
+    measured_hours = (
+        measured_ms / 3_600_000
+        if measured_ms is not None and measured_ms > 0
+        else None
+    )
+    rates = {
+        "reviewed_findings": reviewed,
+        "measurement_hours": round(measured_hours, 4) if measured_hours is not None else None,
+        "exploit_yield": round(real_findings / reviewed, 4) if reviewed else None,
+        "exploit_plus_fix_yield": round(real_with_fix / reviewed, 4) if reviewed else None,
+        "verified_fix_given_exploit": (
+            round(real_with_fix / real_findings, 4) if real_findings else None
+        ),
+        "exploits_per_hour": (
+            round(real_findings / measured_hours, 4) if measured_hours else None
+        ),
+        "exploits_plus_fixes_per_hour": (
+            round(real_with_fix / measured_hours, 4) if measured_hours else None
+        ),
+    }
 
     samples = list(resource_samples)
     cpu = [
@@ -735,6 +764,7 @@ def summarize(
         "event_counts": dict(sorted(event_counts.items())),
         "outcomes": dict(sorted(outcomes.items())),
         "funnel": dict(sorted(funnel.items())),
+        "rates": rates,
         "decisions": dict(sorted(decisions.items())),
         "exploit_verdicts": dict(sorted(exploit_verdicts.items())),
         "fix_statuses": dict(sorted(fix_statuses.items())),
@@ -813,6 +843,7 @@ def _cell(value: Any) -> str:
 
 def render_markdown(summary: Mapping[str, Any]) -> str:
     funnel = summary.get("funnel", {})
+    rates = summary.get("rates", {})
     quality = summary.get("quality", {})
     resources = summary.get("resources", {})
     lines = [
@@ -827,6 +858,15 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     ]
     for name, value in sorted(funnel.items() if isinstance(funnel, Mapping) else []):
         lines.append(f"| {name.replace('_', ' ')} | {value} |")
+    lines += [
+        "",
+        "## Yield and throughput",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+    ]
+    for name, value in sorted(rates.items() if isinstance(rates, Mapping) else []):
+        lines.append(f"| {name.replace('_', ' ')} | {_cell(value)} |")
     lines += [
         "",
         "## Decisions",

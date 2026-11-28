@@ -405,7 +405,7 @@ struct OnlineArgs {
     /// Codex model used by the final adversarial review.
     #[arg(long, default_value = "gpt-5.6-sol")]
     peer_review_model: String,
-    /// Reasoning effort used by the peer-review coordinator and its subagents.
+    /// Reasoning effort used by the sole adversarial peer reviewer.
     #[arg(long, default_value = "medium", value_parser = ["low", "medium", "high", "xhigh", "max", "ultra"])]
     peer_review_reasoning: String,
     /// Cyber access program requested for the peer-review turn.

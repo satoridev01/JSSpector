@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -117,7 +118,7 @@ class PeerReviewTests(unittest.TestCase):
             "decision": decision,
         }
 
-    def test_bundle_is_content_bound_and_defines_three_agent_contracts(self) -> None:
+    def test_bundle_is_content_bound_and_defines_single_reviewer_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             bundle = self.prepare(Path(temporary), fixed=True)
             evidence = json.loads(bundle.evidence.read_text())
@@ -130,7 +131,8 @@ class PeerReviewTests(unittest.TestCase):
             self.assertEqual(evidence["fix_diff_sha256"], bundle.fix_diff_sha256)
             self.assertEqual(evidence["recipe_stage"]["recipe"]["id"], "anonymous")
             prompt = bundle.prompt.read_text()
-            self.assertIn("Spawn exactly three generic subagents", prompt)
+            self.assertIn("You are the only reviewer", prompt)
+            self.assertIn("Do not spawn or delegate to subagents", prompt)
             self.assertIn("<BEGIN_UNTRUSTED_EVIDENCE_JSON>", prompt)
             self.assertIn('"finding_fingerprint": "finding-1"', prompt)
             for name in peer_review.AGENT_NAMES:
@@ -163,14 +165,18 @@ class PeerReviewTests(unittest.TestCase):
         self.assertEqual(bundles[0].artifact_sha256, bundles[1].artifact_sha256)
         self.assertNotIn("root", evidence["report"])
 
-    def test_command_pins_model_effort_daybreak_schema_and_subagents(self) -> None:
+    def test_command_pins_model_effort_daybreak_schema_and_disables_subagents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             bundle = self.prepare(Path(temporary))
             command = peer_review.codex_command(bundle, peer_review.PeerReviewConfig())
         self.assertEqual(command[0], "codex")
         self.assertIn("gpt-5.6-sol", command)
         self.assertIn('model_reasoning_effort="medium"', command)
-        self.assertIn("agents.max_concurrent_threads_per_session=3", command)
+        self.assertIn("agents.enabled=false", command)
+        self.assertFalse(
+            any("agents.max_concurrent_threads_per_session" in item for item in command)
+        )
+        self.assertFalse(any("agents.default_subagent" in item for item in command))
         self.assertIn("daybreak_blue", command)
         self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
         self.assertIn("shell_environment_policy.ignore_default_excludes=false", command)
@@ -337,17 +343,13 @@ class PeerReviewTests(unittest.TestCase):
                 "open(out,'w').write(value)\n"
                 "home=os.environ['CODEX_HOME']; os.makedirs(home,exist_ok=True)\n"
                 "root='00000000-0000-0000-0000-000000000001'\n"
-                "roles=['exploit_replayer','exploit_skeptic','fix_adversary']\n"
                 "state=sqlite3.connect(os.path.join(home,'state_1.sqlite'))\n"
                 "state.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)')\n"
                 "state.execute('CREATE TABLE threads (id TEXT, agent_path TEXT, model TEXT, reasoning_effort TEXT)')\n"
                 "history=sqlite3.connect(os.path.join(home,'thread_history_1.sqlite'))\n"
                 "history.execute('CREATE TABLE thread_turns (thread_id TEXT, status TEXT, duration_ms INTEGER)')\n"
-                "for i,role in enumerate(roles,2):\n"
-                " child=f'00000000-0000-0000-0000-{i:012d}'\n"
-                " state.execute('INSERT INTO thread_spawn_edges VALUES (?,?,?)',(root,child,'open'))\n"
-                " state.execute('INSERT INTO threads VALUES (?,?,?,?)',(child,'/root/'+role,'gpt-5.6-sol','medium'))\n"
-                " history.execute('INSERT INTO thread_turns VALUES (?,?,?)',(child,'completed',100+i))\n"
+                "state.execute('INSERT INTO threads VALUES (?,?,?,?)',(root,'/root','gpt-5.6-sol','medium'))\n"
+                "history.execute('INSERT INTO thread_turns VALUES (?,?,?)',(root,'completed',103))\n"
                 "state.commit(); history.commit(); state.close(); history.close()\n"
                 "sys.stdin.read()\n"
                 "print(json.dumps({'type':'thread.started','thread_id':root}))\n"
@@ -371,13 +373,13 @@ class PeerReviewTests(unittest.TestCase):
         self.assertEqual(
             result.verdict.raw["controller_receipt"], result.collaboration_receipt
         )
-        self.assertEqual(len(result.collaboration_receipt["agents"]), 3)
+        self.assertEqual(len(result.collaboration_receipt["agents"]), 1)
         self.assertEqual(
             result.collaboration_receipt["artifact_sha256"], bundle.artifact_sha256
         )
         self.assertGreaterEqual(
             result.elapsed_s - result.verdict.raw["reviewer"]["duration_ms"] / 1000,
-            0.08,
+            0.02,
         )
 
     def test_collaboration_receipt_is_bound_to_the_exact_bundle(self) -> None:
@@ -386,7 +388,7 @@ class PeerReviewTests(unittest.TestCase):
             receipt = {
                 "schema_version": 1,
                 "verified": True,
-                "policy_version": peer_review.POLICY_VERSION,
+                "policy": peer_review.POLICY,
                 "artifact_sha256": bundle.artifact_sha256,
                 "finding_fingerprint": bundle.fingerprint,
                 "reviewed_commit": bundle.revision,
@@ -408,7 +410,7 @@ class PeerReviewTests(unittest.TestCase):
                 receipt, peer_review.PeerReviewConfig(), bundle
             )
             for key in (
-                "policy_version",
+                "policy",
                 "artifact_sha256",
                 "finding_fingerprint",
                 "reviewed_commit",
@@ -427,6 +429,41 @@ class PeerReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "root hash"):
                 peer_review.validate_collaboration_receipt(
                     invalid_hash, peer_review.PeerReviewConfig(), bundle
+                )
+
+    def test_single_reviewer_receipt_rejects_any_spawned_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = self.prepare(root / "bundle")
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            thread = "00000000-0000-0000-0000-000000000001"
+            state = sqlite3.connect(codex_home / "state_1.sqlite")
+            state.execute(
+                "CREATE TABLE thread_spawn_edges "
+                "(parent_thread_id TEXT, child_thread_id TEXT, status TEXT)"
+            )
+            state.execute(
+                "CREATE TABLE threads "
+                "(id TEXT, agent_path TEXT, model TEXT, reasoning_effort TEXT)"
+            )
+            state.execute(
+                "INSERT INTO threads VALUES (?,?,?,?)",
+                (thread, "/root", "gpt-5.6-sol", "medium"),
+            )
+            state.execute(
+                "INSERT INTO thread_spawn_edges VALUES (?,?,?)",
+                (thread, "child", "open"),
+            )
+            state.commit()
+            state.close()
+
+            with self.assertRaisesRegex(ValueError, "forbids Codex subagents"):
+                peer_review._read_collaboration_receipt(
+                    thread,
+                    bundle,
+                    peer_review.PeerReviewConfig(),
+                    {"CODEX_HOME": str(codex_home)},
                 )
 
     def test_session_deletion_attempts_every_id_and_aggregates_failures(self) -> None:

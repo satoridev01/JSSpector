@@ -85,7 +85,7 @@ class ControllerTests(unittest.TestCase):
         if bundle is not None:
             receipt.update(
                 {
-                    "policy_version": controller.peer_review.POLICY_VERSION,
+                    "policy": controller.peer_review.POLICY,
                     "artifact_sha256": bundle.artifact_sha256,
                     "finding_fingerprint": bundle.fingerprint,
                     "reviewed_commit": bundle.revision,

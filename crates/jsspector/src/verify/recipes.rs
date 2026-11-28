@@ -168,7 +168,7 @@ struct AttestedRecipe {
 struct ControllerReceipt {
     schema_version: u8,
     verified: bool,
-    policy_version: String,
+    policy: String,
     root_thread_sha256: String,
     artifact_sha256: String,
     finding_fingerprint: String,
@@ -552,7 +552,7 @@ impl Book {
 /// Merge one peer-reviewed staged recipe into `store`, optionally publishing an evolve release.
 ///
 /// Unknown verdict fields are ignored, but the controller-owned receipt must bind the complete
-/// review identity and all three completed agents to these exact stage bytes. A sidecar next to
+/// review identity and the completed adversarial reviewer to these exact stage bytes. A sidecar next to
 /// the stage makes a retry after a release failure idempotent without dirtying the recipe checkout.
 pub fn promote_staged_recipe(
     store: &Path,
@@ -609,8 +609,8 @@ fn valid_promotion_attestation(
     staged: &StagedRecipe,
     stage_sha256: &str,
 ) -> bool {
-    const POLICY: &str = "jsspector-peer-review-v2";
-    const ROLES: [&str; 3] = ["exploit_replayer", "exploit_skeptic", "fix_adversary"];
+    const POLICY: &str = "jsspector-peer-review";
+    const ROLES: [&str; 1] = ["adversarial_reviewer"];
 
     let receipt = &attestation.controller_receipt;
     let roles = receipt
@@ -643,7 +643,7 @@ fn valid_promotion_attestation(
         && attestation.recipe.stage_sha256.as_deref() == Some(stage_sha256)
         && receipt.verified
         && receipt.schema_version == 1
-        && receipt.policy_version == POLICY
+        && receipt.policy == POLICY
         && valid_sha256(&receipt.root_thread_sha256)
         && receipt.artifact_sha256 == attestation.artifact_sha256
         && receipt.finding_fingerprint == attestation.finding_fingerprint
@@ -1228,7 +1228,7 @@ mod tests {
             "controller_receipt": {
                 "schema_version": 1,
                 "verified": true,
-                "policy_version": "jsspector-peer-review-v2",
+                "policy": "jsspector-peer-review",
                 "root_thread_sha256": "f".repeat(64),
                 "artifact_sha256": artifact_sha256,
                 "finding_fingerprint": fingerprint,
@@ -1236,26 +1236,10 @@ mod tests {
                 "recipe_stage_sha256": stage_sha256,
                 "agents": [
                     {
-                        "agent": "exploit_replayer",
+                        "agent": "adversarial_reviewer",
                         "model": "gpt-5.6-sol",
                         "reasoning_effort": "medium",
                         "thread_sha256": "1".repeat(64),
-                        "duration_ms": 1000,
-                        "completed": true,
-                    },
-                    {
-                        "agent": "exploit_skeptic",
-                        "model": "gpt-5.6-sol",
-                        "reasoning_effort": "medium",
-                        "thread_sha256": "2".repeat(64),
-                        "duration_ms": 1000,
-                        "completed": true,
-                    },
-                    {
-                        "agent": "fix_adversary",
-                        "model": "gpt-5.6-sol",
-                        "reasoning_effort": "medium",
-                        "thread_sha256": "3".repeat(64),
                         "duration_ms": 1000,
                         "completed": true,
                     },
@@ -1737,8 +1721,8 @@ router.post('/login', async (req, res) => {\n\
             },
             {
                 let mut value = approved.clone();
-                value["controller_receipt"]["agents"][2]["agent"] =
-                    serde_json::json!("exploit_replayer");
+                value["controller_receipt"]["agents"][0]["agent"] =
+                    serde_json::json!("unexpected_reviewer");
                 value
             },
         ] {

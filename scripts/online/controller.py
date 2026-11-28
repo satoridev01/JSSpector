@@ -724,8 +724,8 @@ def sync_key(
                 if isinstance(review, dict)
                 else None,
                 "decision": review.get("decision") if isinstance(review, dict) else None,
-                "policy_version": (review.get("controller_receipt") or {}).get(
-                    "policy_version"
+                "policy": (review.get("controller_receipt") or {}).get(
+                    "policy"
                 )
                 if isinstance(review, dict)
                 and isinstance(review.get("controller_receipt"), dict)
@@ -1924,7 +1924,6 @@ def peer_review_config(args: argparse.Namespace) -> peer_review.PeerReviewConfig
         reasoning_effort=args.peer_review_reasoning,
         cyber_access_program=args.peer_review_program,
         timeout_s=args.peer_review_timeout,
-        subagents=3,
     )
 
 
@@ -1989,7 +1988,7 @@ def review_repository(
         review_run: peer_review.PeerReviewRun
         if (
             isinstance(cached, dict)
-            and cached.get("policy_version") == peer_review.POLICY_VERSION
+            and cached.get("policy") == peer_review.POLICY
             and isinstance(cached.get("verdict"), dict)
         ):
             try:
@@ -2074,7 +2073,7 @@ def review_repository(
                 "repository": result.repository,
                 "revision": result.revision,
                 "fingerprint": fingerprint,
-                "policy_version": peer_review.POLICY_VERSION,
+                "policy": peer_review.POLICY,
                 "reviewed_at": datetime.now(UTC).isoformat(),
                 "elapsed_s": review_run.elapsed_s,
                 "verdict": verdict.raw,
@@ -2621,7 +2620,7 @@ def synchronize(
                 key,
                 "--tag",
                 "peer_review_policy",
-                peer_review.POLICY_VERSION if require_peer_review else "disabled",
+                peer_review.POLICY if require_peer_review else "disabled",
                 "--sync",
             ]
             synced = run(command, capture=True)
@@ -3588,7 +3587,7 @@ def main(argv: list[str] | None = None) -> int:
     EVENT_RECORDER = experiment.EventRecorder(
         run_dir / "events.jsonl",
         experiment_id=args.experiment_id or stamp,
-        policy_version=peer_review.POLICY_VERSION,
+        policy_version=peer_review.POLICY,
     )
     snapshot_configuration = dict(vars(args))
     # Epoch identity belongs in the snapshot metadata, not in the configuration hash: two runs
@@ -3683,7 +3682,7 @@ def main(argv: list[str] | None = None) -> int:
         run_dir / "experiment-configuration.json",
         snapshot_configuration,
         experiment_id=args.experiment_id or stamp,
-        policy_version=peer_review.POLICY_VERSION,
+        policy_version=peer_review.POLICY,
     )
     started = time.monotonic()
     docker_baseline = capture_docker_inventory()

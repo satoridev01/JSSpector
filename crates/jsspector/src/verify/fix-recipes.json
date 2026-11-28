@@ -55,5 +55,14 @@
     "note": "When a proxy exists only to retrieve Amazon S3 objects, parse the URL and allow HTTPS regional S3 object hosts only. Match the complete hostname, never a loose contains/endsWith check that accepts attacker suffixes, reject URL credentials, and disable automatic redirects so an allowed S3 response cannot redirect the client to an internal host.",
     "before": "const response = await fetch(req.query.url);",
     "after": "function isAllowedS3Url(raw) {\n  try {\n    const parsed = new URL(String(raw));\n    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return false;\n    return /^[a-z0-9][a-z0-9.-]*\\.s3\\.[a-z0-9-]+\\.amazonaws\\.com$/.test(parsed.hostname.toLowerCase());\n  } catch {\n    return false;\n  }\n}\nif (!isAllowedS3Url(req.query.url)) return res.status(400).json({ error: 'invalid S3 URL' });\nconst response = await fetch(req.query.url, { redirect: 'error' });"
+  },
+  {
+    "id": "seed-ssrf-exact-host-allowlist",
+    "class": "ssrf",
+    "sink": "fetch",
+    "introduces": ["Set", "URL", "hostname", "protocol", "redirect", "manual"],
+    "note": "When the application already has a finite set of legitimate upstreams, derive an exact hostname allowlist from those call sites. Parse the URL; require HTTPS; reject credentials and non-default ports; compare the complete lower-cased hostname rather than using contains or an unsafe suffix; and use manual redirects so every redirect target is parsed and checked against the same allowlist before it is fetched.",
+    "before": "const response = await fetch(req.query.url);",
+    "after": "const ALLOWED_HOSTS = new Set(['api.example.com']);\nfunction parseAllowedTarget(raw) {\n  const target = new URL(String(raw));\n  if (target.protocol !== 'https:' || target.username || target.password || (target.port && target.port !== '443') || !ALLOWED_HOSTS.has(target.hostname.toLowerCase())) throw new Error('blocked target');\n  return target;\n}\nasync function fetchAllowed(raw, init = {}, redirects = 0) {\n  if (redirects > 5) throw new Error('too many redirects');\n  const target = parseAllowedTarget(raw);\n  const response = await fetch(target, { ...init, redirect: 'manual' });\n  if (response.status >= 300 && response.status < 400) {\n    const location = response.headers.get('location');\n    if (!location) throw new Error('redirect without location');\n    return fetchAllowed(new URL(location, target), init, redirects + 1);\n  }\n  return response;\n}\nconst response = await fetchAllowed(req.query.url);"
   }
 ]
